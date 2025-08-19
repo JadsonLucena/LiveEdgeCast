@@ -1,4 +1,4 @@
-FROM alfg/nginx-rtmp
+FROM alfg/nginx-rtmp:latest
 
 COPY nginx.conf.template /etc/nginx/nginx.conf.template
 COPY entrypoint.sh /entrypoint.sh

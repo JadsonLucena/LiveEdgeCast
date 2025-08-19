@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  liveedgecast:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "1935:1935"
+      - "8080:8080"
+    environment:
+      - RTMP_PUSH_URL=${RTMP_PUSH_URL:-rtmp://upstream.example.com/live/test}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

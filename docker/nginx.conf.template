@@ -28,8 +28,19 @@ http {
     server {
         listen 8080;
 
+        location /health {
+            return 200 'RTMP Edge Proxy is running.';
+            add_header Content-Type text/plain;
+        }
+
+        location /stats {
+            rtmp_stat all;
+            rtmp_stat_stylesheet stat.xsl;
+        }
+
         location / {
-            return 200 'RTMP server is running.';
+            return 200 'LiveEdgeCast - RTMP Edge Proxy for Low-Latency Stream Retransmission';
+            add_header Content-Type text/plain;
         }
     }
 }
