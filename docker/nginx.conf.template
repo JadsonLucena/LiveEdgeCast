@@ -33,6 +33,12 @@ http {
             add_header Content-Type text/plain;
         }
 
+        location /metrics {
+            # Endpoint para KEDA consumir métricas RTMP
+            rtmp_stat all;
+            add_header Content-Type application/json;
+        }
+
         location /stats {
             rtmp_stat all;
             rtmp_stat_stylesheet stat.xsl;
