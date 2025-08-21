@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rtmp-metrics-exporter
+spec:
+  selector:
+    app: rtmp-metrics-exporter
+  ports:
+  - port: 9145
+    targetPort: 9145
+    name: metrics

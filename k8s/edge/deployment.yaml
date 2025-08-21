@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rtmp-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rtmp-edge
+  template:
+    metadata:
+      labels:
+        app: rtmp-edge
+    spec:
+      containers:
+      - name: edge
+        image: liveedgecast-edge:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 1935
+        - containerPort: 8080

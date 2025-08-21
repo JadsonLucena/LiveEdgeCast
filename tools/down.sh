@@ -3,44 +3,29 @@
 set -e
 
 echo "Cleaning up LiveEdgeCast Kubernetes resources..."
-
 command -v kubectl >/dev/null 2>&1 || { echo "kubectl not found. Install kubectl first."; exit 1; }
 
-if kubectl get deployment liveedgecast-deployment >/dev/null 2>&1; then
-    echo "Deleting Kubernetes resources..."
-    kubectl delete -f k8s/
-else
-    echo "No LiveEdgeCast deployment found. Skipping manifest deletion."
-fi
+echo "1. Scaler (KEDA)"
+kubectl delete -f k8s/scaler/ --ignore-not-found
+kubectl wait --for=delete --timeout=120s scaledobject/liveedgecast-rtmp-scaler || true
 
-echo "Cleaning up KEDA resources..."
-if kubectl get scaledobject liveedgecast-scaledobject >/dev/null 2>&1; then
-    echo "Deleting ScaledObject..."
-    kubectl delete scaledobject liveedgecast-scaledobject
-else
-    echo "No ScaledObject found. Skipping ScaledObject deletion."
-fi
+echo "2. Worker"
+kubectl delete -f k8s/worker/ --ignore-not-found
+kubectl rollout status deployment/rtmp-worker --timeout=120s || true
 
-if kubectl get hpa liveedgecast-hpa >/dev/null 2>&1; then
-    echo "Deleting HPA..."
-    kubectl delete hpa liveedgecast-hpa
-else
-    echo "No HPA found. Skipping HPA deletion."
-fi
+echo "3. Edge"
+kubectl delete -f k8s/edge/ --ignore-not-found
+kubectl rollout status deployment/rtmp-edge --timeout=120s || true
 
-echo "Cleaning up KEDA metrics..."
-kubectl delete --ignore-not-found=true \
-    --selector=app=liveedgecast \
-    --all-namespaces \
-    --field-selector=metadata.name!=liveedgecast-deployment \
-    --field-selector=metadata.name!=liveedgecast-service \
-    --field-selector=metadata.name!=liveedgecast-secrets
+echo "4. Exporter"
+kubectl delete -f k8s/exporter/ --ignore-not-found
+kubectl rollout status deployment/rtmp-metrics-exporter --timeout=120s || true
 
-if kubectl get secret liveedgecast-secrets >/dev/null 2>&1; then
-    echo "Deleting secret liveedgecast-secrets..."
-    kubectl delete secret liveedgecast-secrets
-else
-    echo "No liveedgecast-secrets secret found. Skipping secret deletion."
-fi
+echo "5. Prometheus"
+kubectl delete -f k8s/prometheus/ --ignore-not-found
+kubectl rollout status deployment/prometheus --timeout=120s || true
+
+echo "Deleting secret liveedgecast-secrets (if exists)..."
+kubectl delete secret liveedgecast-secrets --ignore-not-found
 
 echo "Cleanup completed!"

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 3s
+    scrape_configs:
+      - job_name: 'nginx-rtmp'
+        static_configs:
+          - targets: ['rtmp-metrics-exporter:9145']

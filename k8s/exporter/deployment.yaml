@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rtmp-metrics-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rtmp-metrics-exporter
+  template:
+    metadata:
+      labels:
+        app: rtmp-metrics-exporter
+    spec:
+      containers:
+      - name: exporter
+        image: nginx/nginx-prometheus-exporter:latest
+        env:
+          - name: NGINX_SCRAPE_URI
+            value: "http://rtmp-edge:8080/stat"
+        ports:
+        - containerPort: 9145

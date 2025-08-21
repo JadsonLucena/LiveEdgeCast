@@ -39,8 +39,11 @@ if ! [[ "$RTMP_PUSH_URL" =~ ^rtmp://.+/.+ ]]; then
     exit 1
 fi
 
-echo "Building Docker image..."
-docker build -f docker/Dockerfile -t liveedgecast:latest . || { echo "Build failed"; exit 1; }
+echo "Building Docker image for edge..."
+docker build -t liveedgecast-edge:latest ./docker/edge || { echo "Edge image build failed"; exit 1; }
+
+echo "Building Docker image for worker..."
+docker build -t liveedgecast-worker:latest ./docker/worker || { echo "Worker image build failed"; exit 1; }
 
 CONTEXT=$(kubectl config current-context)
 if [[ ! $CONTEXT =~ (docker-desktop|localhost|127\.0\.0\.1) ]]; then
@@ -59,12 +62,34 @@ kubectl create secret generic liveedgecast-secrets \
     --from-literal=rtmp-push-url="$RTMP_PUSH_URL" \
     --dry-run=client -o yaml | kubectl apply -f -
 
-echo "Applying Kubernetes resources..."
-kubectl apply -f k8s/
 
-echo "Waiting for pods to be ready..."
-kubectl wait --for=condition=ready pod -l app=liveedgecast --timeout=120s
+echo "Applying Kubernetes manifests in the correct order:"
 
+echo "1. Prometheus"
+kubectl apply -f k8s/prometheus/
+kubectl rollout status deployment/prometheus
+kubectl wait --for=condition=available --timeout=120s deployment/prometheus
+
+echo "2. Exporter"
+kubectl apply -f k8s/exporter/
+kubectl rollout status deployment/rtmp-metrics-exporter
+kubectl wait --for=condition=available --timeout=120s deployment/rtmp-metrics-exporter
+
+echo "3. Edge"
+kubectl apply -f k8s/edge/
+kubectl rollout status deployment/rtmp-edge
+kubectl wait --for=condition=available --timeout=120s deployment/rtmp-edge
+
+echo "4. Worker"
+kubectl apply -f k8s/worker/
+kubectl rollout status deployment/rtmp-worker
+kubectl wait --for=condition=available --timeout=120s deployment/rtmp-worker
+
+echo "5. Scaler (KEDA)"
+kubectl apply -f k8s/scaler/
+
+echo "Since the cluster is running in serverless mode (KEDA), pods will only be created on demand."
+echo "If there are no pods now, this is expected. They will be created automatically when there is load (e.g., RTMP connection)."
 echo "Deployment completed!"
 kubectl get pods,svc -l app=liveedgecast
 

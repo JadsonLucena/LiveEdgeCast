@@ -9,7 +9,7 @@ services:
       - "1935:1935"
       - "8080:8080"
     environment:
-      - RTMP_PUSH_URL=${RTMP_PUSH_URL:-rtmp://upstream.example.com/live/test}
+      - RTMP_PUSH_URL=${RTMP_PUSH_URL}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

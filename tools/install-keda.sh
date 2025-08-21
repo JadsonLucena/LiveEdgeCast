@@ -11,12 +11,8 @@ fi
 
 helm repo add kedacore https://kedacore.github.io/charts
 helm repo update
-
-helm install keda kedacore/keda --namespace keda-system --create-namespace
-
+kubectl create namespace keda --dry-run=client -o yaml | kubectl apply -f -
+helm install keda kedacore/keda --namespace keda
 echo "KEDA installed successfully!"
-echo "Waiting for pods to be ready..."
-
-kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=keda -n keda-system --timeout=300s
-
-echo "KEDA is ready to use!"
+echo "Checking pods in keda namespace..."
+kubectl get pods -n keda

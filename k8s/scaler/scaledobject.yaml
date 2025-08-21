@@ -1,0 +1,19 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: rtmp-worker-scaledobject
+spec:
+  scaleTargetRef:
+    name: rtmp-worker
+  pollingInterval: 15
+  cooldownPeriod: 60
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus:9090
+      metricName: nginx_rtmp_nclients
+      threshold: "1"
+      query: |
+        sum(nginx_rtmp_nclients)
