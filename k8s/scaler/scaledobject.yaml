@@ -5,10 +5,10 @@ metadata:
 spec:
   scaleTargetRef:
     name: rtmp-worker
-  pollingInterval: 15
-  cooldownPeriod: 60
+  pollingInterval: 3
+  cooldownPeriod: 30
   minReplicaCount: 0
-  maxReplicaCount: 20
+  maxReplicaCount: 50
   triggers:
   - type: prometheus
     metadata:
@@ -16,4 +16,5 @@ spec:
       metricName: nginx_rtmp_nclients
       threshold: "1"
       query: |
-        sum(nginx_rtmp_nclients)
+        sum(nginx_rtmp_nclients{job="nginx-rtmp-edge"})
+      activationThreshold: "1"

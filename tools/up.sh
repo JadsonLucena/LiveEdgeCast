@@ -75,7 +75,7 @@ kubectl apply -f k8s/exporter/
 kubectl rollout status deployment/rtmp-metrics-exporter
 kubectl wait --for=condition=available --timeout=120s deployment/rtmp-metrics-exporter
 
-echo "3. Edge"
+echo "3. Edge (including ConfigMap)"
 kubectl apply -f k8s/edge/
 kubectl rollout status deployment/rtmp-edge
 kubectl wait --for=condition=available --timeout=120s deployment/rtmp-edge

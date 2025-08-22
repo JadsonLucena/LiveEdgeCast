@@ -5,8 +5,18 @@ metadata:
 data:
   prometheus.yml: |
     global:
-      scrape_interval: 3s
+      scrape_interval: 5s
+      evaluation_interval: 5s
+    
     scrape_configs:
-      - job_name: 'nginx-rtmp'
+      - job_name: 'nginx-rtmp-edge'
         static_configs:
           - targets: ['rtmp-metrics-exporter:9145']
+        metrics_path: /metrics
+        scrape_interval: 5s
+        scrape_timeout: 3s
+        
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+        scrape_interval: 15s

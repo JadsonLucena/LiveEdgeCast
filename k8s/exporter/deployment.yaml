@@ -17,6 +17,14 @@ spec:
         image: nginx/nginx-prometheus-exporter:latest
         env:
           - name: NGINX_SCRAPE_URI
-            value: "http://rtmp-edge:8080/stat"
+            value: "http://rtmp-edge:8080/rtmp_stat"
         ports:
         - containerPort: 9145
+          name: metrics
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
