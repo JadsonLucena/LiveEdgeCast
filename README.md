@@ -32,7 +32,7 @@ To stop the project, use:
 Alternatively, you can run the project directly using Docker Compose:
 
 ```sh
-RTMP_PUSH_URL=rtmp://upstream.example.com/live/yourStreamKey docker-compose up -d
+RTMP_PUSH_URL=rtmp://a.rtmp.youtube.com/live2/2tww-t6fv-z2mh-0rsq-4z8t docker-compose up -d
 ```
 
 To stop and remove the containers:

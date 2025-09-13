@@ -1,11 +1,9 @@
 FROM alfg/nginx-rtmp:latest
 
-COPY docker/nginx.conf.template /etc/nginx/nginx.conf.template
-COPY docker/entrypoint.sh /entrypoint.sh
+RUN rm -rf /etc/nginx/conf.d/*
 
-RUN chmod +x /entrypoint.sh
+COPY docker/nginx.conf /etc/nginx/nginx.conf
 
 EXPOSE 1935 8080
 
-ENTRYPOINT ["/entrypoint.sh"]
-CMD ["nginx", "-g", "daemon off;"]
+ENTRYPOINT ["sh", "-c", "sed -i 's|\\${RTMP_PUSH_URL}|'\"$RTMP_PUSH_URL\"'|g' /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]

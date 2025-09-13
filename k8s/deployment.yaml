@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: liveedgecast
-        image: liveedgecast:latest  # Image built from local Dockerfile
+        image: liveedgecast:latest
         imagePullPolicy: IfNotPresent
         env:
         - name: RTMP_PUSH_URL
@@ -50,7 +50,5 @@ spec:
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 5
-        command: ["/entrypoint.sh"]
-        args: ["nginx", "-g", "daemon off;"]
       volumes: []
       restartPolicy: Always
