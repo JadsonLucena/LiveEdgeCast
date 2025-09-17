@@ -7,7 +7,7 @@ services:
       dockerfile: docker/Dockerfile
     ports:
       - "1935:1935"
-      - "8080:8080"
+      - ":8080"
     environment:
       - RTMP_PUSH_URL=${RTMP_PUSH_URL:-rtmp://upstream.example.com/live/test}
     restart: unless-stopped

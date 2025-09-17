@@ -1,0 +1,19 @@
+apiVersion: http.keda.sh/v1alpha1
+kind: HTTPScaledObject
+metadata:
+  name: nginx-http-scaledobject
+  namespace: default
+spec:
+  scaleTargetRef:
+    name: nginx-deployment
+    kind: Deployment
+    apiVersion: apps/v1
+    service: nginx-service
+    port: 8080
+  hosts:
+    - "localhost"
+  targetPendingRequests: 10
+  scaledownPeriod: 10
+  replicas:
+    min: 0
+    max: 3

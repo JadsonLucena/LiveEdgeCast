@@ -1,54 +1,21 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: liveedgecast-deployment
+  name: nginx-deployment
   labels:
-    app: liveedgecast
+    app: nginx-deployment
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
-      app: liveedgecast
+      app: nginx-deployment
   template:
     metadata:
       labels:
-        app: liveedgecast
+        app: nginx-deployment
     spec:
       containers:
-      - name: liveedgecast
-        image: liveedgecast:latest
-        imagePullPolicy: IfNotPresent
-        env:
-        - name: RTMP_PUSH_URL
-          valueFrom:
-            secretKeyRef:
-              name: liveedgecast-secrets
-              key: rtmp-push-url
-        ports:
-        - containerPort: 1935
-          name: rtmp
-          protocol: TCP
-        - containerPort: 8080
-          name: http
-          protocol: TCP
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8080
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 5
-      volumes: []
-      restartPolicy: Always
+        - name: nginx
+          image: nginx:latest
+          ports:
+            - containerPort: 8080
