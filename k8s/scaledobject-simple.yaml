@@ -1,0 +1,37 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: rtmp-worker-scaler
+  namespace: media
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: rtmp-worker
+  minReplicaCount: 0    # True serverless - starts with 0 replicas
+  maxReplicaCount: 10   # Scale up to handle multiple streams  
+  cooldownPeriod: 60    # 1min cleanup after inactivity
+  pollingInterval: 5    # Check every 5 seconds for faster response
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0  # Immediate scale up
+          selectPolicy: Max
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 5
+        scaleDown:
+          stabilizationWindowSeconds: 30  # Wait 30s before scale down
+          selectPolicy: Min
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 30
+  triggers:
+    # Metrics API scaler baseado em HTTP endpoint
+    - type: metrics-api
+      metadata:
+        targetValue: "1"
+        url: "http://nginx-scaler.media.svc.cluster.local:8080/count"
+        valueLocation: "value"

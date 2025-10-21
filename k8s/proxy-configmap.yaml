@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rtmp-proxy-nginx-conf
+  namespace: media
+data:
+  nginx.conf: |
+    worker_processes  auto;
+
+    events {
+        worker_connections  1024;
+    }
+
+    rtmp {
+        server {
+            listen 1935;
+            chunk_size 4096;
+
+            application live {
+                live on;
+                record off;
+
+                allow publish all;
+                allow play all;
+
+                # Forward to serverless workers instead of direct YouTube push
+                push rtmp://rtmp-backend.media.svc.cluster.local:1935/live;
+            }
+        }
+    }
+
+    http {
+        include       mime.types;
+        default_type  application/octet-stream;
+
+        server {
+            listen 8080;
+
+            location /health {
+                return 200 'RTMP Edge Proxy is running.';
+                add_header Content-Type text/plain;
+            }
+
+            location /stats {
+                rtmp_stat all;
+                rtmp_stat_stylesheet stat.xsl;
+            }
+
+            location /nginx_status {
+                stub_status on;
+                access_log off;
+                allow all;
+            }
+
+            location /connections {
+                rtmp_stat all;
+                access_log off;
+                add_header Content-Type text/plain;
+            }
+
+            location / {
+                return 200 'LiveEdgeCast - RTMP Edge Proxy for Low-Latency Stream Retransmission';
+                add_header Content-Type text/plain;
+            }
+        }
+    }

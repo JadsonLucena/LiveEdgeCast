@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-stream-STREAM_NAME
+  namespace: media
+  labels:
+    app: rtmp-worker
+    stream: STREAM_NAME
+spec:
+  selector:
+    app: rtmp-worker
+    stream: STREAM_NAME
+  ports:
+  - name: rtmp
+    port: 1935
+    targetPort: 1935
+    protocol: TCP
+  type: ClusterIP
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-stream-STREAM_NAME
+  namespace: media
+  labels:
+    app: rtmp-worker
+    stream: STREAM_NAME
+spec:
+  replicas: 0  # Serverless - KEDA will scale
+  selector:
+    matchLabels:
+      app: rtmp-worker
+      stream: STREAM_NAME
+  template:
+    metadata:
+      labels:
+        app: rtmp-worker
+        stream: STREAM_NAME
+    spec:
+      containers:
+      - name: rtmp-worker
+        image: liveedgecast:local
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 1935
+          name: rtmp
+        - containerPort: 8080
+          name: http
+        env:
+        - name: STREAM_NAME
+          value: "STREAM_NAME"
+        - name: RTMP_PUSH_URL
+          value: "rtmp://a.rtmp.youtube.com/live2/PUSH_URL_PLACEHOLDER"
+        volumeMounts:
+        - name: cfg
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: cfg
+        configMap:
+          name: rtmp-worker-nginx-conf
+
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-stream-STREAM_NAME-scaler
+  namespace: media
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: worker-stream-STREAM_NAME
+  minReplicaCount: 0
+  maxReplicaCount: 1  # Maximum 1 replica per stream
+  cooldownPeriod: 300  # 5min cleanup after inactivity
+  pollingInterval: 15
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+      metricName: rtmp_stream_connection_active
+      # Scale based on active connection for this specific stream
+      query: |
+        nginx_rtmp_connections_active{namespace="media",stream="STREAM_NAME"} or vector(0)
+      threshold: "1"

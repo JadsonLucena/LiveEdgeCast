@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rtmp-worker-nginx-conf
+  namespace: media
+data:
+  nginx.conf: |
+    worker_processes  auto;
+
+    events {
+        worker_connections  1024;
+    }
+
+    rtmp {
+        server {
+            listen 1935;
+            chunk_size 4096;
+            max_connections 1;
+
+            application live {
+                live on;
+                record off;
+
+                allow publish all;
+                deny play all;
+
+                # Worker retransmits to YouTube
+                push rtmp://a.rtmp.youtube.com/live2/2tww-t6fv-z2mh-0rsq-4z8t;
+
+                # Auto-terminate if idle
+                drop_idle_publisher 300s;
+            }
+        }
+    }
+
+    http {
+        include       mime.types;
+        default_type  application/octet-stream;
+
+        server {
+            listen 8080;
+        
+        location /health {
+          return 200 'RTMP Worker is running.';
+          add_header Content-Type text/plain;
+        }
+        
+        location /stats {
+          rtmp_stat all;
+          rtmp_stat_stylesheet stat.xsl;
+        }
+
+        location / {
+          return 200 'LiveEdgeCast - RTMP Worker for Stream Processing';
+          add_header Content-Type text/plain;
+        }
+      }
+    }

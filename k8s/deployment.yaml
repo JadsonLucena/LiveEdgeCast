@@ -1,21 +1,33 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: nginx-deployment
-  labels:
-    app: nginx-deployment
+  name: rtmp-worker
+  namespace: media
 spec:
+  # replicas controlled by KEDA - starts at 0
   replicas: 0
   selector:
-    matchLabels:
-      app: nginx-deployment
+    matchLabels: { app: rtmp-worker }
   template:
     metadata:
-      labels:
-        app: nginx-deployment
+      labels: { app: rtmp-worker }
     spec:
       containers:
-        - name: nginx
-          image: nginx:latest
+        - name: rtmp
+          image: liveedgecast:latest
+          imagePullPolicy: Never
           ports:
-            - containerPort: 8080
+            - containerPort: 1935
+              name: rtmp
+              protocol: TCP
+          volumeMounts:
+            - name: cfg
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+          readinessProbe:
+            tcpSocket: { port: 1935 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+      volumes:
+        - name: cfg
+          configMap: { name: rtmp-worker-nginx-conf }

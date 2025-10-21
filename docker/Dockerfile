@@ -1,9 +1,11 @@
 FROM alfg/nginx-rtmp:latest
 
+# Remove previous configuration
 RUN rm -rf /etc/nginx/conf.d/*
 
+# Copy our configuration
 COPY docker/nginx.conf /etc/nginx/nginx.conf
 
 EXPOSE 1935 8080
 
-ENTRYPOINT ["sh", "-c", "sed -i 's|\\${RTMP_PUSH_URL}|'\"$RTMP_PUSH_URL\"'|g' /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]
+ENTRYPOINT ["nginx", "-g", "daemon off;"]

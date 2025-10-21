@@ -1,0 +1,58 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: rtmp-proxy-scaler
+  namespace: media
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: rtmp-proxy
+  minReplicaCount: 1     # Sempre pelo menos 1 proxy ativo
+  maxReplicaCount: 10    # Máximo 10 proxies para balancear carga
+  cooldownPeriod: 120    # 2min para scale down
+  pollingInterval: 10    # Verifica a cada 10 segundos
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30  # Aguarda 30s antes de escalar
+          selectPolicy: Max
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 180  # Aguarda 3min antes de reduzir
+          selectPolicy: Min
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+  triggers:
+    # Primary Trigger: Escalação baseada em tráfego inbound (1Gbps por node)
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: rtmp_proxy_inbound_gbps
+        query: |
+          sum(rate(container_network_receive_bytes_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m])) / (1000*1000*1000) or vector(0)
+        threshold: "0.8"  # Scale quando > 800Mbps (80% de 1Gbps por node)
+    
+    # Secondary Trigger: Escalação baseada em conexões ativas (backup)
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: rtmp_proxy_active_connections
+        query: |
+          sum(nginx_connections_active{namespace="media",pod=~"rtmp-proxy-.*"}) - 
+          sum(nginx_connections_waiting{namespace="media",pod=~"rtmp-proxy-.*"}) or vector(0)
+        threshold: "50"  # Backup trigger: 1 proxy para cada 50 conexões ativas
+    
+    # Tertiary Trigger: CPU como safety net
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: rtmp_proxy_cpu_usage
+        query: |
+          sum(rate(container_cpu_usage_seconds_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m])) / sum(container_spec_cpu_quota{namespace="media",pod=~"rtmp-proxy-.*"}/container_spec_cpu_period{namespace="media",pod=~"rtmp-proxy-.*"}) * 100 or vector(0)
+        threshold: "80"  # Safety net: Escala quando CPU > 80%

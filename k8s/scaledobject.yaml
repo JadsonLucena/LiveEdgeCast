@@ -1,0 +1,41 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: rtmp-worker-scaler
+  namespace: media
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: rtmp-worker
+  minReplicaCount: 0    # True serverless - starts with 0 replicas
+  maxReplicaCount: 100  # Scale up to handle multiple streams
+  cooldownPeriod: 300   # 5min cleanup after inactivity
+  pollingInterval: 10   # Check every 10 seconds
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0  # Immediate scale up
+          selectPolicy: Max
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 10
+        scaleDown:
+          stabilizationWindowSeconds: 60  # Wait 1min before scale down
+          selectPolicy: Min
+          policies:
+          - type: Percent
+            value: 50
+            periodSeconds: 30
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: rtmp_active_connections
+        # Scale based on active RTMP connections to proxy
+        query: |
+          sum(nginx_rtmp_connections{namespace="media",pod=~"rtmp-proxy-.*"}) or 
+          sum(nginx_connections_active{namespace="media",pod=~"rtmp-proxy-.*"} - nginx_connections_waiting{namespace="media",pod=~"rtmp-proxy-.*"}) or 
+          vector(0)
+        threshold: "1"
