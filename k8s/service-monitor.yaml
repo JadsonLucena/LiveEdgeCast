@@ -11,7 +11,7 @@ spec:
       app: rtmp-worker
   endpoints:
     - port: metrics
-      interval: 15s
+      interval: 10s
 
 ---
 apiVersion: monitoring.coreos.com/v1
@@ -26,6 +26,6 @@ spec:
     matchLabels:
       app: rtmp-proxy
   endpoints:
-    - port: metrics
+    - port: rtmp-metrics
       interval: 10s
       path: /metrics

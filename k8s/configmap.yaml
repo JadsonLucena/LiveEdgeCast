@@ -40,19 +40,16 @@ data:
         server {
             listen 8080;
         
-        location /health {
-          return 200 'RTMP Worker is running.';
-          add_header Content-Type text/plain;
-        }
-        
-        location /stats {
-          rtmp_stat all;
-          rtmp_stat_stylesheet stat.xsl;
-        }
+            # Health check endpoint for Kubernetes probes
+            location /health {
+                return 200 'RTMP Worker is running.';
+                add_header Content-Type text/plain;
+            }
 
-        location / {
-          return 200 'LiveEdgeCast - RTMP Worker for Stream Processing';
-          add_header Content-Type text/plain;
+            # Root endpoint for service identification
+            location / {
+                return 200 'LiveEdgeCast - RTMP Worker for Stream Processing';
+                add_header Content-Type text/plain;
+            }
         }
-      }
     }

@@ -60,6 +60,18 @@ if ! kubectl get namespace keda >/dev/null 2>&1; then
     exit 1
 fi
 
+kubectl apply -f k8s/namespaces.yaml || { print_error "Failed to create namespace"; exit 1; }
+
+# wait for namespace to be active
+kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/media --timeout=30s || {
+    print_error "Namespace 'media' failed to become active"
+    exit 1
+}
+kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/monitoring --timeout=30s || {
+    print_error "Namespace 'keda' failed to become active"
+    exit 1
+}
+
 # Check if Prometheus is installed (for KEDA metrics)
 if ! kubectl get namespace monitoring >/dev/null 2>&1; then
     print_warning "Monitoring namespace not found. Installing Prometheus for KEDA metrics..."
@@ -230,4 +242,65 @@ echo -e "${YELLOW}   • Primary trigger: >800 Mbps inbound (80% of 1Gbps per no
 echo -e "${YELLOW}   • Secondary triggers: >50 connections, >80% CPU${NC}"
 echo -e "${YELLOW}   • Total capacity: ~8 Gbps inbound, ~400 streams per proxy${NC}"
 echo ""
+echo -e "${BLUE}🔍 Testing Prometheus Metrics Collection:${NC}"
+echo ""
+
+# Test 1: Check if nginx-exporter is exposing metrics
+print_step "Testing nginx-exporter endpoints..."
+PROXY_POD=$(kubectl get pods -n media -l app=rtmp-proxy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+if [ -n "$PROXY_POD" ]; then
+    echo "  Testing nginx stub_status endpoint..."
+    if kubectl exec -n media "$PROXY_POD" -c nginx -- wget -qO- http://localhost:8080/nginx_status 2>/dev/null | head -5; then
+        print_success "✓ Nginx stub_status is working"
+    else
+        print_warning "✗ Nginx stub_status not responding"
+    fi
+    
+    echo ""
+    echo "  Testing nginx-exporter metrics endpoint..."
+    if kubectl exec -n media "$PROXY_POD" -c nginx-exporter -- wget -qO- http://localhost:9113/metrics 2>/dev/null | grep "nginx_connections" | head -5; then
+        print_success "✓ Nginx-exporter is exposing metrics"
+    else
+        print_warning "✗ Nginx-exporter not responding"
+    fi
+else
+    print_warning "No proxy pod found for testing"
+fi
+
+echo ""
+print_step "Setting up Prometheus port-forward for testing..."
+# Kill any existing Prometheus port-forward
+pkill -f "kubectl.*port-forward.*prometheus.*9090" 2>/dev/null || true
+sleep 1
+
+# Start Prometheus port-forward in background
+kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090 >/dev/null 2>&1 &
+PROM_PORT_FORWARD_PID=$!
+sleep 3
+
+# Test Prometheus API
+echo "  Testing Prometheus query API..."
+PROM_QUERY="nginx_connections_active{namespace=\"media\"}"
+PROM_RESULT=$(curl -s "http://localhost:9090/api/v1/query?query=$PROM_QUERY" 2>/dev/null)
+
+if echo "$PROM_RESULT" | grep -q "nginx_connections_active"; then
+    print_success "✓ Prometheus is scraping nginx metrics"
+    echo ""
+    echo "  📊 Current nginx_connections_active:"
+    echo "$PROM_RESULT" | grep -o '"value":\[[^]]*\]' | head -3
+else
+    print_warning "✗ Prometheus may not have scraped metrics yet (wait 30s and check manually)"
+fi
+
+echo ""
 echo -e "${GREEN}🚀 Ready to receive RTMP streams!${NC}"
+echo ""
+echo -e "${BLUE}🔍 Metrics Verification:${NC}"
+echo "  🌐 Prometheus UI: http://localhost:9090"
+echo "  📊 Query examples:"
+echo "     - nginx_connections_active{namespace=\"media\"}"
+echo "     - nginx_connections_active - nginx_connections_waiting"
+echo "     - rate(container_network_receive_bytes_total{namespace=\"media\"}[1m])"
+echo ""
+echo "  🛑 Stop Prometheus port-forward: kill $PROM_PORT_FORWARD_PID"

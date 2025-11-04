@@ -32,10 +32,10 @@ spec:
     - type: prometheus
       metadata:
         serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
-        metricName: rtmp_active_connections
-        # Scale based on active RTMP connections to proxy
+        metricName: rtmp_live_clients
+        # Scale based on ACTUAL RTMP clients connected (not HTTP connections!)
+        # This metric comes from nginx-rtmp /stats endpoint: <nclients>N</nclients>
+        # Only counts real RTMP handshake connections, not HTTP monitoring
         query: |
-          sum(nginx_rtmp_connections{namespace="media",pod=~"rtmp-proxy-.*"}) or 
-          sum(nginx_connections_active{namespace="media",pod=~"rtmp-proxy-.*"} - nginx_connections_waiting{namespace="media",pod=~"rtmp-proxy-.*"}) or 
-          vector(0)
-        threshold: "1"
+          sum(nginx_rtmp_live_clients{namespace="media",application="live"}) or vector(0)
+        threshold: "1"  # Scale up when there's at least 1 RTMP client

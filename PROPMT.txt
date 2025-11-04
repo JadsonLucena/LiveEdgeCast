@@ -1,0 +1,8 @@
+Ok, agora reinicialize o sistema e realize um teste completo.
+Todo list:
+
+deixar o sistema up
+testar a saúde od sistema, ele precisa estar acessível pelo localhost
+verificar se o phometeus está funcionando e se o sistema está interpretando corretamente as métricas para escalar normalmente
+iniciar uma transmissão: ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 -f lavfi -i sine=frequency=1000 -vcodec libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -acodec aac -f flv rtmp://localhost:1935/live/test
+Verificar se o worker está escalando

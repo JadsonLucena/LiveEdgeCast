@@ -13,7 +13,7 @@ spec:
       port: 1935
       targetPort: 1935
       protocol: TCP
-    - name: metrics
-      port: 9113
-      targetPort: 9113
+    - name: rtmp-metrics
+      port: 9114
+      targetPort: 9114
       protocol: TCP
