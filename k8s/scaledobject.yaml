@@ -31,11 +31,12 @@ spec:
   triggers:
     - type: prometheus
       metadata:
-        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
-        metricName: rtmp_live_clients
-        # Scale based on ACTUAL RTMP clients connected (not HTTP connections!)
-        # This metric comes from nginx-rtmp /stats endpoint: <nclients>N</nclients>
-        # Only counts real RTMP handshake connections, not HTTP monitoring
+        serverAddress: http://prometheus-server.prometheus.svc.cluster.local:80
+        metricName: rtmp_tcp_connections
+        # Scale based on TCP connections to RTMP port (1935) on PROXY
+        # Each TCP connection = 1 publisher sending a stream
+        # Workers scale 1:1 with publishers (1 worker per stream)
         query: |
-          sum(nginx_rtmp_live_clients{namespace="media",application="live"}) or vector(0)
-        threshold: "1"  # Scale up when there's at least 1 RTMP client
+          sum(nginx_rtmp_tcp_connections{namespace="media",pod=~"rtmp-proxy-.*",port="1935"}) or vector(0)
+        threshold: "1"  # Scale up 1 worker per TCP connection (1:1 mapping)
+        activationThreshold: "0.5"  # Wake up from 0 replicas when >= 1 connection exists

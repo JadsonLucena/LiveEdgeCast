@@ -48,41 +48,94 @@ spec:
             - |
               cat > /tmp/rtmp_exporter.py << 'EXPORTER_EOF'
               #!/usr/bin/env python3
-              import time, xml.etree.ElementTree as ET
+              import time, xml.etree.ElementTree as ET, subprocess
               from http.server import HTTPServer, BaseHTTPRequestHandler
               import urllib.request, os
               
               RTMP_STATS_URL = 'http://localhost:8080/stats'
               EXPORTER_PORT = 9114
+              RTMP_PORT = 1935
+              
+              def count_tcp_connections(port):
+                  """Count ALL active TCP connections on specified port (including localhost)"""
+                  try:
+                      # Try netstat first - counts all connections (external + loopback)
+                      result = subprocess.run(
+                          ['netstat', '-tn'], 
+                          capture_output=True, 
+                          text=True, 
+                          timeout=2
+                      )
+                      if result.returncode == 0:
+                          lines = result.stdout.split('\n')
+                          count = 0
+                          for line in lines:
+                              # Check if line contains our port AND ESTABLISHED state
+                              # This includes connections in BOTH directions:
+                              # - Incoming: Local Address has :port (server accepting)  
+                              # - Via port-forward: Foreign Address has :port (client connecting)
+                              if f':{port}' in line and 'ESTABLISHED' in line:
+                                  count += 1
+                          return count
+                  except:
+                      pass
+                  
+                  try:
+                      # Fallback to ss command
+                      result = subprocess.run(
+                          ['ss', '-tn', 'state', 'established'], 
+                          capture_output=True, 
+                          text=True, 
+                          timeout=2
+                      )
+                      if result.returncode == 0:
+                          lines = result.stdout.split('\n')
+                          count = sum(1 for line in lines if f':{port}' in line and line.strip() and not line.startswith('State'))
+                          return count
+                  except:
+                      pass
+                  
+                  return 0
               
               class MetricsHandler(BaseHTTPRequestHandler):
                   def do_GET(self):
                       if self.path == '/metrics':
                           try:
-                              with urllib.request.urlopen(RTMP_STATS_URL, timeout=5) as response:
-                                  xml_data = response.read()
-                              root = ET.fromstring(xml_data)
                               metrics = []
                               
-                              # RTMP clients metric (THIS IS THE KEY METRIC!)
-                              for server in root.findall('.//server/application'):
-                                  app_name = server.find('name')
-                                  if app_name is not None:
-                                      app = app_name.text
-                                      live = server.find('live')
-                                      if live is not None:
-                                          nclients = live.find('nclients')
-                                          if nclients is not None:
-                                              metrics.append('# HELP nginx_rtmp_live_clients Current number of RTMP live clients')
-                                              metrics.append('# TYPE nginx_rtmp_live_clients gauge')
-                                              metrics.append(f'nginx_rtmp_live_clients{{application="{app}"}} {nclients.text}')
+                              # Count TCP connections on RTMP port (KEY METRIC for scaling!)
+                              tcp_connections = count_tcp_connections(RTMP_PORT)
+                              metrics.append('# HELP nginx_rtmp_tcp_connections Number of established TCP connections on RTMP port')
+                              metrics.append('# TYPE nginx_rtmp_tcp_connections gauge')
+                              metrics.append(f'nginx_rtmp_tcp_connections{{port="{RTMP_PORT}"}} {tcp_connections}')
                               
-                              # Bandwidth metrics
-                              bw_in = root.find('bw_in')
-                              if bw_in is not None:
-                                  metrics.append('# HELP nginx_rtmp_bandwidth_in_bytes_per_second Current inbound bandwidth')
-                                  metrics.append('# TYPE nginx_rtmp_bandwidth_in_bytes_per_second gauge')
-                                  metrics.append(f'nginx_rtmp_bandwidth_in_bytes_per_second {bw_in.text}')
+                              # Get nginx-rtmp stats
+                              try:
+                                  with urllib.request.urlopen(RTMP_STATS_URL, timeout=5) as response:
+                                      xml_data = response.read()
+                                  root = ET.fromstring(xml_data)
+                                  
+                                  # RTMP clients metric (for reference)
+                                  for server in root.findall('.//server/application'):
+                                      app_name = server.find('name')
+                                      if app_name is not None:
+                                          app = app_name.text
+                                          live = server.find('live')
+                                          if live is not None:
+                                              nclients = live.find('nclients')
+                                              if nclients is not None:
+                                                  metrics.append('# HELP nginx_rtmp_live_clients Current number of RTMP live clients')
+                                                  metrics.append('# TYPE nginx_rtmp_live_clients gauge')
+                                                  metrics.append(f'nginx_rtmp_live_clients{{application="{app}"}} {nclients.text}')
+                                  
+                                  # Bandwidth metrics
+                                  bw_in = root.find('bw_in')
+                                  if bw_in is not None:
+                                      metrics.append('# HELP nginx_rtmp_bandwidth_in_bytes_per_second Current inbound bandwidth')
+                                      metrics.append('# TYPE nginx_rtmp_bandwidth_in_bytes_per_second gauge')
+                                      metrics.append(f'nginx_rtmp_bandwidth_in_bytes_per_second {bw_in.text}')
+                              except:
+                                  pass  # Continue even if nginx stats fail
                               
                               response_body = '\n'.join(metrics) + '\n'
                               self.send_response(200)

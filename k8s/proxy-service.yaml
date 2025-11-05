@@ -6,12 +6,13 @@ metadata:
   labels:
     app: rtmp-proxy
 spec:
-  type: LoadBalancer   # ou NodePort, conforme seu cluster
+  type: NodePort
   selector: { app: rtmp-proxy }
   ports:
     - name: rtmp
       port: 1935
       targetPort: 1935
+      nodePort: 31935  # Fixed NodePort for external RTMP access
       protocol: TCP
     - name: rtmp-metrics
       port: 9114
