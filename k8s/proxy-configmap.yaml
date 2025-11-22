@@ -21,10 +21,11 @@ data:
                 record off;
 
                 allow publish all;
-                allow play all;
 
-                # Forward to serverless workers instead of direct YouTube push
-                push rtmp://rtmp-worker.media.svc.cluster.local:1935/live;
+                include /tmp/dynamic_push.conf;
+
+                # Quando o cliente publica, rodamos o script
+                exec_publish /scripts/allocate_worker.sh $name;
             }
         }
     }
@@ -55,3 +56,20 @@ data:
             }
         }
     }
+  allocate_worker.sh: |
+    #!/bin/sh
+    STREAM_NAME="$1"
+    API="http://rtmp-controller.media.svc.cluster.local:8000/allocate"
+    echo "Allocating worker for stream: $STREAM_NAME"
+
+    WORKER=$(wget -qO- $API | jq -r .pod)
+
+    while [ "$WORKER" = "null" ] || [ -z "$WORKER" ]; do
+      echo "Waiting worker start..."
+      sleep 1
+      WORKER=$(wget -qO- $API | jq -r .pod)
+    done
+
+    echo "Worker ready: $WORKER"
+    echo "push rtmp://$WORKER/live;" > /tmp/dynamic_push.conf
+    exit 0

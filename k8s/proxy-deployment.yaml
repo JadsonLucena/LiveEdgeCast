@@ -26,6 +26,9 @@ spec:
             - name: cfg
               mountPath: /etc/nginx/nginx.conf
               subPath: nginx.conf
+            - name: cfg
+              mountPath: /scripts/allocate_worker.sh
+              subPath: allocate_worker.sh
           resources:
             requests:
               memory: "256Mi"

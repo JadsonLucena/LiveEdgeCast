@@ -100,11 +100,13 @@ print_step "Building LiveEdgeCast RTMP image..."
 IMAGE_NAME="liveedgecast:local"
 
 # Build the custom RTMP image
-docker build -t $IMAGE_NAME -f docker/Dockerfile . || { 
+docker build -t $IMAGE_NAME -f docker/rtmp/Dockerfile . || { 
     print_error "Failed to build Docker image"; 
     exit 1; 
 }
 print_success "Docker image $IMAGE_NAME built successfully"
+
+docker build -t rtmp-controller:local -f docker/Dockerfile .
 
 # Handle Docker image for cluster
 CONTEXT=$(kubectl config current-context)
