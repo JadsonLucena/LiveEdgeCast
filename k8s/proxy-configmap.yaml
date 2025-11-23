@@ -5,6 +5,7 @@ metadata:
   namespace: media
 data:
   nginx.conf: |
+    user root;
     worker_processes  auto;
 
     events {
@@ -22,10 +23,10 @@ data:
 
                 allow publish all;
 
-                include /tmp/dynamic_push.conf;
-
-                # Quando o cliente publica, rodamos o script
-                exec_publish /scripts/allocate_worker.sh $name;
+                # Multi-stream support via individual ffmpeg processes
+                # Each stream gets its own ffmpeg process routing to dedicated worker
+                exec_publish /scripts/on_publish_start.sh $name;
+                exec_publish_done /scripts/on_publish_done.sh $name;
             }
         }
     }
@@ -51,25 +52,8 @@ data:
 
             # Root endpoint for service identification
             location / {
-                return 200 'LiveEdgeCast - RTMP Edge Proxy for Low-Latency Stream Retransmission';
+                return 200 'LiveEdgeCast - RTMP Edge Proxy for Multi-Stream Retransmission';
                 add_header Content-Type text/plain;
             }
         }
     }
-  allocate_worker.sh: |
-    #!/bin/sh
-    STREAM_NAME="$1"
-    API="http://rtmp-controller.media.svc.cluster.local:8000/allocate"
-    echo "Allocating worker for stream: $STREAM_NAME"
-
-    WORKER=$(wget -qO- $API | jq -r .pod)
-
-    while [ "$WORKER" = "null" ] || [ -z "$WORKER" ]; do
-      echo "Waiting worker start..."
-      sleep 1
-      WORKER=$(wget -qO- $API | jq -r .pod)
-    done
-
-    echo "Worker ready: $WORKER"
-    echo "push rtmp://$WORKER/live;" > /tmp/dynamic_push.conf
-    exit 0

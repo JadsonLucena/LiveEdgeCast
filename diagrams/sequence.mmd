@@ -1,0 +1,63 @@
+sequenceDiagram
+    participant C as Client (OBS/FFmpeg)
+    participant P as Proxy (NGINX-RTMP)
+    participant S as on_publish_start.sh
+    participant A as Controller API (FastAPI)
+    participant W as RTMP Worker (nginx-rtmp)
+    participant F as FFmpeg Process (no Proxy)
+    participant Y as YouTube RTMP
+
+    Note over C,P: INÍCIO DA STREAM
+
+    C->>P: RTMP connect/publish<br/>rtmp://proxy/live/streamX
+    P->>P: Accept handshake<br/>application live
+
+    P->>S: exec_publish /scripts/on_publish_start.sh streamX
+
+    Note over S,A: Alocação de worker
+
+    S->>A: HTTP GET /allocate?stream=streamX
+    alt Worker já alocado para streamX
+        A-->>S: { pod: worker-abc..., status: "existing" }
+    else Nenhum worker disponível
+        A->>A: list pods app=rtmp-worker (Ready & idle)
+        alt Há worker Ready & idle
+            A-->>S: { pod: worker-xyz..., status: "allocated" }
+        else Nenhum worker Ready
+            A->>A: read deployment scale +1 replicas
+            A-->>S: { pod: null, status: "scaling" }
+            loop Até 60s (timeout)
+                S->>A: /allocate?stream=streamX
+                A-->>S: { pod: worker-xyz..., status: "allocated" }(quando subir)
+            end
+        end
+    end
+
+    S->>S: armazenar WORKER_DNS
+
+    Note over S,F: Iniciar relay FFmpeg por stream
+
+    S->>F: start ffmpeg (background)<br/>input: rtmp://127.0.0.1/live/streamX<br/>output: rtmp://WORKER_DNS/live/streamX
+    S-->>P: exit 0 (exec_publish concluído)
+
+    Note over P,F: NGINX continua recebendo pacotes<br/>FFmpeg lê da mesma app /live
+
+    F->>W: RTMP publish /live/streamX
+    W->>Y: push rtmp://a.rtmp.youtube.com/live2/KEY
+
+    Note over C,P: STREAM ATIVA (tempo real)
+
+    C-->>P: RTMP disconnect (fim da live)
+
+    P->>P: detectar fim de publicação /live/streamX
+    P->>S: exec_publish_done /scripts/on_publish_done.sh streamX
+
+    Note over S,F,A: Cleanup de recursos
+
+    S->>F: kill ffmpeg PID para streamX
+    S->>A: HTTP POST /release?stream=streamX
+    A->>A: remove mapping streamX ↔ worker-xyz
+    A-->>S: { status: "released" }
+    S-->>P: exit 0
+
+    Note over W,Y: Worker fica idle<br/>pronto para próxima stream

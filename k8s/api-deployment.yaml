@@ -11,16 +11,17 @@ spec:
     metadata:
       labels: { app: rtmp-controller }
     spec:
-      serviceAccountName: default
+      serviceAccountName: rtmp-controller
       containers:
         - name: controller
-          image: yourregistry/rtmp-controller:latest
+          image: liveedgecast-controller:latest
+          imagePullPolicy: Never
           ports:
             - containerPort: 8000
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
           readinessProbe:
-            httpGet: { path: /allocate, port: 8000 }
+            httpGet: { path: /health, port: 8000 }
             initialDelaySeconds: 2
             periodSeconds: 3

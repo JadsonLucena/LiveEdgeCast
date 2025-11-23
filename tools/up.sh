@@ -95,76 +95,102 @@ else
     print_success "Monitoring namespace exists"
 fi
 
-# Step 3: Build RTMP Docker image
-print_step "Building LiveEdgeCast RTMP image..."
-IMAGE_NAME="liveedgecast:local"
+# Step 3: Build Docker images
+print_step "Building LiveEdgeCast RTMP Proxy image..."
+RTMP_IMAGE="liveedgecast:latest"
 
-# Build the custom RTMP image
-docker build -t $IMAGE_NAME -f docker/rtmp/Dockerfile . || { 
-    print_error "Failed to build Docker image"; 
+# Build the RTMP proxy image (with curl, jq, wget, bash)
+docker build -t $RTMP_IMAGE -f docker/rtmp/Dockerfile docker/rtmp/ || { 
+    print_error "Failed to build RTMP proxy image"; 
     exit 1; 
 }
-print_success "Docker image $IMAGE_NAME built successfully"
+print_success "RTMP proxy image $RTMP_IMAGE built successfully"
 
-docker build -t rtmp-controller:local -f docker/Dockerfile .
+print_step "Building RTMP Controller API image..."
+CONTROLLER_IMAGE="rtmp-controller:latest"
+docker build -t $CONTROLLER_IMAGE -f docker/controller/Dockerfile docker/controller/ || {
+    print_error "Failed to build controller image";
+    exit 1;
+}
+print_success "Controller image $CONTROLLER_IMAGE built successfully"
 
-# Handle Docker image for cluster
+# Handle Docker images for cluster
 CONTEXT=$(kubectl config current-context)
 if [[ $CONTEXT =~ (kind) ]]; then
-    print_step "Loading image to kind cluster..."
-    kind load docker-image $IMAGE_NAME || {
-        print_error "Failed to load image to kind cluster"
+    print_step "Loading images to kind cluster..."
+    kind load docker-image $RTMP_IMAGE || {
+        print_error "Failed to load RTMP image to kind cluster"
         exit 1
     }
-    print_success "Image loaded to kind cluster"
+    kind load docker-image $CONTROLLER_IMAGE || {
+        print_error "Failed to load controller image to kind cluster"
+        exit 1
+    }
+    print_success "Images loaded to kind cluster"
 elif [[ ! $CONTEXT =~ (docker-desktop|localhost|127\.0\.0\.1) ]]; then
     print_warning "Remote/managed cluster detected: $CONTEXT"
-    print_warning "Ensure the $IMAGE_NAME image is available in the cluster registry."
+    print_warning "Ensure $RTMP_IMAGE and $CONTROLLER_IMAGE are available in the cluster registry."
     echo -n "Continue with deployment? (y/n): "
     read -r continue_deploy
     if [[ ! $continue_deploy =~ ^[Yy]$ ]]; then
-        print_error "Deployment cancelled. Please push image to cluster registry first."
+        print_error "Deployment cancelled. Please push images to cluster registry first."
         exit 1
     fi
 fi
 
 # Step 4: Deploy to Kubernetes
+print_step "Applying RBAC for Controller..."
+kubectl apply -f k8s/controller-rbac.yaml || { print_error "RBAC setup failed"; exit 1; }
+print_success "Controller RBAC configured"
+
 print_step "Deploying to Kubernetes..."
 kubectl apply -f k8s/ || { print_error "Deployment failed"; exit 1; }
 print_success "Kubernetes manifests applied"
 
 # Step 5: Wait for deployments to be ready
+print_step "Waiting for RTMP Controller deployment to be ready..."
+kubectl wait --for=condition=available deployment/rtmp-controller -n media --timeout=120s || {
+    print_error "RTMP Controller deployment failed to become available"
+    kubectl logs -l app=rtmp-controller -n media --tail=50 2>/dev/null || true
+    exit 1
+}
+print_success "RTMP Controller is ready"
+
 print_step "Waiting for RTMP Proxy deployment to be ready..."
 kubectl wait --for=condition=available deployment/rtmp-proxy -n media --timeout=120s || {
     print_error "RTMP Proxy deployment failed to become available"
+    kubectl logs -l app=rtmp-proxy -n media --tail=50 2>/dev/null || true
     exit 1
 }
+print_success "RTMP Proxy is ready"
 
 print_step "Verifying KEDA ScaledObjects..."
 sleep 5
 
-# Check main worker scaler
-if kubectl get scaledobject rtmp-worker-scaler -n media >/dev/null 2>&1; then
-    print_success "RTMP Worker ScaledObject is active"
-else
-    print_warning "RTMP Worker ScaledObject not found or not ready"
-fi
-
-# Check proxy scaler
+# Check proxy scaler (should exist)
 if kubectl get scaledobject rtmp-proxy-scaler -n media >/dev/null 2>&1; then
     print_success "RTMP Proxy ScaledObject is active"
 else
-    print_warning "RTMP Proxy ScaledObject not found or not ready"
+    print_warning "RTMP Proxy ScaledObject not found"
+fi
+
+# Worker scaler is DISABLED in v2.0 (Controller manages scaling)
+if kubectl get scaledobject rtmp-worker-scaler -n media >/dev/null 2>&1; then
+    print_warning "RTMP Worker ScaledObject found (should be disabled - Controller manages workers)"
+else
+    print_success "RTMP Worker scaling managed by Controller (KEDA disabled as expected)"
 fi
 
 print_step "Checking pod status..."
+CONTROLLER_PODS=$(kubectl get pods -l app=rtmp-controller -n media --no-headers 2>/dev/null | wc -l)
 PROXY_PODS=$(kubectl get pods -l app=rtmp-proxy -n media --no-headers 2>/dev/null | wc -l)
 WORKER_PODS=$(kubectl get pods -l app=rtmp-worker -n media --no-headers 2>/dev/null | wc -l)
 
+print_success "RTMP Controller: $CONTROLLER_PODS pod(s) running"
 print_success "RTMP Proxy: $PROXY_PODS pod(s) running"
 
 if [ "$WORKER_PODS" -eq 0 ]; then
-    print_warning "No worker pods running (KEDA serverless - workers will scale on stream connections)"
+    print_warning "No worker pods running (KEDA serverless - workers will scale on demand)"
 else
     print_success "RTMP Workers: $WORKER_PODS pod(s) running"
 fi
@@ -203,14 +229,17 @@ print_success "Deployment completed!"
 echo ""
 print_step "Deployment Status:"
 echo ""
-print_step "KEDA ScaledObjects:"
-kubectl get scaledobject -n media
+print_step "Controller API:"
+kubectl get pods -l app=rtmp-controller -n media
 echo ""
 print_step "RTMP Proxy Pods:"
 kubectl get pods -l app=rtmp-proxy -n media
 echo ""
-print_step "RTMP Worker Pods:"
+print_step "RTMP Worker Pods (Serverless):"
 kubectl get pods -l app=rtmp-worker -n media
+echo ""
+print_step "KEDA ScaledObjects:"
+kubectl get scaledobject -n media
 echo ""
 print_step "Services:"
 kubectl get svc -n media
@@ -224,25 +253,40 @@ echo "  🌐 Monitor: http://localhost:8080/stats"
 echo "  ❤️ Health: http://localhost:8080/health"
 echo ""
 echo -e "${BLUE}🔧 Useful commands:${NC}"
-echo "  📊 Watch scaling: kubectl get pods -l app=rtmp-worker -n media -w"
-echo "  📋 Proxy logs: kubectl logs -l app=rtmp-proxy -n media -f"
+echo "  📊 Watch worker scaling: kubectl get pods -l app=rtmp-worker -n media -w"
+echo "  📊 Controller status: curl http://localhost:8000/status (via port-forward)"
+echo "  📋 Controller logs: kubectl logs -l app=rtmp-controller -n media -f"
+echo "  📋 Proxy logs: kubectl logs -l app=rtmp-proxy -n media -f -c nginx"
 echo "  📋 Worker logs: kubectl logs -l app=rtmp-worker -n media -f"
 echo "  🔍 KEDA status: kubectl get scaledobject -n media"
 echo "  📈 Metrics: kubectl top pods -n media"
 echo "  🛑 Stop RTMP port-forward: kill $RTMP_PORT_FORWARD_PID"
 echo "  🛑 Stop HTTP port-forward: kill $HTTP_PORT_FORWARD_PID"
 echo ""
-echo -e "${YELLOW}💡 Hybrid Scaling Architecture:${NC}"
-echo -e "${YELLOW}   • Proxy: Always-On (min 1 replica) + Auto-scaling (1-10 replicas)${NC}"
-echo -e "${YELLOW}   • Workers: True Serverless (0 replicas) + On-demand scaling${NC}"
-echo -e "${YELLOW}   • Each worker handles exactly 1 stream (1:1 mapping)${NC}"
-echo -e "${YELLOW}   • Proxy buffers streams during worker cold start (90s buffer)${NC}"
+echo -e "${YELLOW}🎬 Testing Multi-Stream:${NC}"
+echo "  # Stream 1"
+echo "  ffmpeg -re -i video1.mp4 -f flv rtmp://localhost:1935/live/stream1"
+echo "  # Stream 2 (simultaneous)"
+echo "  ffmpeg -re -i video2.mp4 -f flv rtmp://localhost:1935/live/stream2"
+echo "  # Stream 3 (simultaneous)"
+echo "  ffmpeg -re -i video3.mp4 -f flv rtmp://localhost:1935/live/stream3"
+echo ""
+echo -e "${YELLOW}💡 Multi-Stream Serverless Architecture v2.0:${NC}"
+echo -e "${YELLOW}   • Controller: Única fonte da verdade para workers (state recovery via métricas)${NC}"
+echo -e "${YELLOW}   • Proxy: Suporte multi-stream via FFmpeg dedicado por publicação${NC}"
+echo -e "${YELLOW}   • Workers: True Serverless (0 replicas) escalados 1:1 pelo Controller${NC}"
+echo -e "${YELLOW}   • Garantia: 1 stream = 1 worker = 1 processo FFmpeg isolado${NC}"
+echo -e "${YELLOW}   • Scripts: Embarcados na imagem Docker (on_publish_start/done.sh)${NC}"
+echo -e "${YELLOW}   • Roteamento: NGINX → FFmpeg → Worker dedicado → YouTube${NC}"
 echo ""
 echo -e "${YELLOW}📊 Auto-Scaling Configuration:${NC}"
-echo -e "${YELLOW}   • Proxy scales: 1-10 replicas based on inbound network traffic${NC}"
-echo -e "${YELLOW}   • Primary trigger: >800 Mbps inbound (80% of 1Gbps per node)${NC}"
-echo -e "${YELLOW}   • Secondary triggers: >50 connections, >80% CPU${NC}"
-echo -e "${YELLOW}   • Total capacity: ~8 Gbps inbound, ~400 streams per proxy${NC}"
+echo -e "${YELLOW}   Proxy Scaling (1-10 replicas via KEDA):${NC}"
+echo -e "${YELLOW}   • Primary: >800 Mbps inbound (80% of 1Gbps per node)${NC}"
+echo -e "${YELLOW}   • Secondary: >50 active connections or >80% CPU${NC}"
+echo -e "${YELLOW}   Worker Scaling (0-100 replicas via Controller):${NC}"
+echo -e "${YELLOW}   • Controller API: /allocate cria workers sob demanda${NC}"
+echo -e "${YELLOW}   • Mapeamento bidirecional: stream ↔ worker${NC}"
+echo -e "${YELLOW}   • State recovery: Automático via métricas RTMP ao reiniciar${NC}"
 echo ""
 echo -e "${BLUE}🔍 Testing Prometheus Metrics Collection:${NC}"
 echo ""

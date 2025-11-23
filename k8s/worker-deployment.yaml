@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: rtmp
-          image: liveedgecast:latest
+          image: liveedgecast-rtmp:latest
           imagePullPolicy: Never
           ports:
             - containerPort: 1935
