@@ -5,7 +5,16 @@ import string
 import threading
 import requests
 import time
+import logging
 from typing import Dict, Optional
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[%(asctime)s] [%(levelname)s] [%(funcName)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -25,8 +34,10 @@ worker_to_stream: Dict[str, str] = {}
 # Load Kubernetes credentials (inside cluster)
 try:
     config.load_incluster_config()
+    logger.info("Loaded in-cluster Kubernetes config")
 except:
     config.load_kube_config()
+    logger.info("Loaded local kubeconfig")
 
 apps = client.AppsV1Api()
 core = client.CoreV1Api()
@@ -56,7 +67,7 @@ def check_worker_metrics(pod_name: str) -> int:
                     return int(content[start:end])
         return 0
     except Exception as e:
-        print(f"Warning: Failed to check metrics for {pod_name}: {e}")
+        logger.warning(f"Failed to check metrics for {pod_name}: {e}")
         return 0
 
 
@@ -65,7 +76,7 @@ def recover_state():
     Recupera estado de alocações após reinício do controller.
     Verifica quais workers estão realmente ocupados consultando suas métricas RTMP.
     """
-    print("[State Recovery] Starting state recovery...")
+    logger.info("[State Recovery] Starting state recovery...")
     
     with allocation_lock:
         pods = core.list_namespaced_pod(
@@ -95,9 +106,9 @@ def recover_state():
                 stream_to_worker[stream_name] = pod_name
                 worker_to_stream[pod_name] = stream_name
                 recovered_count += 1
-                print(f"[State Recovery] Worker {pod_name} is busy ({nclients} clients), marked as allocated")
+                logger.info(f"[State Recovery] Worker {pod_name} is busy ({nclients} clients), marked as allocated")
         
-        print(f"[State Recovery] Completed. Recovered {recovered_count} active workers.")
+        logger.info(f"[State Recovery] Completed. Recovered {recovered_count} active workers.")
 
 
 # Recuperar estado ao iniciar
@@ -126,7 +137,7 @@ def allocate_worker(stream: str = Query(..., description="Stream name")):
         # Verificar se já existe alocação para essa stream
         if stream in stream_to_worker:
             existing_worker = stream_to_worker[stream]
-            print(f"[Allocate] Stream '{stream}' already has worker: {existing_worker}")
+            logger.info(f"[Allocate] Stream '{stream}' already has worker: {existing_worker}")
             return {
                 "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
                 "name": existing_worker,
@@ -164,7 +175,7 @@ def allocate_worker(stream: str = Query(..., description="Stream name")):
             stream_to_worker[stream] = pod_name
             worker_to_stream[pod_name] = stream
             
-            print(f"[Allocate] Allocated worker {pod_name} for stream '{stream}'")
+            logger.info(f"[Allocate] Allocated worker {pod_name} for stream '{stream}'")
             
             return {
                 "pod": f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
@@ -178,7 +189,9 @@ def allocate_worker(stream: str = Query(..., description="Stream name")):
             namespace=NAMESPACE
         )
         
-        new_replicas = current.spec.replicas + 1
+        # Handle None replicas (controlled by KEDA or set to 0)
+        current_replicas = current.spec.replicas if current.spec.replicas is not None else 0
+        new_replicas = current_replicas + 1
         
         body = { "spec": { "replicas": new_replicas } }
 
@@ -188,7 +201,7 @@ def allocate_worker(stream: str = Query(..., description="Stream name")):
             body=body
         )
         
-        print(f"[Allocate] No workers available. Scaled deployment to {new_replicas} replicas.")
+        logger.info(f"[Allocate] No workers available. Scaled deployment to {new_replicas} replicas.")
 
         return { "pod": None, "status": "scaling" }
 
@@ -201,7 +214,7 @@ def release_worker(stream: str = Query(..., description="Stream name to release"
     """
     with allocation_lock:
         if stream not in stream_to_worker:
-            print(f"[Release] WARNING: Stream '{stream}' not found in allocations")
+            logger.warning(f"[Release] Stream '{stream}' not found in allocations")
             return {"status": "not_found", "stream": stream}
         
         worker_name = stream_to_worker[stream]
@@ -210,7 +223,7 @@ def release_worker(stream: str = Query(..., description="Stream name to release"
         del stream_to_worker[stream]
         del worker_to_stream[worker_name]
         
-        print(f"[Release] Released worker {worker_name} from stream '{stream}'")
+        logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
         
         return {
             "status": "released",
@@ -255,7 +268,7 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
     # Em produção, substituir por lógica real de mapeamento
     youtube_key = stream
     
-    print(f"[StreamKey] Returning YouTube key for stream '{stream}': {youtube_key}")
+    logger.debug(f"[StreamKey] Returning YouTube key for stream '{stream}': {youtube_key}")
     
     return {
         "stream": stream,

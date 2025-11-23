@@ -6,6 +6,7 @@ metadata:
 data:
   nginx.conf: |
     worker_processes  auto;
+    error_log /var/log/nginx/error.log debug;
 
     events {
         worker_connections  1024;
@@ -15,7 +16,6 @@ data:
         server {
             listen 1935;
             chunk_size 4096;
-            max_connections 1;
 
             application live {
                 live on;

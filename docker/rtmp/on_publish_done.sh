@@ -31,6 +31,8 @@ FFMPEG_PID=$(cat "$PID_FILE")
 # Matar processo ffmpeg se ainda estiver rodando
 if kill -0 "$FFMPEG_PID" 2>/dev/null; then
   echo "[$(date)] [on_publish_done] Killing ffmpeg process (PID: $FFMPEG_PID)"
+  echo "[$(date)] [on_publish_done] Last 20 lines of FFmpeg log:"
+  tail -20 "/tmp/ffmpeg_${STREAM_NAME}.log" 2>/dev/null || echo "No log file found"
   kill -TERM "$FFMPEG_PID" 2>/dev/null || true
   
   # Aguardar até 5 segundos para término gracioso
@@ -59,8 +61,9 @@ curl -sf -X POST "$CONTROLLER_API/release?stream=$STREAM_NAME" || \
 
 # Limpar arquivos temporários
 rm -f "$PID_FILE"
-rm -f "/tmp/ffmpeg_${STREAM_NAME}.log"
+# Manter log do FFmpeg para debug (não deletar)
+# rm -f "/tmp/ffmpeg_${STREAM_NAME}.log"
 
-echo "[$(date)] [on_publish_done] Cleanup completed for stream '$STREAM_NAME'"
+echo "[$(date)] [on_publish_done] Cleanup completed for stream '$STREAM_NAME' (FFmpeg log preserved at /tmp/ffmpeg_${STREAM_NAME}.log)"
 
 exit 0

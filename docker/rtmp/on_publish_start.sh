@@ -46,6 +46,7 @@ echo "[$(date)] [on_publish_start] Worker allocated: $WORKER_DNS"
 # Input:  rtmp://127.0.0.1:1935/live/$STREAM_NAME (loopback - mesmo container)
 # Output: rtmp://$WORKER_DNS:1935/live/$STREAM_NAME (worker dedicado)
 nohup ffmpeg \
+  -loglevel verbose \
   -i "rtmp://127.0.0.1:1935/live/$STREAM_NAME" \
   -c:v copy -c:a copy \
   -f flv "rtmp://$WORKER_DNS:1935/live/$STREAM_NAME" \
