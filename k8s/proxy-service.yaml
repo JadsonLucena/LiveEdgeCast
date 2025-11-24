@@ -8,13 +8,31 @@ metadata:
 spec:
   type: NodePort
   selector: { app: rtmp-proxy }
+  sessionAffinity: ClientIP  # Mantém cliente sempre no mesmo proxy pod
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800  # 3 horas - streams longas
   ports:
     - name: rtmp
       port: 1935
       targetPort: 1935
       nodePort: 31935  # Fixed NodePort for external RTMP access
       protocol: TCP
-    - name: rtmp-metrics
-      port: 9114
-      targetPort: 9114
+---
+# Headless Service for Pull-Only Architecture
+# Enables pod-specific DNS: <pod-name>.rtmp-proxy-headless.media.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: rtmp-proxy-headless
+  namespace: media
+  labels:
+    app: rtmp-proxy
+spec:
+  clusterIP: None  # Headless Service
+  selector: { app: rtmp-proxy }
+  ports:
+    - name: rtmp
+      port: 1935
+      targetPort: 1935
       protocol: TCP

@@ -22,6 +22,9 @@ RUN apk add --no-cache \
     jq \
     wget \
     bash \
+    # DNS resolution packages
+    bind-tools \
+    c-ares \
     && mkdir -p /tmp/build
 
 # Download e compilar NGINX com módulo RTMP
@@ -53,10 +56,10 @@ RUN cd /tmp/build \
 RUN mkdir -p /var/log/nginx /scripts /tmp/ffmpeg_pids \
     && chmod 755 /scripts
 
-# Copiar scripts de publicação
+# Copiar scripts de publicação (Pull-Only Architecture)
 COPY on_publish_start.sh /scripts/on_publish_start.sh
 COPY on_publish_done.sh /scripts/on_publish_done.sh
-COPY on_worker_publish.sh /scripts/on_worker_publish.sh
+COPY on_worker_pull_push.sh /scripts/on_worker_pull_push.sh
 
 # Garantir permissões de execução
 RUN chmod +x /scripts/*.sh

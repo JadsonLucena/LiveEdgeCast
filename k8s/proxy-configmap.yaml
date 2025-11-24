@@ -22,10 +22,18 @@ data:
                 live on;
                 record off;
 
+                # Accept publish from external sources
                 allow publish all;
 
-                # Multi-stream support via individual ffmpeg processes
-                # Each stream gets its own ffmpeg process routing to dedicated worker
+                # Allow play for workers to pull streams (Pull-Only architecture)
+                allow play all;
+
+                # Auto-disconnect idle publishers (workers drop after 5min)
+                drop_idle_publisher 60s;  # 1min
+
+                # Notify controller when stream starts/stops
+                # Controller orchestrates worker allocation
+                # Worker pulls from proxy and pushes to YouTube
                 exec_publish /scripts/on_publish_start.sh $name;
                 exec_publish_done /scripts/on_publish_done.sh $name;
             }

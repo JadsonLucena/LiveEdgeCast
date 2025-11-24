@@ -6,6 +6,7 @@ import threading
 import requests
 import time
 import logging
+import asyncio
 from typing import Dict, Optional
 
 # Configure logging
@@ -21,6 +22,7 @@ app = FastAPI()
 NAMESPACE = "media"
 WORKER_DEPLOYMENT = "rtmp-worker"
 WORKER_SERVICE = "rtmp-worker"
+SCALE_DOWN_DELAY = 180  # 3 minutos após último release
 
 # Lock para evitar race conditions
 allocation_lock = threading.Lock()
@@ -30,6 +32,17 @@ stream_to_worker: Dict[str, str] = {}
 
 # Mapeamento inverso: worker_pod_name → stream_name
 worker_to_stream: Dict[str, str] = {}
+
+# Mapeamento: stream_name → proxy_pod_name (Pull-Only Architecture)
+stream_to_proxy: Dict[str, str] = {}
+
+# Rastreia streams aguardando worker (evita múltiplas escalações para mesma stream)
+# Mapeia: stream_name → timestamp da primeira solicitação
+streams_pending_allocation: Dict[str, float] = {}
+
+# Timestamp do último release (para scale-down automático)
+last_release_time: Optional[float] = None
+scale_down_task: Optional[asyncio.Task] = None
 
 # Load Kubernetes credentials (inside cluster)
 try:
@@ -45,6 +58,57 @@ core = client.CoreV1Api()
 
 def random_suffix():
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
+
+
+async def schedule_scale_down_if_idle():
+    """
+    Agenda scale-down automático dos workers se ficarem idle por tempo suficiente.
+    Aguarda SCALE_DOWN_DELAY (10min) após último release antes de reduzir para 0.
+    """
+    global last_release_time, scale_down_task
+    
+    last_release_time = time.time()
+    
+    # Aguardar delay
+    await asyncio.sleep(SCALE_DOWN_DELAY)
+    
+    # Verificar se ainda não há workers alocados
+    with allocation_lock:
+        if len(stream_to_worker) == 0:
+            try:
+                current = apps.read_namespaced_deployment_scale(
+                    name=WORKER_DEPLOYMENT,
+                    namespace=NAMESPACE
+                )
+                
+                current_replicas = current.spec.replicas if current.spec.replicas is not None else 0
+                
+                if current_replicas > 0:
+                    # Reduzir para 0 (todos workers idle)
+                    body = {"spec": {"replicas": 0}}
+                    apps.patch_namespaced_deployment_scale(
+                        name=WORKER_DEPLOYMENT,
+                        namespace=NAMESPACE,
+                        body=body
+                    )
+                    logger.info(f"[AutoScaleDown] Reduced workers to 0 (idle for {SCALE_DOWN_DELAY}s)")
+            except Exception as e:
+                logger.error(f"[AutoScaleDown] Failed to scale down: {e}")
+
+
+def get_proxy_pod_ip(proxy_pod: str) -> str:
+    """
+    Obter IP do pod proxy para conexão direta do worker.
+    
+    Substitui DNS headless que não funciona sem StatefulSet/hostname.
+    Worker se conecta diretamente ao IP do proxy pod via ClusterIP.
+    """
+    try:
+        pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
+        return pod.status.pod_ip
+    except Exception as e:
+        logger.error(f"[ProxyIP] Failed to get IP for {proxy_pod}: {e}")
+        return None
 
 
 def check_worker_metrics(pod_name: str) -> int:
@@ -125,24 +189,54 @@ def health():
 
 
 @app.get("/allocate")
-def allocate_worker(stream: str = Query(..., description="Stream name")):
+def allocate_worker(
+    stream: str = Query(..., description="Stream name"),
+    proxy_pod: str = Query(None, description="Proxy pod name for pull-only architecture")
+):
     """
     Aloca um worker dedicado para uma stream.
     Controller é a ÚNICA fonte da verdade para scale-up.
     
-    Retorna worker DNS se disponível, ou None se ainda está escalando.
+    Args:
+        stream: Nome da stream (YouTube key)
+        proxy_pod: Nome do pod do proxy que recebeu a stream (para Pull-Only)
+    
+    Retorna worker DNS + proxy DNS se disponível, ou None se ainda está escalando.
     """
+    global scale_down_task
     
     with allocation_lock:
+        # Cancelar scale-down se houver nova solicitação de alocação
+        if scale_down_task and not scale_down_task.done():
+            scale_down_task.cancel()
+            logger.info("[Allocate] Cancelled pending scale-down task (new allocation request)")
+        
         # Verificar se já existe alocação para essa stream
         if stream in stream_to_worker:
             existing_worker = stream_to_worker[stream]
-            logger.info(f"[Allocate] Stream '{stream}' already has worker: {existing_worker}")
+            
+            # Construir IP do proxy (Pull-Only Architecture)
+            # Usa IP direto do pod proxy (Headless DNS não funciona sem StatefulSet)
+            proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
+            proxy_address = proxy_ip if proxy_ip else "rtmp-proxy.media.svc.cluster.local"
+            
+            logger.info(f"[Allocate] Stream '{stream}' already has worker: {existing_worker} - Proxy: {proxy_address}")
             return {
                 "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
                 "name": existing_worker,
+                "proxy": proxy_address,
                 "status": "existing"
             }
+        
+        # Verificar se stream já está aguardando alocação (evita múltiplas escalações)
+        if stream in streams_pending_allocation:
+            elapsed = time.time() - streams_pending_allocation[stream]
+            logger.info(f"[Allocate] Stream '{stream}' is already pending allocation ({elapsed:.1f}s elapsed). Checking for ready workers...")
+            # Não escala novamente, apenas verifica se algum worker ficou pronto
+        else:
+            # Primeira solicitação para essa stream
+            streams_pending_allocation[stream] = time.time()
+            logger.info(f"[Allocate] Stream '{stream}' added to pending allocation queue")
         
         # Listar workers disponíveis
         pods = core.list_namespaced_pod(
@@ -170,51 +264,97 @@ def allocate_worker(stream: str = Query(..., description="Stream name")):
         if available_workers:
             pod = available_workers[0]
             pod_name = pod.metadata.name
+            pod_ip = pod.status.pod_ip
             
             # Criar mapeamento bidirecional
             stream_to_worker[stream] = pod_name
             worker_to_stream[pod_name] = stream
             
-            logger.info(f"[Allocate] Allocated worker {pod_name} for stream '{stream}'")
+            # Armazenar proxy para Pull-Only Architecture
+            if proxy_pod:
+                stream_to_proxy[stream] = proxy_pod
+            
+            # Remover de pending allocation (worker foi alocado)
+            if stream in streams_pending_allocation:
+                elapsed = time.time() - streams_pending_allocation[stream]
+                del streams_pending_allocation[stream]
+                logger.info(f"[Allocate] Removed stream '{stream}' from pending queue (allocated in {elapsed:.1f}s)")
+            
+            # Usar DNS estável via Headless Service em vez de IP direto
+            # Formato: <pod-name>.<service-name>.<namespace>.svc.cluster.local
+            worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
+            
+            # Obter IP do proxy para retornar ao worker (Pull-Only Architecture)
+            proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
+            proxy_address = proxy_ip if proxy_ip else "rtmp-proxy.media.svc.cluster.local"
+            
+            logger.info(f"[Allocate] Allocated worker {pod_name} (DNS: {worker_dns}) for stream '{stream}' - Proxy: {proxy_address}")
             
             return {
-                "pod": f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
+                "pod": worker_dns,  # DNS estável via Headless Service
                 "name": pod_name,
+                "proxy": proxy_address,  # IP do proxy para pull (Pull-Only)
+                "worker": pod_name,
                 "status": "allocated"
             }
 
-        # Nenhum worker disponível → escalar deployment
-        current = apps.read_namespaced_deployment_scale(
-            name=WORKER_DEPLOYMENT,
-            namespace=NAMESPACE
-        )
+        # Nenhum worker disponível → escalar deployment (APENAS se stream não está em pending)
+        # Se já está em pending, significa que já escalou antes
+        if stream not in streams_pending_allocation:
+            # Nunca deveria chegar aqui (proteção dupla)
+            streams_pending_allocation[stream] = time.time()
         
-        # Handle None replicas (controlled by KEDA or set to 0)
-        current_replicas = current.spec.replicas if current.spec.replicas is not None else 0
-        new_replicas = current_replicas + 1
+        # Verificar se precisa escalar (só escala na primeira vez)
+        elapsed_since_pending = time.time() - streams_pending_allocation[stream]
         
-        body = { "spec": { "replicas": new_replicas } }
+        # Só escala se for a primeira tentativa (elapsed < 1s)
+        if elapsed_since_pending < 1.0:
+            current = apps.read_namespaced_deployment_scale(
+                name=WORKER_DEPLOYMENT,
+                namespace=NAMESPACE
+            )
+            
+            # Handle None replicas (controlled by KEDA or set to 0)
+            current_replicas = current.spec.replicas if current.spec.replicas is not None else 0
+            new_replicas = current_replicas + 1
+            
+            body = { "spec": { "replicas": new_replicas } }
 
-        apps.patch_namespaced_deployment_scale(
-            name=WORKER_DEPLOYMENT,
-            namespace=NAMESPACE,
-            body=body
-        )
-        
-        logger.info(f"[Allocate] No workers available. Scaled deployment to {new_replicas} replicas.")
+            apps.patch_namespaced_deployment_scale(
+                name=WORKER_DEPLOYMENT,
+                namespace=NAMESPACE,
+                body=body
+            )
+            
+            logger.info(f"[Allocate] No workers available. Scaled deployment to {new_replicas} replicas for stream '{stream}'.")
+        else:
+            logger.info(f"[Allocate] Stream '{stream}' still waiting for worker (pending for {elapsed_since_pending:.1f}s). Not scaling again.")
 
-        return { "pod": None, "status": "scaling" }
+        return { 
+            "pod": None, 
+            "status": "scaling",
+            "pending_seconds": elapsed_since_pending
+        }
 
 
 @app.post("/release")
-def release_worker(stream: str = Query(..., description="Stream name to release")):
+async def release_worker(stream: str = Query(..., description="Stream name to release")):
     """
     Libera worker alocado para uma stream.
     Remove mapeamento stream→worker.
+    Agenda scale-down automático se todos workers ficarem idle.
     """
+    global scale_down_task
+    
     with allocation_lock:
         if stream not in stream_to_worker:
             logger.warning(f"[Release] Stream '{stream}' not found in allocations")
+            
+            # Limpar pending allocation se existir
+            if stream in streams_pending_allocation:
+                del streams_pending_allocation[stream]
+                logger.info(f"[Release] Removed stream '{stream}' from pending allocation queue (never allocated)")
+            
             return {"status": "not_found", "stream": stream}
         
         worker_name = stream_to_worker[stream]
@@ -223,7 +363,26 @@ def release_worker(stream: str = Query(..., description="Stream name to release"
         del stream_to_worker[stream]
         del worker_to_stream[worker_name]
         
+        # Remover proxy mapping (Pull-Only)
+        if stream in stream_to_proxy:
+            del stream_to_proxy[stream]
+        
+        # Remover de pending allocation se ainda estiver lá
+        if stream in streams_pending_allocation:
+            del streams_pending_allocation[stream]
+            logger.info(f"[Release] Removed stream '{stream}' from pending allocation queue")
+        
         logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
+        
+        # Auto scale-down: Reduzir deployment se não há workers alocados
+        # Cancela task anterior e agenda nova
+        if scale_down_task and not scale_down_task.done():
+            scale_down_task.cancel()
+        
+        if len(stream_to_worker) == 0:
+            # Nenhum worker alocado - agendar scale-down após delay
+            scale_down_task = asyncio.create_task(schedule_scale_down_if_idle())
+            logger.info(f"[Release] Scheduled auto scale-down in {SCALE_DOWN_DELAY}s")
         
         return {
             "status": "released",
@@ -254,9 +413,9 @@ def get_status():
 @app.get("/stream-key")
 def get_stream_key(stream: str = Query(..., description="Stream name")):
     """
-    Retorna a chave do YouTube para uma stream específica.
+    Retorna a chave do YouTube E proxy DNS para uma stream específica.
     
-    Esta função implementa a lógica de mapeamento stream → YouTube key.
+    Esta função implementa a lógica de mapeamento stream → YouTube key + proxy.
     Por padrão, usa o próprio stream name como chave.
     
     Em produção, você pode:
@@ -268,9 +427,55 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
     # Em produção, substituir por lógica real de mapeamento
     youtube_key = stream
     
-    logger.debug(f"[StreamKey] Returning YouTube key for stream '{stream}': {youtube_key}")
+    # Obter proxy DNS para Pull-Only Architecture
+    proxy_pod = stream_to_proxy.get(stream)
+    
+    # Obter IP do proxy específico para Pull-Only Architecture
+    proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
+    proxy_address = proxy_ip if proxy_ip else "rtmp-proxy.media.svc.cluster.local"
+    
+    logger.debug(f"[StreamKey] Returning info for stream '{stream}': YouTube={youtube_key}, Proxy={proxy_address}")
     
     return {
         "stream": stream,
-        "youtubeKey": youtube_key
+        "youtubeKey": youtube_key,
+        "proxyDns": proxy_address
     }
+
+
+@app.get("/start-worker")
+def start_worker(stream: str = Query(..., description="Stream name"), worker: str = Query(..., description="Worker pod name")):
+    """
+    Endpoint chamado pelo proxy para iniciar worker pull+push.
+    Worker executa on_worker_publish_push.sh para iniciar FFmpeg.
+    
+    Pull-Only Architecture:
+    - Proxy notifica controller após alocar worker
+    - Controller executa script no worker via kubectl exec
+    - Worker inicia FFmpeg pull do proxy específico + push YouTube
+    """
+    try:
+        logger.info(f"[StartWorker] Starting worker '{worker}' for stream '{stream}'")
+        
+        # Executar on_worker_pull_push.sh no worker via kubectl exec
+        import subprocess
+        result = subprocess.run(
+            [
+                "kubectl", "exec", "-n", NAMESPACE, worker, "--",
+                "/scripts/on_worker_pull_push.sh", stream
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if result.returncode == 0:
+            logger.info(f"[StartWorker] Worker '{worker}' started successfully for stream '{stream}'")
+            return {"status": "started", "worker": worker, "stream": stream}
+        else:
+            logger.error(f"[StartWorker] Failed to start worker '{worker}': {result.stderr}")
+            return {"status": "error", "error": result.stderr}
+            
+    except Exception as e:
+        logger.error(f"[StartWorker] Exception starting worker '{worker}': {str(e)}")
+        return {"status": "error", "error": str(e)}

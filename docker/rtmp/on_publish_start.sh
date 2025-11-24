@@ -2,32 +2,39 @@
 #
 # on_publish_start.sh - Chamado quando uma stream é publicada no proxy
 # Responsabilidades:
-#   1. Alocar um worker via Controller API
-#   2. Iniciar processo ffmpeg dedicado para re-transmitir essa stream para o worker
-#   3. Armazenar PID do ffmpeg para cleanup posterior
+#   1. Notificar Controller para alocar worker
+#   2. Passar proxy_pod para worker fazer pull correto (Pull-Only)
 #
 # Argumentos:
-#   $1 = stream name (ex: "mystream")
+#   $1 = stream name (ex: "2tww-t6fv-z2mh-0rsq-4z8t")
+#
+# PULL-ONLY ARCHITECTURE:
+#   - Proxy apenas aceita stream e notifica controller
+#   - Controller aloca worker e informa qual proxy usar
+#   - Worker faz PULL do proxy específico + PUSH para YouTube
+#   - Sem FFmpeg relay no proxy (mais eficiente)
 #
 
 set -e
 
 STREAM_NAME="$1"
 CONTROLLER_API="http://rtmp-controller.media.svc.cluster.local:8000"
-MAX_RETRIES=60
+MAX_RETRIES=10
 RETRY_COUNT=0
-PID_DIR="/tmp/ffmpeg_pids"
 
-# Criar diretório para PIDs se não existir
-mkdir -p "$PID_DIR"
+# Obter nome do pod do proxy (para Pull-Only)
+PROXY_POD=$(hostname)
 
-echo "[$(date)] [on_publish_start] Stream '$STREAM_NAME' started - allocating worker..."
+echo "[$(date)] [on_publish_start] Stream '$STREAM_NAME' published on proxy '$PROXY_POD' - notifying controller..."
 
 # Chamar API do controller para alocar worker
-WORKER_DNS=$(curl -sf "$CONTROLLER_API/allocate?stream=$STREAM_NAME" | jq -r '.pod // empty')
+# Passar proxy_pod para worker fazer pull do proxy correto
+RESPONSE=$(curl -sf "$CONTROLLER_API/allocate?stream=$STREAM_NAME&proxy_pod=$PROXY_POD")
+WORKER_POD=$(echo "$RESPONSE" | jq -r '.name // empty')
+WORKER_DNS=$(echo "$RESPONSE" | jq -r '.pod // empty')
 
 # Aguardar worker ficar ready (com timeout)
-while [ -z "$WORKER_DNS" ] || [ "$WORKER_DNS" = "null" ]; do
+while [ -z "$WORKER_POD" ] || [ "$WORKER_POD" = "null" ]; do
   RETRY_COUNT=$((RETRY_COUNT + 1))
   
   if [ $RETRY_COUNT -gt $MAX_RETRIES ]; then
@@ -37,27 +44,18 @@ while [ -z "$WORKER_DNS" ] || [ "$WORKER_DNS" = "null" ]; do
   
   echo "[$(date)] [on_publish_start] Waiting for worker... ($RETRY_COUNT/$MAX_RETRIES)"
   sleep 1
-  WORKER_DNS=$(curl -sf "$CONTROLLER_API/allocate?stream=$STREAM_NAME" | jq -r '.pod // empty')
+  RESPONSE=$(curl -sf "$CONTROLLER_API/allocate?stream=$STREAM_NAME&proxy_pod=$PROXY_POD")
+  WORKER_POD=$(echo "$RESPONSE" | jq -r '.name // empty')
+  WORKER_DNS=$(echo "$RESPONSE" | jq -r '.pod // empty')
 done
 
-echo "[$(date)] [on_publish_start] Worker allocated: $WORKER_DNS"
+echo "[$(date)] [on_publish_start] Worker allocated: $WORKER_POD (DNS: $WORKER_DNS)"
+echo "[$(date)] [on_publish_start] Notifying worker to start pull+push..."
 
-# Iniciar ffmpeg para re-transmitir stream do proxy local para o worker remoto
-# Input:  rtmp://127.0.0.1:1935/live/$STREAM_NAME (loopback - mesmo container)
-# Output: rtmp://$WORKER_DNS:1935/live/$STREAM_NAME (worker dedicado)
-nohup ffmpeg \
-  -loglevel verbose \
-  -i "rtmp://127.0.0.1:1935/live/$STREAM_NAME" \
-  -c:v copy -c:a copy \
-  -f flv "rtmp://$WORKER_DNS:1935/live/$STREAM_NAME" \
-  > "/tmp/ffmpeg_${STREAM_NAME}.log" 2>&1 &
+# Notificar worker para iniciar pull via HTTP API do controller
+curl -sf "$CONTROLLER_API/start-worker?stream=$STREAM_NAME&worker=$WORKER_POD" || true
 
-FFMPEG_PID=$!
-
-# Salvar PID do ffmpeg para cleanup no on_publish_done
-echo "$FFMPEG_PID" > "$PID_DIR/${STREAM_NAME}.pid"
-
-echo "[$(date)] [on_publish_start] FFmpeg started for stream '$STREAM_NAME' (PID: $FFMPEG_PID)"
-echo "[$(date)] [on_publish_start] Routing: rtmp://127.0.0.1/live/$STREAM_NAME -> rtmp://$WORKER_DNS/live/$STREAM_NAME"
+echo "[$(date)] [on_publish_start] Worker '$WORKER_POD' will PULL from proxy '$PROXY_POD' and PUSH to YouTube"
+echo "[$(date)] [on_publish_start] Pull-Only Architecture - No relay, no trigger publish"
 
 exit 0

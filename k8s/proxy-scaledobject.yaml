@@ -9,7 +9,7 @@ spec:
     name: rtmp-proxy
   minReplicaCount: 1     # Sempre pelo menos 1 proxy ativo
   maxReplicaCount: 10    # Máximo 10 proxies para balancear carga
-  cooldownPeriod: 120    # 2min para scale down
+  cooldownPeriod: 300    # 5min para scale down (maior que worker)
   pollingInterval: 10    # Verifica a cada 10 segundos
   advanced:
     horizontalPodAutoscalerConfig:
@@ -22,33 +22,23 @@ spec:
             value: 100
             periodSeconds: 15
         scaleDown:
-          stabilizationWindowSeconds: 180  # Aguarda 3min antes de reduzir
+          stabilizationWindowSeconds: 420  # Aguarda 7min antes de reduzir
           selectPolicy: Min
           policies:
           - type: Percent
             value: 25
             periodSeconds: 60
   triggers:
-    # Primary Trigger: Escalação baseada em tráfego inbound (1Gbps por node)
+    # Primary Trigger: Escalação baseada em tráfego inbound (métricas Kubernetes nativas)
     - type: prometheus
       metadata:
         serverAddress: http://prometheus-server.prometheus.svc.cluster.local:80
-        metricName: rtmp_proxy_inbound_gbps
+        metricName: rtmp_proxy_inbound_mbps
         query: |
-          sum(rate(container_network_receive_bytes_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m])) / (1000*1000*1000) or vector(0)
-        threshold: "0.8"  # Scale quando > 800Mbps (80% de 1Gbps por node)
+          sum(rate(container_network_receive_bytes_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m])) / (1000*1000) or vector(0)
+        threshold: "800"  # Scale quando > 800Mbps de tráfego de entrada
     
-    # Secondary Trigger: Escalação baseada em conexões ativas (backup)
-    - type: prometheus
-      metadata:
-        serverAddress: http://prometheus-server.prometheus.svc.cluster.local:80
-        metricName: rtmp_proxy_active_connections
-        query: |
-          sum(nginx_connections_active{namespace="media",pod=~"rtmp-proxy-.*"}) - 
-          sum(nginx_connections_waiting{namespace="media",pod=~"rtmp-proxy-.*"}) or vector(0)
-        threshold: "50"  # Backup trigger: 1 proxy para cada 50 conexões ativas
-    
-    # Tertiary Trigger: CPU como safety net
+    # Secondary Trigger: CPU como safety net (métricas Kubernetes nativas)
     - type: prometheus
       metadata:
         serverAddress: http://prometheus-server.prometheus.svc.cluster.local:80
