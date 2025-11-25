@@ -96,18 +96,18 @@ else
 fi
 
 # Step 3: Build Docker images
-print_step "Building LiveEdgeCast RTMP Proxy image..."
-RTMP_IMAGE="liveedgecast:latest"
+print_step "Building LiveEdgeCast RTMP image..."
+RTMP_IMAGE="liveedgecast-rtmp:latest"
 
-# Build the RTMP proxy image (with curl, jq, wget, bash)
+# Build the RTMP image (proxy + worker use same image)
 docker build -t $RTMP_IMAGE -f docker/rtmp/Dockerfile docker/rtmp/ || { 
-    print_error "Failed to build RTMP proxy image"; 
+    print_error "Failed to build RTMP image"; 
     exit 1; 
 }
-print_success "RTMP proxy image $RTMP_IMAGE built successfully"
+print_success "RTMP image $RTMP_IMAGE built successfully"
 
 print_step "Building RTMP Controller API image..."
-CONTROLLER_IMAGE="rtmp-controller:latest"
+CONTROLLER_IMAGE="liveedgecast-controller:latest"
 docker build -t $CONTROLLER_IMAGE -f docker/controller/Dockerfile docker/controller/ || {
     print_error "Failed to build controller image";
     exit 1;
@@ -205,23 +205,14 @@ kubectl get pods -n keda -l app=keda-metrics-apiserver --no-headers | grep Runni
     print_warning "KEDA Metrics API Server may not be ready yet"
 }
 
-# Step 7: Setup port-forward for RTMP
-print_step "Setting up port-forward for RTMP access..."
+# Step 7: Get NodePort access information
+print_step "Getting NodePort access information..."
 
-# Kill any existing port-forwards
-pkill -f "kubectl.*port-forward.*1935" 2>/dev/null || true
-pkill -f "kubectl.*port-forward.*8080" 2>/dev/null || true
-sleep 2
+# Get Kubernetes node IP
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+WSL_IP=$(ip addr show eth0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 || echo "N/A")
 
-# Start RTMP port-forward
-print_step "Starting port-forward to RTMP Proxy on localhost:1935..."
-kubectl port-forward -n media svc/rtmp-proxy 1935:1935 >/dev/null 2>&1 &
-RTMP_PORT_FORWARD_PID=$!
-
-# Start HTTP port-forward for monitoring
-print_step "Starting port-forward to RTMP Proxy HTTP on localhost:8080..."
-kubectl port-forward -n media svc/rtmp-proxy 8080:8080 >/dev/null 2>&1 &
-HTTP_PORT_FORWARD_PID=$!
+print_success "NodePort RTMP Service configured on port 31935"
 
 print_success "Deployment completed!"
 
@@ -247,29 +238,39 @@ kubectl get svc -n media
 echo ""
 print_success "🎉 LiveEdgeCast RTMP Serverless is ready!"
 echo ""
-echo -e "${GREEN}📡 RTMP Streaming:${NC}"
-echo "  📺 Publish to: rtmp://localhost:1935/live/{your-stream-key}"
-echo "  🌐 Monitor: http://localhost:8080/stats"
-echo "  ❤️ Health: http://localhost:8080/health"
+echo -e "${GREEN}📡 RTMP Streaming (NodePort - External Access):${NC}"
+echo "  📺 From Windows/OBS: rtmp://localhost:31935/live/{your-youtube-key}"
+echo "  📺 From WSL: rtmp://${WSL_IP}:31935/live/{your-youtube-key}"
+echo "  📺 From Network: rtmp://${NODE_IP}:31935/live/{your-youtube-key}"
+echo ""
+echo -e "${YELLOW}🎥 OBS Studio Configuration:${NC}"
+echo "  1. Settings → Stream"
+echo "  2. Service: Custom"
+echo "  3. Server: rtmp://localhost:31935/live"
+echo "  4. Stream Key: {your-youtube-stream-key}"
+echo "  5. Click 'Start Streaming'"
 echo ""
 echo -e "${BLUE}🔧 Useful commands:${NC}"
 echo "  📊 Watch worker scaling: kubectl get pods -l app=rtmp-worker -n media -w"
-echo "  📊 Controller status: curl http://localhost:8000/status (via port-forward)"
+echo "  📊 Controller status: kubectl logs -l app=rtmp-controller -n media --tail=50"
 echo "  📋 Controller logs: kubectl logs -l app=rtmp-controller -n media -f"
-echo "  📋 Proxy logs: kubectl logs -l app=rtmp-proxy -n media -f -c nginx"
+echo "  📋 Proxy logs: kubectl logs -l app=rtmp-proxy -n media -f"
 echo "  📋 Worker logs: kubectl logs -l app=rtmp-worker -n media -f"
 echo "  🔍 KEDA status: kubectl get scaledobject -n media"
 echo "  📈 Metrics: kubectl top pods -n media"
-echo "  🛑 Stop RTMP port-forward: kill $RTMP_PORT_FORWARD_PID"
-echo "  🛑 Stop HTTP port-forward: kill $HTTP_PORT_FORWARD_PID"
 echo ""
-echo -e "${YELLOW}🎬 Testing Multi-Stream:${NC}"
-echo "  # Stream 1"
-echo "  ffmpeg -re -i video1.mp4 -f flv rtmp://localhost:1935/live/stream1"
-echo "  # Stream 2 (simultaneous)"
-echo "  ffmpeg -re -i video2.mp4 -f flv rtmp://localhost:1935/live/stream2"
-echo "  # Stream 3 (simultaneous)"
-echo "  ffmpeg -re -i video3.mp4 -f flv rtmp://localhost:1935/live/stream3"
+echo -e "${YELLOW}🎬 Testing with FFmpeg (NodePort):${NC}"
+echo "  # Test stream with YouTube key"
+echo "  ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 \\"
+echo "         -f lavfi -i sine=frequency=1000 \\"
+echo "         -c:v libx264 -preset ultrafast -b:v 2500k \\"
+echo "         -c:a aac -b:a 128k -t 60 \\"
+echo "         -f flv rtmp://localhost:31935/live/{your-youtube-key}"
+echo ""
+echo "  # Multiple streams simultaneously"
+echo "  ffmpeg -re -i video1.mp4 -f flv rtmp://localhost:31935/live/key1 &"
+echo "  ffmpeg -re -i video2.mp4 -f flv rtmp://localhost:31935/live/key2 &"
+echo "  ffmpeg -re -i video3.mp4 -f flv rtmp://localhost:31935/live/key3 &"
 echo ""
 echo -e "${YELLOW}💡 Multi-Stream Serverless Architecture v2.0:${NC}"
 echo -e "${YELLOW}   • Controller: Única fonte da verdade para workers (state recovery via métricas)${NC}"
@@ -288,65 +289,36 @@ echo -e "${YELLOW}   • Controller API: /allocate cria workers sob demanda${NC}
 echo -e "${YELLOW}   • Mapeamento bidirecional: stream ↔ worker${NC}"
 echo -e "${YELLOW}   • State recovery: Automático via métricas RTMP ao reiniciar${NC}"
 echo ""
-echo -e "${BLUE}🔍 Testing Prometheus Metrics Collection:${NC}"
-echo ""
-
-# Test 1: Check if nginx-exporter is exposing metrics
-print_step "Testing nginx-exporter endpoints..."
-PROXY_POD=$(kubectl get pods -n media -l app=rtmp-proxy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-
-if [ -n "$PROXY_POD" ]; then
-    echo "  Testing nginx stub_status endpoint..."
-    if kubectl exec -n media "$PROXY_POD" -c nginx -- wget -qO- http://localhost:8080/nginx_status 2>/dev/null | head -5; then
-        print_success "✓ Nginx stub_status is working"
-    else
-        print_warning "✗ Nginx stub_status not responding"
-    fi
-    
-    echo ""
-    echo "  Testing nginx-exporter metrics endpoint..."
-    if kubectl exec -n media "$PROXY_POD" -c nginx-exporter -- wget -qO- http://localhost:9113/metrics 2>/dev/null | grep "nginx_connections" | head -5; then
-        print_success "✓ Nginx-exporter is exposing metrics"
-    else
-        print_warning "✗ Nginx-exporter not responding"
-    fi
-else
-    print_warning "No proxy pod found for testing"
-fi
-
-echo ""
-print_step "Setting up Prometheus port-forward for testing..."
-# Kill any existing Prometheus port-forward
-pkill -f "kubectl.*port-forward.*prometheus.*9090" 2>/dev/null || true
-sleep 1
-
-# Start Prometheus port-forward in background
-kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090 >/dev/null 2>&1 &
-PROM_PORT_FORWARD_PID=$!
-sleep 3
-
-# Test Prometheus API
-echo "  Testing Prometheus query API..."
-PROM_QUERY="nginx_connections_active{namespace=\"media\"}"
-PROM_RESULT=$(curl -s "http://localhost:9090/api/v1/query?query=$PROM_QUERY" 2>/dev/null)
-
-if echo "$PROM_RESULT" | grep -q "nginx_connections_active"; then
-    print_success "✓ Prometheus is scraping nginx metrics"
-    echo ""
-    echo "  📊 Current nginx_connections_active:"
-    echo "$PROM_RESULT" | grep -o '"value":\[[^]]*\]' | head -3
-else
-    print_warning "✗ Prometheus may not have scraped metrics yet (wait 30s and check manually)"
-fi
-
-echo ""
 echo -e "${GREEN}🚀 Ready to receive RTMP streams!${NC}"
 echo ""
-echo -e "${BLUE}🔍 Metrics Verification:${NC}"
-echo "  🌐 Prometheus UI: http://localhost:9090"
-echo "  📊 Query examples:"
-echo "     - nginx_connections_active{namespace=\"media\"}"
-echo "     - nginx_connections_active - nginx_connections_waiting"
-echo "     - rate(container_network_receive_bytes_total{namespace=\"media\"}[1m])"
+echo -e "${BLUE}🔍 Health Check:${NC}"
+# Verificar health do proxy
+PROXY_POD=$(kubectl get pods -n media -l app=rtmp-proxy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -n "$PROXY_POD" ]; then
+    if kubectl exec -n media "$PROXY_POD" -- wget -qO- http://localhost:8080/health 2>/dev/null | grep -q "running"; then
+        print_success "✓ RTMP Proxy is healthy and ready"
+    else
+        print_warning "⚠ RTMP Proxy may not be fully ready yet"
+    fi
+fi
+
+# Verificar health do controller
+CONTROLLER_POD=$(kubectl get pods -n media -l app=rtmp-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -n "$CONTROLLER_POD" ]; then
+    if kubectl exec -n media "$CONTROLLER_POD" -- wget -qO- http://localhost:8000/health 2>/dev/null | grep -q "ok"; then
+        print_success "✓ Controller API is healthy and ready"
+    else
+        print_warning "⚠ Controller API may not be fully ready yet"
+    fi
+fi
+
 echo ""
-echo "  🛑 Stop Prometheus port-forward: kill $PROM_PORT_FORWARD_PID"
+echo -e "${BLUE}📊 Monitoring (Optional):${NC}"
+echo "  To access Prometheus UI:"
+echo "    kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090"
+echo "    Then open: http://localhost:9090"
+echo ""
+echo "  Useful Prometheus queries:"
+echo "    - rate(container_network_receive_bytes_total{namespace=\"media\"}[1m])/1000000  # Mbps"
+echo "    - container_memory_usage_bytes{namespace=\"media\",pod=~\"rtmp-.*\"}/1024/1024  # MB"
+echo "    - rate(container_cpu_usage_seconds_total{namespace=\"media\"}[1m])*100  # CPU %"
