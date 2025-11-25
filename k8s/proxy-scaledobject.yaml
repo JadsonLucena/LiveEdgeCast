@@ -46,3 +46,12 @@ spec:
         query: |
           sum(rate(container_cpu_usage_seconds_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m])) / sum(container_spec_cpu_quota{namespace="media",pod=~"rtmp-proxy-.*"}/container_spec_cpu_period{namespace="media",pod=~"rtmp-proxy-.*"}) * 100 or vector(0)
         threshold: "80"  # Safety net: Escala quando CPU > 80%
+    
+    # Tertiary Trigger: Memória como safety net adicional (métricas Kubernetes nativas)
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-server.prometheus.svc.cluster.local:80
+        metricName: rtmp_proxy_memory_usage
+        query: |
+          sum(container_memory_working_set_bytes{namespace="media",pod=~"rtmp-proxy-.*"}) / sum(container_spec_memory_limit_bytes{namespace="media",pod=~"rtmp-proxy-.*"}) * 100 or vector(0)
+        threshold: "80"  # Safety net: Escala quando memória > 80%
