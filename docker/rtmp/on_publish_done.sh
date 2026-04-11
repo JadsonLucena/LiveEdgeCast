@@ -14,6 +14,8 @@ set -e
 STREAM_NAME="$1"
 CONTROLLER_API="http://rtmp-controller.media.svc.cluster.local:8000"
 PID_FILE="/tmp/relay_${STREAM_NAME}.pid"
+HEARTBEAT_PID_FILE="/tmp/stream_hb_${STREAM_NAME}.pid"
+PROXY_POD=$(hostname)
 
 echo "[$(date)] [on_publish_done] Stream '$STREAM_NAME' ended - cleaning up..."
 
@@ -27,6 +29,20 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
   rm -f "/tmp/relay_${STREAM_NAME}.log"
 fi
+
+# Parar heartbeat da stream
+if [ -f "$HEARTBEAT_PID_FILE" ]; then
+  HEARTBEAT_PID=$(cat "$HEARTBEAT_PID_FILE")
+  if ps -p "$HEARTBEAT_PID" > /dev/null 2>&1; then
+    echo "[$(date)] [on_publish_done] Stopping stream heartbeat (PID: $HEARTBEAT_PID)"
+    kill "$HEARTBEAT_PID" 2>/dev/null || true
+  fi
+  rm -f "$HEARTBEAT_PID_FILE"
+fi
+
+# Liberar stream no registry efêmero
+curl -sf -X POST "$CONTROLLER_API/streams/release?stream=$STREAM_NAME&proxy_pod=$PROXY_POD" || \
+  echo "[$(date)] [on_publish_done] WARNING: Failed to release stream registry"
 
 # Notificar controller para liberar worker
 curl -sf -X POST "$CONTROLLER_API/release?stream=$STREAM_NAME" || \

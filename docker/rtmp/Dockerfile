@@ -60,6 +60,7 @@ RUN mkdir -p /var/log/nginx /scripts /tmp/ffmpeg_pids \
 COPY on_publish_start.sh /scripts/on_publish_start.sh
 COPY on_publish_done.sh /scripts/on_publish_done.sh
 COPY on_worker_pull_push.sh /scripts/on_worker_pull_push.sh
+COPY worker_recovery_loop.sh /scripts/worker_recovery_loop.sh
 
 # Garantir permissões de execução
 RUN chmod +x /scripts/*.sh

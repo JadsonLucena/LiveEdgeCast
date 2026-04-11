@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from kubernetes import client, config
 import random
 import string
@@ -35,6 +35,9 @@ worker_to_stream: Dict[str, str] = {}
 
 # Mapeamento: stream_name → proxy_pod_name (Pull-Only Architecture)
 stream_to_proxy: Dict[str, str] = {}
+# Registro efêmero de streams no proxy com TTL
+# Mapeia: stream_name -> {"proxy_pod": str, "expires_at": float}
+stream_registry: Dict[str, Dict[str, float]] = {}
 
 # Rastreia streams aguardando worker (evita múltiplas escalações para mesma stream)
 # Mapeia: stream_name → timestamp da primeira solicitação
@@ -43,6 +46,8 @@ streams_pending_allocation: Dict[str, float] = {}
 # Timestamp do último release (para scale-down automático)
 last_release_time: Optional[float] = None
 scale_down_task: Optional[asyncio.Task] = None
+STREAM_TTL_SECONDS = 15
+STREAM_HEARTBEAT_INTERVAL_SECONDS = 5
 
 # Load Kubernetes credentials (inside cluster)
 try:
@@ -58,6 +63,37 @@ core = client.CoreV1Api()
 
 def random_suffix():
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
+
+
+def cleanup_expired_streams() -> None:
+    """
+    Remove streams expiradas do registro efêmero.
+    Também remove stream_to_proxy para manter consistência.
+    """
+    now = time.time()
+    expired = []
+
+    for stream, entry in stream_registry.items():
+        if entry.get("expires_at", 0) <= now:
+            expired.append(stream)
+
+    for stream in expired:
+        stream_registry.pop(stream, None)
+        stream_to_proxy.pop(stream, None)
+        logger.info(f"[Registry] Stream '{stream}' expired (missing heartbeat)")
+
+
+def register_or_refresh_stream(stream: str, proxy_pod: str):
+    """
+    Cria ou renova registro efêmero da stream no proxy.
+    """
+    expires_at = time.time() + STREAM_TTL_SECONDS
+    stream_registry[stream] = {
+        "proxy_pod": proxy_pod,
+        "expires_at": expires_at
+    }
+    stream_to_proxy[stream] = proxy_pod
+    return expires_at
 
 
 async def schedule_scale_down_if_idle():
@@ -206,6 +242,11 @@ def allocate_worker(
     global scale_down_task
     
     with allocation_lock:
+        cleanup_expired_streams()
+
+        if proxy_pod:
+            register_or_refresh_stream(stream, proxy_pod)
+
         # Cancelar scale-down se houver nova solicitação de alocação
         if scale_down_task and not scale_down_task.done():
             scale_down_task.cancel()
@@ -366,6 +407,8 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         # Remover proxy mapping (Pull-Only)
         if stream in stream_to_proxy:
             del stream_to_proxy[stream]
+        if stream in stream_registry:
+            del stream_registry[stream]
         
         # Remover de pending allocation se ainda estiver lá
         if stream in streams_pending_allocation:
@@ -391,6 +434,93 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         }
 
 
+@app.post("/streams/register")
+def register_stream(
+    stream: str = Query(..., description="Stream name"),
+    proxy_pod: str = Query(..., description="Proxy pod name")
+):
+    with allocation_lock:
+        cleanup_expired_streams()
+        expires_at = register_or_refresh_stream(stream, proxy_pod)
+        return {
+            "status": "registered",
+            "stream": stream,
+            "proxy_pod": proxy_pod,
+            "ttl_seconds": STREAM_TTL_SECONDS,
+            "heartbeat_interval_seconds": STREAM_HEARTBEAT_INTERVAL_SECONDS,
+            "expires_at": expires_at
+        }
+
+
+@app.post("/streams/heartbeat")
+def heartbeat_stream(
+    stream: str = Query(..., description="Stream name"),
+    proxy_pod: str = Query(..., description="Proxy pod name")
+):
+    with allocation_lock:
+        cleanup_expired_streams()
+        current = stream_registry.get(stream)
+
+        if current and current.get("proxy_pod") != proxy_pod:
+            raise HTTPException(
+                status_code=409,
+                detail=f"stream '{stream}' already owned by proxy '{current.get('proxy_pod')}'"
+            )
+
+        expires_at = register_or_refresh_stream(stream, proxy_pod)
+        return {
+            "status": "ok",
+            "stream": stream,
+            "proxy_pod": proxy_pod,
+            "expires_at": expires_at
+        }
+
+
+@app.get("/streams/resolve")
+def resolve_stream(stream: str = Query(..., description="Stream name")):
+    with allocation_lock:
+        cleanup_expired_streams()
+        entry = stream_registry.get(stream)
+
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"stream '{stream}' not found")
+
+        proxy_pod = entry.get("proxy_pod")
+        proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
+
+        if not proxy_ip:
+            raise HTTPException(status_code=404, detail=f"proxy for stream '{stream}' unavailable")
+
+        return {
+            "stream": stream,
+            "proxyPod": proxy_pod,
+            "proxyAddress": proxy_ip,
+            "expiresAt": entry.get("expires_at")
+        }
+
+
+@app.post("/streams/release")
+def release_stream_registry(
+    stream: str = Query(..., description="Stream name"),
+    proxy_pod: str = Query(None, description="Proxy pod name")
+):
+    with allocation_lock:
+        cleanup_expired_streams()
+        current = stream_registry.get(stream)
+        if not current:
+            return {"status": "not_found", "stream": stream}
+
+        if proxy_pod and current.get("proxy_pod") != proxy_pod:
+            raise HTTPException(
+                status_code=409,
+                detail=f"stream '{stream}' owned by another proxy '{current.get('proxy_pod')}'"
+            )
+
+        stream_registry.pop(stream, None)
+        stream_to_proxy.pop(stream, None)
+        return {"status": "released", "stream": stream}
+
+
 @app.get("/status")
 def get_status():
     """
@@ -398,14 +528,24 @@ def get_status():
     Útil para debug e monitoramento.
     """
     with allocation_lock:
+        cleanup_expired_streams()
         return {
             "active_streams": len(stream_to_worker),
+            "registry_streams": len(stream_registry),
             "allocations": [
                 {
                     "stream": stream,
                     "worker": worker
                 }
                 for stream, worker in stream_to_worker.items()
+            ],
+            "registry": [
+                {
+                    "stream": stream,
+                    "proxy_pod": data.get("proxy_pod"),
+                    "expires_at": data.get("expires_at")
+                }
+                for stream, data in stream_registry.items()
             ]
         }
 
@@ -427,19 +567,20 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
     # Em produção, substituir por lógica real de mapeamento
     youtube_key = stream
     
-    # Obter proxy DNS para Pull-Only Architecture
-    proxy_pod = stream_to_proxy.get(stream)
+    with allocation_lock:
+        cleanup_expired_streams()
+        proxy_pod = stream_to_proxy.get(stream)
+        proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
     
-    # Obter IP do proxy específico para Pull-Only Architecture
-    proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
-    proxy_address = proxy_ip if proxy_ip else "rtmp-proxy.media.svc.cluster.local"
+    if not proxy_ip:
+        raise HTTPException(status_code=404, detail=f"stream '{stream}' has no active proxy")
     
-    logger.debug(f"[StreamKey] Returning info for stream '{stream}': YouTube={youtube_key}, Proxy={proxy_address}")
+    logger.debug(f"[StreamKey] Returning info for stream '{stream}': YouTube={youtube_key}, Proxy={proxy_ip}")
     
     return {
         "stream": stream,
         "youtubeKey": youtube_key,
-        "proxyDns": proxy_address
+        "proxyDns": proxy_ip
     }
 
 
