@@ -32,6 +32,12 @@ while true; do
   log "Attempt $ATTEMPT: resolving stream '$STREAM_NAME' in controller"
 
   STREAM_INFO=$(curl -sf "$CONTROLLER_API/stream-key?stream=$STREAM_NAME" 2>/dev/null || true)
+  if [ -z "$STREAM_INFO" ] || ! echo "$STREAM_INFO" | jq -e . >/dev/null 2>&1; then
+    log "Controller returned empty/invalid JSON. Waiting ${RETRY_DELAY_SECONDS}s before next attempt."
+    sleep "$RETRY_DELAY_SECONDS"
+    continue
+  fi
+
   YOUTUBE_KEY=$(echo "$STREAM_INFO" | jq -r '.youtubeKey // empty')
   PROXY_ADDR=$(echo "$STREAM_INFO" | jq -r '.proxyDns // empty')
 

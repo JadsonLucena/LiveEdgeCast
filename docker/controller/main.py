@@ -96,6 +96,18 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
     return expires_at
 
 
+def register_or_refresh_stream_if_owner_matches(stream: str, proxy_pod: str):
+    """
+    Renova registro apenas se:
+    - stream não existe ainda, ou
+    - stream já pertence ao mesmo proxy_pod
+    """
+    current = stream_registry.get(stream)
+    if current and current.get("proxy_pod") != proxy_pod:
+        return None
+    return register_or_refresh_stream(stream, proxy_pod)
+
+
 async def schedule_scale_down_if_idle():
     """
     Agenda scale-down automático dos workers se ficarem idle por tempo suficiente.
@@ -245,7 +257,12 @@ def allocate_worker(
         cleanup_expired_streams()
 
         if proxy_pod:
-            register_or_refresh_stream(stream, proxy_pod)
+            expires_at = register_or_refresh_stream_if_owner_matches(stream, proxy_pod)
+            if expires_at is None:
+                logger.warning(
+                    f"[Allocate] Stream '{stream}' already owned by proxy "
+                    f"'{stream_registry.get(stream, {}).get('proxy_pod')}', ignoring proxy '{proxy_pod}'"
+                )
 
         # Cancelar scale-down se houver nova solicitação de alocação
         if scale_down_task and not scale_down_task.done():
@@ -441,6 +458,12 @@ def register_stream(
 ):
     with allocation_lock:
         cleanup_expired_streams()
+        current = stream_registry.get(stream)
+        if current and current.get("proxy_pod") != proxy_pod:
+            raise HTTPException(
+                status_code=409,
+                detail=f"stream '{stream}' already owned by proxy '{current.get('proxy_pod')}'"
+            )
         expires_at = register_or_refresh_stream(stream, proxy_pod)
         return {
             "status": "registered",
@@ -478,6 +501,9 @@ def heartbeat_stream(
 
 @app.get("/streams/resolve")
 def resolve_stream(stream: str = Query(..., description="Stream name")):
+    proxy_pod = None
+    expires_at = None
+
     with allocation_lock:
         cleanup_expired_streams()
         entry = stream_registry.get(stream)
@@ -486,17 +512,19 @@ def resolve_stream(stream: str = Query(..., description="Stream name")):
             raise HTTPException(status_code=404, detail=f"stream '{stream}' not found")
 
         proxy_pod = entry.get("proxy_pod")
-        proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
+        expires_at = entry.get("expires_at")
 
-        if not proxy_ip:
-            raise HTTPException(status_code=404, detail=f"proxy for stream '{stream}' unavailable")
+    proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
 
-        return {
-            "stream": stream,
-            "proxyPod": proxy_pod,
-            "proxyAddress": proxy_ip,
-            "expiresAt": entry.get("expires_at")
-        }
+    if not proxy_ip:
+        raise HTTPException(status_code=404, detail=f"proxy for stream '{stream}' unavailable")
+
+    return {
+        "stream": stream,
+        "proxyPod": proxy_pod,
+        "proxyAddress": proxy_ip,
+        "expiresAt": expires_at
+    }
 
 
 @app.post("/streams/release")
