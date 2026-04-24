@@ -21,9 +21,6 @@ STREAM_NAME="$1"
 CONTROLLER_API="http://rtmp-controller.media.svc.cluster.local:8000"
 MAX_RETRIES=10
 RETRY_COUNT=0
-HEARTBEAT_PID_FILE="/tmp/stream_hb_${STREAM_NAME}.pid"
-HEARTBEAT_INTERVAL=5
-HEARTBEAT_LOG_FILE="/tmp/stream_heartbeat_${STREAM_NAME}.log"
 
 # Obter nome do pod do proxy (para Pull-Only)
 PROXY_POD=$(hostname)
@@ -32,27 +29,6 @@ echo "[$(date)] [on_publish_start] Stream '$STREAM_NAME' published on proxy '$PR
 
 # Registrar stream no controller com TTL curto
 curl -sf -X POST "$CONTROLLER_API/streams/register?stream=$STREAM_NAME&proxy_pod=$PROXY_POD" >/dev/null
-
-# Iniciar heartbeat periódico em background enquanto stream estiver ativa
-nohup bash -c "
-  while true; do
-    curl -sf -X POST '$CONTROLLER_API/streams/heartbeat?stream=$STREAM_NAME&proxy_pod=$PROXY_POD' >/dev/null || true
-    sleep $HEARTBEAT_INTERVAL
-  done
-" >/tmp/stream_heartbeat_${STREAM_NAME}.log 2>&1 &
-echo $! > "$HEARTBEAT_PID_FILE"
-
-cleanup_heartbeat_on_error() {
-  if [ -f "$HEARTBEAT_PID_FILE" ]; then
-    HB_PID=$(cat "$HEARTBEAT_PID_FILE")
-    if ps -p "$HB_PID" >/dev/null 2>&1; then
-      kill "$HB_PID" 2>/dev/null || true
-    fi
-    rm -f "$HEARTBEAT_PID_FILE" "$HEARTBEAT_LOG_FILE"
-  fi
-}
-
-trap cleanup_heartbeat_on_error ERR
 
 # Chamar API do controller para alocar worker
 # Passar proxy_pod para worker fazer pull do proxy correto
@@ -84,7 +60,5 @@ curl -sf "$CONTROLLER_API/start-worker?stream=$STREAM_NAME&worker=$WORKER_POD" |
 
 echo "[$(date)] [on_publish_start] Worker '$WORKER_POD' will PULL from proxy '$PROXY_POD' and PUSH to YouTube"
 echo "[$(date)] [on_publish_start] Pull-Only Architecture - No relay, no trigger publish"
-
-trap - ERR
 
 exit 0

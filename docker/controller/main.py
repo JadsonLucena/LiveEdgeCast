@@ -46,8 +46,12 @@ streams_pending_allocation: Dict[str, float] = {}
 # Timestamp do último release (para scale-down automático)
 last_release_time: Optional[float] = None
 scale_down_task: Optional[asyncio.Task] = None
-STREAM_TTL_SECONDS = 15
-STREAM_HEARTBEAT_INTERVAL_SECONDS = 5
+registry_health_task: Optional[asyncio.Task] = None
+PROXY_HEALTHCHECK_INTERVAL_SECONDS = 5
+PROXY_HEALTHCHECK_MAX_FAILURES = 3
+PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
+STREAM_TTL_SECONDS = PROXY_HEALTHCHECK_INTERVAL_SECONDS * PROXY_HEALTHCHECK_MAX_FAILURES
+proxy_health_failures: Dict[str, int] = {}
 
 # Load Kubernetes credentials (inside cluster)
 try:
@@ -80,7 +84,7 @@ def cleanup_expired_streams() -> None:
     for stream in expired:
         stream_registry.pop(stream, None)
         stream_to_proxy.pop(stream, None)
-        logger.info(f"[Registry] Stream '{stream}' expired (missing heartbeat)")
+        logger.info(f"[Registry] Stream '{stream}' expired (proxy healthcheck timeout)")
 
 
 def register_or_refresh_stream(stream: str, proxy_pod: str):
@@ -93,6 +97,7 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
         "expires_at": expires_at
     }
     stream_to_proxy[stream] = proxy_pod
+    proxy_health_failures[proxy_pod] = 0
     return expires_at
 
 
@@ -142,6 +147,68 @@ async def schedule_scale_down_if_idle():
                     logger.info(f"[AutoScaleDown] Reduced workers to 0 (idle for {SCALE_DOWN_DELAY}s)")
             except Exception as e:
                 logger.error(f"[AutoScaleDown] Failed to scale down: {e}")
+
+
+def check_proxy_health(proxy_pod: str) -> bool:
+    proxy_ip = get_proxy_pod_ip(proxy_pod)
+    if not proxy_ip:
+        return False
+
+    try:
+        response = requests.get(
+            f"http://{proxy_ip}:8080/health",
+            timeout=PROXY_HEALTHCHECK_TIMEOUT_SECONDS
+        )
+        return response.status_code == 200
+    except Exception as e:
+        logger.warning(f"[ProxyHealth] Healthcheck failed for {proxy_pod}: {e}")
+        return False
+
+
+async def monitor_stream_registry_health():
+    """
+    Controller-driven health monitoring:
+    - A cada 5s verifica /health de cada proxy com stream ativa
+    - Após 3 falhas consecutivas, expira todas as streams daquele proxy
+    """
+    while True:
+        await asyncio.sleep(PROXY_HEALTHCHECK_INTERVAL_SECONDS)
+
+        with allocation_lock:
+            cleanup_expired_streams()
+            proxies = {entry.get("proxy_pod") for entry in stream_registry.values() if entry.get("proxy_pod")}
+
+        for proxy_pod in proxies:
+            is_healthy = check_proxy_health(proxy_pod)
+
+            with allocation_lock:
+                if is_healthy:
+                    proxy_health_failures[proxy_pod] = 0
+                    # Proxy online: renovar validade de todas as streams deste proxy
+                    for stream, entry in stream_registry.items():
+                        if entry.get("proxy_pod") == proxy_pod:
+                            entry["expires_at"] = time.time() + STREAM_TTL_SECONDS
+                else:
+                    failures = proxy_health_failures.get(proxy_pod, 0) + 1
+                    proxy_health_failures[proxy_pod] = failures
+                    logger.warning(
+                        f"[ProxyHealth] Proxy '{proxy_pod}' failed healthcheck "
+                        f"({failures}/{PROXY_HEALTHCHECK_MAX_FAILURES})"
+                    )
+
+                    if failures >= PROXY_HEALTHCHECK_MAX_FAILURES:
+                        impacted_streams = [
+                            stream for stream, entry in stream_registry.items()
+                            if entry.get("proxy_pod") == proxy_pod
+                        ]
+                        for stream in impacted_streams:
+                            stream_registry.pop(stream, None)
+                            stream_to_proxy.pop(stream, None)
+                            logger.info(
+                                f"[Registry] Stream '{stream}' expired after "
+                                f"{PROXY_HEALTHCHECK_MAX_FAILURES} failed proxy healthchecks"
+                            )
+                        proxy_health_failures.pop(proxy_pod, None)
 
 
 def get_proxy_pod_ip(proxy_pod: str) -> str:
@@ -226,9 +293,18 @@ def recover_state():
 # Recuperar estado ao iniciar
 @app.on_event("startup")
 async def startup_event():
+    global registry_health_task
     # Aguardar 5 segundos para Kubernetes estabilizar
     time.sleep(5)
     recover_state()
+    registry_health_task = asyncio.create_task(monitor_stream_registry_health())
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global registry_health_task
+    if registry_health_task and not registry_health_task.done():
+        registry_health_task.cancel()
 
 
 @app.get("/health")
@@ -470,7 +546,8 @@ def register_stream(
             "stream": stream,
             "proxy_pod": proxy_pod,
             "ttl_seconds": STREAM_TTL_SECONDS,
-            "heartbeat_interval_seconds": STREAM_HEARTBEAT_INTERVAL_SECONDS,
+            "healthcheck_interval_seconds": PROXY_HEALTHCHECK_INTERVAL_SECONDS,
+            "max_failed_healthchecks": PROXY_HEALTHCHECK_MAX_FAILURES,
             "expires_at": expires_at
         }
 
