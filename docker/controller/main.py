@@ -50,6 +50,8 @@ registry_health_task: Optional[asyncio.Task] = None
 PROXY_HEALTHCHECK_INTERVAL_SECONDS = 5
 PROXY_HEALTHCHECK_MAX_FAILURES = 3
 PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
+PROXY_HEALTHCHECK_MAX_CONCURRENCY = 20
+PROXY_HEALTHCHECK_JITTER_SECONDS = 1.5
 STREAM_TTL_SECONDS = PROXY_HEALTHCHECK_INTERVAL_SECONDS * PROXY_HEALTHCHECK_MAX_FAILURES
 proxy_health_failures: Dict[str, int] = {}
 
@@ -171,6 +173,44 @@ async def monitor_stream_registry_health():
     - A cada 5s verifica /health de cada proxy com stream ativa
     - Após 3 falhas consecutivas, expira todas as streams daquele proxy
     """
+    semaphore = asyncio.Semaphore(PROXY_HEALTHCHECK_MAX_CONCURRENCY)
+
+    async def run_proxy_check(proxy_pod: str):
+        if PROXY_HEALTHCHECK_JITTER_SECONDS > 0:
+            await asyncio.sleep(random.uniform(0, PROXY_HEALTHCHECK_JITTER_SECONDS))
+
+        async with semaphore:
+            is_healthy = await asyncio.to_thread(check_proxy_health, proxy_pod)
+
+        with allocation_lock:
+            if is_healthy:
+                proxy_health_failures[proxy_pod] = 0
+                # Proxy online: renovar validade de todas as streams deste proxy
+                for stream, entry in stream_registry.items():
+                    if entry.get("proxy_pod") == proxy_pod:
+                        entry["expires_at"] = time.time() + STREAM_TTL_SECONDS
+            else:
+                failures = proxy_health_failures.get(proxy_pod, 0) + 1
+                proxy_health_failures[proxy_pod] = failures
+                logger.warning(
+                    f"[ProxyHealth] Proxy '{proxy_pod}' failed healthcheck "
+                    f"({failures}/{PROXY_HEALTHCHECK_MAX_FAILURES})"
+                )
+
+                if failures >= PROXY_HEALTHCHECK_MAX_FAILURES:
+                    impacted_streams = [
+                        stream for stream, entry in stream_registry.items()
+                        if entry.get("proxy_pod") == proxy_pod
+                    ]
+                    for stream in impacted_streams:
+                        stream_registry.pop(stream, None)
+                        stream_to_proxy.pop(stream, None)
+                        logger.info(
+                            f"[Registry] Stream '{stream}' expired after "
+                            f"{PROXY_HEALTHCHECK_MAX_FAILURES} failed proxy healthchecks"
+                        )
+                    proxy_health_failures.pop(proxy_pod, None)
+
     while True:
         await asyncio.sleep(PROXY_HEALTHCHECK_INTERVAL_SECONDS)
 
@@ -178,37 +218,8 @@ async def monitor_stream_registry_health():
             cleanup_expired_streams()
             proxies = {entry.get("proxy_pod") for entry in stream_registry.values() if entry.get("proxy_pod")}
 
-        for proxy_pod in proxies:
-            is_healthy = check_proxy_health(proxy_pod)
-
-            with allocation_lock:
-                if is_healthy:
-                    proxy_health_failures[proxy_pod] = 0
-                    # Proxy online: renovar validade de todas as streams deste proxy
-                    for stream, entry in stream_registry.items():
-                        if entry.get("proxy_pod") == proxy_pod:
-                            entry["expires_at"] = time.time() + STREAM_TTL_SECONDS
-                else:
-                    failures = proxy_health_failures.get(proxy_pod, 0) + 1
-                    proxy_health_failures[proxy_pod] = failures
-                    logger.warning(
-                        f"[ProxyHealth] Proxy '{proxy_pod}' failed healthcheck "
-                        f"({failures}/{PROXY_HEALTHCHECK_MAX_FAILURES})"
-                    )
-
-                    if failures >= PROXY_HEALTHCHECK_MAX_FAILURES:
-                        impacted_streams = [
-                            stream for stream, entry in stream_registry.items()
-                            if entry.get("proxy_pod") == proxy_pod
-                        ]
-                        for stream in impacted_streams:
-                            stream_registry.pop(stream, None)
-                            stream_to_proxy.pop(stream, None)
-                            logger.info(
-                                f"[Registry] Stream '{stream}' expired after "
-                                f"{PROXY_HEALTHCHECK_MAX_FAILURES} failed proxy healthchecks"
-                            )
-                        proxy_health_failures.pop(proxy_pod, None)
+        if proxies:
+            await asyncio.gather(*(run_proxy_check(proxy_pod) for proxy_pod in proxies))
 
 
 def get_proxy_pod_ip(proxy_pod: str) -> str:
