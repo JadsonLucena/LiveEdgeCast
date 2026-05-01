@@ -82,7 +82,7 @@ log_snippet() {
 
 filter_stream() {
   local pattern="$1"
-  grep -En "$pattern" || true
+  grep -Ein "$pattern" || true
 }
 
 echo "Runtime checklist"
@@ -103,6 +103,7 @@ kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR"
 kubectl get deploy -n "$NAMESPACE" "$CONTROLLER_DEPLOYMENT"
 
 WORKER_COUNT="$(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+WORKER_DESIRED="$(kubectl get deploy -n "$NAMESPACE" rtmp-worker -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "unknown")"
 
 if [[ "$WORKER_COUNT" == "0" ]]; then
   echo ""
@@ -113,6 +114,10 @@ if [[ "$WORKER_COUNT" == "0" ]]; then
   echo "--- Worker deployment status (replicas/conditions) ---"
   kubectl get deploy -n "$NAMESPACE" rtmp-worker -o wide 2>/dev/null || yellow "WARN: deployment/rtmp-worker not found"
   kubectl describe deploy -n "$NAMESPACE" rtmp-worker 2>/dev/null | tail -n 80 || true
+  if [[ "$WORKER_DESIRED" == "0" ]]; then
+    yellow "DIAG: deployment/rtmp-worker está com spec.replicas=0. O worker não foi solicitado para escalar ainda."
+    yellow "DIAG: provável causa -> fluxo de alocação não chegou ao controller (/allocate) para essa stream."
+  fi
 
   echo ""
   echo "--- HPA / KEDA objects related to worker ---"
@@ -133,6 +138,7 @@ fi
 if [[ -n "$CTRL_POD" ]]; then
   check_warn "controller /health" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/health; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/health; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'ok'"
   check_warn "controller /metrics has stream gauges" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/metrics; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/metrics; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'stream_delivery_status|stream_uptime_seconds|recovery_attempt_total'"
+  check_warn "controller OpenAPI has /allocate route" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/openapi.json; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/openapi.json; else echo 'missing curl/wget'; exit 1; fi | grep -Eq '\"/allocate\"'"
 else
   yellow "WARN: could not resolve controller pod by label; skipping in-pod endpoint checks"
 fi
@@ -144,6 +150,17 @@ if [[ -n "$CTRL_POD" ]]; then
     log_snippet "$CTRL_POD" "$STREAM_NAME|Allocate|Release|StartWorker|Delivery|Recovery|pending allocation|Registry|ProxyHealth"
   else
     log_snippet "$CTRL_POD" "Allocate|Release|StartWorker|Delivery|Recovery|pending allocation|Registry|ProxyHealth"
+  fi
+fi
+
+if [[ "$WORKER_COUNT" == "0" ]]; then
+  echo ""
+  echo "=== Quick interpretation ==="
+  if [[ "$WORKER_DESIRED" == "0" ]]; then
+    yellow "Sem worker porque replicas desejadas do deployment continuam em 0."
+    yellow "Próximo passo: verificar se proxy chamou o endpoint /allocate no controller para a stream."
+  else
+    yellow "Deployment pede worker (replicas > 0), mas pods não subiram. Verifique eventos de scheduling/imagem."
   fi
 fi
 
