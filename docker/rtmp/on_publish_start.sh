@@ -19,7 +19,7 @@ set -e
 
 STREAM_NAME="$1"
 CONTROLLER_API="http://rtmp-controller.media.svc.cluster.local:8000"
-MAX_RETRIES=10
+MAX_RETRIES=30  # 30 seconds timeout (1s sleep × 30 retries)
 RETRY_COUNT=0
 
 # Obter nome do pod do proxy (para Pull-Only)
