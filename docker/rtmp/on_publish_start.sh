@@ -27,8 +27,15 @@ PROXY_POD=$(hostname)
 
 echo "[$(date)] [on_publish_start] Stream '$STREAM_NAME' published on proxy '$PROXY_POD' - notifying controller..."
 
-# Registrar stream no controller com TTL curto
-curl -sf -X POST "$CONTROLLER_API/streams/register?stream=$STREAM_NAME&proxy_pod=$PROXY_POD" >/dev/null
+# Registrar stream no controller com TTL curto.
+# Não deve abortar o fluxo de alocação se houver 409 (owner antigo/stale),
+# pois /allocate já tenta renovar/conciliar propriedade.
+REGISTER_HTTP_CODE=$(curl -sS -o /tmp/register_${STREAM_NAME}.json -w "%{http_code}" \
+  -X POST "$CONTROLLER_API/streams/register?stream=$STREAM_NAME&proxy_pod=$PROXY_POD" || true)
+
+if [ "$REGISTER_HTTP_CODE" != "200" ]; then
+  echo "[$(date)] [on_publish_start] WARNING: register returned HTTP $REGISTER_HTTP_CODE, continuing with allocate"
+fi
 
 # Chamar API do controller para alocar worker
 # Passar proxy_pod para worker fazer pull do proxy correto
