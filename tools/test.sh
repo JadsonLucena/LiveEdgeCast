@@ -43,10 +43,6 @@ done
 green() { printf "\033[32m%s\033[0m\n" "$*"; }
 yellow() { printf "\033[33m%s\033[0m\n" "$*"; }
 red() { printf "\033[31m%s\033[0m\n" "$*"; }
-HAS_RG=0
-if command -v rg >/dev/null 2>&1; then
-  HAS_RG=1
-fi
 
 check() {
   local title="$1"
@@ -78,11 +74,7 @@ log_snippet() {
   local pod="$1"
   local pattern="${2:-}"
   if [[ -n "$pattern" ]]; then
-    if [[ "$HAS_RG" == "1" ]]; then
-      kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | rg -n "$pattern" || true
-    else
-      kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | grep -En "$pattern" || true
-    fi
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | grep -En "$pattern" || true
   else
     kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | tail -n "$TAIL_LINES" || true
   fi
@@ -90,11 +82,7 @@ log_snippet() {
 
 filter_stream() {
   local pattern="$1"
-  if [[ "$HAS_RG" == "1" ]]; then
-    rg -n "$pattern" || true
-  else
-    grep -En "$pattern" || true
-  fi
+  grep -En "$pattern" || true
 }
 
 echo "Runtime checklist"
