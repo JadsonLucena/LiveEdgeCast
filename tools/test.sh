@@ -43,6 +43,10 @@ done
 green() { printf "\033[32m%s\033[0m\n" "$*"; }
 yellow() { printf "\033[33m%s\033[0m\n" "$*"; }
 red() { printf "\033[31m%s\033[0m\n" "$*"; }
+HAS_RG=0
+if command -v rg >/dev/null 2>&1; then
+  HAS_RG=1
+fi
 
 check() {
   local title="$1"
@@ -74,9 +78,22 @@ log_snippet() {
   local pod="$1"
   local pattern="${2:-}"
   if [[ -n "$pattern" ]]; then
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | rg -n "$pattern" || true
+    if [[ "$HAS_RG" == "1" ]]; then
+      kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | rg -n "$pattern" || true
+    else
+      kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | grep -En "$pattern" || true
+    fi
   else
     kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | tail -n "$TAIL_LINES" || true
+  fi
+}
+
+filter_stream() {
+  local pattern="$1"
+  if [[ "$HAS_RG" == "1" ]]; then
+    rg -n "$pattern" || true
+  else
+    grep -En "$pattern" || true
   fi
 }
 
@@ -111,12 +128,12 @@ if [[ "$WORKER_COUNT" == "0" ]]; then
 
   echo ""
   echo "--- HPA / KEDA objects related to worker ---"
-  kubectl get scaledobject,keda -n "$NAMESPACE" 2>/dev/null | rg -n "worker|NAME|NAMESPACE" || true
-  kubectl get hpa -n "$NAMESPACE" 2>/dev/null | rg -n "worker|NAME" || true
+  kubectl get scaledobject -n "$NAMESPACE" 2>/dev/null | filter_stream "worker|NAME|NAMESPACE"
+  kubectl get hpa -n "$NAMESPACE" 2>/dev/null | filter_stream "worker|NAME"
 
   echo ""
   echo "--- Recent namespace events (worker/controller/proxy) ---"
-  kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 120 | rg -n "worker|rtmp-worker|controller|proxy|Failed|Warning|BackOff|Insufficient|Forbidden|Error" || true
+  kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 120 | filter_stream "worker|rtmp-worker|controller|proxy|Failed|Warning|BackOff|Insufficient|Forbidden|Error"
 fi
 
 echo ""
@@ -126,8 +143,8 @@ if [[ -z "$CTRL_POD" ]]; then
   CTRL_POD="$(kubectl get pod -n "$NAMESPACE" -l app=rtmp-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
 fi
 if [[ -n "$CTRL_POD" ]]; then
-  check "controller /health" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "wget -qO- http://127.0.0.1:8000/health | rg -q 'ok'"
-  check "controller /metrics has stream gauges" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "wget -qO- http://127.0.0.1:8000/metrics | rg -q 'stream_delivery_status|stream_uptime_seconds|recovery_attempt_total'"
+  check_warn "controller /health" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/health; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/health; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'ok'"
+  check_warn "controller /metrics has stream gauges" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/metrics; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/metrics; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'stream_delivery_status|stream_uptime_seconds|recovery_attempt_total'"
 else
   yellow "WARN: could not resolve controller pod by label; skipping in-pod endpoint checks"
 fi
@@ -147,9 +164,9 @@ echo "=== Proxy logs (publish hooks + routing) ==="
 for pod in $(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o name); do
   echo "--- $pod ---"
   if [[ -n "$STREAM_NAME" ]]; then
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "on_publish_start|on_publish_done|$STREAM_NAME|allocat|worker|heartbeat|error|warn" || true
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "on_publish_start|on_publish_done|$STREAM_NAME|allocat|worker|heartbeat|error|warn"
   else
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "on_publish_start|on_publish_done|allocat|worker|heartbeat|error|warn" || true
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "on_publish_start|on_publish_done|allocat|worker|heartbeat|error|warn"
   fi
 done
 
@@ -158,9 +175,9 @@ echo "=== Worker logs (recovery/ffmpeg) ==="
 for pod in $(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" -o name); do
   echo "--- $pod ---"
   if [[ -n "$STREAM_NAME" ]]; then
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "$STREAM_NAME|worker_recovery|ffmpeg|recovery-report|heartbeat|error|warn|youtube|tcp" || true
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "$STREAM_NAME|worker_recovery|ffmpeg|recovery-report|heartbeat|error|warn|youtube|tcp"
   else
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "worker_recovery|ffmpeg|recovery-report|heartbeat|error|warn|youtube|tcp" || true
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "worker_recovery|ffmpeg|recovery-report|heartbeat|error|warn|youtube|tcp"
   fi
 done
 
