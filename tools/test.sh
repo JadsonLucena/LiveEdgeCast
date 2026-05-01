@@ -8,6 +8,37 @@ PROXY_SELECTOR="${PROXY_SELECTOR:-app=rtmp-proxy}"
 WORKER_SELECTOR="${WORKER_SELECTOR:-app=rtmp-worker}"
 STREAM_NAME="${STREAM_NAME:-}"
 SINCE="${SINCE:-10m}"
+TAIL_LINES="${TAIL_LINES:-120}"
+
+usage() {
+  cat <<USAGE
+Usage: tools/test.sh [options]
+
+Options:
+  -n, --namespace <name>            Kubernetes namespace (default: ${NAMESPACE})
+  -c, --controller <deployment>     Controller deployment name (default: ${CONTROLLER_DEPLOYMENT})
+  -p, --proxy-selector <selector>   Label selector for proxy pods (default: ${PROXY_SELECTOR})
+  -w, --worker-selector <selector>  Label selector for worker pods (default: ${WORKER_SELECTOR})
+  -s, --stream-name <name>          Stream name filter (also accepts STREAM_NAME env)
+      --since <duration>            Log window passed to kubectl logs (default: ${SINCE})
+      --tail-lines <n>              Tail lines per pod when no filter match (default: ${TAIL_LINES})
+  -h, --help                        Show this help
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--namespace) NAMESPACE="$2"; shift 2 ;;
+    -c|--controller) CONTROLLER_DEPLOYMENT="$2"; shift 2 ;;
+    -p|--proxy-selector) PROXY_SELECTOR="$2"; shift 2 ;;
+    -w|--worker-selector) WORKER_SELECTOR="$2"; shift 2 ;;
+    -s|--stream-name) STREAM_NAME="$2"; shift 2 ;;
+    --since) SINCE="$2"; shift 2 ;;
+    --tail-lines) TAIL_LINES="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1"; usage; exit 1 ;;
+  esac
+done
 
 green() { printf "\033[32m%s\033[0m\n" "$*"; }
 yellow() { printf "\033[33m%s\033[0m\n" "$*"; }
@@ -32,7 +63,7 @@ log_snippet() {
   if [[ -n "$pattern" ]]; then
     kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | rg -n "$pattern" || true
   else
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | tail -n 50 || true
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null | tail -n "$TAIL_LINES" || true
   fi
 }
 
@@ -70,20 +101,20 @@ echo ""
 echo "=== Controller logs (allocation lifecycle) ==="
 if [[ -n "$CTRL_POD" ]]; then
   if [[ -n "$STREAM_NAME" ]]; then
-    log_snippet "$CTRL_POD" "$STREAM_NAME|Allocate|Release|StartWorker|Delivery|Recovery|pending allocation"
+    log_snippet "$CTRL_POD" "$STREAM_NAME|Allocate|Release|StartWorker|Delivery|Recovery|pending allocation|Registry|ProxyHealth"
   else
-    log_snippet "$CTRL_POD" "Allocate|Release|StartWorker|Delivery|Recovery|pending allocation"
+    log_snippet "$CTRL_POD" "Allocate|Release|StartWorker|Delivery|Recovery|pending allocation|Registry|ProxyHealth"
   fi
 fi
 
 echo ""
-echo "=== Proxy logs (publish hooks) ==="
+echo "=== Proxy logs (publish hooks + routing) ==="
 for pod in $(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o name); do
   echo "--- $pod ---"
   if [[ -n "$STREAM_NAME" ]]; then
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "on_publish_start|on_publish_done|$STREAM_NAME|allocat|worker" || true
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "on_publish_start|on_publish_done|$STREAM_NAME|allocat|worker|heartbeat|error|warn" || true
   else
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "on_publish_start|on_publish_done|allocat|worker" || true
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "on_publish_start|on_publish_done|allocat|worker|heartbeat|error|warn" || true
   fi
 done
 
@@ -92,21 +123,22 @@ echo "=== Worker logs (recovery/ffmpeg) ==="
 for pod in $(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" -o name); do
   echo "--- $pod ---"
   if [[ -n "$STREAM_NAME" ]]; then
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "$STREAM_NAME|worker_recovery|ffmpeg|recovery-report|heartbeat|error" || true
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "$STREAM_NAME|worker_recovery|ffmpeg|recovery-report|heartbeat|error|warn|youtube|tcp" || true
   else
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "worker_recovery|ffmpeg|recovery-report|heartbeat|error" || true
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | rg -n "worker_recovery|ffmpeg|recovery-report|heartbeat|error|warn|youtube|tcp" || true
   fi
 done
 
 echo ""
 echo "=== Objective checklist (manual confirmation) ==="
-cat <<'EOF'
+cat <<'CHECKLIST'
 [ ] Proxy log has "on_publish_start" for your stream.
 [ ] Controller log has "Allocate" and either "allocated" or "scaled deployment".
 [ ] Controller log has "StartWorker" success for selected worker.
 [ ] Worker log has recovery loop start and FFmpeg start for stream.
+[ ] Worker log shows no repeated FFmpeg/network errors for your stream.
 [ ] Controller /metrics includes stream_delivery_status and recovery_attempt_total.
 [ ] On stream stop, proxy has "on_publish_done" and controller has "Release".
-EOF
+CHECKLIST
 
 green "Checklist script finished."
