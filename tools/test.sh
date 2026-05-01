@@ -146,6 +146,11 @@ if [[ -n "$PROXY_POD_FOR_NET" ]]; then
   check_warn "proxy resolves controller service DNS" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "getent hosts rtmp-controller.${NAMESPACE}.svc.cluster.local >/dev/null 2>&1 || nslookup rtmp-controller.${NAMESPACE}.svc.cluster.local >/dev/null 2>&1"
   check_warn "proxy reaches controller /health" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://rtmp-controller.${NAMESPACE}.svc.cluster.local:8000/health; elif command -v wget >/dev/null 2>&1; then wget -qO- http://rtmp-controller.${NAMESPACE}.svc.cluster.local:8000/health; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'ok'"
   check_warn "proxy nginx has on_publish hooks" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "grep -Ein 'on_publish|on_publish_done|exec_publish' /etc/nginx/nginx.conf"
+  check_warn "proxy has curl and jq for publish hooks" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1"
+  check_warn "on_publish_start script targets current namespace controller" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "grep -En 'CONTROLLER_API=' /scripts/on_publish_start.sh | grep -Eq 'rtmp-controller\\.${NAMESPACE}\\.svc\\.cluster\\.local|rtmp-controller\\.media\\.svc\\.cluster\\.local'"
+  if [[ -n "$STREAM_NAME" ]]; then
+    check_warn "manual allocate probe from proxy (stream)" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "PROXY_POD=\$(hostname); curl -sS -o /tmp/alloc_probe_${STREAM_NAME}.json -w '%{http_code}' \"http://rtmp-controller.${NAMESPACE}.svc.cluster.local:8000/allocate?stream=${STREAM_NAME}&proxy_pod=\$PROXY_POD\" | grep -Eq '200'"
+  fi
 else
   yellow "WARN: no proxy pod resolved for connectivity checks"
 fi
