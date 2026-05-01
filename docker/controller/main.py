@@ -52,8 +52,12 @@ PROXY_HEALTHCHECK_MAX_FAILURES = 3
 PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
 PROXY_HEALTHCHECK_MAX_CONCURRENCY = 20
 PROXY_HEALTHCHECK_JITTER_SECONDS = 1.5
-STREAM_TTL_SECONDS = PROXY_HEALTHCHECK_INTERVAL_SECONDS * PROXY_HEALTHCHECK_MAX_FAILURES
+STREAM_TTL_SECONDS = PROXY_HEALTHCHECK_INTERVAL_SECONDS * PROXY_HEALTHCHECK_MAX_FAILURES * PROXY_HEALTHCHECK_TIMEOUT_SECONDS * PROXY_HEALTHCHECK_JITTER_SECONDS
 proxy_health_failures: Dict[str, int] = {}
+
+# Rastreia último heartbeat de cada stream (para renovar TTL mesmo se healthcheck falhar)
+# Mapeia: stream_name → timestamp do último heartbeat
+stream_last_heartbeat: Dict[str, float] = {}
 
 # Load Kubernetes credentials (inside cluster)
 try:
@@ -74,19 +78,26 @@ def random_suffix():
 def cleanup_expired_streams() -> None:
     """
     Remove streams expiradas do registro efêmero.
+    Streams com heartbeat recente (últimos 10s) não expiram mesmo se TTL passou.
     Também remove stream_to_proxy para manter consistência.
     """
     now = time.time()
     expired = []
+    HEARTBEAT_GRACE_PERIOD = 10  # Streams com heartbeat recente não expiram
 
     for stream, entry in stream_registry.items():
-        if entry.get("expires_at", 0) <= now:
+        last_heartbeat = stream_last_heartbeat.get(stream, 0)
+        time_since_heartbeat = now - last_heartbeat
+        
+        # Expirar se TTL passou E não há heartbeat recente
+        if entry.get("expires_at", 0) <= now and time_since_heartbeat > HEARTBEAT_GRACE_PERIOD:
             expired.append(stream)
 
     for stream in expired:
         stream_registry.pop(stream, None)
         stream_to_proxy.pop(stream, None)
-        logger.info(f"[Registry] Stream '{stream}' expired (proxy healthcheck timeout)")
+        stream_last_heartbeat.pop(stream, None)
+        logger.info(f"[Registry] Stream '{stream}' expired (no heartbeat for {HEARTBEAT_GRACE_PERIOD}s)")
 
 
 def register_or_refresh_stream(stream: str, proxy_pod: str):
@@ -152,18 +163,31 @@ async def schedule_scale_down_if_idle():
 
 
 def check_proxy_health(proxy_pod: str) -> bool:
+    """
+    Check proxy health using TCP connection to RTMP port (1935).
+    TCP check is more reliable than HTTP for detecting port availability.
+    Detects actual RTMP availability, not just HTTP endpoint availability.
+    """
+    import socket
+    
     proxy_ip = get_proxy_pod_ip(proxy_pod)
     if not proxy_ip:
         return False
 
     try:
-        response = requests.get(
-            f"http://{proxy_ip}:8080/health",
-            timeout=PROXY_HEALTHCHECK_TIMEOUT_SECONDS
-        )
-        return response.status_code == 200
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(PROXY_HEALTHCHECK_TIMEOUT_SECONDS)
+        result = sock.connect_ex((proxy_ip, 1935))
+        sock.close()
+        
+        if result == 0:
+            logger.debug(f"[ProxyHealth] TCP check passed for {proxy_pod}:{proxy_ip}:1935")
+            return True
+        else:
+            logger.warning(f"[ProxyHealth] TCP check failed for {proxy_pod}:{proxy_ip}:1935 (errno={result})")
+            return False
     except Exception as e:
-        logger.warning(f"[ProxyHealth] Healthcheck failed for {proxy_pod}: {e}")
+        logger.warning(f"[ProxyHealth] TCP healthcheck failed for {proxy_pod}: {e}")
         return False
 
 
@@ -202,13 +226,28 @@ async def monitor_stream_registry_health():
                         stream for stream, entry in stream_registry.items()
                         if entry.get("proxy_pod") == proxy_pod
                     ]
+                    now = time.time()
+                    HEARTBEAT_GRACE_PERIOD = 10
+                    
                     for stream in impacted_streams:
-                        stream_registry.pop(stream, None)
-                        stream_to_proxy.pop(stream, None)
-                        logger.info(
-                            f"[Registry] Stream '{stream}' expired after "
-                            f"{PROXY_HEALTHCHECK_MAX_FAILURES} failed proxy healthchecks"
-                        )
+                        last_heartbeat = stream_last_heartbeat.get(stream, 0)
+                        time_since_heartbeat = now - last_heartbeat
+                        
+                        # Expirar apenas se não há heartbeat recente
+                        if time_since_heartbeat > HEARTBEAT_GRACE_PERIOD:
+                            stream_registry.pop(stream, None)
+                            stream_to_proxy.pop(stream, None)
+                            logger.info(
+                                f"[Registry] Stream '{stream}' expired after "
+                                f"{PROXY_HEALTHCHECK_MAX_FAILURES} failed proxy healthchecks "
+                                f"(no heartbeat for {time_since_heartbeat:.1f}s)"
+                            )
+                        else:
+                            logger.info(
+                                f"[Registry] Stream '{stream}' protected by heartbeat "
+                                f"({time_since_heartbeat:.1f}s since last beat)"
+                            )
+                    
                     proxy_health_failures.pop(proxy_pod, None)
 
     while True:
@@ -519,6 +558,10 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
             del streams_pending_allocation[stream]
             logger.info(f"[Release] Removed stream '{stream}' from pending allocation queue")
         
+        # Remove heartbeat tracking
+        if stream in stream_last_heartbeat:
+            del stream_last_heartbeat[stream]
+        
         logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
         
         # Auto scale-down: Reduzir deployment se não há workers alocados
@@ -568,6 +611,10 @@ def heartbeat_stream(
     stream: str = Query(..., description="Stream name"),
     proxy_pod: str = Query(..., description="Proxy pod name")
 ):
+    """
+    Worker sends heartbeat to prove stream is actively being pulled and pushed.
+    This protects stream from expiring even if proxy healthchecks fail.
+    """
     with allocation_lock:
         cleanup_expired_streams()
         current = stream_registry.get(stream)
@@ -578,7 +625,14 @@ def heartbeat_stream(
                 detail=f"stream '{stream}' already owned by proxy '{current.get('proxy_pod')}'"
             )
 
+        # Record heartbeat timestamp - stream is alive!
+        stream_last_heartbeat[stream] = time.time()
+        
+        # Also refresh TTL to be safe
         expires_at = register_or_refresh_stream(stream, proxy_pod)
+        
+        logger.debug(f"[Heartbeat] Stream '{stream}' heartbeat recorded. TTL renewed.")
+        
         return {
             "status": "ok",
             "stream": stream,

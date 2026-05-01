@@ -15,6 +15,14 @@ log() {
   echo "[$(date)] [worker_recovery] $1"
 }
 
+send_heartbeat() {
+  local stream=$1
+  local proxy_pod=$2
+  curl -sf -X POST \
+    "$CONTROLLER_API/streams/heartbeat?stream=$stream&proxy_pod=$proxy_pod" \
+    >/dev/null 2>&1 || log "Heartbeat send failed for stream '$stream'"
+}
+
 log "Recovery loop started for stream '$STREAM_NAME'"
 
 while true; do
@@ -49,8 +57,27 @@ while true; do
 
   PROXY_RTMP="rtmp://${PROXY_ADDR}:1935/live/${STREAM_NAME}"
   YT_RTMP="rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_KEY}"
-
+  
+  # Extract proxy pod name from CONTROLLER for heartbeat
+  # For heartbeat, we need to send proxy_pod. Get it from controller's registry
+  PROXY_POD_NAME=$(hostname)  # Default to this pod name if available
+  
   log "Starting FFmpeg (pull=$PROXY_RTMP, push=$YT_RTMP)"
+  log "Heartbeat will be sent every 2s to keep stream alive in controller registry"
+  
+  # Start heartbeat loop in background (sends every 2s while FFmpeg runs)
+  (
+    while true; do
+      sleep 2
+      if [ -f "$PID_FILE" ]; then
+        send_heartbeat "$STREAM_NAME" "$PROXY_POD_NAME"
+      else
+        break
+      fi
+    done
+  ) &
+  HEARTBEAT_PID=$!
+  
   ffmpeg \
     -loglevel warning \
     -rw_timeout 15000000 \
@@ -69,6 +96,10 @@ while true; do
     EXIT_CODE=$?
   fi
   rm -f "$PID_FILE"
+  
+  # Stop heartbeat loop
+  kill "$HEARTBEAT_PID" 2>/dev/null || true
+  wait "$HEARTBEAT_PID" 2>/dev/null || true
 
   if [ "$EXIT_CODE" -eq 0 ]; then
     log "FFmpeg exited cleanly for stream '$STREAM_NAME'. Stopping recovery loop."
