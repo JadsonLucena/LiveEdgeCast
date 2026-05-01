@@ -26,6 +26,7 @@ send_heartbeat() {
 log "Recovery loop started for stream '$STREAM_NAME'"
 
 while true; do
+  RECOVERY_START_TS=$(date +%s)
   NOW_TS=$(date +%s)
   ELAPSED=$((NOW_TS - START_TS))
 
@@ -100,6 +101,18 @@ while true; do
   # Stop heartbeat loop
   kill "$HEARTBEAT_PID" 2>/dev/null || true
   wait "$HEARTBEAT_PID" 2>/dev/null || true
+  RECOVERY_END_TS=$(date +%s)
+  RECOVERY_TIME=$((RECOVERY_END_TS - RECOVERY_START_TS))
+
+  if [ "$EXIT_CODE" -eq 0 ]; then
+    curl -sf -X POST \
+      "$CONTROLLER_API/streams/recovery-report?stream=$STREAM_NAME&success=true&recovery_time=$RECOVERY_TIME&exit_code=0" \
+      >/dev/null 2>&1 || log "Failed to report successful recovery"
+  else
+    curl -sf -X POST \
+      "$CONTROLLER_API/streams/recovery-report?stream=$STREAM_NAME&success=false&recovery_time=$RECOVERY_TIME&exit_code=$EXIT_CODE" \
+      >/dev/null 2>&1 || log "Failed to report failed recovery"
+  fi
 
   if [ "$EXIT_CODE" -eq 0 ]; then
     log "FFmpeg exited cleanly for stream '$STREAM_NAME'. Stopping recovery loop."

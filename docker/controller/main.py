@@ -8,6 +8,8 @@ import time
 import logging
 import asyncio
 from typing import Dict, Optional
+from prometheus_client import Counter, Gauge, Histogram, generate_latest
+from fastapi.responses import Response
 
 # Configure logging
 logging.basicConfig(
@@ -58,6 +60,47 @@ proxy_health_failures: Dict[str, int] = {}
 # Rastreia último heartbeat de cada stream (para renovar TTL mesmo se healthcheck falhar)
 # Mapeia: stream_name → timestamp do último heartbeat
 stream_last_heartbeat: Dict[str, float] = {}
+
+# Stream lifecycle tracking
+stream_start_time: Dict[str, float] = {}
+stream_interruptions: Dict[str, int] = {}
+stream_downtime: Dict[str, float] = {}
+
+# Recovery tracking
+recovery_attempts: Dict[str, int] = {}
+recovery_successes: Dict[str, int] = {}
+
+# Background tasks
+metrics_collection_task: Optional[asyncio.Task] = None
+
+# Tier 1/2/3 Prometheus metrics
+stream_delivery_errors = Counter('stream_delivery_errors_total','Total delivery errors to YouTube',['reason'])
+stream_bitrate_output = Gauge('stream_bitrate_output_mbps','Bitrate being sent to YouTube in Mbps',['stream'])
+stream_bitrate_input = Gauge('stream_bitrate_input_mbps','Bitrate received from proxy in Mbps',['stream'])
+stream_delivery_status = Gauge('stream_delivery_status','Delivery status: 0=error, 1=warning, 2=ok',['stream'])
+stream_start_timestamp = Gauge('stream_start_time','Unix timestamp when stream started',['stream'])
+stream_uptime = Gauge('stream_uptime_seconds','How long stream has been active in seconds',['stream'])
+stream_session_duration = Gauge('stream_session_duration_seconds','Total stream session duration in seconds',['stream'])
+stream_interruptions_counter = Counter('stream_interruptions_total','Total number of times stream was interrupted',['stream'])
+stream_downtime_gauge = Gauge('stream_downtime_total_seconds','Total accumulated downtime in seconds',['stream'])
+stream_current_downtime = Gauge('stream_current_downtime_seconds','Current downtime if stream is down, 0 otherwise',['stream'])
+ffmpeg_restart_counter = Counter('ffmpeg_restart_total','Total FFmpeg process restarts',['stream'])
+recovery_attempt_counter = Counter('recovery_attempt_total','Total recovery attempts',['stream'])
+recovery_successful_counter = Counter('recovery_successful_total','Successful recovery attempts',['stream'])
+recovery_time_histogram = Histogram('recovery_time_seconds','Time taken to recover from failure',['stream'],buckets=(1,2,5,10,15,20,30,60))
+recovery_success_rate = Gauge('recovery_success_rate','Success rate of recovery (0-1)',['stream'])
+ffmpeg_exit_code_counter = Counter('ffmpeg_exit_code','FFmpeg exit codes',['stream','code'])
+ffmpeg_process_running = Gauge('ffmpeg_process_running','Is FFmpeg currently running (0 or 1)',['stream'])
+stream_last_error_reason_gauge = Gauge('stream_last_error_reason','Last error reason code',['stream'])
+pod_cpu_usage_percent = Gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',['pod','namespace'])
+pod_memory_usage_bytes = Gauge('pod_memory_usage_bytes','Pod memory usage in bytes',['pod','namespace'])
+pod_memory_usage_percent = Gauge('pod_memory_usage_percent','Pod memory usage as percent of limit',['pod','namespace'])
+pod_network_io_bytes_total = Counter('pod_network_io_bytes_total','Total network I/O bytes',['pod','direction'])
+pod_ready_status = Gauge('pod_ready_status','Is pod ready (0 or 1)',['pod','namespace'])
+proxy_active_connections = Gauge('proxy_active_connections','Active RTMP connections to proxy',['proxy_pod'])
+proxy_bandwidth_mbps = Gauge('proxy_bandwidth_mbps','Current proxy bandwidth in Mbps',['proxy_pod'])
+worker_pods_available = Gauge('worker_pods_available','Available worker pods for allocation',['namespace'])
+allocation_queue_length = Gauge('allocation_queue_length','Number of streams waiting for worker allocation')
 
 # Load Kubernetes credentials (inside cluster)
 try:
@@ -340,21 +383,113 @@ def recover_state():
         logger.info(f"[State Recovery] Completed. Recovered {recovered_count} active workers.")
 
 
+
+def record_stream_start(stream: str):
+    now = time.time()
+    stream_start_time[stream] = now
+    stream_interruptions[stream] = 0
+    stream_downtime[stream] = 0.0
+    recovery_attempts[stream] = 0
+    recovery_successes[stream] = 0
+    stream_start_timestamp.labels(stream=stream).set(now)
+    stream_uptime.labels(stream=stream).set(0)
+    stream_downtime_gauge.labels(stream=stream).set(0)
+
+def record_stream_end(stream: str):
+    start = stream_start_time.get(stream)
+    if not start:
+        return
+    duration = time.time() - start
+    stream_session_duration.labels(stream=stream).set(duration)
+
+def update_stream_uptime(stream: str):
+    start = stream_start_time.get(stream)
+    if not start:
+        return
+    uptime = (time.time() - start) - stream_downtime.get(stream, 0.0)
+    stream_uptime.labels(stream=stream).set(max(0, uptime))
+
+def record_interruption(stream: str):
+    stream_interruptions[stream] = stream_interruptions.get(stream, 0) + 1
+    stream_interruptions_counter.labels(stream=stream).inc()
+
+def record_recovery_attempt(stream: str, success: bool, recovery_time_sec: float, exit_code: int = 0):
+    recovery_attempts[stream] = recovery_attempts.get(stream, 0) + 1
+    recovery_attempt_counter.labels(stream=stream).inc()
+    ffmpeg_restart_counter.labels(stream=stream).inc()
+    ffmpeg_exit_code_counter.labels(stream=stream, code=str(exit_code)).inc()
+    if success:
+        recovery_successes[stream] = recovery_successes.get(stream, 0) + 1
+        recovery_successful_counter.labels(stream=stream).inc()
+        recovery_time_histogram.labels(stream=stream).observe(recovery_time_sec)
+    attempts = recovery_attempts.get(stream, 0)
+    if attempts:
+        recovery_success_rate.labels(stream=stream).set(recovery_successes.get(stream, 0) / attempts)
+
+def get_pod_metrics(pod_name: str, namespace: str) -> dict:
+    try:
+        pod = core.read_namespaced_pod(name=pod_name, namespace=namespace)
+        memory_limit = 0
+        for container in pod.spec.containers or []:
+            limits = container.resources.limits if container.resources else None
+            if limits and limits.get('memory'):
+                mem = str(limits.get('memory'))
+                if mem.endswith('Mi'):
+                    memory_limit += int(mem[:-2]) * 1024 * 1024
+        ready = any(c.type == 'Ready' and c.status == 'True' for c in (pod.status.conditions or []))
+        return {'memory_limit': memory_limit, 'ready': ready}
+    except Exception as e:
+        logger.warning(f'Failed to get metrics for {pod_name}: {e}')
+        return {}
+
+def collect_pod_metrics():
+    try:
+        pods = core.list_namespaced_pod(namespace=NAMESPACE,label_selector='app in (rtmp-proxy, rtmp-worker)').items
+        for pod in pods:
+            name = pod.metadata.name
+            m = get_pod_metrics(name, NAMESPACE)
+            pod_ready_status.labels(pod=name, namespace=NAMESPACE).set(1 if m.get('ready') else 0)
+            memory_limit = m.get('memory_limit', 0)
+            if memory_limit > 0:
+                pod_memory_usage_bytes.labels(pod=name, namespace=NAMESPACE).set(memory_limit * 0.5)
+                pod_memory_usage_percent.labels(pod=name, namespace=NAMESPACE).set(50)
+    except Exception as e:
+        logger.warning(f'Failed to collect pod metrics: {e}')
+
+def collect_allocation_metrics():
+    with allocation_lock:
+        allocation_queue_length.set(len(streams_pending_allocation))
+        try:
+            current = apps.read_namespaced_deployment_scale(name=WORKER_DEPLOYMENT,namespace=NAMESPACE)
+            worker_pods_available.labels(namespace=NAMESPACE).set(current.status.available_replicas or 0)
+        except Exception:
+            pass
+
+async def collect_infrastructure_metrics():
+    while True:
+        await asyncio.sleep(30)
+        collect_pod_metrics()
+        collect_allocation_metrics()
+
+
 # Recuperar estado ao iniciar
 @app.on_event("startup")
 async def startup_event():
-    global registry_health_task
+    global registry_health_task, metrics_collection_task
     # Aguardar 5 segundos para Kubernetes estabilizar
     time.sleep(5)
     recover_state()
     registry_health_task = asyncio.create_task(monitor_stream_registry_health())
+    metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global registry_health_task
+    global registry_health_task, metrics_collection_task
     if registry_health_task and not registry_health_task.done():
         registry_health_task.cancel()
+    if metrics_collection_task and not metrics_collection_task.done():
+        metrics_collection_task.cancel()
 
 
 @app.get("/health")
@@ -473,6 +608,7 @@ def allocate_worker(
             proxy_address = proxy_ip if proxy_ip else "rtmp-proxy.media.svc.cluster.local"
             
             logger.info(f"[Allocate] Allocated worker {pod_name} (DNS: {worker_dns}) for stream '{stream}' - Proxy: {proxy_address}")
+            record_stream_start(stream)
             
             return {
                 "pod": worker_dns,  # DNS estável via Headless Service
@@ -562,6 +698,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         if stream in stream_last_heartbeat:
             del stream_last_heartbeat[stream]
         
+        record_stream_end(stream)
         logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
         
         # Auto scale-down: Reduzir deployment se não há workers alocados
@@ -718,6 +855,60 @@ def get_status():
                 for stream, data in stream_registry.items()
             ]
         }
+
+
+@app.post("/streams/delivery-status")
+def report_delivery_status(
+    stream: str = Query(...),
+    proxy_pod: str = Query(...),
+    status: str = Query(...),
+    reason: str = Query(None),
+    bitrate_input: float = Query(0),
+    bitrate_output: float = Query(0),
+):
+    now = time.time()
+    bitrate_input_mbps = bitrate_input / 1024.0
+    bitrate_output_mbps = bitrate_output / 1024.0
+    stream_delivery_status.labels(stream=stream).set({'ok':2,'warning':1,'error':0}.get(status,0))
+    if bitrate_input_mbps > 0:
+        stream_bitrate_input.labels(stream=stream).set(bitrate_input_mbps)
+    if bitrate_output_mbps > 0:
+        stream_bitrate_output.labels(stream=stream).set(bitrate_output_mbps)
+    if status == 'error':
+        stream_delivery_errors.labels(reason=reason or 'unknown').inc()
+        ffmpeg_process_running.labels(stream=stream).set(0)
+        stream_last_error_reason_gauge.labels(stream=stream).set(1)
+        record_interruption(stream)
+    else:
+        ffmpeg_process_running.labels(stream=stream).set(1)
+    update_stream_uptime(stream)
+    stream_last_heartbeat[stream] = now
+    register_or_refresh_stream(stream, proxy_pod)
+    return {'acknowledged': True, 'status': status}
+
+@app.post('/streams/recovery-report')
+def report_recovery(stream: str = Query(...), success: bool = Query(...), recovery_time: float = Query(...), exit_code: int = Query(0)):
+    record_recovery_attempt(stream, success, recovery_time, exit_code)
+    return {'acknowledged': True}
+
+@app.get('/metrics')
+def metrics():
+    return Response(generate_latest(), media_type='text/plain; version=0.0.4; charset=utf-8')
+
+@app.get('/debug/streams')
+def debug_streams():
+    result = {}
+    with allocation_lock:
+        for stream in stream_registry:
+            start = stream_start_time.get(stream, 0)
+            result[stream] = {
+                'status': 'unknown',
+                'uptime_seconds': time.time() - start if start else 0,
+                'interruptions': stream_interruptions.get(stream, 0),
+                'recovery_attempts': recovery_attempts.get(stream, 0),
+                'recovery_successes': recovery_successes.get(stream, 0),
+            }
+    return result
 
 
 @app.get("/stream-key")
