@@ -130,6 +130,27 @@ if [[ "$WORKER_COUNT" == "0" ]]; then
 fi
 
 echo ""
+echo "=== Proxy -> Controller path diagnostics ==="
+echo "--- Controller service and endpoints ---"
+kubectl get svc -n "$NAMESPACE" rtmp-controller -o wide 2>/dev/null || yellow "WARN: service/rtmp-controller not found"
+kubectl get endpoints -n "$NAMESPACE" rtmp-controller -o wide 2>/dev/null || yellow "WARN: endpoints/rtmp-controller not found"
+
+echo ""
+echo "--- Proxy deployment env (controller-related) ---"
+kubectl get deploy -n "$NAMESPACE" rtmp-proxy -o yaml 2>/dev/null | filter_stream "name:|value:|controller|api|rtmp-controller|publish|hook"
+
+PROXY_POD_FOR_NET="$(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+if [[ -n "$PROXY_POD_FOR_NET" ]]; then
+  echo ""
+  echo "--- In-proxy connectivity checks to controller ---"
+  check_warn "proxy resolves controller service DNS" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "getent hosts rtmp-controller.${NAMESPACE}.svc.cluster.local >/dev/null 2>&1 || nslookup rtmp-controller.${NAMESPACE}.svc.cluster.local >/dev/null 2>&1"
+  check_warn "proxy reaches controller /health" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://rtmp-controller.${NAMESPACE}.svc.cluster.local:8000/health; elif command -v wget >/dev/null 2>&1; then wget -qO- http://rtmp-controller.${NAMESPACE}.svc.cluster.local:8000/health; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'ok'"
+  check_warn "proxy nginx has on_publish hooks" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "grep -Ein 'on_publish|on_publish_done|exec_publish' /etc/nginx/nginx.conf"
+else
+  yellow "WARN: no proxy pod resolved for connectivity checks"
+fi
+
+echo ""
 echo "=== Controller /health and /metrics ==="
 CTRL_POD="$(kubectl get pod -n "$NAMESPACE" -l app="$CONTROLLER_DEPLOYMENT" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
 if [[ -z "$CTRL_POD" ]]; then
