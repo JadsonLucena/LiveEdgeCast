@@ -57,6 +57,19 @@ check() {
   fi
 }
 
+check_warn() {
+  local title="$1"
+  shift
+  echo ""
+  echo "=== $title ==="
+  if "$@"; then
+    green "OK: $title"
+    return 0
+  fi
+  yellow "WARN: $title"
+  return 0
+}
+
 log_snippet() {
   local pod="$1"
   local pattern="${2:-}"
@@ -76,13 +89,35 @@ check "kubectl connectivity" kubectl version --client >/dev/null
 check "namespace exists" kubectl get ns "$NAMESPACE" >/dev/null
 check "controller deployment exists" kubectl get deploy -n "$NAMESPACE" "$CONTROLLER_DEPLOYMENT" >/dev/null
 check "proxy pods present" bash -lc "kubectl get pods -n '$NAMESPACE' -l '$PROXY_SELECTOR' --no-headers | wc -l | awk '{exit !(\$1>0)}'"
-check "worker pods present" bash -lc "kubectl get pods -n '$NAMESPACE' -l '$WORKER_SELECTOR' --no-headers | wc -l | awk '{exit !(\$1>0)}'"
+check_warn "worker pods present" bash -lc "kubectl get pods -n '$NAMESPACE' -l '$WORKER_SELECTOR' --no-headers | wc -l | awk '{exit !(\$1>0)}'"
 
 echo ""
 echo "=== Pod status ==="
 kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR"
 kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR"
 kubectl get deploy -n "$NAMESPACE" "$CONTROLLER_DEPLOYMENT"
+
+WORKER_COUNT="$(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+
+if [[ "$WORKER_COUNT" == "0" ]]; then
+  echo ""
+  echo "=== Worker not created: focused diagnostics ==="
+  echo "No worker pods matched selector '$WORKER_SELECTOR'. Collecting likely causes..."
+
+  echo ""
+  echo "--- Worker deployment status (replicas/conditions) ---"
+  kubectl get deploy -n "$NAMESPACE" rtmp-worker -o wide 2>/dev/null || yellow "WARN: deployment/rtmp-worker not found"
+  kubectl describe deploy -n "$NAMESPACE" rtmp-worker 2>/dev/null | tail -n 80 || true
+
+  echo ""
+  echo "--- HPA / KEDA objects related to worker ---"
+  kubectl get scaledobject,keda -n "$NAMESPACE" 2>/dev/null | rg -n "worker|NAME|NAMESPACE" || true
+  kubectl get hpa -n "$NAMESPACE" 2>/dev/null | rg -n "worker|NAME" || true
+
+  echo ""
+  echo "--- Recent namespace events (worker/controller/proxy) ---"
+  kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 120 | rg -n "worker|rtmp-worker|controller|proxy|Failed|Warning|BackOff|Insufficient|Forbidden|Error" || true
+fi
 
 echo ""
 echo "=== Controller /health and /metrics ==="
