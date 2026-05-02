@@ -25,6 +25,7 @@ NAMESPACE = "media"
 WORKER_DEPLOYMENT = "rtmp-worker"
 WORKER_SERVICE = "rtmp-worker"
 SCALE_DOWN_DELAY = 180  # 3 minutos após último release
+WORKER_RECONNECT_GRACE_SECONDS = 120  # Deve espelhar worker_recovery_loop.sh (MAX_RECOVERY_SECONDS)
 
 # Lock para evitar race conditions
 allocation_lock = threading.Lock()
@@ -355,15 +356,32 @@ def remove_worker_allocation(stream: str, reason: str) -> Optional[str]:
 def reconcile_worker_allocations() -> int:
     """
     Remove alocações apontando para workers indisponíveis.
+
+    Regra de segurança: só limpa após janela de reconexão expirar,
+    para ficar alinhado ao tempo de recuperação do worker.
     Retorna quantidade de alocações recuperadas.
     """
-    stale_streams = [
-        stream for stream, worker in stream_to_worker.items()
-        if not is_worker_ready(worker)
-    ]
+    now = time.time()
+    stale_streams = []
+
+    for stream, worker in stream_to_worker.items():
+        if is_worker_ready(worker):
+            continue
+
+        last_heartbeat = stream_last_heartbeat.get(stream)
+        if last_heartbeat:
+            offline_seconds = now - last_heartbeat
+            if offline_seconds < WORKER_RECONNECT_GRACE_SECONDS:
+                logger.info(
+                    f"[AllocationRecovery] Stream '{stream}' still in reconnect grace "
+                    f"({offline_seconds:.1f}s/{WORKER_RECONNECT_GRACE_SECONDS}s); keeping allocation"
+                )
+                continue
+
+        stale_streams.append(stream)
 
     for stream in stale_streams:
-        remove_worker_allocation(stream, "worker_not_ready_or_missing")
+        remove_worker_allocation(stream, "worker_not_ready_or_missing_after_reconnect_grace")
 
     return len(stale_streams)
 def check_worker_metrics(pod_name: str, pod_ip: Optional[str] = None) -> int:
