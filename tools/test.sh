@@ -266,7 +266,7 @@ echo ""
 echo "=== Proxy reconnect clients (RTMP churn summary) ==="
 for pod in $(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o name); do
   echo "--- $pod ---"
-  CLIENT_IPS="$(kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null \
+  CLIENT_IPS="$(kubectl logs -n "$NAMESPACE" "${pod#pod/}" --since="$SINCE" 2>/dev/null \
     | grep -Eo "client connected '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'" \
     | sed -E "s/.*'([0-9.]+)'.*/\1/" \
     | sort | uniq -c | sort -nr | head -n 8 || true)"
