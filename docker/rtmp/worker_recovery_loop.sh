@@ -123,6 +123,11 @@ while true; do
     exit 0
   fi
 
+  if [ "$EXIT_CODE" -ne 0 ]; then
+    log "FFmpeg failure details (last 40 lines):"
+    tail -n 40 "/tmp/ffmpeg_${STREAM_NAME}.log" | sed 's/^/[ffmpeg] /' || true
+  fi
+
   log "FFmpeg exited with code $EXIT_CODE. Will re-resolve and retry in ${RETRY_DELAY_SECONDS}s."
   sleep "$RETRY_DELAY_SECONDS"
 done
