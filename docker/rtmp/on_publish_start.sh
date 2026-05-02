@@ -62,8 +62,8 @@ done
 echo "[$(date)] [on_publish_start] Worker allocated: $WORKER_POD (DNS: $WORKER_DNS)"
 echo "[$(date)] [on_publish_start] Notifying worker to start pull+push..."
 
-# Notificar worker para iniciar pull via HTTP API do controller
-curl -sf "$CONTROLLER_API/start-worker?stream=$STREAM_NAME&worker=$WORKER_POD" || true
+# Notificar worker para iniciar pull via HTTP API do controller (POST idempotente)
+curl -sf -X POST "$CONTROLLER_API/start-worker?stream=$STREAM_NAME&worker=$WORKER_POD" || true
 
 echo "[$(date)] [on_publish_start] Worker '$WORKER_POD' will PULL from proxy '$PROXY_POD' and PUSH to YouTube"
 echo "[$(date)] [on_publish_start] Pull-Only Architecture - No relay, no trigger publish"

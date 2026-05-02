@@ -34,6 +34,7 @@ stream_to_worker: Dict[str, str] = {}
 
 # Mapeamento inverso: worker_pod_name → stream_name
 worker_to_stream: Dict[str, str] = {}
+stream_worker_started: Dict[str, bool] = {}
 
 # Mapeamento: stream_name → proxy_pod_name (Pull-Only Architecture)
 stream_to_proxy: Dict[str, str] = {}
@@ -319,14 +320,16 @@ def get_proxy_pod_ip(proxy_pod: str) -> str:
         return None
 
 
-def check_worker_metrics(pod_name: str) -> int:
+def check_worker_metrics(pod_name: str, pod_ip: Optional[str] = None) -> int:
     """
     Verifica métricas RTMP do worker para determinar se está ocupado.
     Retorna número de clientes RTMP ativos.
     """
     try:
-        # Tentar acessar /stats do worker
-        stats_url = f"http://{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local:8080/stats"
+        # Tentar acessar /stats do worker.
+        # Prioriza IP do pod (mais confiável que DNS por pod em Deployment sem headless/stateful hostname).
+        target = pod_ip if pod_ip else f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
+        stats_url = f"http://{target}:8080/stats"
         response = requests.get(stats_url, timeout=2)
         
         if response.status_code == 200:
@@ -369,7 +372,7 @@ def recover_state():
             pod_name = pod.metadata.name
             
             # Verificar se worker tem clientes RTMP ativos
-            nclients = check_worker_metrics(pod_name)
+            nclients = check_worker_metrics(pod_name, pod.status.pod_ip)
             
             if nclients > 0:
                 # Worker está ocupado, mas não sabemos qual stream
@@ -575,7 +578,7 @@ def allocate_worker(
             # Worker deve estar Ready E não alocado
             if cond.get("Ready") == "True" and pod_name not in worker_to_stream:
                 # Dupla verificação: consultar métricas para garantir que está realmente livre
-                nclients = check_worker_metrics(pod_name)
+                nclients = check_worker_metrics(pod_name, p.status.pod_ip)
                 if nclients == 0:
                     available_workers.append(p)
 
@@ -682,6 +685,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         # Remover mapeamentos
         del stream_to_worker[stream]
         del worker_to_stream[worker_name]
+        stream_worker_started.pop(stream, None)
         
         # Remover proxy mapping (Pull-Only)
         if stream in stream_to_proxy:
@@ -941,12 +945,12 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
     return {
         "stream": stream,
         "youtubeKey": youtube_key,
-        "proxyDns": proxy_ip
+        "proxyDns": proxy_ip,
+        "proxyPod": proxy_pod
     }
 
 
-@app.get("/start-worker")
-def start_worker(stream: str = Query(..., description="Stream name"), worker: str = Query(..., description="Worker pod name")):
+def _start_worker_impl(stream: str, worker: str):
     """
     Endpoint chamado pelo proxy para iniciar worker pull+push.
     Worker executa on_worker_publish_push.sh para iniciar FFmpeg.
@@ -956,28 +960,107 @@ def start_worker(stream: str = Query(..., description="Stream name"), worker: st
     - Controller executa script no worker via kubectl exec
     - Worker inicia FFmpeg pull do proxy específico + push YouTube
     """
+    started_at_wall = time.time()
+    started_at_perf = time.perf_counter()
+    timeline = []
+
+    def mark(step: str):
+        now_wall = time.time()
+        now_perf = time.perf_counter()
+        timeline.append({
+            "step": step,
+            "ts_epoch": now_wall,
+            "offset_ms": round((now_perf - started_at_perf) * 1000, 1)
+        })
+
+    mark("request_received")
+    logger.info(
+        f"[StartWorker][Timeline] stream='{stream}' worker='{worker}' "
+        f"request_received ts={started_at_wall:.3f}"
+    )
+
     try:
+        mark("acquiring_allocation_lock")
+        with allocation_lock:
+            mark("allocation_lock_acquired")
+            allocated_worker = stream_to_worker.get(stream)
+            if allocated_worker and allocated_worker != worker:
+                mark("worker_mismatch_ignored")
+                logger.warning(
+                    f"[StartWorker][Timeline] stream='{stream}' worker='{worker}' "
+                    f"ignored=worker_mismatch allocated_worker='{allocated_worker}' timeline={timeline}"
+                )
+                logger.warning(
+                    f"[StartWorker] Ignoring start for stream '{stream}' on worker '{worker}' "
+                    f"(currently allocated to '{allocated_worker}')"
+                )
+                return {"status": "ignored", "reason": "worker_mismatch", "worker": allocated_worker, "stream": stream}
+
+            if stream_worker_started.get(stream) is True:
+                mark("already_started_noop")
+                logger.info(
+                    f"[StartWorker][Timeline] stream='{stream}' worker='{worker}' "
+                    f"already_started timeline={timeline}"
+                )
+                logger.info(f"[StartWorker] Stream '{stream}' already started on worker '{worker}'. Idempotent no-op.")
+                return {"status": "already_started", "worker": worker, "stream": stream}
+
+        mark("pre_exec")
         logger.info(f"[StartWorker] Starting worker '{worker}' for stream '{stream}'")
         
         # Executar on_worker_pull_push.sh no worker via kubectl exec
         import subprocess
+        cmd = [
+            "kubectl", "exec", "-n", NAMESPACE, worker, "--",
+            "/scripts/on_worker_pull_push.sh", stream
+        ]
+        mark("kubectl_exec_spawn")
         result = subprocess.run(
-            [
-                "kubectl", "exec", "-n", NAMESPACE, worker, "--",
-                "/scripts/on_worker_pull_push.sh", stream
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=10
         )
+        mark("kubectl_exec_finished")
         
         if result.returncode == 0:
+            mark("marking_started_state")
+            with allocation_lock:
+                stream_worker_started[stream] = True
+            mark("completed_success")
+            logger.info(
+                f"[StartWorker][Timeline] stream='{stream}' worker='{worker}' status=started "
+                f"kubectl_rc={result.returncode} stdout_len={len(result.stdout)} stderr_len={len(result.stderr)} "
+                f"timeline={timeline}"
+            )
             logger.info(f"[StartWorker] Worker '{worker}' started successfully for stream '{stream}'")
             return {"status": "started", "worker": worker, "stream": stream}
         else:
+            mark("completed_error_returncode")
+            logger.error(
+                f"[StartWorker][Timeline] stream='{stream}' worker='{worker}' status=error "
+                f"kubectl_rc={result.returncode} stdout_len={len(result.stdout)} stderr_len={len(result.stderr)} "
+                f"timeline={timeline}"
+            )
             logger.error(f"[StartWorker] Failed to start worker '{worker}': {result.stderr}")
             return {"status": "error", "error": result.stderr}
             
     except Exception as e:
+        mark("completed_exception")
+        logger.error(
+            f"[StartWorker][Timeline] stream='{stream}' worker='{worker}' status=exception "
+            f"error='{str(e)}' timeline={timeline}"
+        )
         logger.error(f"[StartWorker] Exception starting worker '{worker}': {str(e)}")
         return {"status": "error", "error": str(e)}
+
+
+@app.post("/start-worker")
+def start_worker_post(stream: str = Query(..., description="Stream name"), worker: str = Query(..., description="Worker pod name")):
+    return _start_worker_impl(stream=stream, worker=worker)
+
+
+@app.get("/start-worker")
+def start_worker_get(stream: str = Query(..., description="Stream name"), worker: str = Query(..., description="Worker pod name")):
+    logger.warning("[StartWorker] GET /start-worker is deprecated. Use POST /start-worker.")
+    return _start_worker_impl(stream=stream, worker=worker)
