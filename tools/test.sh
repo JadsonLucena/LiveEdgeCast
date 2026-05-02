@@ -232,6 +232,14 @@ for pod in $(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o name); do
 done
 
 echo ""
+echo "=== Proxy source lifecycle (who stopped first?) ==="
+for pod in $(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o name); do
+  echo "--- $pod ---"
+  check_warn "proxy stdout has publish/connect/disconnect timeline" kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "publish|on_publish|on_publish_done|play|connect|disconnect|close|deleteStream|$STREAM_NAME"
+  check_warn "proxy nginx error/access logs (in-pod files)" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "for f in /var/log/nginx/error.log /var/log/nginx/access.log; do [ -f \"\$f\" ] && echo \"### \$f\" && tail -n 120 \"\$f\"; done" | filter_stream "publish|on_publish|on_publish_done|play|connect|disconnect|close|deleteStream|$STREAM_NAME|error|warn|fail"
+done
+
+echo ""
 echo "=== Worker logs (recovery/ffmpeg) ==="
 for pod in $(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" -o name); do
   echo "--- $pod ---"
