@@ -22,6 +22,15 @@ MANAGER_PID_FILE="/tmp/ffmpeg_manager_${STREAM_NAME}.pid"
 
 echo "[$(date)] [worker_publish] Starting worker recovery manager for stream '$STREAM_NAME'..."
 
+if [ -f "$MANAGER_PID_FILE" ]; then
+  EXISTING_PID="$(cat "$MANAGER_PID_FILE" 2>/dev/null || true)"
+  if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+    echo "[$(date)] [worker_publish] Recovery manager already running for stream '$STREAM_NAME' (PID: $EXISTING_PID). Skipping duplicate start."
+    exit 0
+  fi
+  echo "[$(date)] [worker_publish] Found stale PID file for stream '$STREAM_NAME' (PID: ${EXISTING_PID:-unknown}). Replacing."
+fi
+
 nohup /scripts/worker_recovery_loop.sh "$STREAM_NAME" \
   > "/tmp/ffmpeg_manager_${STREAM_NAME}.log" 2>&1 &
 
