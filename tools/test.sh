@@ -91,6 +91,71 @@ filter_stream() {
   grep -Ein "$pattern" | head -n "$MAX_MATCHES" || true
 }
 
+to_epoch() {
+  local ts="$1"
+  date -u -d "$ts" +%s 2>/dev/null || true
+}
+
+print_bootstrap_metrics() {
+  local ctrl_pod="$1"
+  local worker_pod="$2"
+
+  echo ""
+  echo "=== Bootstrap timing metrics (best-effort) ==="
+
+  if [[ -z "$ctrl_pod" || -z "$worker_pod" ]]; then
+    yellow "WARN: missing controller/worker pod; skipping bootstrap timing"
+    return 0
+  fi
+
+  local alloc_secs
+  alloc_secs="$(kubectl logs -n "$NAMESPACE" "$ctrl_pod" --since="$SINCE" 2>/dev/null \
+    | grep -E "Removed stream .* from pending queue \(allocated in [0-9.]+s\)" \
+    | tail -n 1 \
+    | sed -E 's/.*allocated in ([0-9.]+)s.*/\1/' || true)"
+  if [[ -n "$alloc_secs" ]]; then
+    echo "metric allocate->start-worker ~= ${alloc_secs}s (controller pending queue timing)"
+  else
+    yellow "WARN: could not derive allocate->start-worker timing from controller logs"
+  fi
+
+  local spawn_ts first_input_ts first_push_ts
+  spawn_ts="$(kubectl logs -n "$NAMESPACE" "$worker_pod" --since="$SINCE" 2>/dev/null \
+    | grep -E "\[worker_recovery\] Starting FFmpeg" \
+    | tail -n 1 \
+    | sed -E "s/^\[([^]]+)\].*/\1/" || true)"
+  first_input_ts="$(kubectl logs -n "$NAMESPACE" "$worker_pod" --since="$SINCE" 2>/dev/null \
+    | grep -E "ffmpeg].*(Input #0|Stream mapping|frame=|video:|audio:)" \
+    | head -n 1 \
+    | sed -E "s/^\[([^]]+)\].*/\1/" || true)"
+  first_push_ts="$(kubectl logs -n "$NAMESPACE" "$worker_pod" --since="$SINCE" 2>/dev/null \
+    | grep -E "ffmpeg].*(Output #0|rtmp://a\.rtmp\.youtube\.com|av_interleaved_write_frame|Non-monotonous DTS|frame=)" \
+    | head -n 1 \
+    | sed -E "s/^\[([^]]+)\].*/\1/" || true)"
+
+  if [[ -n "$spawn_ts" && -n "$first_input_ts" ]]; then
+    local spawn_epoch input_epoch
+    spawn_epoch="$(to_epoch "$spawn_ts")"
+    input_epoch="$(to_epoch "$first_input_ts")"
+    if [[ -n "$spawn_epoch" && -n "$input_epoch" ]]; then
+      echo "metric ffmpeg_spawn->first_packet ~= $((input_epoch - spawn_epoch))s"
+    fi
+  else
+    yellow "WARN: could not derive ffmpeg spawn->first packet (increase ffmpeg verbosity if needed)"
+  fi
+
+  if [[ -n "$first_input_ts" && -n "$first_push_ts" ]]; then
+    local input_epoch push_epoch
+    input_epoch="$(to_epoch "$first_input_ts")"
+    push_epoch="$(to_epoch "$first_push_ts")"
+    if [[ -n "$input_epoch" && -n "$push_epoch" ]]; then
+      echo "metric first_packet->push_youtube ~= $((push_epoch - input_epoch))s"
+    fi
+  else
+    yellow "WARN: could not derive first packet->push youtube (increase ffmpeg verbosity if needed)"
+  fi
+}
+
 resolve_ip_owner() {
   local ip="$1"
   if [[ -z "$ip" ]]; then
@@ -305,6 +370,9 @@ if [[ "$WORKER_COUNT" != "0" ]]; then
     check_warn "worker can resolve youtube ingest DNS" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "getent hosts a.rtmp.youtube.com >/dev/null 2>&1 || nslookup a.rtmp.youtube.com >/dev/null 2>&1"
   done
 fi
+
+WORKER_POD_FOR_TIMING="$(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+print_bootstrap_metrics "$CTRL_POD" "$WORKER_POD_FOR_TIMING"
 
 echo ""
 echo "=== Objective checklist (manual confirmation) ==="
