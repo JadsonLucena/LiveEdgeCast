@@ -195,9 +195,13 @@ echo ""
 echo "=== Controller diagnostics: worker creation errors ==="
 if [[ -n "$CTRL_POD" ]]; then
   if [[ -n "$STREAM_NAME" ]]; then
-    kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" | filter_stream "$STREAM_NAME|error|exception|traceback|failed|forbidden|timeout|start-worker|allocate|scale|replica"
+    kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" \
+      | grep -Eiv "\\[DEBUG\\] \\[request\\] response body" \
+      | filter_stream "$STREAM_NAME|error|exception|traceback|failed|forbidden|timeout|start-worker|allocate|scaled deployment|waiting for worker|released worker"
   else
-    kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" | filter_stream "error|exception|traceback|failed|forbidden|timeout|start-worker|allocate|scale|replica"
+    kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" \
+      | grep -Eiv "\\[DEBUG\\] \\[request\\] response body" \
+      | filter_stream "error|exception|traceback|failed|forbidden|timeout|start-worker|allocate|scaled deployment|waiting for worker|released worker"
   fi
 fi
 
