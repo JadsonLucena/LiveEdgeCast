@@ -320,6 +320,52 @@ def get_proxy_pod_ip(proxy_pod: str) -> str:
         return None
 
 
+
+
+def is_worker_ready(pod_name: str) -> bool:
+    """
+    Verifica se o pod do worker existe e está Ready.
+    """
+    try:
+        pod = core.read_namespaced_pod(name=pod_name, namespace=NAMESPACE)
+    except Exception:
+        return False
+
+    if not pod.status or not pod.status.conditions:
+        return False
+
+    cond = {c.type: c.status for c in pod.status.conditions}
+    return cond.get("Ready") == "True"
+
+
+def remove_worker_allocation(stream: str, reason: str) -> Optional[str]:
+    """
+    Remove mapeamentos de alocação quando um worker falha ou fica indisponível.
+    """
+    worker_name = stream_to_worker.pop(stream, None)
+    if not worker_name:
+        return None
+
+    worker_to_stream.pop(worker_name, None)
+    stream_worker_started.pop(stream, None)
+    logger.warning(f"[AllocationRecovery] Removed stale allocation: stream='{stream}' worker='{worker_name}' reason='{reason}'")
+    return worker_name
+
+
+def reconcile_worker_allocations() -> int:
+    """
+    Remove alocações apontando para workers indisponíveis.
+    Retorna quantidade de alocações recuperadas.
+    """
+    stale_streams = [
+        stream for stream, worker in stream_to_worker.items()
+        if not is_worker_ready(worker)
+    ]
+
+    for stream in stale_streams:
+        remove_worker_allocation(stream, "worker_not_ready_or_missing")
+
+    return len(stale_streams)
 def check_worker_metrics(pod_name: str, pod_ip: Optional[str] = None) -> int:
     """
     Verifica métricas RTMP do worker para determinar se está ocupado.
@@ -519,6 +565,9 @@ def allocate_worker(
     
     with allocation_lock:
         cleanup_expired_streams()
+        recovered_allocations = reconcile_worker_allocations()
+        if recovered_allocations > 0:
+            logger.warning(f"[Allocate] Recovered {recovered_allocations} stale worker allocations before allocating stream '{stream}'")
 
         if proxy_pod:
             expires_at = register_or_refresh_stream_if_owner_matches(stream, proxy_pod)
@@ -670,6 +719,8 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
     global scale_down_task
     
     with allocation_lock:
+        reconcile_worker_allocations()
+
         if stream not in stream_to_worker:
             logger.warning(f"[Release] Stream '{stream}' not found in allocations")
             
@@ -840,6 +891,7 @@ def get_status():
     """
     with allocation_lock:
         cleanup_expired_streams()
+        reconcile_worker_allocations()
         return {
             "active_streams": len(stream_to_worker),
             "registry_streams": len(stream_registry),
