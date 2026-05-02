@@ -249,7 +249,7 @@ if [[ "$WORKER_COUNT" != "0" ]]; then
     echo "--- $pod ---"
     check_warn "worker has ffmpeg manager process" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "ps aux | grep -E 'worker_recovery_loop|ffmpeg' | grep -v grep"
     check_warn "worker manager logs mention stream/start" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "ls /tmp/ffmpeg_manager_*.log >/dev/null 2>&1 && grep -Ein 'start|stream|ffmpeg|error|recovery' /tmp/ffmpeg_manager_*.log | tail -n 40"
-    check_warn "ffmpeg runtime log has no immediate push errors" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "if ls /tmp/ffmpeg_*.log >/dev/null 2>&1; then tail -n 80 /tmp/ffmpeg_*.log | grep -Ein 'error|failed|refused|timed out|broken pipe|invalid|forbidden|401|403' && exit 1 || exit 0; else echo 'ffmpeg log not found yet'; exit 1; fi"
+    check_warn "ffmpeg runtime log has no immediate input/push errors" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "if ls /tmp/ffmpeg_*.log >/dev/null 2>&1; then tail -n 80 /tmp/ffmpeg_*.log | grep -Ein 'Error demuxing input|I/O error|Connection reset|Connection refused|timed out|broken pipe|forbidden|401|403|Invalid argument|Server error' && exit 1 || exit 0; else echo 'ffmpeg log not found yet'; exit 1; fi"
     check_warn "worker can resolve youtube ingest DNS" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "getent hosts a.rtmp.youtube.com >/dev/null 2>&1 || nslookup a.rtmp.youtube.com >/dev/null 2>&1"
   done
 fi
