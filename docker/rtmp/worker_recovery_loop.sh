@@ -5,7 +5,7 @@ set -euo pipefail
 STREAM_NAME="$1"
 CONTROLLER_API="http://rtmp-controller.media.svc.cluster.local:8000"
 MAX_RECOVERY_ATTEMPTS=8
-MAX_RECOVERY_SECONDS=120
+MAX_RECOVERY_SECONDS=45
 RETRY_DELAY_SECONDS=3
 PID_FILE="/tmp/ffmpeg_${STREAM_NAME}.pid"
 START_TS=$(date +%s)

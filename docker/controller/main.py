@@ -25,7 +25,7 @@ NAMESPACE = "media"
 WORKER_DEPLOYMENT = "rtmp-worker"
 WORKER_SERVICE = "rtmp-worker"
 SCALE_DOWN_DELAY = 180  # 3 minutos após último release
-WORKER_RECONNECT_GRACE_SECONDS = 120  # Deve espelhar worker_recovery_loop.sh (MAX_RECOVERY_SECONDS)
+WORKER_RECONNECT_GRACE_SECONDS = 45  # Deve espelhar worker_recovery_loop.sh (MAX_RECOVERY_SECONDS)
 
 # Lock para evitar race conditions
 allocation_lock = threading.Lock()
@@ -163,13 +163,8 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
 
 def register_or_refresh_stream_if_owner_matches(stream: str, proxy_pod: str):
     """
-    Renova registro apenas se:
-    - stream não existe ainda, ou
-    - stream já pertence ao mesmo proxy_pod
+    Renova registro da stream permitindo troca de proxy em reconexão/restart.
     """
-    current = stream_registry.get(stream)
-    if current and current.get("proxy_pod") != proxy_pod:
-        return None
     return register_or_refresh_stream(stream, proxy_pod)
 
 
@@ -607,6 +602,25 @@ def health():
     return {"status": "ok"}
 
 
+
+
+def update_stream_proxy_mapping(stream: str, new_proxy_pod: str, reason: str) -> bool:
+    """Atualiza proxy dono da stream e sinaliza restart do worker se mudou."""
+    old_proxy = stream_to_proxy.get(stream)
+    if old_proxy == new_proxy_pod:
+        return False
+
+    stream_to_proxy[stream] = new_proxy_pod
+    register_or_refresh_stream(stream, new_proxy_pod)
+
+    worker = stream_to_worker.get(stream)
+    if worker:
+        stream_worker_started[stream] = False
+        logger.warning(
+            f"[ProxyRemap] stream='{stream}' proxy changed {old_proxy} -> {new_proxy_pod} ({reason}); "
+            f"worker='{worker}' will restart ffmpeg with new proxy"
+        )
+    return True
 @app.get("/allocate")
 def allocate_worker(
     stream: str = Query(..., description="Stream name"),
@@ -631,12 +645,7 @@ def allocate_worker(
             logger.warning(f"[Allocate] Recovered {recovered_allocations} stale worker allocations before allocating stream '{stream}'")
 
         if proxy_pod:
-            expires_at = register_or_refresh_stream_if_owner_matches(stream, proxy_pod)
-            if expires_at is None:
-                logger.warning(
-                    f"[Allocate] Stream '{stream}' already owned by proxy "
-                    f"'{stream_registry.get(stream, {}).get('proxy_pod')}', ignoring proxy '{proxy_pod}'"
-                )
+            update_stream_proxy_mapping(stream, proxy_pod, "allocate")
 
         # Cancelar scale-down se houver nova solicitação de alocação
         if scale_down_task and not scale_down_task.done():
@@ -843,12 +852,7 @@ def register_stream(
 ):
     with allocation_lock:
         cleanup_expired_streams()
-        current = stream_registry.get(stream)
-        if current and current.get("proxy_pod") != proxy_pod:
-            raise HTTPException(
-                status_code=409,
-                detail=f"stream '{stream}' already owned by proxy '{current.get('proxy_pod')}'"
-            )
+        update_stream_proxy_mapping(stream, proxy_pod, "register")
         expires_at = register_or_refresh_stream(stream, proxy_pod)
         return {
             "status": "registered",
@@ -872,13 +876,7 @@ def heartbeat_stream(
     """
     with allocation_lock:
         cleanup_expired_streams()
-        current = stream_registry.get(stream)
-
-        if current and current.get("proxy_pod") != proxy_pod:
-            raise HTTPException(
-                status_code=409,
-                detail=f"stream '{stream}' already owned by proxy '{current.get('proxy_pod')}'"
-            )
+        update_stream_proxy_mapping(stream, proxy_pod, "heartbeat")
 
         # Record heartbeat timestamp - stream is alive!
         stream_last_heartbeat[stream] = time.time()
