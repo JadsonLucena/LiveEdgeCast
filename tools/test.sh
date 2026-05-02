@@ -280,6 +280,18 @@ if [[ -n "$CTRL_POD" ]]; then
 fi
 
 echo ""
+echo "=== Controller start-worker troubleshooting timeline ==="
+if [[ -n "$CTRL_POD" ]]; then
+  if [[ -n "$STREAM_NAME" ]]; then
+    kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" \
+      | filter_stream "$STREAM_NAME|\\[StartWorker\\]\\[Timeline\\]|/start-worker|worker_mismatch|already_started"
+  else
+    kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" \
+      | filter_stream "\\[StartWorker\\]\\[Timeline\\]|/start-worker|worker_mismatch|already_started"
+  fi
+fi
+
+echo ""
 echo "=== Controller diagnostics: worker creation errors ==="
 if [[ -n "$CTRL_POD" ]]; then
   if [[ -n "$STREAM_NAME" ]]; then
@@ -356,6 +368,19 @@ for pod in $(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" -o name); do
     kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "$STREAM_NAME|worker_recovery|ffmpeg|recovery-report|heartbeat|error|warn|youtube|tcp"
   else
     kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "worker_recovery|ffmpeg|recovery-report|heartbeat|error|warn|youtube|tcp"
+  fi
+done
+
+echo ""
+echo "=== Worker troubleshooting timeline ==="
+for pod in $(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" -o name); do
+  echo "--- $pod ---"
+  if [[ -n "$STREAM_NAME" ]]; then
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" \
+      | filter_stream "$STREAM_NAME|\\[worker_publish\\]\\[timeline\\]|\\[worker_recovery\\] \\[timeline\\]|Recovery manager already running|Starting FFmpeg|FFmpeg exited"
+  else
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" \
+      | filter_stream "\\[worker_publish\\]\\[timeline\\]|\\[worker_recovery\\] \\[timeline\\]|Recovery manager already running|Starting FFmpeg|FFmpeg exited"
   fi
 done
 
