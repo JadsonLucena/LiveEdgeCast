@@ -85,7 +85,7 @@ while true; do
   
   ffmpeg \
     -loglevel warning \
-    -rw_timeout 5000000 \
+    -rw_timeout 15000000 \
     -i "$PROXY_RTMP" \
     -c:v copy \
     -c:a copy \

@@ -91,6 +91,29 @@ filter_stream() {
   grep -Ein "$pattern" | head -n "$MAX_MATCHES" || true
 }
 
+resolve_ip_owner() {
+  local ip="$1"
+  if [[ -z "$ip" ]]; then
+    return 0
+  fi
+
+  local node
+  node="$(kubectl get nodes -o wide --no-headers 2>/dev/null | awk -v ip="$ip" '$0 ~ ip {print $1; exit}')"
+  if [[ -n "$node" ]]; then
+    echo "node/$node"
+    return 0
+  fi
+
+  local pod
+  pod="$(kubectl get pods -A -o wide --no-headers 2>/dev/null | awk -v ip="$ip" '$7==ip {print $1"/"$2; exit}')"
+  if [[ -n "$pod" ]]; then
+    echo "pod/$pod"
+    return 0
+  fi
+
+  echo "unknown"
+}
+
 echo "Runtime checklist"
 echo "- namespace: $NAMESPACE"
 echo "- stream_name filter: ${STREAM_NAME:-<none>}"
@@ -237,6 +260,27 @@ for pod in $(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o name); do
   echo "--- $pod ---"
   check_warn "proxy stdout has publish/connect/disconnect timeline" kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "publish|on_publish|on_publish_done|play|connect|disconnect|close|deleteStream|$STREAM_NAME"
   check_warn "proxy nginx error/access logs (in-pod files)" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "for f in /var/log/nginx/error.log /var/log/nginx/access.log; do [ -f \"\$f\" ] && echo \"### \$f\" && tail -n 120 \"\$f\"; done" | filter_stream "publish|on_publish|on_publish_done|play|connect|disconnect|close|deleteStream|$STREAM_NAME|error|warn|fail"
+done
+
+echo ""
+echo "=== Proxy reconnect clients (RTMP churn summary) ==="
+for pod in $(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o name); do
+  echo "--- $pod ---"
+  CLIENT_IPS="$(kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" 2>/dev/null \
+    | grep -Eo "client connected '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'" \
+    | sed -E "s/.*'([0-9.]+)'.*/\1/" \
+    | sort | uniq -c | sort -nr | head -n 8 || true)"
+
+  if [[ -z "$CLIENT_IPS" ]]; then
+    yellow "WARN: no RTMP client connection lines found in window"
+    continue
+  fi
+
+  while read -r count ip; do
+    [[ -z "${ip:-}" ]] && continue
+    owner="$(resolve_ip_owner "$ip")"
+    echo "connections=$count client_ip=$ip owner=$owner"
+  done <<< "$CLIENT_IPS"
 done
 
 echo ""
