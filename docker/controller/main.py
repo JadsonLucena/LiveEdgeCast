@@ -319,14 +319,16 @@ def get_proxy_pod_ip(proxy_pod: str) -> str:
         return None
 
 
-def check_worker_metrics(pod_name: str) -> int:
+def check_worker_metrics(pod_name: str, pod_ip: Optional[str] = None) -> int:
     """
     Verifica métricas RTMP do worker para determinar se está ocupado.
     Retorna número de clientes RTMP ativos.
     """
     try:
-        # Tentar acessar /stats do worker
-        stats_url = f"http://{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local:8080/stats"
+        # Tentar acessar /stats do worker.
+        # Prioriza IP do pod (mais confiável que DNS por pod em Deployment sem headless/stateful hostname).
+        target = pod_ip if pod_ip else f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
+        stats_url = f"http://{target}:8080/stats"
         response = requests.get(stats_url, timeout=2)
         
         if response.status_code == 200:
@@ -369,7 +371,7 @@ def recover_state():
             pod_name = pod.metadata.name
             
             # Verificar se worker tem clientes RTMP ativos
-            nclients = check_worker_metrics(pod_name)
+            nclients = check_worker_metrics(pod_name, pod.status.pod_ip)
             
             if nclients > 0:
                 # Worker está ocupado, mas não sabemos qual stream
@@ -575,7 +577,7 @@ def allocate_worker(
             # Worker deve estar Ready E não alocado
             if cond.get("Ready") == "True" and pod_name not in worker_to_stream:
                 # Dupla verificação: consultar métricas para garantir que está realmente livre
-                nclients = check_worker_metrics(pod_name)
+                nclients = check_worker_metrics(pod_name, p.status.pod_ip)
                 if nclients == 0:
                     available_workers.append(p)
 
