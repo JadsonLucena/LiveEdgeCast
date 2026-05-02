@@ -950,8 +950,7 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
     }
 
 
-@app.get("/start-worker")
-def start_worker(stream: str = Query(..., description="Stream name"), worker: str = Query(..., description="Worker pod name")):
+def _start_worker_impl(stream: str, worker: str):
     """
     Endpoint chamado pelo proxy para iniciar worker pull+push.
     Worker executa on_worker_publish_push.sh para iniciar FFmpeg.
@@ -1001,3 +1000,14 @@ def start_worker(stream: str = Query(..., description="Stream name"), worker: st
     except Exception as e:
         logger.error(f"[StartWorker] Exception starting worker '{worker}': {str(e)}")
         return {"status": "error", "error": str(e)}
+
+
+@app.post("/start-worker")
+def start_worker_post(stream: str = Query(..., description="Stream name"), worker: str = Query(..., description="Worker pod name")):
+    return _start_worker_impl(stream=stream, worker=worker)
+
+
+@app.get("/start-worker")
+def start_worker_get(stream: str = Query(..., description="Stream name"), worker: str = Query(..., description="Worker pod name")):
+    logger.warning("[StartWorker] GET /start-worker is deprecated. Use POST /start-worker.")
+    return _start_worker_impl(stream=stream, worker=worker)
