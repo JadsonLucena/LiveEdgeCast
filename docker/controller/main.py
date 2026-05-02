@@ -36,6 +36,7 @@ stream_to_worker: Dict[str, str] = {}
 # Mapeamento inverso: worker_pod_name → stream_name
 worker_to_stream: Dict[str, str] = {}
 stream_worker_started: Dict[str, bool] = {}
+worker_restart_count_by_stream: Dict[str, int] = {}
 
 # Mapeamento: stream_name → proxy_pod_name (Pull-Only Architecture)
 stream_to_proxy: Dict[str, str] = {}
@@ -51,6 +52,7 @@ streams_pending_allocation: Dict[str, float] = {}
 last_release_time: Optional[float] = None
 scale_down_task: Optional[asyncio.Task] = None
 registry_health_task: Optional[asyncio.Task] = None
+worker_restart_monitor_task: Optional[asyncio.Task] = None
 PROXY_HEALTHCHECK_INTERVAL_SECONDS = 5
 PROXY_HEALTHCHECK_MAX_FAILURES = 3
 PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
@@ -410,6 +412,44 @@ def check_worker_metrics(pod_name: str, pod_ip: Optional[str] = None) -> int:
         return 0
 
 
+
+
+def get_worker_restart_count(pod_name: str) -> int:
+    try:
+        pod = core.read_namespaced_pod(name=pod_name, namespace=NAMESPACE)
+        statuses = pod.status.container_statuses or []
+        if not statuses:
+            return 0
+        return max((s.restart_count or 0) for s in statuses)
+    except Exception:
+        return -1
+
+
+async def monitor_worker_restarts():
+    """Reinicia manager no worker quando container reinicia no mesmo pod."""
+    while True:
+        await asyncio.sleep(5)
+        restart_needed = []
+
+        with allocation_lock:
+            for stream, worker in stream_to_worker.items():
+                current_rc = get_worker_restart_count(worker)
+                if current_rc < 0:
+                    continue
+                previous_rc = worker_restart_count_by_stream.get(stream, current_rc)
+                if current_rc > previous_rc:
+                    worker_restart_count_by_stream[stream] = current_rc
+                    stream_worker_started[stream] = False
+                    logger.warning(
+                        f"[WorkerRestart] Detected restart for stream='{stream}' worker='{worker}' "
+                        f"restart_count {previous_rc}->{current_rc}. Will restart manager."
+                    )
+                if stream_worker_started.get(stream) is not True:
+                    restart_needed.append((stream, worker))
+
+        for stream, worker in restart_needed:
+            result = await asyncio.to_thread(_start_worker_impl, stream, worker)
+            logger.info(f"[WorkerRestart] start-worker reconcile result for stream='{stream}': {result}")
 def recover_state():
     """
     Recupera estado de alocações após reinício do controller.
@@ -542,21 +582,24 @@ async def collect_infrastructure_metrics():
 # Recuperar estado ao iniciar
 @app.on_event("startup")
 async def startup_event():
-    global registry_health_task, metrics_collection_task
+    global registry_health_task, metrics_collection_task, worker_restart_monitor_task
     # Aguardar 5 segundos para Kubernetes estabilizar
     time.sleep(5)
     recover_state()
     registry_health_task = asyncio.create_task(monitor_stream_registry_health())
     metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
+    worker_restart_monitor_task = asyncio.create_task(monitor_worker_restarts())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global registry_health_task, metrics_collection_task
+    global registry_health_task, metrics_collection_task, worker_restart_monitor_task
     if registry_health_task and not registry_health_task.done():
         registry_health_task.cancel()
     if metrics_collection_task and not metrics_collection_task.done():
         metrics_collection_task.cancel()
+    if worker_restart_monitor_task and not worker_restart_monitor_task.done():
+        worker_restart_monitor_task.cancel()
 
 
 @app.get("/health")
@@ -658,6 +701,7 @@ def allocate_worker(
             # Criar mapeamento bidirecional
             stream_to_worker[stream] = pod_name
             worker_to_stream[pod_name] = stream
+            worker_restart_count_by_stream[stream] = get_worker_restart_count(pod_name)
             
             # Armazenar proxy para Pull-Only Architecture
             if proxy_pod:
@@ -755,6 +799,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         del stream_to_worker[stream]
         del worker_to_stream[worker_name]
         stream_worker_started.pop(stream, None)
+        worker_restart_count_by_stream.pop(stream, None)
         
         # Remover proxy mapping (Pull-Only)
         if stream in stream_to_proxy:
