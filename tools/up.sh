@@ -84,6 +84,7 @@ if ! kubectl get namespace monitoring >/dev/null 2>&1; then
     # Install Prometheus
     helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
         --namespace monitoring --create-namespace \
+        --set prometheus-node-exporter.enabled=false \
         --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
         --wait --timeout=300s || {
         print_error "Failed to install Prometheus"

@@ -18,61 +18,29 @@
 set -e
 
 STREAM_NAME="$1"
-CONTROLLER_API="http://rtmp-controller.media.svc.cluster.local:8000"
-MAX_RETRIES=10
-RETRY_COUNT=0
-PID_FILE="/tmp/ffmpeg_${STREAM_NAME}.pid"
+MANAGER_PID_FILE="/tmp/ffmpeg_manager_${STREAM_NAME}.pid"
 
-echo "[$(date)] [worker_publish] Worker ready - getting stream info from controller..."
+echo "[$(date)] [worker_publish] Starting worker recovery manager for stream '$STREAM_NAME'..."
+START_TS="$(date +%s)"
+echo "[$(date)] [worker_publish][timeline] step='request_received' ts_epoch=${START_TS} offset_s=0"
 
-# Obter YouTube key E proxy DNS do Controller
-YOUTUBE_KEY=""
-PROXY_DNS=""
-while [ -z "$YOUTUBE_KEY" ] || [ "$YOUTUBE_KEY" = "null" ] || [ -z "$PROXY_DNS" ] || [ "$PROXY_DNS" = "null" ]; do
-  RETRY_COUNT=$((RETRY_COUNT + 1))
-  
-  if [ $RETRY_COUNT -gt $MAX_RETRIES ]; then
-    echo "[$(date)] [worker_publish] ERROR: Failed to get stream info after ${MAX_RETRIES} attempts"
-    exit 1
+if [ -f "$MANAGER_PID_FILE" ]; then
+  EXISTING_PID="$(cat "$MANAGER_PID_FILE" 2>/dev/null || true)"
+  if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+    NOW_TS="$(date +%s)"
+    echo "[$(date)] [worker_publish] Recovery manager already running for stream '$STREAM_NAME' (PID: $EXISTING_PID). Skipping duplicate start."
+    echo "[$(date)] [worker_publish][timeline] step='already_running_noop' ts_epoch=${NOW_TS} offset_s=$((NOW_TS - START_TS)) pid=$EXISTING_PID"
+    exit 0
   fi
-  
-  STREAM_INFO=$(curl -sf "$CONTROLLER_API/stream-key?stream=$STREAM_NAME")
-  YOUTUBE_KEY=$(echo "$STREAM_INFO" | jq -r '.youtubeKey // empty')
-  PROXY_DNS=$(echo "$STREAM_INFO" | jq -r '.proxyDns // empty')
-  
-  if [ -z "$YOUTUBE_KEY" ] || [ "$YOUTUBE_KEY" = "null" ] || [ -z "$PROXY_DNS" ] || [ "$PROXY_DNS" = "null" ]; then
-    echo "[$(date)] [worker_publish] Waiting for stream info... ($RETRY_COUNT/$MAX_RETRIES)"
-    sleep 1
-  fi
-done
-
-PROXY_RTMP="rtmp://${PROXY_DNS}:1935"
-
-echo "[$(date)] [worker_publish] YouTube key: $YOUTUBE_KEY"
-echo "[$(date)] [worker_publish] Proxy DNS: $PROXY_DNS"
-echo "[$(date)] [worker_publish] Starting FFmpeg PULL: $PROXY_RTMP/live/$STREAM_NAME → YouTube"
-
-# Verificar resolução DNS antes de iniciar FFmpeg
-if ! nslookup a.rtmp.youtube.com > /dev/null 2>&1; then
-  echo "[$(date)] [worker_publish] WARNING: Cannot resolve a.rtmp.youtube.com"
-  echo "[$(date)] [worker_publish] Trying with Google DNS (8.8.8.8)..."
+  echo "[$(date)] [worker_publish] Found stale PID file for stream '$STREAM_NAME' (PID: ${EXISTING_PID:-unknown}). Replacing."
 fi
 
-# Iniciar FFmpeg em background para fazer pull+push
-# Input:  Proxy RTMP server (pull)
-# Output: YouTube RTMP (push)
-nohup ffmpeg \
-  -loglevel verbose \
-  -i "$PROXY_RTMP/live/$STREAM_NAME" \
-  -c:v copy \
-  -c:a copy \
-  -f flv "rtmp://a.rtmp.youtube.com/live2/$YOUTUBE_KEY" \
-  > "/tmp/ffmpeg_${STREAM_NAME}.log" 2>&1 &
+nohup /scripts/worker_recovery_loop.sh "$STREAM_NAME" \
+  > "/tmp/ffmpeg_manager_${STREAM_NAME}.log" 2>&1 &
 
-FFMPEG_PID=$!
-echo "$FFMPEG_PID" > "$PID_FILE"
-
-echo "[$(date)] [worker_publish] FFmpeg started (PID: $FFMPEG_PID)"
-echo "[$(date)] [worker_publish] Stream '$STREAM_NAME' now streaming to YouTube"
+echo "$!" > "$MANAGER_PID_FILE"
+echo "[$(date)] [worker_publish] Recovery manager started (PID: $(cat "$MANAGER_PID_FILE"))"
+NOW_TS="$(date +%s)"
+echo "[$(date)] [worker_publish][timeline] step='manager_started' ts_epoch=${NOW_TS} offset_s=$((NOW_TS - START_TS)) pid=$(cat "$MANAGER_PID_FILE")"
 
 exit 0
