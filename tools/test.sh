@@ -179,6 +179,20 @@ if [[ -n "$CTRL_POD" ]]; then
   fi
 fi
 
+echo ""
+echo "=== Controller diagnostics: worker creation errors ==="
+if [[ -n "$CTRL_POD" ]]; then
+  if [[ -n "$STREAM_NAME" ]]; then
+    kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" | filter_stream "$STREAM_NAME|error|exception|traceback|failed|forbidden|timeout|start-worker|allocate|scale|replica"
+  else
+    kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" | filter_stream "error|exception|traceback|failed|forbidden|timeout|start-worker|allocate|scale|replica"
+  fi
+fi
+
+echo ""
+echo "--- Kubernetes events related to worker creation ---"
+kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 200 | filter_stream "rtmp-worker|replicaset|FailedCreate|FailedScheduling|FailedMount|ErrImage|BackOff|Forbidden|denied|insufficient|quota|oom|pull"
+
 if [[ "$WORKER_COUNT" == "0" ]]; then
   echo ""
   echo "=== Quick interpretation ==="
