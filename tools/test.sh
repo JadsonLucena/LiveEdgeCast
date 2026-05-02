@@ -9,6 +9,8 @@ WORKER_SELECTOR="${WORKER_SELECTOR:-app=rtmp-worker}"
 STREAM_NAME="${STREAM_NAME:-}"
 SINCE="${SINCE:-10m}"
 TAIL_LINES="${TAIL_LINES:-120}"
+VERBOSE="${VERBOSE:-0}"
+MAX_MATCHES="${MAX_MATCHES:-40}"
 
 usage() {
   cat <<USAGE
@@ -22,6 +24,8 @@ Options:
   -s, --stream-name <name>          Stream name filter (also accepts STREAM_NAME env)
       --since <duration>            Log window passed to kubectl logs (default: ${SINCE})
       --tail-lines <n>              Tail lines per pod when no filter match (default: ${TAIL_LINES})
+      --max-matches <n>             Max filtered lines per section (default: ${MAX_MATCHES})
+  -v, --verbose                     Print extra details (yaml/describe full sections)
   -h, --help                        Show this help
 USAGE
 }
@@ -35,6 +39,8 @@ while [[ $# -gt 0 ]]; do
     -s|--stream-name) STREAM_NAME="$2"; shift 2 ;;
     --since) SINCE="$2"; shift 2 ;;
     --tail-lines) TAIL_LINES="$2"; shift 2 ;;
+    --max-matches) MAX_MATCHES="$2"; shift 2 ;;
+    -v|--verbose) VERBOSE="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
@@ -82,7 +88,7 @@ log_snippet() {
 
 filter_stream() {
   local pattern="$1"
-  grep -Ein "$pattern" || true
+  grep -Ein "$pattern" | head -n "$MAX_MATCHES" || true
 }
 
 echo "Runtime checklist"
@@ -113,7 +119,9 @@ if [[ "$WORKER_COUNT" == "0" ]]; then
   echo ""
   echo "--- Worker deployment status (replicas/conditions) ---"
   kubectl get deploy -n "$NAMESPACE" rtmp-worker -o wide 2>/dev/null || yellow "WARN: deployment/rtmp-worker not found"
-  kubectl describe deploy -n "$NAMESPACE" rtmp-worker 2>/dev/null | tail -n 80 || true
+  if [[ "$VERBOSE" == "1" ]]; then
+    kubectl describe deploy -n "$NAMESPACE" rtmp-worker 2>/dev/null | tail -n 120 || true
+  fi
   if [[ "$WORKER_DESIRED" == "0" ]]; then
     yellow "DIAG: deployment/rtmp-worker está com spec.replicas=0. O worker não foi solicitado para escalar ainda."
     yellow "DIAG: provável causa -> fluxo de alocação não chegou ao controller (/allocate) para essa stream."
@@ -137,7 +145,11 @@ kubectl get endpoints -n "$NAMESPACE" rtmp-controller -o wide 2>/dev/null || yel
 
 echo ""
 echo "--- Proxy deployment env (controller-related) ---"
-kubectl get deploy -n "$NAMESPACE" rtmp-proxy -o yaml 2>/dev/null | filter_stream "name:|value:|controller|api|rtmp-controller|publish|hook"
+  if [[ "$VERBOSE" == "1" ]]; then
+    kubectl get deploy -n "$NAMESPACE" rtmp-proxy -o yaml 2>/dev/null | filter_stream "name:|value:|controller|api|rtmp-controller|publish|hook"
+  else
+    kubectl get deploy -n "$NAMESPACE" rtmp-proxy -o jsonpath='{range .spec.template.spec.containers[*].env[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null | filter_stream "controller|api|rtmp|publish|hook"
+  fi
 
 PROXY_POD_FOR_NET="$(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
 if [[ -n "$PROXY_POD_FOR_NET" ]]; then
