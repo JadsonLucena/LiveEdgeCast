@@ -173,9 +173,9 @@ echo ""
 echo "=== Controller logs (allocation lifecycle) ==="
 if [[ -n "$CTRL_POD" ]]; then
   if [[ -n "$STREAM_NAME" ]]; then
-    log_snippet "$CTRL_POD" "$STREAM_NAME|Allocate|Release|StartWorker|Delivery|Recovery|pending allocation|Registry|ProxyHealth"
+    log_snippet "$CTRL_POD" "$STREAM_NAME|Allocate|Release|StartWorker|start-worker|Delivery|Recovery|pending allocation|Registry|ProxyHealth|/start-worker"
   else
-    log_snippet "$CTRL_POD" "Allocate|Release|StartWorker|Delivery|Recovery|pending allocation|Registry|ProxyHealth"
+    log_snippet "$CTRL_POD" "Allocate|Release|StartWorker|start-worker|Delivery|Recovery|pending allocation|Registry|ProxyHealth|/start-worker"
   fi
 fi
 
@@ -211,6 +211,16 @@ for pod in $(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" -o name); do
     kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "worker_recovery|ffmpeg|recovery-report|heartbeat|error|warn|youtube|tcp"
   fi
 done
+
+if [[ "$WORKER_COUNT" != "0" ]]; then
+  echo ""
+  echo "=== Worker process checks (manager/ffmpeg) ==="
+  for pod in $(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" -o name); do
+    echo "--- $pod ---"
+    check_warn "worker has ffmpeg manager process" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "ps aux | grep -E 'worker_recovery_loop|ffmpeg' | grep -v grep"
+    check_warn "worker manager logs mention stream/start" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "ls /tmp/ffmpeg_manager_*.log >/dev/null 2>&1 && grep -Ein 'start|stream|ffmpeg|error|recovery' /tmp/ffmpeg_manager_*.log | tail -n 40"
+  done
+fi
 
 echo ""
 echo "=== Objective checklist (manual confirmation) ==="
