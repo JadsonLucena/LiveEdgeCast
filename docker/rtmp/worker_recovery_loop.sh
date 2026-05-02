@@ -59,9 +59,13 @@ while true; do
   PROXY_RTMP="rtmp://${PROXY_ADDR}:1935/live/${STREAM_NAME}"
   YT_RTMP="rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_KEY}"
   
-  # Extract proxy pod name from CONTROLLER for heartbeat
-  # For heartbeat, we need to send proxy_pod. Get it from controller's registry
-  PROXY_POD_NAME=$(hostname)  # Default to this pod name if available
+  # Obter proxy_pod real retornado pelo controller (owner correto da stream).
+  # IMPORTANTE: usar hostname do worker aqui quebra heartbeat (owner mismatch).
+  PROXY_POD_NAME=$(echo "$STREAM_INFO" | jq -r '.proxyPod // empty')
+  if [ -z "$PROXY_POD_NAME" ]; then
+    log "Stream info missing proxyPod; heartbeat will use best-effort fallback from proxyDns"
+    PROXY_POD_NAME=$(echo "$PROXY_ADDR" | cut -d'.' -f1)
+  fi
   
   log "Starting FFmpeg (pull=$PROXY_RTMP, push=$YT_RTMP)"
   log "Heartbeat will be sent every 2s to keep stream alive in controller registry"
