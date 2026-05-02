@@ -34,6 +34,7 @@ stream_to_worker: Dict[str, str] = {}
 
 # Mapeamento inverso: worker_pod_name → stream_name
 worker_to_stream: Dict[str, str] = {}
+stream_worker_started: Dict[str, bool] = {}
 
 # Mapeamento: stream_name → proxy_pod_name (Pull-Only Architecture)
 stream_to_proxy: Dict[str, str] = {}
@@ -684,6 +685,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         # Remover mapeamentos
         del stream_to_worker[stream]
         del worker_to_stream[worker_name]
+        stream_worker_started.pop(stream, None)
         
         # Remover proxy mapping (Pull-Only)
         if stream in stream_to_proxy:
@@ -960,6 +962,19 @@ def start_worker(stream: str = Query(..., description="Stream name"), worker: st
     - Worker inicia FFmpeg pull do proxy específico + push YouTube
     """
     try:
+        with allocation_lock:
+            allocated_worker = stream_to_worker.get(stream)
+            if allocated_worker and allocated_worker != worker:
+                logger.warning(
+                    f"[StartWorker] Ignoring start for stream '{stream}' on worker '{worker}' "
+                    f"(currently allocated to '{allocated_worker}')"
+                )
+                return {"status": "ignored", "reason": "worker_mismatch", "worker": allocated_worker, "stream": stream}
+
+            if stream_worker_started.get(stream) is True:
+                logger.info(f"[StartWorker] Stream '{stream}' already started on worker '{worker}'. Idempotent no-op.")
+                return {"status": "already_started", "worker": worker, "stream": stream}
+
         logger.info(f"[StartWorker] Starting worker '{worker}' for stream '{stream}'")
         
         # Executar on_worker_pull_push.sh no worker via kubectl exec
@@ -975,6 +990,8 @@ def start_worker(stream: str = Query(..., description="Stream name"), worker: st
         )
         
         if result.returncode == 0:
+            with allocation_lock:
+                stream_worker_started[stream] = True
             logger.info(f"[StartWorker] Worker '{worker}' started successfully for stream '{stream}'")
             return {"status": "started", "worker": worker, "stream": stream}
         else:
