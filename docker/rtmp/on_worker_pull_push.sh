@@ -21,11 +21,15 @@ STREAM_NAME="$1"
 MANAGER_PID_FILE="/tmp/ffmpeg_manager_${STREAM_NAME}.pid"
 
 echo "[$(date)] [worker_publish] Starting worker recovery manager for stream '$STREAM_NAME'..."
+START_TS="$(date +%s)"
+echo "[$(date)] [worker_publish][timeline] step='request_received' ts_epoch=${START_TS} offset_s=0"
 
 if [ -f "$MANAGER_PID_FILE" ]; then
   EXISTING_PID="$(cat "$MANAGER_PID_FILE" 2>/dev/null || true)"
   if [ -n "$EXISTING_PID" ] && kill -0 "$EXISTING_PID" 2>/dev/null; then
+    NOW_TS="$(date +%s)"
     echo "[$(date)] [worker_publish] Recovery manager already running for stream '$STREAM_NAME' (PID: $EXISTING_PID). Skipping duplicate start."
+    echo "[$(date)] [worker_publish][timeline] step='already_running_noop' ts_epoch=${NOW_TS} offset_s=$((NOW_TS - START_TS)) pid=$EXISTING_PID"
     exit 0
   fi
   echo "[$(date)] [worker_publish] Found stale PID file for stream '$STREAM_NAME' (PID: ${EXISTING_PID:-unknown}). Replacing."
@@ -36,5 +40,7 @@ nohup /scripts/worker_recovery_loop.sh "$STREAM_NAME" \
 
 echo "$!" > "$MANAGER_PID_FILE"
 echo "[$(date)] [worker_publish] Recovery manager started (PID: $(cat "$MANAGER_PID_FILE"))"
+NOW_TS="$(date +%s)"
+echo "[$(date)] [worker_publish][timeline] step='manager_started' ts_epoch=${NOW_TS} offset_s=$((NOW_TS - START_TS)) pid=$(cat "$MANAGER_PID_FILE")"
 
 exit 0
