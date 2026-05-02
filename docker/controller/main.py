@@ -941,7 +941,8 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
     return {
         "stream": stream,
         "youtubeKey": youtube_key,
-        "proxyDns": proxy_ip
+        "proxyDns": proxy_ip,
+        "proxyPod": proxy_pod
     }
 
 
