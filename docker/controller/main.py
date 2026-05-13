@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Query, HTTPException
 from kubernetes import client, config
+from kubernetes.client.exceptions import ApiException
 import random
 import string
 import threading
@@ -7,6 +8,7 @@ import requests
 import time
 import logging
 import asyncio
+import json
 from typing import Dict, Optional
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from fastapi.responses import Response
@@ -61,6 +63,8 @@ proxy_health_failures: Dict[str, int] = {}
 # Rastreia último heartbeat de cada stream (para renovar TTL mesmo se healthcheck falhar)
 # Mapeia: stream_name → timestamp do último heartbeat
 stream_last_heartbeat: Dict[str, float] = {}
+STATE_CONFIGMAP_NAME = "rtmp-controller-state"
+STATE_CONFIGMAP_KEY = "state.json"
 
 # Stream lifecycle tracking
 stream_start_time: Dict[str, float] = {}
@@ -113,6 +117,75 @@ except:
 
 apps = client.AppsV1Api()
 core = client.CoreV1Api()
+
+
+def persist_state_locked() -> None:
+    """
+    Persiste o estado crítico do controller em ConfigMap para sobreviver a restart/crash do pod.
+    Deve ser chamado apenas dentro de allocation_lock.
+    """
+    payload = {
+        "stream_to_worker": stream_to_worker,
+        "worker_to_stream": worker_to_stream,
+        "stream_to_proxy": stream_to_proxy,
+        "stream_registry": stream_registry,
+        "streams_pending_allocation": streams_pending_allocation,
+        "stream_last_heartbeat": stream_last_heartbeat,
+    }
+    body = client.V1ConfigMap(
+        metadata=client.V1ObjectMeta(name=STATE_CONFIGMAP_NAME, namespace=NAMESPACE),
+        data={STATE_CONFIGMAP_KEY: json.dumps(payload)}
+    )
+    try:
+        core.patch_namespaced_config_map(
+            name=STATE_CONFIGMAP_NAME,
+            namespace=NAMESPACE,
+            body=body
+        )
+    except ApiException as e:
+        if e.status == 404:
+            core.create_namespaced_config_map(namespace=NAMESPACE, body=body)
+        else:
+            raise
+
+
+def restore_persisted_state_locked() -> bool:
+    """
+    Restaura estado persistido do ConfigMap.
+    Retorna True se houve estado restaurado.
+    Deve ser chamado apenas dentro de allocation_lock.
+    """
+    try:
+        cm = core.read_namespaced_config_map(name=STATE_CONFIGMAP_NAME, namespace=NAMESPACE)
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        logger.warning(f"[State Recovery] Failed to read state ConfigMap: {e}")
+        return False
+
+    raw = (cm.data or {}).get(STATE_CONFIGMAP_KEY)
+    if not raw:
+        return False
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("[State Recovery] Invalid JSON in persisted state, ignoring.")
+        return False
+
+    stream_to_worker.clear()
+    stream_to_worker.update(data.get("stream_to_worker", {}))
+    worker_to_stream.clear()
+    worker_to_stream.update(data.get("worker_to_stream", {}))
+    stream_to_proxy.clear()
+    stream_to_proxy.update(data.get("stream_to_proxy", {}))
+    stream_registry.clear()
+    stream_registry.update(data.get("stream_registry", {}))
+    streams_pending_allocation.clear()
+    streams_pending_allocation.update(data.get("streams_pending_allocation", {}))
+    stream_last_heartbeat.clear()
+    stream_last_heartbeat.update(data.get("stream_last_heartbeat", {}))
+    return True
 
 
 def random_suffix():
@@ -354,6 +427,13 @@ def recover_state():
     logger.info("[State Recovery] Starting state recovery...")
     
     with allocation_lock:
+        restored = restore_persisted_state_locked()
+        if restored:
+            logger.info(
+                f"[State Recovery] Restored persisted state with {len(stream_to_worker)} active stream allocations."
+            )
+            return
+
         pods = core.list_namespaced_pod(
             namespace=NAMESPACE,
             label_selector="app=rtmp-worker"
@@ -383,6 +463,7 @@ def recover_state():
                 recovered_count += 1
                 logger.info(f"[State Recovery] Worker {pod_name} is busy ({nclients} clients), marked as allocated")
         
+        persist_state_locked()
         logger.info(f"[State Recovery] Completed. Recovered {recovered_count} active workers.")
 
 
@@ -601,6 +682,7 @@ def allocate_worker(
                 elapsed = time.time() - streams_pending_allocation[stream]
                 del streams_pending_allocation[stream]
                 logger.info(f"[Allocate] Removed stream '{stream}' from pending queue (allocated in {elapsed:.1f}s)")
+            persist_state_locked()
             
             # Usar DNS estável via Headless Service em vez de IP direto
             # Formato: <pod-name>.<service-name>.<namespace>.svc.cluster.local
@@ -652,6 +734,7 @@ def allocate_worker(
             logger.info(f"[Allocate] No workers available. Scaled deployment to {new_replicas} replicas for stream '{stream}'.")
         else:
             logger.info(f"[Allocate] Stream '{stream}' still waiting for worker (pending for {elapsed_since_pending:.1f}s). Not scaling again.")
+        persist_state_locked()
 
         return { 
             "pod": None, 
@@ -677,6 +760,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
             if stream in streams_pending_allocation:
                 del streams_pending_allocation[stream]
                 logger.info(f"[Release] Removed stream '{stream}' from pending allocation queue (never allocated)")
+                persist_state_locked()
             
             return {"status": "not_found", "stream": stream}
         
@@ -701,6 +785,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         # Remove heartbeat tracking
         if stream in stream_last_heartbeat:
             del stream_last_heartbeat[stream]
+        persist_state_locked()
         
         record_stream_end(stream)
         logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
@@ -736,6 +821,7 @@ def register_stream(
                 detail=f"stream '{stream}' already owned by proxy '{current.get('proxy_pod')}'"
             )
         expires_at = register_or_refresh_stream(stream, proxy_pod)
+        persist_state_locked()
         return {
             "status": "registered",
             "stream": stream,
@@ -771,6 +857,7 @@ def heartbeat_stream(
         
         # Also refresh TTL to be safe
         expires_at = register_or_refresh_stream(stream, proxy_pod)
+        persist_state_locked()
         
         logger.debug(f"[Heartbeat] Stream '{stream}' heartbeat recorded. TTL renewed.")
         
@@ -829,6 +916,8 @@ def release_stream_registry(
 
         stream_registry.pop(stream, None)
         stream_to_proxy.pop(stream, None)
+        stream_last_heartbeat.pop(stream, None)
+        persist_state_locked()
         return {"status": "released", "stream": stream}
 
 
@@ -886,8 +975,10 @@ def report_delivery_status(
     else:
         ffmpeg_process_running.labels(stream=stream).set(1)
     update_stream_uptime(stream)
-    stream_last_heartbeat[stream] = now
-    register_or_refresh_stream(stream, proxy_pod)
+    with allocation_lock:
+        stream_last_heartbeat[stream] = now
+        register_or_refresh_stream(stream, proxy_pod)
+        persist_state_locked()
     return {'acknowledged': True, 'status': status}
 
 @app.post('/streams/recovery-report')

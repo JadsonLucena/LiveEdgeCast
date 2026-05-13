@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rtmp-controller-state
+  namespace: media
+data:
+  state.json: "{}"
