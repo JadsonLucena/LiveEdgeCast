@@ -59,6 +59,10 @@ if kubectl get deployment rtmp-proxy -n media >/dev/null 2>&1; then
     kubectl scale deployment/rtmp-proxy --replicas=0 -n media
     print_success "Proxy scaled to 0"
 fi
+if kubectl get deployment rtmp-proxy-lb -n media >/dev/null 2>&1; then
+    kubectl scale deployment/rtmp-proxy-lb --replicas=0 -n media
+    print_success "Proxy LB scaled to 0"
+fi
 
 if kubectl get deployment rtmp-controller -n media >/dev/null 2>&1; then
     kubectl scale deployment/rtmp-controller --replicas=0 -n media
@@ -72,12 +76,14 @@ sleep 3
 print_step "Step 3/7: Deleting Deployments..."
 kubectl delete deployment rtmp-worker -n media 2>/dev/null && print_success "Worker deployment deleted" || print_warning "No Worker deployment found"
 kubectl delete deployment rtmp-proxy -n media 2>/dev/null && print_success "Proxy deployment deleted" || print_warning "No Proxy deployment found"
+kubectl delete deployment rtmp-proxy-lb -n media 2>/dev/null && print_success "Proxy LB deployment deleted" || print_warning "No Proxy LB deployment found"
 kubectl delete deployment rtmp-controller -n media 2>/dev/null && print_success "Controller deployment deleted" || print_warning "No Controller deployment found"
 
 # Wait for deployments to be fully deleted
 print_step "Waiting for all deployments to terminate..."
 kubectl wait --for=delete deployment/rtmp-worker -n media --timeout=60s 2>/dev/null || print_warning "Worker deployment deletion timed out"
 kubectl wait --for=delete deployment/rtmp-proxy -n media --timeout=60s 2>/dev/null || print_warning "Proxy deployment deletion timed out"
+kubectl wait --for=delete deployment/rtmp-proxy-lb -n media --timeout=60s 2>/dev/null || print_warning "Proxy LB deployment deletion timed out"
 kubectl wait --for=delete deployment/rtmp-controller -n media --timeout=60s 2>/dev/null || print_warning "Controller deployment deletion timed out"
 print_success "All deployments terminated"
 
@@ -85,13 +91,15 @@ print_success "All deployments terminated"
 print_step "Step 4/7: Deleting Services..."
 kubectl delete service rtmp-worker -n media 2>/dev/null && print_success "Worker service deleted" || print_warning "No Worker service found"
 kubectl delete service rtmp-proxy -n media 2>/dev/null && print_success "Proxy service deleted" || print_warning "No Proxy service found"
+kubectl delete service rtmp-entry -n media 2>/dev/null && print_success "Proxy entry service deleted" || print_warning "No Proxy entry service found"
 kubectl delete service rtmp-proxy-headless -n media 2>/dev/null && print_success "Proxy headless service deleted" || print_warning "No Proxy headless service found"
 kubectl delete service rtmp-controller -n media 2>/dev/null && print_success "Controller service deleted" || print_warning "No Controller service found"
+kubectl delete configmap rtmp-proxy-lb-config -n media 2>/dev/null && print_success "Proxy LB config deleted" || print_warning "No Proxy LB config found"
 
 # 2.5: Delete ServiceMonitors (Prometheus)
 print_step "Step 5/7: Deleting ServiceMonitors..."
-kubectl delete servicemonitor rtmp-worker-metrics -n media 2>/dev/null && print_success "Worker ServiceMonitor deleted" || print_warning "No Worker ServiceMonitor found"
-kubectl delete servicemonitor rtmp-proxy-metrics -n media 2>/dev/null && print_success "Proxy ServiceMonitor deleted" || print_warning "No Proxy ServiceMonitor found"
+kubectl delete servicemonitor rtmp-worker-metrics -n monitoring 2>/dev/null && print_success "Worker ServiceMonitor deleted" || print_warning "No Worker ServiceMonitor found"
+kubectl delete servicemonitor rtmp-proxy-metrics -n monitoring 2>/dev/null && print_success "Proxy ServiceMonitor deleted" || print_warning "No Proxy ServiceMonitor found"
 
 # 2.6: Delete RBAC (last, after all pods are gone)
 print_step "Step 6/6: Deleting RBAC resources..."
@@ -101,7 +109,11 @@ kubectl delete serviceaccount rtmp-controller -n media 2>/dev/null && print_succ
 
 print_success "All Kubernetes resources deleted in correct order"
 
-# Step 3: Clean up any remaining pods (force if needed)
+# Step 3: Delete namespaces declared in manifest
+print_step "Step 7/7: Deleting namespaces from k8s/namespaces.yaml..."
+kubectl delete -f k8s/namespaces.yaml --ignore-not-found=true 2>/dev/null || print_warning "Namespace deletion command returned warnings"
+
+# Step 4: Clean up any remaining pods (force if needed)
 print_step "Checking for remaining pods..."
 CONTROLLER_PODS=$(kubectl get pods -l app=rtmp-controller -n media --no-headers 2>/dev/null | wc -l)
 PROXY_PODS=$(kubectl get pods -l app=rtmp-proxy -n media --no-headers 2>/dev/null | wc -l)
@@ -129,7 +141,7 @@ if [ "$CONTROLLER_PODS" -eq 0 ] && [ "$PROXY_PODS" -eq 0 ] && [ "$WORKER_PODS" -
     print_success "No remaining pods found"
 fi
 
-# Step 4: Verify cleanup
+# Step 5: Verify cleanup
 print_step "Verifying cleanup..."
 echo ""
 echo "📊 Final status:"
@@ -139,7 +151,7 @@ echo ""
 SCALEDOBJECTS=$(kubectl get scaledobject -n media --no-headers 2>/dev/null | wc -l)
 DEPLOYMENTS=$(kubectl get deployment -n media --no-headers 2>/dev/null | wc -l)
 SERVICES=$(kubectl get service -n media --no-headers 2>/dev/null | wc -l)
-SERVICEMONITORS=$(kubectl get servicemonitor -n media --no-headers 2>/dev/null | wc -l)
+SERVICEMONITORS=$(kubectl get servicemonitor -n monitoring --no-headers 2>/dev/null | wc -l)
 PODS=$(kubectl get pods -n media --no-headers 2>/dev/null | wc -l)
 RBAC_ROLES=$(kubectl get role -n media --no-headers 2>/dev/null | grep rtmp-controller | wc -l)
 RBAC_ROLEBINDINGS=$(kubectl get rolebinding -n media --no-headers 2>/dev/null | grep rtmp-controller | wc -l)

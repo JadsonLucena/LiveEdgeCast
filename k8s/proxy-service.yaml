@@ -6,21 +6,21 @@ metadata:
   labels:
     app: rtmp-proxy
 spec:
-  type: NodePort
+  type: ClusterIP
   selector: { app: rtmp-proxy }
-  sessionAffinity: ClientIP  # Mantém cliente sempre no mesmo proxy pod
-  sessionAffinityConfig:
-    clientIP:
-      timeoutSeconds: 10800  # 3 horas - streams longas
+  sessionAffinity: None
   ports:
     - name: rtmp
       port: 1935
       targetPort: 1935
-      nodePort: 31935  # Fixed NodePort for external RTMP access
       protocol: TCP
     - name: http
       port: 8080
       targetPort: 8080
+      protocol: TCP
+    - name: metrics
+      port: 9113
+      targetPort: 9113
       protocol: TCP
 ---
 # Headless Service for Pull-Only Architecture
