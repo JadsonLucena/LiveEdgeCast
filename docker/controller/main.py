@@ -106,6 +106,7 @@ proxy_active_connections = Gauge('proxy_active_connections','Active RTMP connect
 proxy_bandwidth_mbps = Gauge('proxy_bandwidth_mbps','Current proxy bandwidth in Mbps',['proxy_pod'])
 worker_pods_available = Gauge('worker_pods_available','Available worker pods for allocation',['namespace'])
 allocation_queue_length = Gauge('allocation_queue_length','Number of streams waiting for worker allocation')
+stream_proxy_handover_counter = Counter('stream_proxy_handover_total','Total proxy handovers accepted by controller',['stream'])
 
 # Load Kubernetes credentials (inside cluster)
 try:
@@ -601,7 +602,18 @@ def allocate_worker(
     with allocation_lock:
         cleanup_expired_streams()
 
-        if proxy_pod:
+        current_owner = stream_registry.get(stream, {}).get("proxy_pod")
+        has_existing_worker = stream in stream_to_worker
+
+        if proxy_pod and has_existing_worker and current_owner and current_owner != proxy_pod:
+            logger.info(
+                f"[Allocate][Handover] Stream '{stream}' moving owner from "
+                f"'{current_owner}' to '{proxy_pod}' (existing worker)"
+            )
+            register_or_refresh_stream(stream, proxy_pod)
+            stream_proxy_handover_counter.labels(stream=stream).inc()
+            persist_state_locked()
+        elif proxy_pod:
             expires_at = register_or_refresh_stream_if_owner_matches(stream, proxy_pod)
             if expires_at is None:
                 logger.warning(

@@ -73,8 +73,8 @@ kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/mon
 }
 
 # Check if Prometheus is installed (for KEDA metrics)
-if ! kubectl get namespace monitoring >/dev/null 2>&1; then
-    print_warning "Monitoring namespace not found. Installing Prometheus for KEDA metrics..."
+if ! kubectl get service kube-prometheus-stack-prometheus -n monitoring >/dev/null 2>&1; then
+    print_warning "Prometheus service not found in namespace 'monitoring'. Installing Prometheus stack..."
     print_step "Installing Prometheus stack..."
     
     # Add Prometheus Helm repo
@@ -93,7 +93,7 @@ if ! kubectl get namespace monitoring >/dev/null 2>&1; then
     
     print_success "Prometheus installed successfully"
 else
-    print_success "Monitoring namespace exists"
+    print_success "Prometheus stack already available in namespace 'monitoring'"
 fi
 
 # Step 3: Build Docker images
