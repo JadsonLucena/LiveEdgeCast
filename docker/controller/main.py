@@ -107,6 +107,11 @@ proxy_bandwidth_mbps = Gauge('proxy_bandwidth_mbps','Current proxy bandwidth in 
 worker_pods_available = Gauge('worker_pods_available','Available worker pods for allocation',['namespace'])
 allocation_queue_length = Gauge('allocation_queue_length','Number of streams waiting for worker allocation')
 stream_proxy_handover_counter = Counter('stream_proxy_handover_total','Total proxy handovers accepted by controller',['stream'])
+handover_attempts_total = Counter('handover_attempts_total', 'Total proxy handover attempts', ['stream'])
+handover_success_total = Counter('handover_success_total', 'Total successful proxy handovers', ['stream'])
+handover_conflict_total = Counter('handover_conflict_total', 'Total conflicting proxy handovers denied', ['stream'])
+
+HANDOVER_HEARTBEAT_STALE_SECONDS = 10
 
 # Load Kubernetes credentials (inside cluster)
 try:
@@ -242,6 +247,50 @@ def register_or_refresh_stream_if_owner_matches(stream: str, proxy_pod: str):
     if current and current.get("proxy_pod") != proxy_pod:
         return None
     return register_or_refresh_stream(stream, proxy_pod)
+
+
+def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
+    """
+    Regra de ownership com troca segura:
+    - idempotente: se já pertence ao candidate_proxy_pod, apenas renova
+    - troca permitida se owner antigo estiver inelegível por QUALQUER critério:
+      heartbeat stale OU proxy unhealthy/dead
+    """
+    handover_attempts_total.labels(stream=stream).inc()
+    current = stream_registry.get(stream)
+    if not current:
+        register_or_refresh_stream(stream, candidate_proxy_pod)
+        handover_success_total.labels(stream=stream).inc()
+        return True
+
+    current_owner = current.get("proxy_pod")
+    if current_owner == candidate_proxy_pod:
+        register_or_refresh_stream(stream, candidate_proxy_pod)
+        return True
+
+    now = time.time()
+    last_heartbeat = stream_last_heartbeat.get(stream, 0)
+    heartbeat_age = now - last_heartbeat if last_heartbeat else float("inf")
+    owner_unhealthy = proxy_health_failures.get(current_owner, 0) >= PROXY_HEALTHCHECK_MAX_FAILURES
+    if not owner_unhealthy:
+        owner_unhealthy = not check_proxy_health(current_owner)
+
+    if heartbeat_age > HANDOVER_HEARTBEAT_STALE_SECONDS or owner_unhealthy:
+        logger.info(
+            f"[Handover] Stream '{stream}' ownership moved from '{current_owner}' "
+            f"to '{candidate_proxy_pod}' (heartbeat_age={heartbeat_age:.1f}s, owner_unhealthy={owner_unhealthy})"
+        )
+        register_or_refresh_stream(stream, candidate_proxy_pod)
+        handover_success_total.labels(stream=stream).inc()
+        stream_proxy_handover_counter.labels(stream=stream).inc()
+        return True
+
+    handover_conflict_total.labels(stream=stream).inc()
+    logger.warning(
+        f"[Handover] Denied ownership change for stream '{stream}' from '{current_owner}' "
+        f"to '{candidate_proxy_pod}' (heartbeat_age={heartbeat_age:.1f}s, owner_unhealthy={owner_unhealthy})"
+    )
+    return False
 
 
 async def schedule_scale_down_if_idle():
@@ -602,24 +651,15 @@ def allocate_worker(
     with allocation_lock:
         cleanup_expired_streams()
 
-        current_owner = stream_registry.get(stream, {}).get("proxy_pod")
-        has_existing_worker = stream in stream_to_worker
-
-        if proxy_pod and has_existing_worker and current_owner and current_owner != proxy_pod:
-            logger.info(
-                f"[Allocate][Handover] Stream '{stream}' moving owner from "
-                f"'{current_owner}' to '{proxy_pod}' (existing worker)"
-            )
-            register_or_refresh_stream(stream, proxy_pod)
-            stream_proxy_handover_counter.labels(stream=stream).inc()
-            persist_state_locked()
-        elif proxy_pod:
-            expires_at = register_or_refresh_stream_if_owner_matches(stream, proxy_pod)
-            if expires_at is None:
-                logger.warning(
-                    f"[Allocate] Stream '{stream}' already owned by proxy "
-                    f"'{stream_registry.get(stream, {}).get('proxy_pod')}', ignoring proxy '{proxy_pod}'"
+        if proxy_pod:
+            if not try_handover_stream_owner(stream, proxy_pod):
+                owner = stream_registry.get(stream, {}).get("proxy_pod")
+                persist_state_locked()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"stream '{stream}' owned by proxy '{owner}'"
                 )
+            persist_state_locked()
 
         # Cancelar scale-down se houver nova solicitação de alocação
         if scale_down_task and not scale_down_task.done():
@@ -632,7 +672,8 @@ def allocate_worker(
             
             # Construir IP do proxy (Pull-Only Architecture)
             # Usa IP direto do pod proxy (Headless DNS não funciona sem StatefulSet)
-            proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
+            owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+            proxy_ip = get_proxy_pod_ip(owner_proxy) if owner_proxy else None
             proxy_address = proxy_ip if proxy_ip else "rtmp-proxy.media.svc.cluster.local"
             
             logger.info(f"[Allocate] Stream '{stream}' already has worker: {existing_worker} - Proxy: {proxy_address}")
@@ -686,8 +727,9 @@ def allocate_worker(
             worker_to_stream[pod_name] = stream
             
             # Armazenar proxy para Pull-Only Architecture
-            if proxy_pod:
-                stream_to_proxy[stream] = proxy_pod
+            owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+            if owner_proxy:
+                stream_to_proxy[stream] = owner_proxy
             
             # Remover de pending allocation (worker foi alocado)
             if stream in streams_pending_allocation:
@@ -701,7 +743,8 @@ def allocate_worker(
             worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
             
             # Obter IP do proxy para retornar ao worker (Pull-Only Architecture)
-            proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
+            owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+            proxy_ip = get_proxy_pod_ip(owner_proxy) if owner_proxy else None
             proxy_address = proxy_ip if proxy_ip else "rtmp-proxy.media.svc.cluster.local"
             
             logger.info(f"[Allocate] Allocated worker {pod_name} (DNS: {worker_dns}) for stream '{stream}' - Proxy: {proxy_address}")
@@ -826,13 +869,13 @@ def register_stream(
 ):
     with allocation_lock:
         cleanup_expired_streams()
-        current = stream_registry.get(stream)
-        if current and current.get("proxy_pod") != proxy_pod:
+        if not try_handover_stream_owner(stream, proxy_pod):
+            current_owner = stream_registry.get(stream, {}).get("proxy_pod")
             raise HTTPException(
                 status_code=409,
-                detail=f"stream '{stream}' already owned by proxy '{current.get('proxy_pod')}'"
+                detail=f"stream '{stream}' already owned by proxy '{current_owner}'"
             )
-        expires_at = register_or_refresh_stream(stream, proxy_pod)
+        expires_at = stream_registry.get(stream, {}).get("expires_at")
         persist_state_locked()
         return {
             "status": "registered",
@@ -856,12 +899,11 @@ def heartbeat_stream(
     """
     with allocation_lock:
         cleanup_expired_streams()
-        current = stream_registry.get(stream)
-
-        if current and current.get("proxy_pod") != proxy_pod:
+        if not try_handover_stream_owner(stream, proxy_pod):
+            current_owner = stream_registry.get(stream, {}).get("proxy_pod")
             raise HTTPException(
                 status_code=409,
-                detail=f"stream '{stream}' already owned by proxy '{current.get('proxy_pod')}'"
+                detail=f"stream '{stream}' already owned by proxy '{current_owner}'"
             )
 
         # Record heartbeat timestamp - stream is alive!
