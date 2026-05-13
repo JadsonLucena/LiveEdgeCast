@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: rtmp
-          image: liveedgecast-rtmp:latest
+          image: liveedgecast-worker:latest
           imagePullPolicy: Never
           ports:
             - containerPort: 1935
@@ -23,10 +23,6 @@ spec:
             - containerPort: 8080
               name: http
               protocol: TCP
-          volumeMounts:
-            - name: cfg
-              mountPath: /etc/nginx/nginx.conf
-              subPath: nginx.conf
           resources:
             requests:
               memory: "256Mi"
@@ -42,6 +38,3 @@ spec:
             tcpSocket: { port: 1935 }
             initialDelaySeconds: 5
             periodSeconds: 10
-      volumes:
-        - name: cfg
-          configMap: { name: rtmp-worker-nginx-conf }

@@ -93,13 +93,8 @@ print_step "Step 5/7: Deleting ServiceMonitors..."
 kubectl delete servicemonitor rtmp-worker-metrics -n media 2>/dev/null && print_success "Worker ServiceMonitor deleted" || print_warning "No Worker ServiceMonitor found"
 kubectl delete servicemonitor rtmp-proxy-metrics -n media 2>/dev/null && print_success "Proxy ServiceMonitor deleted" || print_warning "No Proxy ServiceMonitor found"
 
-# 2.6: Delete ConfigMaps
-print_step "Step 6/7: Deleting ConfigMaps..."
-kubectl delete configmap rtmp-worker-nginx-conf -n media 2>/dev/null && print_success "Worker ConfigMap deleted" || print_warning "No Worker ConfigMap found"
-kubectl delete configmap rtmp-proxy-nginx-conf -n media 2>/dev/null && print_success "Proxy ConfigMap deleted" || print_warning "No Proxy ConfigMap found"
-
-# 2.7: Delete RBAC (last, after all pods are gone)
-print_step "Step 7/7: Deleting RBAC resources..."
+# 2.6: Delete RBAC (last, after all pods are gone)
+print_step "Step 6/6: Deleting RBAC resources..."
 kubectl delete rolebinding rtmp-controller-binding -n media 2>/dev/null && print_success "Controller RoleBinding deleted" || print_warning "No Controller RoleBinding found"
 kubectl delete role rtmp-controller-role -n media 2>/dev/null && print_success "Controller Role deleted" || print_warning "No Controller Role found"
 kubectl delete serviceaccount rtmp-controller -n media 2>/dev/null && print_success "Controller ServiceAccount deleted" || print_warning "No Controller ServiceAccount found"
@@ -145,7 +140,6 @@ SCALEDOBJECTS=$(kubectl get scaledobject -n media --no-headers 2>/dev/null | wc 
 DEPLOYMENTS=$(kubectl get deployment -n media --no-headers 2>/dev/null | wc -l)
 SERVICES=$(kubectl get service -n media --no-headers 2>/dev/null | wc -l)
 SERVICEMONITORS=$(kubectl get servicemonitor -n media --no-headers 2>/dev/null | wc -l)
-CONFIGMAPS=$(kubectl get configmap -n media --no-headers 2>/dev/null | wc -l)
 PODS=$(kubectl get pods -n media --no-headers 2>/dev/null | wc -l)
 RBAC_ROLES=$(kubectl get role -n media --no-headers 2>/dev/null | grep rtmp-controller | wc -l)
 RBAC_ROLEBINDINGS=$(kubectl get rolebinding -n media --no-headers 2>/dev/null | grep rtmp-controller | wc -l)
@@ -178,11 +172,6 @@ else
     print_warning "ServiceMonitors: $SERVICEMONITORS remaining"
 fi
 
-if [ "$CONFIGMAPS" -eq 0 ]; then
-    print_success "ConfigMaps: 0 (all deleted)"
-else
-    print_warning "ConfigMaps: $CONFIGMAPS remaining"
-fi
 
 if [ "$PODS" -eq 0 ]; then
     print_success "Pods: 0 (all deleted)"
