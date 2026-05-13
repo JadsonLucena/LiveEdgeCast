@@ -97,15 +97,21 @@ else
 fi
 
 # Step 3: Build Docker images
-print_step "Building LiveEdgeCast RTMP image..."
-RTMP_IMAGE="liveedgecast-rtmp:latest"
-
-# Build the RTMP image (proxy + worker use same image)
-docker build -t $RTMP_IMAGE -f docker/rtmp/Dockerfile docker/rtmp/ || { 
-    print_error "Failed to build RTMP image"; 
-    exit 1; 
+print_step "Building LiveEdgeCast proxy image..."
+PROXY_IMAGE="liveedgecast-proxy:latest"
+docker build -t $PROXY_IMAGE -f docker/proxy/Dockerfile docker/proxy || {
+    print_error "Failed to build proxy image";
+    exit 1;
 }
-print_success "RTMP image $RTMP_IMAGE built successfully"
+print_success "Proxy image $PROXY_IMAGE built successfully"
+
+print_step "Building LiveEdgeCast worker image..."
+WORKER_IMAGE="liveedgecast-worker:latest"
+docker build -t $WORKER_IMAGE -f docker/worker/Dockerfile docker/worker || {
+    print_error "Failed to build worker image";
+    exit 1;
+}
+print_success "Worker image $WORKER_IMAGE built successfully"
 
 print_step "Building RTMP Controller API image..."
 CONTROLLER_IMAGE="liveedgecast-controller:latest"
@@ -119,8 +125,12 @@ print_success "Controller image $CONTROLLER_IMAGE built successfully"
 CONTEXT=$(kubectl config current-context)
 if [[ $CONTEXT =~ (kind) ]]; then
     print_step "Loading images to kind cluster..."
-    kind load docker-image $RTMP_IMAGE || {
-        print_error "Failed to load RTMP image to kind cluster"
+    kind load docker-image $PROXY_IMAGE || {
+        print_error "Failed to load proxy image to kind cluster"
+        exit 1
+    }
+    kind load docker-image $WORKER_IMAGE || {
+        print_error "Failed to load worker image to kind cluster"
         exit 1
     }
     kind load docker-image $CONTROLLER_IMAGE || {
@@ -130,7 +140,7 @@ if [[ $CONTEXT =~ (kind) ]]; then
     print_success "Images loaded to kind cluster"
 elif [[ ! $CONTEXT =~ (docker-desktop|localhost|127\.0\.0\.1) ]]; then
     print_warning "Remote/managed cluster detected: $CONTEXT"
-    print_warning "Ensure $RTMP_IMAGE and $CONTROLLER_IMAGE are available in the cluster registry."
+    print_warning "Ensure $PROXY_IMAGE, $WORKER_IMAGE and $CONTROLLER_IMAGE are available in the cluster registry."
     echo -n "Continue with deployment? (y/n): "
     read -r continue_deploy
     if [[ ! $continue_deploy =~ ^[Yy]$ ]]; then
