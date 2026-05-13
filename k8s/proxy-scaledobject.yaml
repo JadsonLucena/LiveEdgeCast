@@ -38,7 +38,23 @@ spec:
           sum(rate(container_network_receive_bytes_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m])) / (1000*1000) or vector(0)
         threshold: "800"  # Scale quando > 800Mbps de tráfego de entrada
     
-    # Secondary Trigger: CPU como safety net (métricas Kubernetes nativas)
+    # Secondary Trigger (Guard rail): saturação média de tráfego por pod
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: rtmp_proxy_avg_inbound_mbps_per_pod
+        query: |
+          (
+            sum(rate(container_network_receive_bytes_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m])) / (1000*1000)
+          )
+          /
+          clamp_min(
+            count(container_memory_working_set_bytes{namespace="media",pod=~"rtmp-proxy-.*"}),
+            1
+          )
+        threshold: "250"  # Scale quando média por pod > 250 Mbps
+
+    # Tertiary Trigger: CPU como safety net (métricas Kubernetes nativas)
     - type: prometheus
       metadata:
         serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
@@ -47,7 +63,7 @@ spec:
           sum(rate(container_cpu_usage_seconds_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m])) / sum(container_spec_cpu_quota{namespace="media",pod=~"rtmp-proxy-.*"}/container_spec_cpu_period{namespace="media",pod=~"rtmp-proxy-.*"}) * 100 or vector(0)
         threshold: "80"  # Safety net: Escala quando CPU > 80%
     
-    # Tertiary Trigger: Memória como safety net adicional (métricas Kubernetes nativas)
+    # Quaternary Trigger: Memória como safety net adicional (métricas Kubernetes nativas)
     - type: prometheus
       metadata:
         serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090

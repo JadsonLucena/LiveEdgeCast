@@ -10,6 +10,6 @@ spec:
     matchLabels:
       app: rtmp-proxy
   endpoints:
-    - port: http
+    - port: metrics
       interval: 10s
       path: /metrics

@@ -3,8 +3,7 @@ kind: Namespace
 metadata:
   name: media
 ---
-# A monitoring namespace already exists and is used by Prometheus
-# apiVersion: v1
-# kind: Namespace
-# metadata:
-#   name: monitoring
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
