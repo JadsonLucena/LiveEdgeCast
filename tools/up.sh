@@ -99,7 +99,7 @@ fi
 # Step 3: Build Docker images
 print_step "Building LiveEdgeCast proxy image..."
 PROXY_IMAGE="liveedgecast-proxy:latest"
-docker build -t $PROXY_IMAGE -f docker/proxy/Dockerfile docker || {
+docker build -t $PROXY_IMAGE -f docker/proxy/Dockerfile docker/proxy || {
     print_error "Failed to build proxy image";
     exit 1;
 }
@@ -107,7 +107,7 @@ print_success "Proxy image $PROXY_IMAGE built successfully"
 
 print_step "Building LiveEdgeCast worker image..."
 WORKER_IMAGE="liveedgecast-worker:latest"
-docker build -t $WORKER_IMAGE -f docker/worker/Dockerfile docker || {
+docker build -t $WORKER_IMAGE -f docker/worker/Dockerfile docker/worker || {
     print_error "Failed to build worker image";
     exit 1;
 }

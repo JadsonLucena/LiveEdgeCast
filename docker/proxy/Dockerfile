@@ -54,8 +54,8 @@ RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
     && mkdir -p /var/log/nginx /scripts /tmp/ffmpeg_pids \
     && chmod 755 /scripts
 
-COPY rtmp/on_publish_start.sh /scripts/on_publish_start.sh
-COPY rtmp/on_publish_done.sh /scripts/on_publish_done.sh
+COPY on_publish_start.sh /scripts/on_publish_start.sh
+COPY on_publish_done.sh /scripts/on_publish_done.sh
 RUN chmod +x /scripts/*.sh
 COPY nginx.conf /etc/nginx/nginx.conf
 

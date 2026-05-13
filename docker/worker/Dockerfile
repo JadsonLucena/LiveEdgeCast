@@ -54,8 +54,8 @@ RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
     && mkdir -p /var/log/nginx /scripts /tmp/ffmpeg_pids \
     && chmod 755 /scripts
 
-COPY rtmp/on_worker_pull_push.sh /scripts/on_worker_pull_push.sh
-COPY rtmp/worker_recovery_loop.sh /scripts/worker_recovery_loop.sh
+COPY on_worker_pull_push.sh /scripts/on_worker_pull_push.sh
+COPY worker_recovery_loop.sh /scripts/worker_recovery_loop.sh
 RUN chmod +x /scripts/*.sh
 COPY nginx.conf /etc/nginx/nginx.conf
 
