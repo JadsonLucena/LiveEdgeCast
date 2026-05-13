@@ -37,7 +37,9 @@ RUN ./configure \
 
 FROM alpine:3.21
 
-RUN apk add --no-cache \
+ENV NGINX_VERSION=1.24.0
+
+RUN apk add --no-cache \\
     ca-certificates \
     openssl \
     pcre2 \
@@ -50,6 +52,7 @@ RUN apk add --no-cache \
     c-ares
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
+COPY --from=builder /tmp/build/nginx-${NGINX_VERSION}/conf/mime.types /etc/nginx/mime.types
 RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
     && mkdir -p /var/log/nginx /scripts /tmp/ffmpeg_pids \
     && chmod 755 /scripts
