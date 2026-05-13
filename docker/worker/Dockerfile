@@ -39,7 +39,7 @@ FROM alpine:3.21
 
 ENV NGINX_VERSION=1.24.0
 
-RUN apk add --no-cache \\
+RUN apk add --no-cache \
     ca-certificates \
     openssl \
     pcre2 \
