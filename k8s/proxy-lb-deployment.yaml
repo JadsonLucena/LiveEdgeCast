@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rtmp-proxy-lb
+  namespace: media
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rtmp-proxy-lb
+  template:
+    metadata:
+      labels:
+        app: rtmp-proxy-lb
+    spec:
+      containers:
+        - name: haproxy
+          image: haproxy:2.9-alpine
+          ports:
+            - name: rtmp
+              containerPort: 1935
+              protocol: TCP
+          volumeMounts:
+            - name: config
+              mountPath: /usr/local/etc/haproxy/haproxy.cfg
+              subPath: haproxy.cfg
+          readinessProbe:
+            tcpSocket:
+              port: 1935
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 1935
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: rtmp-proxy-lb-config

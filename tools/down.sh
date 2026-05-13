@@ -59,6 +59,10 @@ if kubectl get deployment rtmp-proxy -n media >/dev/null 2>&1; then
     kubectl scale deployment/rtmp-proxy --replicas=0 -n media
     print_success "Proxy scaled to 0"
 fi
+if kubectl get deployment rtmp-proxy-lb -n media >/dev/null 2>&1; then
+    kubectl scale deployment/rtmp-proxy-lb --replicas=0 -n media
+    print_success "Proxy LB scaled to 0"
+fi
 
 if kubectl get deployment rtmp-controller -n media >/dev/null 2>&1; then
     kubectl scale deployment/rtmp-controller --replicas=0 -n media
@@ -72,12 +76,14 @@ sleep 3
 print_step "Step 3/7: Deleting Deployments..."
 kubectl delete deployment rtmp-worker -n media 2>/dev/null && print_success "Worker deployment deleted" || print_warning "No Worker deployment found"
 kubectl delete deployment rtmp-proxy -n media 2>/dev/null && print_success "Proxy deployment deleted" || print_warning "No Proxy deployment found"
+kubectl delete deployment rtmp-proxy-lb -n media 2>/dev/null && print_success "Proxy LB deployment deleted" || print_warning "No Proxy LB deployment found"
 kubectl delete deployment rtmp-controller -n media 2>/dev/null && print_success "Controller deployment deleted" || print_warning "No Controller deployment found"
 
 # Wait for deployments to be fully deleted
 print_step "Waiting for all deployments to terminate..."
 kubectl wait --for=delete deployment/rtmp-worker -n media --timeout=60s 2>/dev/null || print_warning "Worker deployment deletion timed out"
 kubectl wait --for=delete deployment/rtmp-proxy -n media --timeout=60s 2>/dev/null || print_warning "Proxy deployment deletion timed out"
+kubectl wait --for=delete deployment/rtmp-proxy-lb -n media --timeout=60s 2>/dev/null || print_warning "Proxy LB deployment deletion timed out"
 kubectl wait --for=delete deployment/rtmp-controller -n media --timeout=60s 2>/dev/null || print_warning "Controller deployment deletion timed out"
 print_success "All deployments terminated"
 
@@ -85,8 +91,10 @@ print_success "All deployments terminated"
 print_step "Step 4/7: Deleting Services..."
 kubectl delete service rtmp-worker -n media 2>/dev/null && print_success "Worker service deleted" || print_warning "No Worker service found"
 kubectl delete service rtmp-proxy -n media 2>/dev/null && print_success "Proxy service deleted" || print_warning "No Proxy service found"
+kubectl delete service rtmp-entry -n media 2>/dev/null && print_success "Proxy entry service deleted" || print_warning "No Proxy entry service found"
 kubectl delete service rtmp-proxy-headless -n media 2>/dev/null && print_success "Proxy headless service deleted" || print_warning "No Proxy headless service found"
 kubectl delete service rtmp-controller -n media 2>/dev/null && print_success "Controller service deleted" || print_warning "No Controller service found"
+kubectl delete configmap rtmp-proxy-lb-config -n media 2>/dev/null && print_success "Proxy LB config deleted" || print_warning "No Proxy LB config found"
 
 # 2.5: Delete ServiceMonitors (Prometheus)
 print_step "Step 5/7: Deleting ServiceMonitors..."
