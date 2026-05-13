@@ -1,0 +1,32 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: liveedgecast-proxy-observability
+  namespace: monitoring
+spec:
+  groups:
+    - name: liveedgecast.proxy.observability
+      interval: 15s
+      rules:
+        - record: liveedgecast:proxy:inbound_mbps_total
+          expr: |
+            sum(rate(container_network_receive_bytes_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m])) / (1000*1000)
+        - record: liveedgecast:proxy:inbound_mbps_avg_per_pod
+          expr: |
+            (
+              sum(rate(container_network_receive_bytes_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m])) / (1000*1000)
+            )
+            /
+            clamp_min(count(container_memory_working_set_bytes{namespace="media",pod=~"rtmp-proxy-.*"}), 1)
+        - record: liveedgecast:proxy:cpu_percent
+          expr: |
+            sum(rate(container_cpu_usage_seconds_total{namespace="media",pod=~"rtmp-proxy-.*"}[1m]))
+            /
+            sum(container_spec_cpu_quota{namespace="media",pod=~"rtmp-proxy-.*"}/container_spec_cpu_period{namespace="media",pod=~"rtmp-proxy-.*"})
+            * 100
+        - record: liveedgecast:proxy:memory_percent
+          expr: |
+            sum(container_memory_working_set_bytes{namespace="media",pod=~"rtmp-proxy-.*"})
+            /
+            sum(container_spec_memory_limit_bytes{namespace="media",pod=~"rtmp-proxy-.*"})
+            * 100
