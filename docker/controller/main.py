@@ -32,7 +32,6 @@ allocation_lock = threading.Lock()
 stream_to_worker: Dict[str, str] = {}
 
 worker_to_stream: Dict[str, str] = {}
-stream_worker_started: Dict[str, bool] = {}
 
 stream_to_proxy: Dict[str, str] = {}
 stream_generation: Dict[str, int] = {}
@@ -229,7 +228,6 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
     stream_to_worker[stream] = new_worker
     worker_to_stream.pop(old_worker, None)
     worker_to_stream[new_worker] = stream
-    stream_worker_started[stream] = True
 
     try:
         core.delete_namespaced_pod(name=old_worker, namespace=NAMESPACE, grace_period_seconds=0)
@@ -385,7 +383,6 @@ async def monitor_stream_registry_health():
                         worker_name = stream_to_worker.pop(stream, None)
                         if worker_name:
                             worker_to_stream.pop(worker_name, None)
-                            stream_worker_started.pop(stream, None)
                             try:
                                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
                             except Exception as e:
@@ -583,7 +580,6 @@ async def monitor_worker_health():
     while True:
         await asyncio.sleep(3)
         to_replace = []
-        pending_to_start = []
 
         with allocation_lock:
             allocations = list(stream_to_worker.items())
@@ -621,7 +617,6 @@ async def monitor_worker_health():
                         continue
 
                     pod_name = pod.metadata.name
-                    pod_ip = pod.status.pod_ip
 
                     cond = {c.type: c.status for c in pod.status.conditions}
                     if cond.get("Ready") != "True":
@@ -642,7 +637,6 @@ async def monitor_worker_health():
                         if owner_proxy:
                             stream_to_proxy[stream] = owner_proxy
 
-                        pending_to_start.append((stream, pod_name, pod_ip))
                         logger.info(
                             f"[PendingAllocation] Allocated worker '{pod_name}' to pending stream '{stream}' "
                             f"(waiting since {time.time() - stream_time:.1f}s)"
@@ -660,7 +654,6 @@ async def monitor_worker_health():
                         continue
                     stream_to_worker.pop(stream, None)
                     worker_to_stream.pop(worker_pod, None)
-                    stream_worker_started.pop(stream, None)
                     streams_pending_allocation.pop(stream, None)
                     logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
                     try:
@@ -668,21 +661,6 @@ async def monitor_worker_health():
                     except Exception as e:
                         logger.warning(f"[WorkerHealth] Failed to delete pod {worker_pod}: {e}")
                 persist_state_locked()
-
-        # Start FFmpeg on newly allocated workers
-        for stream, worker_pod, pod_ip in pending_to_start:
-            try:
-                start_result = _start_worker_impl(
-                    stream=stream,
-                    worker=worker_pod,
-                    generation=stream_generation.get(stream, 1)
-                )
-                logger.info(
-                    f"[PendingAllocation] Started FFmpeg for pending stream '{stream}' on worker '{worker_pod}': "
-                    f"status={start_result.get('status')}"
-                )
-            except Exception as e:
-                logger.error(f"[PendingAllocation] Failed to start FFmpeg for stream '{stream}': {e}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -827,7 +805,6 @@ def allocate_worker(
         pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
         stream_to_worker[stream] = pod_name
         worker_to_stream[pod_name] = stream
-        stream_worker_started[stream] = True
         streams_pending_allocation.pop(stream, None)
         persist_state_locked()
 
@@ -860,7 +837,6 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         
         del stream_to_worker[stream]
         del worker_to_stream[worker_name]
-        stream_worker_started.pop(stream, None)
         
         if stream in stream_to_proxy:
             del stream_to_proxy[stream]
@@ -995,17 +971,10 @@ def stream_started(
     register_stream(stream=stream, proxy_pod=proxy_pod)
     allocation = allocate_worker(stream=stream, proxy_pod=proxy_pod)
 
-    worker_name = allocation.get("name")
-    if worker_name:
-        start_result = _start_worker_impl(stream=stream, worker=worker_name, generation=stream_generation.get(stream, 1))
-    else:
-        start_result = {"status": "pending_allocation"}
-
     return {
         "status": "started_event_processed",
         "stream": stream,
         "allocation": allocation,
-        "worker_start": start_result,
     }
 @app.post("/streams/ended")
 async def stream_ended(
@@ -1142,25 +1111,4 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
     }
 
 
-def _start_worker_impl(stream: str, worker: str, generation: Optional[int] = None):
-    """Legacy endpoint kept for compatibility. Worker now starts automatically from pod entrypoint."""
-    with allocation_lock:
-        allocated_worker = stream_to_worker.get(stream)
-        if allocated_worker and allocated_worker != worker:
-            return {"status": "ignored", "reason": "worker_mismatch", "worker": allocated_worker, "stream": stream}
-        current_generation = stream_generation.get(stream, 1)
-        if generation is not None and generation != current_generation:
-            return {"status": "ignored", "reason": "generation_mismatch", "expected_generation": current_generation}
-        stream_worker_started[stream] = True
-    return {"status": "started", "worker": worker, "stream": stream, "mode": "auto_entrypoint"}
 
-
-@app.post("/start-worker")
-def start_worker_post(stream: str = Query(..., description="Stream name"), worker: str = Query(..., description="Worker pod name"), generation: Optional[int] = Query(None)):
-    return _start_worker_impl(stream=stream, worker=worker, generation=generation)
-
-
-@app.get("/start-worker")
-def start_worker_get(stream: str = Query(..., description="Stream name"), worker: str = Query(..., description="Worker pod name"), generation: Optional[int] = Query(None)):
-    logger.warning("[StartWorker] GET /start-worker is deprecated. Use POST /start-worker.")
-    return _start_worker_impl(stream=stream, worker=worker, generation=generation)
