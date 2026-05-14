@@ -4,12 +4,14 @@ ENV NGINX_VERSION=1.24.0 \
     NGINX_RTMP_MODULE_VERSION=1.2.2
 
 RUN apk add --no-cache \
+    build-base \
     ca-certificates \
-    openssl \
-    pcre2 \
-    zlib \
-    curl \
-    bash
+    openssl-dev \
+    pcre2-dev \
+    zlib-dev \
+    linux-headers \
+    wget \
+    tar
 
 WORKDIR /tmp/build
 RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
