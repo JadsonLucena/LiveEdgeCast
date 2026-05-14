@@ -567,13 +567,17 @@ async def collect_infrastructure_metrics():
 
 
 async def monitor_worker_health():
-    """Controller-driven worker healthcheck every 3s."""
+    """Controller-driven worker healthcheck every 3s + pending allocation retry."""
     while True:
         await asyncio.sleep(3)
         to_replace = []
+        pending_to_start = []
+
         with allocation_lock:
             allocations = list(stream_to_worker.items())
+            pending_streams = list(streams_pending_allocation.keys())
 
+        # Health check for allocated workers
         for stream, worker_pod in allocations:
             healthy = False
             try:
@@ -588,24 +592,85 @@ async def monitor_worker_health():
             if not healthy:
                 to_replace.append((stream, worker_pod))
 
-        if not to_replace:
-            continue
+        # Try to allocate workers for pending streams
+        for stream in pending_streams:
+            with allocation_lock:
+                if stream in stream_to_worker:
+                    continue  # Already allocated
 
-        with allocation_lock:
-            for stream, worker_pod in to_replace:
-                allocated = stream_to_worker.get(stream)
-                if allocated != worker_pod:
-                    continue
-                stream_to_worker.pop(stream, None)
-                worker_to_stream.pop(worker_pod, None)
-                stream_worker_started.pop(stream, None)
-                streams_pending_allocation.pop(stream, None)
-                logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
-                try:
-                    core.delete_namespaced_pod(name=worker_pod, namespace=NAMESPACE, grace_period_seconds=0)
-                except Exception as e:
-                    logger.warning(f"[WorkerHealth] Failed to delete pod {worker_pod}: {e}")
-            persist_state_locked()
+            try:
+                pods = core.list_namespaced_pod(
+                    namespace=NAMESPACE,
+                    label_selector="app=worker"
+                ).items
+
+                for pod in pods:
+                    if not pod.status.conditions:
+                        continue
+
+                    pod_name = pod.metadata.name
+                    pod_ip = pod.status.pod_ip
+
+                    cond = {c.type: c.status for c in pod.status.conditions}
+                    if cond.get("Ready") != "True":
+                        continue
+
+                    with allocation_lock:
+                        if pod_name in worker_to_stream:
+                            continue  # Worker already has a stream
+
+                        # Allocate this worker to the pending stream
+                        stream_time = streams_pending_allocation.get(stream, time.time())
+                        stream_to_worker[stream] = pod_name
+                        worker_to_stream[pod_name] = stream
+                        streams_pending_allocation.pop(stream, None)
+                        persist_state_locked()
+
+                        owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+                        if owner_proxy:
+                            stream_to_proxy[stream] = owner_proxy
+
+                        pending_to_start.append((stream, pod_name, pod_ip))
+                        logger.info(
+                            f"[PendingAllocation] Allocated worker '{pod_name}' to pending stream '{stream}' "
+                            f"(waiting since {time.time() - stream_time:.1f}s)"
+                        )
+                        break
+            except Exception as e:
+                logger.warning(f"[PendingAllocation] Error allocating workers for stream '{stream}': {e}")
+
+        # Handle unhealthy workers
+        if to_replace:
+            with allocation_lock:
+                for stream, worker_pod in to_replace:
+                    allocated = stream_to_worker.get(stream)
+                    if allocated != worker_pod:
+                        continue
+                    stream_to_worker.pop(stream, None)
+                    worker_to_stream.pop(worker_pod, None)
+                    stream_worker_started.pop(stream, None)
+                    streams_pending_allocation.pop(stream, None)
+                    logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
+                    try:
+                        core.delete_namespaced_pod(name=worker_pod, namespace=NAMESPACE, grace_period_seconds=0)
+                    except Exception as e:
+                        logger.warning(f"[WorkerHealth] Failed to delete pod {worker_pod}: {e}")
+                persist_state_locked()
+
+        # Start FFmpeg on newly allocated workers
+        for stream, worker_pod, pod_ip in pending_to_start:
+            try:
+                start_result = _start_worker_impl(
+                    stream=stream,
+                    worker=worker_pod,
+                    generation=stream_generation.get(stream, 1)
+                )
+                logger.info(
+                    f"[PendingAllocation] Started FFmpeg for pending stream '{stream}' on worker '{worker_pod}': "
+                    f"status={start_result.get('status')}"
+                )
+            except Exception as e:
+                logger.error(f"[PendingAllocation] Failed to start FFmpeg for stream '{stream}': {e}")
 
 @app.on_event("startup")
 async def startup_event():
