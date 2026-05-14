@@ -221,6 +221,30 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
     )
     core.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
     return pod_name
+
+
+def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optional[str]:
+    """Recria o worker da stream para aplicar novo PROXY_DNS (env imutável em Pod existente)."""
+    old_worker = stream_to_worker.get(stream)
+    if not old_worker:
+        return None
+
+    new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
+    stream_to_worker[stream] = new_worker
+    worker_to_stream.pop(old_worker, None)
+    worker_to_stream[new_worker] = stream
+    stream_worker_started[stream] = True
+
+    try:
+        core.delete_namespaced_pod(name=old_worker, namespace=NAMESPACE, grace_period_seconds=0)
+    except ApiException as e:
+        logger.warning(f"[Handover] Failed deleting old worker pod {old_worker}: {e}")
+
+    logger.info(
+        f"[Handover] Replaced worker pod for stream '{stream}' due to proxy change: "
+        f"old='{old_worker}' new='{new_worker}' proxy_dns='{proxy_dns}'"
+    )
+    return new_worker
 def cleanup_expired_streams() -> None:
     """
     Removes expired streams from the ephemeral registry.
@@ -293,6 +317,13 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
         )
         stream_generation[stream] = stream_generation.get(stream, 1) + 1
         register_or_refresh_stream(stream, candidate_proxy_pod)
+
+        # PROXY_DNS é env de Pod; para atualizar em reconexão/handover, recria o worker.
+        proxy_ip = get_proxy_pod_ip(candidate_proxy_pod)
+        proxy_dns = proxy_ip if proxy_ip else "proxy.media.svc.cluster.local"
+        if stream in stream_to_worker:
+            replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
+
         handover_success_total.labels(stream=stream).inc()
         stream_proxy_handover_counter.labels(stream=stream).inc()
         return True
