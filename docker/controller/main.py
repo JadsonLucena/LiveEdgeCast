@@ -595,11 +595,35 @@ async def monitor_worker_health():
                     allocated = stream_to_worker.get(stream)
                     if allocated != worker_pod:
                         continue
-                    stream_to_worker.pop(stream, None)
                     worker_to_stream.pop(worker_pod, None)
                     worker_ready_since.pop(worker_pod, None)
-                    streams_pending_allocation.pop(stream, None)
-                    logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
+                    logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing quickly.")
+
+                    owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+                    if owner_proxy:
+                        try:
+                            proxy_address = resolve_proxy_address(owner_proxy)
+                            new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
+                            stream_to_worker[stream] = new_worker
+                            worker_to_stream[new_worker] = stream
+                            logger.info(
+                                f"[WorkerHealth] Recreated worker for active stream '{stream}': "
+                                f"old='{worker_pod}' new='{new_worker}' proxy='{owner_proxy}'"
+                            )
+                        except Exception as e:
+                            stream_to_worker.pop(stream, None)
+                            streams_pending_allocation.pop(stream, None)
+                            logger.warning(
+                                f"[WorkerHealth] Failed to recreate worker for stream '{stream}'. "
+                                f"Stream will wait for a new allocation trigger. Error: {e}"
+                            )
+                    else:
+                        stream_to_worker.pop(stream, None)
+                        streams_pending_allocation.pop(stream, None)
+                        logger.info(
+                            f"[WorkerHealth] Stream '{stream}' has no active proxy owner. "
+                            "Worker mapping removed."
+                        )
                     try:
                         core.delete_namespaced_pod(name=worker_pod, namespace=NAMESPACE, grace_period_seconds=0)
                     except Exception as e:
