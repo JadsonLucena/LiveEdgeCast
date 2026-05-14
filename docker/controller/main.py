@@ -53,6 +53,7 @@ WORKER_READY_HEALTH_DELAY_SECONDS = 3
 STREAM_TTL_SECONDS = 180
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
+proxy_ready_since: Dict[str, float] = {}
 
 STATE_CONFIGMAP_NAME = "controller-state"
 STATE_CONFIGMAP_KEY = "state.json"
@@ -392,6 +393,7 @@ async def monitor_stream_registry_health():
                                 logger.warning(f"[ProxyHealth] Failed deleting worker {worker_name}: {e}")
                     
                     proxy_health_failures.pop(proxy_pod, None)
+                    proxy_ready_since.pop(proxy_pod, None)
 
     while True:
         await asyncio.sleep(PROXY_HEALTHCHECK_INTERVAL_SECONDS)
@@ -420,8 +422,22 @@ def resolve_proxy_address(proxy_pod: Optional[str]) -> str:
 
 
 def check_proxy_health(proxy_pod: str) -> bool:
-    target = resolve_proxy_address(proxy_pod)
     try:
+        pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
+        ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
+        if not ready:
+            proxy_ready_since.pop(proxy_pod, None)
+            return False
+
+        now = time.time()
+        first_ready_at = proxy_ready_since.get(proxy_pod)
+        if first_ready_at is None:
+            proxy_ready_since[proxy_pod] = now
+            return False
+        if (now - first_ready_at) < WORKER_READY_HEALTH_DELAY_SECONDS:
+            return False
+
+        target = resolve_proxy_address(proxy_pod)
         response = requests.get(f"http://{target}:8080/health", timeout=PROXY_HEALTHCHECK_TIMEOUT_SECONDS)
         return response.status_code == 200
     except Exception:
