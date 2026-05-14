@@ -25,8 +25,6 @@ app = FastAPI()
 NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
 WORKER_SERVICE = "worker"
-WORKER_IMAGE = "liveedgecast-worker:latest"
-WORKER_RTMP_PUSH_BASE_URL = "rtmp://a.rtmp.youtube.com/live2"
 SCALE_DOWN_DELAY = 180
 
 allocation_lock = threading.Lock()
@@ -188,37 +186,35 @@ def random_suffix():
 
 
 def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
+    """
+    Cria Pod por stream reaproveitando o template do worker Deployment.
+    Apenas STREAM_KEY e PROXY_DNS são injetados dinamicamente.
+    """
     pod_name = f"worker-{stream.lower().replace('_','-')[:40]}-{random_suffix()}"
+
+    deployment = apps.read_namespaced_deployment(name=WORKER_DEPLOYMENT, namespace=NAMESPACE)
+    template = deployment.spec.template
+    if not template or not template.spec or not template.spec.containers:
+        raise RuntimeError("worker deployment template is invalid or has no containers")
+
+    pod_spec = template.spec
+    pod_spec.restart_policy = "Always"
+
+    for c in pod_spec.containers:
+        env = list(c.env or [])
+        env = [e for e in env if e.name not in ("STREAM_KEY", "PROXY_DNS")]
+        env.append(client.V1EnvVar(name="STREAM_KEY", value=stream))
+        env.append(client.V1EnvVar(name="PROXY_DNS", value=proxy_dns))
+        c.env = env
+
+    labels = dict(template.metadata.labels or {}) if template.metadata else {}
+    labels.update({"app": "worker", "stream": stream})
+
     pod_manifest = client.V1Pod(
-        metadata=client.V1ObjectMeta(
-            name=pod_name,
-            namespace=NAMESPACE,
-            labels={"app": "worker", "stream": stream}
-        ),
-        spec=client.V1PodSpec(
-            restart_policy="Always",
-            containers=[
-                client.V1Container(
-                    name="rtmp",
-                    image=WORKER_IMAGE,
-                    image_pull_policy="Never",
-                    env=[
-                        client.V1EnvVar(name="RTMP_PUSH_BASE_URL", value=WORKER_RTMP_PUSH_BASE_URL),
-                        client.V1EnvVar(name="STREAM_KEY", value=stream),
-                        client.V1EnvVar(name="PROXY_DNS", value=proxy_dns),
-                    ],
-                    ports=[
-                        client.V1ContainerPort(container_port=1935, name="rtmp", protocol="TCP"),
-                        client.V1ContainerPort(container_port=8080, name="http", protocol="TCP"),
-                    ],
-                    resources=client.V1ResourceRequirements(
-                        requests={"memory": "256Mi", "cpu": "250m"},
-                        limits={"memory": "1Gi", "cpu": "1000m"},
-                    ),
-                )
-            ],
-        ),
+        metadata=client.V1ObjectMeta(name=pod_name, namespace=NAMESPACE, labels=labels),
+        spec=pod_spec,
     )
+
     core.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
     return pod_name
 
