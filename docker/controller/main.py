@@ -26,6 +26,7 @@ NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
 WORKER_SERVICE = "worker"
 PROXY_SERVICE_DNS = "proxy.media.svc.cluster.local"
+PROXY_HEADLESS_SERVICE = "proxy-headless"
 SCALE_DOWN_DELAY = 180
 
 allocation_lock = threading.Lock()
@@ -417,7 +418,9 @@ def get_proxy_pod_ip(proxy_pod: str) -> str:
 
 
 def resolve_proxy_address(proxy_pod: Optional[str]) -> str:
-    """Retorna endereço DNS estável para workers (evita IP efêmero de Pod)."""
+    """Retorna DNS específico do pod proxy (via service headless) quando disponível."""
+    if proxy_pod:
+        return f"{proxy_pod}.{PROXY_HEADLESS_SERVICE}.{NAMESPACE}.svc.cluster.local"
     return PROXY_SERVICE_DNS
 
 
