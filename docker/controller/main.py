@@ -49,6 +49,7 @@ PROXY_HEALTHCHECK_MAX_FAILURES = 3
 PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
 PROXY_HEALTHCHECK_MAX_CONCURRENCY = 20
 PROXY_HEALTHCHECK_JITTER_SECONDS = 1.5
+WORKER_STARTUP_GRACE_SECONDS = 20
 STREAM_TTL_SECONDS = 180
 proxy_health_failures: Dict[str, int] = {}
 
@@ -592,6 +593,13 @@ async def monitor_worker_health():
             healthy = False
             try:
                 pod = core.read_namespaced_pod(name=worker_pod, namespace=NAMESPACE)
+                created_at = pod.metadata.creation_timestamp.timestamp() if pod.metadata and pod.metadata.creation_timestamp else None
+                if created_at and (time.time() - created_at) < WORKER_STARTUP_GRACE_SECONDS:
+                    logger.debug(
+                        f"[WorkerHealth] Skipping healthcheck for '{worker_pod}' during startup grace "
+                        f"({time.time() - created_at:.1f}s/{WORKER_STARTUP_GRACE_SECONDS}s)"
+                    )
+                    continue
                 ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
                 healthy = ready and check_worker_health(worker_pod, pod.status.pod_ip)
             except Exception:
@@ -1043,4 +1051,3 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
         "proxyPod": proxy_pod,
         "generation": stream_generation.get(stream, 1)
     }
-
