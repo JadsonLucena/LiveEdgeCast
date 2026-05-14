@@ -718,7 +718,6 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/allocate")
 def allocate_worker(
     stream: str = Query(..., description="Stream name"),
     proxy_pod: str = Query(None, description="Proxy pod name for pull-only architecture")
@@ -787,7 +786,6 @@ def allocate_worker(
         return {"pod": worker_dns, "name": pod_name, "proxy": proxy_address, "worker": pod_name, "status": "created"}
 
 
-@app.post("/release")
 async def release_worker(stream: str = Query(..., description="Stream name to release")):
     """
     Libera worker alocado para uma stream.
@@ -846,7 +844,6 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         }
 
 
-@app.post("/streams/register")
 def register_stream(
     stream: str = Query(..., description="Stream name"),
     proxy_pod: str = Query(..., description="Proxy pod name")
@@ -872,7 +869,6 @@ def register_stream(
         }
 
 
-@app.post("/streams/heartbeat")
 def heartbeat_stream(
     stream: str = Query(..., description="Stream name"),
     proxy_pod: str = Query(..., description="Proxy pod name")
@@ -880,7 +876,6 @@ def heartbeat_stream(
     raise HTTPException(status_code=410, detail="heartbeat disabled: controller performs healthchecks")
 
 
-@app.get("/streams/resolve")
 def resolve_stream(stream: str = Query(..., description="Stream name")):
     proxy_pod = None
     expires_at = None
@@ -907,7 +902,6 @@ def resolve_stream(stream: str = Query(..., description="Stream name")):
     }
 
 
-@app.post("/streams/release")
 def release_stream_registry(
     stream: str = Query(..., description="Stream name"),
     proxy_pod: str = Query(None, description="Proxy pod name")
@@ -1051,7 +1045,6 @@ def debug_streams():
     return result
 
 
-@app.get("/stream-key")
 def get_stream_key(stream: str = Query(..., description="Stream name")):
     """
     Retorna a chave do YouTube E proxy DNS para uma stream específica.
