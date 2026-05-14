@@ -12,11 +12,11 @@ log() {
 log "Starting worker stream runner for stream '$STREAM_NAME'"
 
 YOUTUBE_KEY="$STREAM_NAME"
-RTMP_PUSH_BASE_URL="${RTMP_PUSH_BASE_URL:-rtmp://a.rtmp.youtube.com/live2}"
+RTMP_PUSH_BASE_URL="${RTMP_PUSH_BASE_URL:-}"
 PROXY_ADDR="${PROXY_DNS:-}"
 
-if [ -z "$PROXY_ADDR" ] || [ -z "$YOUTUBE_KEY" ]; then
-  log "Missing required startup args (PROXY_DNS/STREAM_KEY). Crashing worker."
+if [ -z "$PROXY_ADDR" ] || [ -z "$YOUTUBE_KEY" ] || [ -z "$RTMP_PUSH_BASE_URL" ]; then
+  log "Missing required startup args (PROXY_DNS/STREAM_KEY/RTMP_PUSH_BASE_URL). Crashing worker."
   exit 1
 fi
 
