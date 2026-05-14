@@ -25,6 +25,7 @@ app = FastAPI()
 NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
 WORKER_SERVICE = "worker"
+PROXY_SERVICE_DNS = "proxy.media.svc.cluster.local"
 SCALE_DOWN_DELAY = 180
 
 allocation_lock = threading.Lock()
@@ -313,8 +314,7 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
         register_or_refresh_stream(stream, candidate_proxy_pod)
 
         # PROXY_DNS é env de Pod; para atualizar em reconexão/handover, recria o worker.
-        proxy_ip = get_proxy_pod_ip(candidate_proxy_pod)
-        proxy_dns = proxy_ip if proxy_ip else "proxy.media.svc.cluster.local"
+        proxy_dns = resolve_proxy_address(candidate_proxy_pod)
         if stream in stream_to_worker:
             replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
 
@@ -416,6 +416,11 @@ def get_proxy_pod_ip(proxy_pod: str) -> str:
         return None
 
 
+
+
+def resolve_proxy_address(proxy_pod: Optional[str]) -> str:
+    """Retorna endereço DNS estável para workers (evita IP efêmero de Pod)."""
+    return PROXY_SERVICE_DNS
 def check_worker_metrics(pod_name: str, pod_ip: Optional[str] = None) -> int:
     """
     Verifica métricas RTMP do worker para determinar se está ocupado.
@@ -597,8 +602,7 @@ async def monitor_worker_health():
                 pod = core.read_namespaced_pod(name=worker_pod, namespace=NAMESPACE)
                 pod_ip = pod.status.pod_ip
                 ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
-                nclients = check_worker_metrics(worker_pod, pod_ip)
-                healthy = ready and nclients > 0
+                healthy = ready
             except Exception:
                 healthy = False
 
@@ -731,8 +735,7 @@ def allocate_worker(
             existing_worker = stream_to_worker[stream]
             
             owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-            proxy_ip = get_proxy_pod_ip(owner_proxy) if owner_proxy else None
-            proxy_address = proxy_ip if proxy_ip else "proxy.media.svc.cluster.local"
+            proxy_address = resolve_proxy_address(owner_proxy)
             
             logger.info(f"[Allocate] Stream '{stream}' already has worker: {existing_worker} - Proxy: {proxy_address}")
             return {
@@ -788,8 +791,7 @@ def allocate_worker(
             worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
             
             owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-            proxy_ip = get_proxy_pod_ip(owner_proxy) if owner_proxy else None
-            proxy_address = proxy_ip if proxy_ip else "proxy.media.svc.cluster.local"
+            proxy_address = resolve_proxy_address(owner_proxy)
             
             logger.info(f"[Allocate] Allocated worker {pod_name} (DNS: {worker_dns}) for stream '{stream}' - Proxy: {proxy_address}")
             stream_assignment_info.labels(stream=stream, proxy_pod=owner_proxy or "unknown", worker_pod=pod_name, generation=str(stream_generation.get(stream,1))).set(1)
@@ -804,8 +806,7 @@ def allocate_worker(
             }
 
         owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-        proxy_ip = get_proxy_pod_ip(owner_proxy) if owner_proxy else None
-        proxy_address = proxy_ip if proxy_ip else "proxy.media.svc.cluster.local"
+        proxy_address = resolve_proxy_address(owner_proxy)
 
         pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
         stream_to_worker[stream] = pod_name
@@ -925,15 +926,12 @@ def resolve_stream(stream: str = Query(..., description="Stream name")):
         proxy_pod = entry.get("proxy_pod")
         expires_at = entry.get("expires_at")
 
-    proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
-
-    if not proxy_ip:
-        raise HTTPException(status_code=404, detail=f"proxy for stream '{stream}' unavailable")
+    proxy_address = resolve_proxy_address(proxy_pod)
 
     return {
         "stream": stream,
         "proxyPod": proxy_pod,
-        "proxyAddress": proxy_ip,
+        "proxyAddress": proxy_address,
         "expiresAt": expires_at
     }
 
@@ -1100,17 +1098,14 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
     with allocation_lock:
         cleanup_expired_streams()
         proxy_pod = stream_to_proxy.get(stream)
-        proxy_ip = get_proxy_pod_ip(proxy_pod) if proxy_pod else None
-    
-    if not proxy_ip:
-        raise HTTPException(status_code=404, detail=f"stream '{stream}' has no active proxy")
-    
-    logger.debug(f"[StreamKey] Returning info for stream '{stream}': YouTube={youtube_key}, Proxy={proxy_ip}")
+        proxy_address = resolve_proxy_address(proxy_pod)
+
+    logger.debug(f"[StreamKey] Returning info for stream '{stream}': YouTube={youtube_key}, Proxy={proxy_address}")
     
     return {
         "stream": stream,
         "youtubeKey": youtube_key,
-        "proxyDns": proxy_ip,
+        "proxyDns": proxy_address,
         "proxyPod": proxy_pod,
         "generation": stream_generation.get(stream, 1)
     }
