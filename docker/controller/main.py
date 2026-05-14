@@ -406,16 +406,6 @@ async def monitor_stream_registry_health():
             await asyncio.gather(*(run_proxy_check(proxy_pod) for proxy_pod in proxies))
 
 
-def get_proxy_pod_ip(proxy_pod: str) -> str:
-    """Compat helper (legacy)."""
-    try:
-        pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
-        return pod.status.pod_ip
-    except Exception as e:
-        logger.error(f"[ProxyIP] Failed to get IP for {proxy_pod}: {e}")
-        return None
-
-
 def resolve_proxy_address(proxy_pod: str) -> str:
     """Retorna DNS específico do pod proxy (via service headless)."""
     if not proxy_pod:
