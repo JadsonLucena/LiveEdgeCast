@@ -9,6 +9,7 @@ import time
 import logging
 import asyncio
 import json
+import os
 from typing import Dict, Optional
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from fastapi.responses import Response
@@ -1146,13 +1147,16 @@ def _start_worker_impl(stream: str, worker: str, generation: Optional[int] = Non
         if not proxy_dns:
             return {"status": "error", "error": "missing_proxy_dns"}
 
+        target_rtmp_base = os.getenv("RTMP_PUSH_BASE_URL", "rtmp://a.rtmp.youtube.com/live2")
+
         cmd = [
             "kubectl", "exec", "-n", NAMESPACE, worker, "--",
             "env",
             f"STREAM_KEY={stream}",
             f"STREAM_GENERATION={stream_generation.get(stream, 1)}",
             f"PROXY_DNS={proxy_dns}",
-            "/scripts/worker_stream_runner.sh", stream
+            f"RTMP_PUSH_BASE_URL={target_rtmp_base}",
+            "/scripts/worker_stream_runner.sh"
         ]
         mark("kubectl_exec_spawn")
         result = subprocess.run(
