@@ -63,9 +63,6 @@ stream_start_time: Dict[str, float] = {}
 stream_interruptions: Dict[str, int] = {}
 stream_downtime: Dict[str, float] = {}
 
-recovery_attempts: Dict[str, int] = {}
-recovery_successes: Dict[str, int] = {}
-
 metrics_collection_task: Optional[asyncio.Task] = None
 
 stream_delivery_errors = Counter('stream_delivery_errors_total','Total delivery errors to YouTube',['reason'])
@@ -79,11 +76,6 @@ stream_interruptions_counter = Counter('stream_interruptions_total','Total numbe
 stream_downtime_gauge = Gauge('stream_downtime_total_seconds','Total accumulated downtime in seconds',['stream'])
 stream_current_downtime = Gauge('stream_current_downtime_seconds','Current downtime if stream is down, 0 otherwise',['stream'])
 ffmpeg_restart_counter = Counter('ffmpeg_restart_total','Total FFmpeg process restarts',['stream'])
-recovery_attempt_counter = Counter('recovery_attempt_total','Total recovery attempts',['stream'])
-recovery_successful_counter = Counter('recovery_successful_total','Successful recovery attempts',['stream'])
-recovery_time_histogram = Histogram('recovery_time_seconds','Time taken to recover from failure',['stream'],buckets=(1,2,5,10,15,20,30,60))
-recovery_success_rate = Gauge('recovery_success_rate','Success rate of recovery (0-1)',['stream'])
-ffmpeg_exit_code_counter = Counter('ffmpeg_exit_code','FFmpeg exit codes',['stream','code'])
 ffmpeg_process_running = Gauge('ffmpeg_process_running','Is FFmpeg currently running (0 or 1)',['stream'])
 stream_last_error_reason_gauge = Gauge('stream_last_error_reason','Last error reason code',['stream'])
 pod_cpu_usage_percent = Gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',['pod','namespace'])
@@ -498,8 +490,6 @@ def record_stream_start(stream: str):
     stream_start_time[stream] = now
     stream_interruptions[stream] = 0
     stream_downtime[stream] = 0.0
-    recovery_attempts[stream] = 0
-    recovery_successes[stream] = 0
     stream_start_timestamp.labels(stream=stream).set(now)
     stream_uptime.labels(stream=stream).set(0)
     stream_downtime_gauge.labels(stream=stream).set(0)
@@ -521,19 +511,6 @@ def update_stream_uptime(stream: str):
 def record_interruption(stream: str):
     stream_interruptions[stream] = stream_interruptions.get(stream, 0) + 1
     stream_interruptions_counter.labels(stream=stream).inc()
-
-def record_recovery_attempt(stream: str, success: bool, recovery_time_sec: float, exit_code: int = 0):
-    recovery_attempts[stream] = recovery_attempts.get(stream, 0) + 1
-    recovery_attempt_counter.labels(stream=stream).inc()
-    ffmpeg_restart_counter.labels(stream=stream).inc()
-    ffmpeg_exit_code_counter.labels(stream=stream, code=str(exit_code)).inc()
-    if success:
-        recovery_successes[stream] = recovery_successes.get(stream, 0) + 1
-        recovery_successful_counter.labels(stream=stream).inc()
-        recovery_time_histogram.labels(stream=stream).observe(recovery_time_sec)
-    attempts = recovery_attempts.get(stream, 0)
-    if attempts:
-        recovery_success_rate.labels(stream=stream).set(recovery_successes.get(stream, 0) / attempts)
 
 def get_pod_metrics(pod_name: str, namespace: str) -> dict:
     try:
@@ -1020,10 +997,6 @@ def report_delivery_status(
         persist_state_locked()
     return {'acknowledged': True, 'status': status}
 
-@app.post('/streams/recovery-report')
-def report_recovery(stream: str = Query(...), success: bool = Query(...), recovery_time: float = Query(...), exit_code: int = Query(0)):
-    record_recovery_attempt(stream, success, recovery_time, exit_code)
-    return {'acknowledged': True}
 
 @app.get('/metrics')
 def metrics():
@@ -1039,8 +1012,6 @@ def debug_streams():
                 'status': 'unknown',
                 'uptime_seconds': time.time() - start if start else 0,
                 'interruptions': stream_interruptions.get(stream, 0),
-                'recovery_attempts': recovery_attempts.get(stream, 0),
-                'recovery_successes': recovery_successes.get(stream, 0),
             }
     return result
 
