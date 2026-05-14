@@ -1159,7 +1159,7 @@ def _start_worker_impl(stream: str, worker: str, generation: Optional[int] = Non
             cmd,
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=15
         )
         mark("kubectl_exec_finished")
         
