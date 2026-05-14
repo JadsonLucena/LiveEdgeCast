@@ -20,7 +20,7 @@ sequenceDiagram
     alt Worker já alocado para streamX
         A-->>S: { pod: worker-abc..., status: "existing" }
     else Nenhum worker disponível
-        A->>A: list pods app=rtmp-worker (Ready & idle)
+        A->>A: list pods app=worker (Ready & idle)
         alt Há worker Ready & idle
             A-->>S: { pod: worker-xyz..., status: "allocated" }
         else Nenhum worker Ready

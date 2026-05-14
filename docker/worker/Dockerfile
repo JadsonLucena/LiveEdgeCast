@@ -4,14 +4,12 @@ ENV NGINX_VERSION=1.24.0 \
     NGINX_RTMP_MODULE_VERSION=1.2.2
 
 RUN apk add --no-cache \
-    build-base \
     ca-certificates \
-    openssl-dev \
-    pcre2-dev \
-    zlib-dev \
-    linux-headers \
-    wget \
-    tar
+    openssl \
+    pcre2 \
+    zlib \
+    ffmpeg \
+    bash
 
 WORKDIR /tmp/build
 RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
@@ -45,20 +43,15 @@ RUN apk add --no-cache \
     pcre2 \
     zlib \
     ffmpeg \
-    curl \
-    jq \
-    bash \
-    bind-tools \
-    c-ares
+    bash
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
 COPY --from=builder /tmp/build/nginx-${NGINX_VERSION}/conf/mime.types /etc/nginx/mime.types
 RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
-    && mkdir -p /var/log/nginx /scripts /tmp/ffmpeg_pids \
+    && mkdir -p /var/log/nginx /scripts \
     && chmod 755 /scripts
 
-COPY on_worker_pull_push.sh /scripts/on_worker_pull_push.sh
-COPY worker_recovery_loop.sh /scripts/worker_recovery_loop.sh
+COPY worker_stream_runner.sh /scripts/worker_stream_runner.sh
 RUN chmod +x /scripts/*.sh
 COPY nginx.conf /etc/nginx/nginx.conf
 

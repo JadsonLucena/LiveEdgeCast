@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: rtmp-controller
+  name: controller
   namespace: media
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: rtmp-controller-role
+  name: controller-role
   namespace: media
 rules:
   - apiGroups: [""]
@@ -29,13 +29,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: rtmp-controller-binding
+  name: controller-binding
   namespace: media
 subjects:
   - kind: ServiceAccount
-    name: rtmp-controller
+    name: controller
     namespace: media
 roleRef:
   kind: Role
-  name: rtmp-controller-role
+  name: controller-role
   apiGroup: rbac.authorization.k8s.io

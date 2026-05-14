@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: rtmp-proxy
+  name: proxy
   namespace: media
   labels:
-    app: rtmp-proxy
+    app: proxy
 spec:
   type: ClusterIP
-  selector: { app: rtmp-proxy }
+  selector: { app: proxy }
   sessionAffinity: None
   ports:
     - name: rtmp
@@ -23,18 +23,16 @@ spec:
       targetPort: 9113
       protocol: TCP
 ---
-# Headless Service for Pull-Only Architecture
-# Enables pod-specific DNS: <pod-name>.rtmp-proxy-headless.media.svc.cluster.local
 apiVersion: v1
 kind: Service
 metadata:
-  name: rtmp-proxy-headless
+  name: proxy-headless
   namespace: media
   labels:
-    app: rtmp-proxy
+    app: proxy
 spec:
-  clusterIP: None  # Headless Service
-  selector: { app: rtmp-proxy }
+  clusterIP: None
+  selector: { app: proxy }
   ports:
     - name: rtmp
       port: 1935

@@ -1,17 +1,17 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rtmp-proxy-lb
+  name: proxy-lb
   namespace: media
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: rtmp-proxy-lb
+      app: proxy-lb
   template:
     metadata:
       labels:
-        app: rtmp-proxy-lb
+        app: proxy-lb
     spec:
       containers:
         - name: haproxy
@@ -37,4 +37,4 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: rtmp-proxy-lb-config
+            name: proxy-lb-config

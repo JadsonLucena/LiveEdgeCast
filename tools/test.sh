@@ -3,9 +3,9 @@
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-media}"
-CONTROLLER_DEPLOYMENT="${CONTROLLER_DEPLOYMENT:-rtmp-controller}"
-PROXY_SELECTOR="${PROXY_SELECTOR:-app=rtmp-proxy}"
-WORKER_SELECTOR="${WORKER_SELECTOR:-app=rtmp-worker}"
+CONTROLLER_DEPLOYMENT="${CONTROLLER_DEPLOYMENT:-controller}"
+PROXY_SELECTOR="${PROXY_SELECTOR:-app=proxy}"
+WORKER_SELECTOR="${WORKER_SELECTOR:-app=worker}"
 STREAM_NAME="${STREAM_NAME:-}"
 SINCE="${SINCE:-10m}"
 TAIL_LINES="${TAIL_LINES:-120}"
@@ -197,7 +197,7 @@ kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR"
 kubectl get deploy -n "$NAMESPACE" "$CONTROLLER_DEPLOYMENT"
 
 WORKER_COUNT="$(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-WORKER_DESIRED="$(kubectl get deploy -n "$NAMESPACE" rtmp-worker -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "unknown")"
+WORKER_DESIRED="$(kubectl get deploy -n "$NAMESPACE" worker -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "unknown")"
 
 if [[ "$WORKER_COUNT" == "0" ]]; then
   echo ""
@@ -206,12 +206,12 @@ if [[ "$WORKER_COUNT" == "0" ]]; then
 
   echo ""
   echo "--- Worker deployment status (replicas/conditions) ---"
-  kubectl get deploy -n "$NAMESPACE" rtmp-worker -o wide 2>/dev/null || yellow "WARN: deployment/rtmp-worker not found"
+  kubectl get deploy -n "$NAMESPACE" worker -o wide 2>/dev/null || yellow "WARN: deployment/worker not found"
   if [[ "$VERBOSE" == "1" ]]; then
-    kubectl describe deploy -n "$NAMESPACE" rtmp-worker 2>/dev/null | tail -n 120 || true
+    kubectl describe deploy -n "$NAMESPACE" worker 2>/dev/null | tail -n 120 || true
   fi
   if [[ "$WORKER_DESIRED" == "0" ]]; then
-    yellow "DIAG: deployment/rtmp-worker está com spec.replicas=0. O worker não foi solicitado para escalar ainda."
+    yellow "DIAG: deployment/worker está com spec.replicas=0. O worker não foi solicitado para escalar ainda."
     yellow "DIAG: provável causa -> fluxo de alocação não chegou ao controller (/allocate) para essa stream."
   fi
 
@@ -222,34 +222,34 @@ if [[ "$WORKER_COUNT" == "0" ]]; then
 
   echo ""
   echo "--- Recent namespace events (worker/controller/proxy) ---"
-  kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 120 | filter_stream "worker|rtmp-worker|controller|proxy|Failed|Warning|BackOff|Insufficient|Forbidden|Error"
+  kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 120 | filter_stream "worker|worker|controller|proxy|Failed|Warning|BackOff|Insufficient|Forbidden|Error"
 fi
 
 echo ""
 echo "=== Proxy -> Controller path diagnostics ==="
 echo "--- Controller service and endpoints ---"
-kubectl get svc -n "$NAMESPACE" rtmp-controller -o wide 2>/dev/null || yellow "WARN: service/rtmp-controller not found"
-kubectl get endpoints -n "$NAMESPACE" rtmp-controller -o wide 2>/dev/null || yellow "WARN: endpoints/rtmp-controller not found"
+kubectl get svc -n "$NAMESPACE" controller -o wide 2>/dev/null || yellow "WARN: service/controller not found"
+kubectl get endpoints -n "$NAMESPACE" controller -o wide 2>/dev/null || yellow "WARN: endpoints/controller not found"
 
 echo ""
 echo "--- Proxy deployment env (controller-related) ---"
   if [[ "$VERBOSE" == "1" ]]; then
-    kubectl get deploy -n "$NAMESPACE" rtmp-proxy -o yaml 2>/dev/null | filter_stream "name:|value:|controller|api|rtmp-controller|publish|hook"
+    kubectl get deploy -n "$NAMESPACE" proxy -o yaml 2>/dev/null | filter_stream "name:|value:|controller|api|controller|publish|hook"
   else
-    kubectl get deploy -n "$NAMESPACE" rtmp-proxy -o jsonpath='{range .spec.template.spec.containers[*].env[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null | filter_stream "controller|api|rtmp|publish|hook"
+    kubectl get deploy -n "$NAMESPACE" proxy -o jsonpath='{range .spec.template.spec.containers[*].env[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null | filter_stream "controller|api|rtmp|publish|hook"
   fi
 
 PROXY_POD_FOR_NET="$(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
 if [[ -n "$PROXY_POD_FOR_NET" ]]; then
   echo ""
   echo "--- In-proxy connectivity checks to controller ---"
-  check_warn "proxy resolves controller service DNS" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "getent hosts rtmp-controller.${NAMESPACE}.svc.cluster.local >/dev/null 2>&1 || nslookup rtmp-controller.${NAMESPACE}.svc.cluster.local >/dev/null 2>&1"
-  check_warn "proxy reaches controller /health" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://rtmp-controller.${NAMESPACE}.svc.cluster.local:8000/health; elif command -v wget >/dev/null 2>&1; then wget -qO- http://rtmp-controller.${NAMESPACE}.svc.cluster.local:8000/health; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'ok'"
+  check_warn "proxy resolves controller service DNS" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "getent hosts controller.${NAMESPACE}.svc.cluster.local >/dev/null 2>&1 || nslookup controller.${NAMESPACE}.svc.cluster.local >/dev/null 2>&1"
+  check_warn "proxy reaches controller /health" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://controller.${NAMESPACE}.svc.cluster.local:8000/health; elif command -v wget >/dev/null 2>&1; then wget -qO- http://controller.${NAMESPACE}.svc.cluster.local:8000/health; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'ok'"
   check_warn "proxy nginx has on_publish hooks" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "grep -Ein 'on_publish|on_publish_done|exec_publish' /etc/nginx/nginx.conf"
   check_warn "proxy has curl and jq for publish hooks" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1"
-  check_warn "on_publish_start script targets current namespace controller" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "grep -En 'CONTROLLER_API=' /scripts/on_publish_start.sh | grep -Eq 'rtmp-controller\\.${NAMESPACE}\\.svc\\.cluster\\.local|rtmp-controller\\.media\\.svc\\.cluster\\.local'"
+  check_warn "on_publish_start script targets current namespace controller" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "grep -En 'CONTROLLER_API=' /scripts/on_publish_start.sh | grep -Eq 'controller\\.${NAMESPACE}\\.svc\\.cluster\\.local|controller\\.media\\.svc\\.cluster\\.local'"
   if [[ -n "$STREAM_NAME" ]]; then
-    check_warn "manual allocate probe from proxy (stream)" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "PROXY_POD=\$(hostname); curl -sS -o /tmp/alloc_probe_${STREAM_NAME}.json -w '%{http_code}' \"http://rtmp-controller.${NAMESPACE}.svc.cluster.local:8000/allocate?stream=${STREAM_NAME}&proxy_pod=\$PROXY_POD\" | grep -Eq '200'"
+    check_warn "manual allocate probe from proxy (stream)" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "PROXY_POD=\$(hostname); curl -sS -o /tmp/alloc_probe_${STREAM_NAME}.json -w '%{http_code}' \"http://controller.${NAMESPACE}.svc.cluster.local:8000/allocate?stream=${STREAM_NAME}&proxy_pod=\$PROXY_POD\" | grep -Eq '200'"
   fi
 else
   yellow "WARN: no proxy pod resolved for connectivity checks"
@@ -259,7 +259,7 @@ echo ""
 echo "=== Controller /health and /metrics ==="
 CTRL_POD="$(kubectl get pod -n "$NAMESPACE" -l app="$CONTROLLER_DEPLOYMENT" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
 if [[ -z "$CTRL_POD" ]]; then
-  CTRL_POD="$(kubectl get pod -n "$NAMESPACE" -l app=rtmp-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  CTRL_POD="$(kubectl get pod -n "$NAMESPACE" -l app=controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
 fi
 if [[ -n "$CTRL_POD" ]]; then
   check_warn "controller /health" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/health; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/health; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'ok'"
@@ -307,7 +307,7 @@ fi
 
 echo ""
 echo "--- Kubernetes events related to worker creation ---"
-kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 200 | filter_stream "rtmp-worker|replicaset|FailedCreate|FailedScheduling|FailedMount|ErrImage|BackOff|Forbidden|denied|insufficient|quota|oom|pull"
+kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 200 | filter_stream "worker|replicaset|FailedCreate|FailedScheduling|FailedMount|ErrImage|BackOff|Forbidden|denied|insufficient|quota|oom|pull"
 
 if [[ "$WORKER_COUNT" == "0" ]]; then
   echo ""
@@ -389,8 +389,8 @@ if [[ "$WORKER_COUNT" != "0" ]]; then
   echo "=== Worker process checks (manager/ffmpeg) ==="
   for pod in $(kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" -o name); do
     echo "--- $pod ---"
-    check_warn "worker has ffmpeg manager process" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "ps aux | grep -E 'worker_recovery_loop|ffmpeg' | grep -v grep"
-    check_warn "worker manager logs mention stream/start" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "ls /tmp/ffmpeg_manager_*.log >/dev/null 2>&1 && grep -Ein 'start|stream|ffmpeg|error|recovery' /tmp/ffmpeg_manager_*.log | tail -n 40"
+    check_warn "worker has ffmpeg manager process" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "ps aux | grep -E 'worker_stream_runner|ffmpeg' | grep -v grep"
+    check_warn "worker manager logs mention stream/start" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "ls /tmp/ffmpeg_*.log >/dev/null 2>&1 && grep -Ein 'start|stream|ffmpeg|error|recovery' /tmp/ffmpeg_*.log | tail -n 40"
     check_warn "ffmpeg runtime log has no immediate input/push errors" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "if ls /tmp/ffmpeg_*.log >/dev/null 2>&1; then tail -n 80 /tmp/ffmpeg_*.log | grep -Ein 'Error demuxing input|I/O error|Connection reset|Connection refused|timed out|broken pipe|forbidden|401|403|Invalid argument|Server error' && exit 1 || exit 0; else echo 'ffmpeg log not found yet'; exit 1; fi"
     check_warn "worker can resolve youtube ingest DNS" kubectl exec -n "$NAMESPACE" "${pod#pod/}" -- sh -lc "getent hosts a.rtmp.youtube.com >/dev/null 2>&1 || nslookup a.rtmp.youtube.com >/dev/null 2>&1"
   done
