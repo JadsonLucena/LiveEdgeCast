@@ -454,34 +454,9 @@ def recover_state(
             )
             return
 
-        pods = core.list_namespaced_pod(
-            namespace=NAMESPACE,
-            label_selector="app=worker"
-        ).items
-        
-        recovered_count = 0
-        
-        for pod in pods:
-            if not pod.status.conditions:
-                continue
-                
-            cond = {c.type: c.status for c in pod.status.conditions}
-            if cond.get("Ready") != "True":
-                continue
-            
-            pod_name = pod.metadata.name
-            
-            is_healthy = check_worker_health(pod_name, pod.status.pod_ip)
-
-            if is_healthy:
-                stream_name = f"recovered_stream_{random_suffix()}"
-                stream_to_worker[stream_name] = pod_name
-                worker_to_stream[pod_name] = stream_name
-                recovered_count += 1
-                logger.info(f"[State Recovery] Worker {pod_name} responded /health, marked as allocated")
-        
-        persist_state_locked()
-        logger.info(f"[State Recovery] Completed. Recovered {recovered_count} active workers.")
+        # Sem estado persistido: não reaproveitar pods já existentes.
+        # No modelo por-env (STREAM_KEY/PROXY_DNS), reuso pode carregar config obsoleta.
+        logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
 
 
 
@@ -606,50 +581,7 @@ async def monitor_worker_health():
             if not healthy:
                 to_replace.append((stream, worker_pod))
 
-        # Try to allocate workers for pending streams
-        for stream in pending_streams:
-            with allocation_lock:
-                if stream in stream_to_worker:
-                    continue  # Already allocated
-
-            try:
-                pods = core.list_namespaced_pod(
-                    namespace=NAMESPACE,
-                    label_selector="app=worker"
-                ).items
-
-                for pod in pods:
-                    if not pod.status.conditions:
-                        continue
-
-                    pod_name = pod.metadata.name
-
-                    cond = {c.type: c.status for c in pod.status.conditions}
-                    if cond.get("Ready") != "True":
-                        continue
-
-                    with allocation_lock:
-                        if pod_name in worker_to_stream:
-                            continue  # Worker already has a stream
-
-                        # Allocate this worker to the pending stream
-                        stream_time = streams_pending_allocation.get(stream, time.time())
-                        stream_to_worker[stream] = pod_name
-                        worker_to_stream[pod_name] = stream
-                        streams_pending_allocation.pop(stream, None)
-                        persist_state_locked()
-
-                        owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-                        if owner_proxy:
-                            stream_to_proxy[stream] = owner_proxy
-
-                        logger.info(
-                            f"[PendingAllocation] Allocated worker '{pod_name}' to pending stream '{stream}' "
-                            f"(waiting since {time.time() - stream_time:.1f}s)"
-                        )
-                        break
-            except Exception as e:
-                logger.warning(f"[PendingAllocation] Error allocating workers for stream '{stream}': {e}")
+        # Não reaproveitar pods prontos para pendências; sempre criar pod novo na alocação explícita.
 
         # Handle unhealthy workers
         if to_replace:
