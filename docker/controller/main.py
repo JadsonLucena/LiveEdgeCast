@@ -399,10 +399,15 @@ async def monitor_stream_registry_health():
 
 
 def resolve_proxy_address(proxy_pod: str) -> str:
-    """Retorna DNS específico do pod proxy (via service headless)."""
+    """Retorna o IP atual do pod proxy owner da stream."""
     if not proxy_pod:
         raise RuntimeError("proxy_pod is required to resolve proxy address")
-    return f"{proxy_pod}.{PROXY_HEADLESS_SERVICE}.{NAMESPACE}.svc.cluster.local"
+
+    pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
+    pod_ip = (pod.status.pod_ip or "").strip() if pod and pod.status else ""
+    if not pod_ip:
+        raise RuntimeError(f"proxy pod '{proxy_pod}' has no assigned pod IP")
+    return pod_ip
 
 
 def check_proxy_health(proxy_pod: str) -> bool:
