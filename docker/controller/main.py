@@ -402,12 +402,7 @@ async def monitor_stream_registry_health():
 
 
 def get_proxy_pod_ip(proxy_pod: str) -> str:
-    """
-    Obter IP do pod proxy para conexão direta do worker.
-    
-    Substitui DNS headless que não funciona sem StatefulSet/hostname.
-    Worker se conecta diretamente ao IP do proxy pod via ClusterIP.
-    """
+    """Compat helper (legacy)."""
     try:
         pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
         return pod.status.pod_ip
@@ -416,35 +411,32 @@ def get_proxy_pod_ip(proxy_pod: str) -> str:
         return None
 
 
-
-
 def resolve_proxy_address(proxy_pod: Optional[str]) -> str:
     """Retorna endereço DNS estável para workers (evita IP efêmero de Pod)."""
     return PROXY_SERVICE_DNS
-def check_worker_metrics(pod_name: str, pod_ip: Optional[str] = None) -> int:
-    """
-    Verifica métricas RTMP do worker para determinar se está ocupado.
-    Retorna número de clientes RTMP ativos.
-    """
+
+
+def check_proxy_health(proxy_pod: str) -> bool:
+    target = resolve_proxy_address(proxy_pod)
+    try:
+        response = requests.get(f"http://{target}:8080/health", timeout=PROXY_HEALTHCHECK_TIMEOUT_SECONDS)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def check_worker_health(pod_name: str, pod_ip: Optional[str] = None) -> bool:
     try:
         target = pod_ip if pod_ip else f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
-        stats_url = f"http://{target}:8080/stats"
-        response = requests.get(stats_url, timeout=2)
-        
-        if response.status_code == 200:
-            content = response.text
-            if '<nclients>' in content:
-                start = content.find('<nclients>') + 10
-                end = content.find('</nclients>')
-                if end > start:
-                    return int(content[start:end])
-        return 0
+        response = requests.get(f"http://{target}:8080/health", timeout=2)
+        return response.status_code == 200
     except Exception as e:
-        logger.warning(f"Failed to check metrics for {pod_name}: {e}")
-        return 0
+        logger.warning(f"Failed to check /health for {pod_name}: {e}")
+        return False
 
 
-def recover_state():
+def recover_state(
+):
     """
     Recupera estado de alocações após reinício do controller.
     Verifica quais workers estão realmente ocupados consultando suas métricas RTMP.
@@ -476,14 +468,14 @@ def recover_state():
             
             pod_name = pod.metadata.name
             
-            nclients = check_worker_metrics(pod_name, pod.status.pod_ip)
-            
-            if nclients > 0:
+            is_healthy = check_worker_health(pod_name, pod.status.pod_ip)
+
+            if is_healthy:
                 stream_name = f"recovered_stream_{random_suffix()}"
                 stream_to_worker[stream_name] = pod_name
                 worker_to_stream[pod_name] = stream_name
                 recovered_count += 1
-                logger.info(f"[State Recovery] Worker {pod_name} is busy ({nclients} clients), marked as allocated")
+                logger.info(f"[State Recovery] Worker {pod_name} responded /health, marked as allocated")
         
         persist_state_locked()
         logger.info(f"[State Recovery] Completed. Recovered {recovered_count} active workers.")
@@ -600,9 +592,8 @@ async def monitor_worker_health():
             healthy = False
             try:
                 pod = core.read_namespaced_pod(name=worker_pod, namespace=NAMESPACE)
-                pod_ip = pod.status.pod_ip
                 ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
-                healthy = ready
+                healthy = ready and check_worker_health(worker_pod, pod.status.pod_ip)
             except Exception:
                 healthy = False
 
@@ -766,8 +757,7 @@ def allocate_worker(
             pod_name = p.metadata.name
             
             if cond.get("Ready") == "True" and pod_name not in worker_to_stream:
-                nclients = check_worker_metrics(pod_name, p.status.pod_ip)
-                if nclients == 0:
+                if check_worker_health(pod_name, p.status.pod_ip):
                     available_workers.append(p)
 
         if available_workers:
