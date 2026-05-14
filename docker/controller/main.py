@@ -49,9 +49,10 @@ PROXY_HEALTHCHECK_MAX_FAILURES = 3
 PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
 PROXY_HEALTHCHECK_MAX_CONCURRENCY = 20
 PROXY_HEALTHCHECK_JITTER_SECONDS = 1.5
-WORKER_STARTUP_GRACE_SECONDS = 20
+WORKER_READY_HEALTH_DELAY_SECONDS = 3
 STREAM_TTL_SECONDS = 180
 proxy_health_failures: Dict[str, int] = {}
+worker_ready_since: Dict[str, float] = {}
 
 STATE_CONFIGMAP_NAME = "controller-state"
 STATE_CONFIGMAP_KEY = "state.json"
@@ -384,6 +385,7 @@ async def monitor_stream_registry_health():
                         worker_name = stream_to_worker.pop(stream, None)
                         if worker_name:
                             worker_to_stream.pop(worker_name, None)
+                            worker_ready_since.pop(worker_name, None)
                             try:
                                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
                             except Exception as e:
@@ -593,15 +595,26 @@ async def monitor_worker_health():
             healthy = False
             try:
                 pod = core.read_namespaced_pod(name=worker_pod, namespace=NAMESPACE)
-                created_at = pod.metadata.creation_timestamp.timestamp() if pod.metadata and pod.metadata.creation_timestamp else None
-                if created_at and (time.time() - created_at) < WORKER_STARTUP_GRACE_SECONDS:
+                ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
+                if not ready:
+                    worker_ready_since.pop(worker_pod, None)
+                    continue
+
+                now = time.time()
+                first_ready_at = worker_ready_since.get(worker_pod)
+                if first_ready_at is None:
+                    worker_ready_since[worker_pod] = now
+                    logger.debug(f"[WorkerHealth] Worker '{worker_pod}' became Ready. Starting /health delay timer.")
+                    continue
+
+                if (now - first_ready_at) < WORKER_READY_HEALTH_DELAY_SECONDS:
                     logger.debug(
-                        f"[WorkerHealth] Skipping healthcheck for '{worker_pod}' during startup grace "
-                        f"({time.time() - created_at:.1f}s/{WORKER_STARTUP_GRACE_SECONDS}s)"
+                        f"[WorkerHealth] Waiting {WORKER_READY_HEALTH_DELAY_SECONDS}s after Ready for '{worker_pod}' "
+                        f"before probing /health ({now - first_ready_at:.1f}s elapsed)."
                     )
                     continue
-                ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
-                healthy = ready and check_worker_health(worker_pod, pod.status.pod_ip)
+
+                healthy = check_worker_health(worker_pod, pod.status.pod_ip)
             except Exception:
                 healthy = False
 
@@ -662,6 +675,7 @@ async def monitor_worker_health():
                         continue
                     stream_to_worker.pop(stream, None)
                     worker_to_stream.pop(worker_pod, None)
+                    worker_ready_since.pop(worker_pod, None)
                     streams_pending_allocation.pop(stream, None)
                     logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
                     try:
@@ -785,6 +799,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         
         del stream_to_worker[stream]
         del worker_to_stream[worker_name]
+        worker_ready_since.pop(worker_name, None)
         
         if stream in stream_to_proxy:
             del stream_to_proxy[stream]
