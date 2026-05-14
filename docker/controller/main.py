@@ -736,64 +736,9 @@ def allocate_worker(
                 "status": "existing"
             }
         
-        if stream in streams_pending_allocation:
-            elapsed = time.time() - streams_pending_allocation[stream]
-            logger.info(f"[Allocate] Stream '{stream}' is already pending allocation ({elapsed:.1f}s elapsed). Checking for ready workers...")
-        else:
-            streams_pending_allocation[stream] = time.time()
-            logger.info(f"[Allocate] Stream '{stream}' added to pending allocation queue")
-        
-        pods = core.list_namespaced_pod(
-            namespace=NAMESPACE,
-            label_selector="app=worker"
-        ).items
-
-        available_workers = []
-        for p in pods:
-            if not p.status.conditions:
-                continue
-            cond = {c.type: c.status for c in p.status.conditions}
-            
-            pod_name = p.metadata.name
-            
-            if cond.get("Ready") == "True" and pod_name not in worker_to_stream:
-                if check_worker_health(pod_name, p.status.pod_ip):
-                    available_workers.append(p)
-
-        if available_workers:
-            pod = available_workers[0]
-            pod_name = pod.metadata.name
-            pod_ip = pod.status.pod_ip
-            
-            stream_to_worker[stream] = pod_name
-            worker_to_stream[pod_name] = stream
-            
-            owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-            if owner_proxy:
-                stream_to_proxy[stream] = owner_proxy
-            
-            if stream in streams_pending_allocation:
-                elapsed = time.time() - streams_pending_allocation[stream]
-                del streams_pending_allocation[stream]
-                logger.info(f"[Allocate] Removed stream '{stream}' from pending queue (allocated in {elapsed:.1f}s)")
-            persist_state_locked()
-            
-            worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
-            
-            owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-            proxy_address = resolve_proxy_address(owner_proxy)
-            
-            logger.info(f"[Allocate] Allocated worker {pod_name} (DNS: {worker_dns}) for stream '{stream}' - Proxy: {proxy_address}")
-            stream_assignment_info.labels(stream=stream, proxy_pod=owner_proxy or "unknown", worker_pod=pod_name, generation=str(stream_generation.get(stream,1))).set(1)
-            record_stream_start(stream)
-            
-            return {
-                "pod": worker_dns,
-                "name": pod_name,
-                "proxy": proxy_address,
-                "worker": pod_name,
-                "status": "allocated"
-            }
+        # Modelo 1:1 (pod por stream): nunca reaproveitar worker já existente.
+        # Isso evita reuso indevido entre sessões e simplifica o ciclo de vida.
+        streams_pending_allocation.pop(stream, None)
 
         owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
         proxy_address = resolve_proxy_address(owner_proxy)
@@ -801,7 +746,6 @@ def allocate_worker(
         pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
         stream_to_worker[stream] = pod_name
         worker_to_stream[pod_name] = stream
-        streams_pending_allocation.pop(stream, None)
         persist_state_locked()
 
         worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
@@ -1099,5 +1043,4 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
         "proxyPod": proxy_pod,
         "generation": stream_generation.get(stream, 1)
     }
-
 
