@@ -561,8 +561,13 @@ def collect_allocation_metrics():
     with allocation_lock:
         allocation_queue_length.set(len(streams_pending_allocation))
         try:
-            current = apps.read_namespaced_deployment_scale(name=WORKER_DEPLOYMENT,namespace=NAMESPACE)
-            worker_pods_available.labels(namespace=NAMESPACE).set(current.status.available_replicas or 0)
+            pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker").items
+            ready = 0
+            for pod in pods:
+                conditions = {c.type: c.status for c in (pod.status.conditions or [])}
+                if conditions.get("Ready") == "True":
+                    ready += 1
+            worker_pods_available.labels(namespace=NAMESPACE).set(ready)
         except Exception:
             pass
 
@@ -1109,6 +1114,5 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
         "proxyPod": proxy_pod,
         "generation": stream_generation.get(stream, 1)
     }
-
 
 
