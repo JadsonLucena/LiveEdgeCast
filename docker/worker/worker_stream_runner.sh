@@ -21,9 +21,9 @@ if [ -z "$PROXY_ADDR" ] || [ -z "$YOUTUBE_KEY" ] || [ -z "$RTMP_PUSH_BASE_URL" ]
 fi
 
 PROXY_RTMP="rtmp://${PROXY_ADDR}:1935/live/${STREAM_NAME}"
-YT_RTMP="${RTMP_PUSH_BASE_URL}/${YOUTUBE_KEY}"
+TARGET_RTMP="${RTMP_PUSH_BASE_URL}/${YOUTUBE_KEY}"
 
-log "Launching FFmpeg (pull=$PROXY_RTMP push=$YT_RTMP)"
+log "Launching FFmpeg (pull=$PROXY_RTMP push=$TARGET_RTMP)"
 
 ffmpeg \
   -loglevel warning \
@@ -31,7 +31,7 @@ ffmpeg \
   -i "$PROXY_RTMP" \
   -c:v copy \
   -c:a copy \
-  -f flv "$YT_RTMP" \
+  -f flv "$TARGET_RTMP" \
   >> "/tmp/ffmpeg_${STREAM_NAME}.log" 2>&1 &
 
 FFMPEG_PID=$!
