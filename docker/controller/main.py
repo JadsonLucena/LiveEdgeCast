@@ -1214,7 +1214,7 @@ def _start_worker_impl(stream: str, worker: str, generation: Optional[int] = Non
         cmd = [
             "kubectl", "exec", "-n", NAMESPACE, worker, "--",
             "sh", "-c",
-            f"STREAM_KEY={stream} PROXY_DNS={proxy_dns} RTMP_PUSH_BASE_URL=$RTMP_PUSH_BASE_URL /scripts/worker_stream_runner.sh"
+            f"STREAM_KEY={stream} PROXY_DNS={proxy_dns} /scripts/worker_stream_runner.sh"
         ]
         mark("kubectl_exec_spawn")
         result = subprocess.run(
