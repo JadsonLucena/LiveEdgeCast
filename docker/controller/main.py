@@ -244,6 +244,13 @@ def cleanup_expired_streams() -> None:
     expired = [stream for stream, entry in stream_registry.items() if entry.get("expires_at", 0) <= now]
 
     for stream in expired:
+        if stream in stream_to_worker:
+            # Enquanto houver worker ativo para a stream, não expirar o owner no registry.
+            # Isso evita perder ownership por oscilação momentânea de healthcheck.
+            entry = stream_registry.get(stream)
+            if entry is not None:
+                entry["expires_at"] = now + STREAM_TTL_SECONDS
+            continue
         stream_registry.pop(stream, None)
         stream_to_proxy.pop(stream, None)
         logger.info(f"[Registry] Stream '{stream}' expired after inactivity window")
@@ -369,20 +376,25 @@ async def monitor_stream_registry_health():
                         if entry.get("proxy_pod") == proxy_pod
                     ]
                     for stream in impacted_streams:
+                        if stream in stream_to_worker:
+                            # Regra principal: não matar worker enquanto o cliente ainda pode estar transmitindo.
+                            # Mantemos ownership e deixamos /streams/ended fazer cleanup definitivo.
+                            entry = stream_registry.get(stream)
+                            if entry is not None:
+                                entry["expires_at"] = time.time() + STREAM_TTL_SECONDS
+                            logger.warning(
+                                f"[ProxyHealth] Preserving active stream '{stream}' after "
+                                f"{PROXY_HEALTHCHECK_MAX_FAILURES} proxy healthcheck failures "
+                                f"for proxy '{proxy_pod}'."
+                            )
+                            continue
+
                         stream_registry.pop(stream, None)
                         stream_to_proxy.pop(stream, None)
                         logger.info(
                             f"[Registry] Stream '{stream}' expired after "
                             f"{PROXY_HEALTHCHECK_MAX_FAILURES} failed proxy healthchecks"
                         )
-                        worker_name = stream_to_worker.pop(stream, None)
-                        if worker_name:
-                            worker_to_stream.pop(worker_name, None)
-                            worker_ready_since.pop(worker_name, None)
-                            try:
-                                core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
-                            except Exception as e:
-                                logger.warning(f"[ProxyHealth] Failed deleting worker {worker_name}: {e}")
                     
                     proxy_health_failures.pop(proxy_pod, None)
                     proxy_ready_since.pop(proxy_pod, None)
