@@ -45,6 +45,7 @@ RUN apk add --no-cache \
     pcre2 \
     zlib \
     curl \
+    jq \
     bash
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx

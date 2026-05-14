@@ -54,9 +54,10 @@ RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
     && chmod 755 /scripts
 
 COPY worker_stream_runner.sh /scripts/worker_stream_runner.sh
+COPY entrypoint.sh /scripts/entrypoint.sh
 RUN chmod +x /scripts/*.sh
 COPY nginx.conf /etc/nginx/nginx.conf
 
 EXPOSE 1935 8080
 STOPSIGNAL SIGQUIT
-CMD ["nginx", "-g", "daemon off;"]
+ENTRYPOINT ["/scripts/entrypoint.sh"]
