@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-STREAM_KEY="${STREAM_KEY:-${1:-}}"
+STREAM_KEY="${STREAM_KEY:-}"
 PID_FILE="/tmp/ffmpeg_${STREAM_KEY}.pid"
 
 log() {
