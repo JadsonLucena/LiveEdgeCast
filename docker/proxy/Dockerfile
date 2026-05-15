@@ -44,17 +44,14 @@ RUN apk add --no-cache \
     openssl \
     pcre2 \
     zlib \
-    ffmpeg \
     curl \
     jq \
-    bash \
-    bind-tools \
-    c-ares
+    bash
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
 COPY --from=builder /tmp/build/nginx-${NGINX_VERSION}/conf/mime.types /etc/nginx/mime.types
 RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
-    && mkdir -p /var/log/nginx /scripts /tmp/ffmpeg_pids \
+    && mkdir -p /var/log/nginx /scripts \
     && chmod 755 /scripts
 
 COPY on_publish_start.sh /scripts/on_publish_start.sh

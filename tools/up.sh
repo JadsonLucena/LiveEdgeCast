@@ -4,12 +4,11 @@ echo "🚀 Deploying LiveEdgeCast with KEDA RTMP Serverless Architecture..."
 
 set -e
 
-# Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 print_step() {
     echo -e "${BLUE}📋 $1${NC}"
@@ -27,7 +26,6 @@ print_error() {
     echo -e "${RED}❌ $1${NC}"
 }
 
-# Function to check if command exists
 check_command() {
     if ! command -v $1 >/dev/null 2>&1; then
         print_error "$1 not found. Please install $1 first."
@@ -36,13 +34,11 @@ check_command() {
     print_success "$1 is installed"
 }
 
-# Step 1: Check prerequisites
 print_step "Checking prerequisites..."
 check_command "docker"
 check_command "kubectl"
 check_command "helm"
 
-# Check if kubectl can connect to cluster
 if ! kubectl cluster-info >/dev/null 2>&1; then
     print_error "Cannot connect to Kubernetes cluster!"
     kubectl config current-context 2>/dev/null || echo "  No active context found"
@@ -50,7 +46,6 @@ if ! kubectl cluster-info >/dev/null 2>&1; then
 fi
 print_success "kubectl can connect to cluster"
 
-# Step 2: Check if KEDA is installed
 print_step "Checking KEDA installation..."
 if ! kubectl get namespace keda >/dev/null 2>&1; then
     print_error "KEDA namespace not found. Please install KEDA first:"
@@ -62,7 +57,6 @@ fi
 
 kubectl apply -f k8s/namespaces.yaml || { print_error "Failed to create namespace"; exit 1; }
 
-# wait for namespace to be active
 kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/media --timeout=30s || {
     print_error "Namespace 'media' failed to become active"
     exit 1
@@ -72,16 +66,13 @@ kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/mon
     exit 1
 }
 
-# Check if Prometheus is installed (for KEDA metrics)
 if ! kubectl get service kube-prometheus-stack-prometheus -n monitoring >/dev/null 2>&1; then
     print_warning "Prometheus service not found in namespace 'monitoring'. Installing Prometheus stack..."
     print_step "Installing Prometheus stack..."
     
-    # Add Prometheus Helm repo
     helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
     helm repo update >/dev/null 2>&1
     
-    # Install Prometheus
     helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
         --namespace monitoring --create-namespace \
         --set prometheus-node-exporter.enabled=false \
@@ -96,7 +87,6 @@ else
     print_success "Prometheus stack already available in namespace 'monitoring'"
 fi
 
-# Step 3: Build Docker images
 print_step "Building LiveEdgeCast proxy image..."
 PROXY_IMAGE="liveedgecast-proxy:latest"
 docker build -t $PROXY_IMAGE -f docker/proxy/Dockerfile docker/proxy || {
@@ -121,7 +111,6 @@ docker build -t $CONTROLLER_IMAGE -f docker/controller/Dockerfile docker/control
 }
 print_success "Controller image $CONTROLLER_IMAGE built successfully"
 
-# Handle Docker images for cluster
 CONTEXT=$(kubectl config current-context)
 if [[ $CONTEXT =~ (kind) ]]; then
     print_step "Loading images to kind cluster..."
@@ -149,7 +138,6 @@ elif [[ ! $CONTEXT =~ (docker-desktop|localhost|127\.0\.0\.1) ]]; then
     fi
 fi
 
-# Step 4: Deploy to Kubernetes
 print_step "Applying RBAC for Controller..."
 kubectl apply -f k8s/controller-rbac.yaml || { print_error "RBAC setup failed"; exit 1; }
 print_success "Controller RBAC configured"
@@ -158,19 +146,18 @@ print_step "Deploying to Kubernetes..."
 kubectl apply -f k8s/ || { print_error "Deployment failed"; exit 1; }
 print_success "Kubernetes manifests applied"
 
-# Step 5: Wait for deployments to be ready
 print_step "Waiting for RTMP Controller deployment to be ready..."
-kubectl wait --for=condition=available deployment/rtmp-controller -n media --timeout=120s || {
+kubectl wait --for=condition=available deployment/controller -n media --timeout=120s || {
     print_error "RTMP Controller deployment failed to become available"
-    kubectl logs -l app=rtmp-controller -n media --tail=50 2>/dev/null || true
+    kubectl logs -l app=controller -n media --tail=50 2>/dev/null || true
     exit 1
 }
 print_success "RTMP Controller is ready"
 
 print_step "Waiting for RTMP Proxy deployment to be ready..."
-kubectl wait --for=condition=available deployment/rtmp-proxy -n media --timeout=120s || {
+kubectl wait --for=condition=available deployment/proxy -n media --timeout=120s || {
     print_error "RTMP Proxy deployment failed to become available"
-    kubectl logs -l app=rtmp-proxy -n media --tail=50 2>/dev/null || true
+    kubectl logs -l app=proxy -n media --tail=50 2>/dev/null || true
     exit 1
 }
 print_success "RTMP Proxy is ready"
@@ -178,24 +165,22 @@ print_success "RTMP Proxy is ready"
 print_step "Verifying KEDA ScaledObjects..."
 sleep 5
 
-# Check proxy scaler (should exist)
-if kubectl get scaledobject rtmp-proxy-scaler -n media >/dev/null 2>&1; then
+if kubectl get scaledobject proxy-scaler -n media >/dev/null 2>&1; then
     print_success "RTMP Proxy ScaledObject is active"
 else
     print_warning "RTMP Proxy ScaledObject not found"
 fi
 
-# Worker scaler is DISABLED in v2.0 (Controller manages scaling)
-if kubectl get scaledobject rtmp-worker-scaler -n media >/dev/null 2>&1; then
+if kubectl get scaledobject worker-scaler -n media >/dev/null 2>&1; then
     print_warning "RTMP Worker ScaledObject found (should be disabled - Controller manages workers)"
 else
     print_success "RTMP Worker scaling managed by Controller (KEDA disabled as expected)"
 fi
 
 print_step "Checking pod status..."
-CONTROLLER_PODS=$(kubectl get pods -l app=rtmp-controller -n media --no-headers 2>/dev/null | wc -l)
-PROXY_PODS=$(kubectl get pods -l app=rtmp-proxy -n media --no-headers 2>/dev/null | wc -l)
-WORKER_PODS=$(kubectl get pods -l app=rtmp-worker -n media --no-headers 2>/dev/null | wc -l)
+CONTROLLER_PODS=$(kubectl get pods -l app=controller -n media --no-headers 2>/dev/null | wc -l)
+PROXY_PODS=$(kubectl get pods -l app=proxy -n media --no-headers 2>/dev/null | wc -l)
+WORKER_PODS=$(kubectl get pods -l app=worker -n media --no-headers 2>/dev/null | wc -l)
 
 print_success "RTMP Controller: $CONTROLLER_PODS pod(s) running"
 print_success "RTMP Proxy: $PROXY_PODS pod(s) running"
@@ -206,7 +191,6 @@ else
     print_success "RTMP Workers: $WORKER_PODS pod(s) running"
 fi
 
-# Step 6: Check KEDA status
 print_step "Checking KEDA Operator status..."
 kubectl get pods -n keda -l app=keda-operator --no-headers | grep Running >/dev/null || {
     print_warning "KEDA Operator may not be ready yet"
@@ -216,10 +200,8 @@ kubectl get pods -n keda -l app=keda-metrics-apiserver --no-headers | grep Runni
     print_warning "KEDA Metrics API Server may not be ready yet"
 }
 
-# Step 7: Get NodePort access information
 print_step "Getting NodePort access information..."
 
-# Get Kubernetes node IP
 NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 WSL_IP=$(ip addr show eth0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 || echo "N/A")
 
@@ -227,18 +209,17 @@ print_success "NodePort RTMP Service configured on port 31935"
 
 print_success "Deployment completed!"
 
-# Display status
 echo ""
 print_step "Deployment Status:"
 echo ""
 print_step "Controller API:"
-kubectl get pods -l app=rtmp-controller -n media
+kubectl get pods -l app=controller -n media
 echo ""
 print_step "RTMP Proxy Pods:"
-kubectl get pods -l app=rtmp-proxy -n media
+kubectl get pods -l app=proxy -n media
 echo ""
 print_step "RTMP Worker Pods (Serverless):"
-kubectl get pods -l app=rtmp-worker -n media
+kubectl get pods -l app=worker -n media
 echo ""
 print_step "KEDA ScaledObjects:"
 kubectl get scaledobject -n media
@@ -262,11 +243,11 @@ echo "  4. Stream Key: {your-youtube-stream-key}"
 echo "  5. Click 'Start Streaming'"
 echo ""
 echo -e "${BLUE}🔧 Useful commands:${NC}"
-echo "  📊 Watch worker scaling: kubectl get pods -l app=rtmp-worker -n media -w"
-echo "  📊 Controller status: kubectl logs -l app=rtmp-controller -n media --tail=50"
-echo "  📋 Controller logs: kubectl logs -l app=rtmp-controller -n media -f"
-echo "  📋 Proxy logs: kubectl logs -l app=rtmp-proxy -n media -f"
-echo "  📋 Worker logs: kubectl logs -l app=rtmp-worker -n media -f"
+echo "  📊 Watch worker scaling: kubectl get pods -l app=worker -n media -w"
+echo "  📊 Controller status: kubectl logs -l app=controller -n media --tail=50"
+echo "  📋 Controller logs: kubectl logs -l app=controller -n media -f"
+echo "  📋 Proxy logs: kubectl logs -l app=proxy -n media -f"
+echo "  📋 Worker logs: kubectl logs -l app=worker -n media -f"
 echo "  🔍 KEDA status: kubectl get scaledobject -n media"
 echo "  📈 Metrics: kubectl top pods -n media"
 echo ""
@@ -303,8 +284,7 @@ echo ""
 echo -e "${GREEN}🚀 Ready to receive RTMP streams!${NC}"
 echo ""
 echo -e "${BLUE}🔍 Health Check:${NC}"
-# Verificar health do proxy
-PROXY_POD=$(kubectl get pods -n media -l app=rtmp-proxy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+PROXY_POD=$(kubectl get pods -n media -l app=proxy -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 if [ -n "$PROXY_POD" ]; then
     if kubectl exec -n media "$PROXY_POD" -- wget -qO- http://localhost:8080/health 2>/dev/null | grep -q "running"; then
         print_success "✓ RTMP Proxy is healthy and ready"
@@ -313,8 +293,7 @@ if [ -n "$PROXY_POD" ]; then
     fi
 fi
 
-# Verificar health do controller
-CONTROLLER_POD=$(kubectl get pods -n media -l app=rtmp-controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+CONTROLLER_POD=$(kubectl get pods -n media -l app=controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 if [ -n "$CONTROLLER_POD" ]; then
     if kubectl exec -n media "$CONTROLLER_POD" -- wget -qO- http://localhost:8000/health 2>/dev/null | grep -q "ok"; then
         print_success "✓ Controller API is healthy and ready"

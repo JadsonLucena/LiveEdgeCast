@@ -1,17 +1,17 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rtmp-controller
+  name: controller
   namespace: media
 spec:
   replicas: 1
   selector:
-    matchLabels: { app: rtmp-controller }
+    matchLabels: { app: controller }
   template:
     metadata:
-      labels: { app: rtmp-controller }
+      labels: { app: controller }
     spec:
-      serviceAccountName: rtmp-controller
+      serviceAccountName: controller
       containers:
         - name: controller
           image: liveedgecast-controller:latest

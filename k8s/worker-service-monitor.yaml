@@ -1,14 +1,14 @@
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: rtmp-worker-metrics
+  name: worker-metrics
   namespace: monitoring
 spec:
   namespaceSelector:
     matchNames: ["media"]
   selector:
     matchLabels:
-      app: rtmp-worker
+      app: worker
   endpoints:
     - port: metrics
       interval: 10s

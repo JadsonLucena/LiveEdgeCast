@@ -1,15 +1,14 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rtmp-proxy
+  name: proxy
   namespace: media
 spec:
-  # replicas removed - controlled by KEDA ScaledObject
   selector:
-    matchLabels: { app: rtmp-proxy }
+    matchLabels: { app: proxy }
   template:
     metadata:
-      labels: { app: rtmp-proxy }
+      labels: { app: proxy }
     spec:
       containers:
         - name: nginx

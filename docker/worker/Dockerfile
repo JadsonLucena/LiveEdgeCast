@@ -45,23 +45,19 @@ RUN apk add --no-cache \
     pcre2 \
     zlib \
     ffmpeg \
-    curl \
-    jq \
-    bash \
-    bind-tools \
-    c-ares
+    bash
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
 COPY --from=builder /tmp/build/nginx-${NGINX_VERSION}/conf/mime.types /etc/nginx/mime.types
 RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
-    && mkdir -p /var/log/nginx /scripts /tmp/ffmpeg_pids \
+    && mkdir -p /var/log/nginx /scripts \
     && chmod 755 /scripts
 
-COPY on_worker_pull_push.sh /scripts/on_worker_pull_push.sh
-COPY worker_recovery_loop.sh /scripts/worker_recovery_loop.sh
+COPY worker_stream_runner.sh /scripts/worker_stream_runner.sh
+COPY entrypoint.sh /scripts/entrypoint.sh
 RUN chmod +x /scripts/*.sh
 COPY nginx.conf /etc/nginx/nginx.conf
 
 EXPOSE 1935 8080
 STOPSIGNAL SIGQUIT
-CMD ["nginx", "-g", "daemon off;"]
+ENTRYPOINT ["/scripts/entrypoint.sh"]
