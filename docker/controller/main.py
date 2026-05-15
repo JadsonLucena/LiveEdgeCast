@@ -53,6 +53,8 @@ WORKER_READY_HEALTH_DELAY_SECONDS = 3
 STREAM_TTL_SECONDS = 180
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
+worker_unhealthy_since: Dict[str, float] = {}
+WORKER_UNHEALTHY_OWNER_GRACE_SECONDS = 20
 proxy_ready_since: Dict[str, float] = {}
 
 STATE_CONFIGMAP_NAME = "controller-state"
@@ -613,6 +615,7 @@ async def monitor_worker_health():
 
                     owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
                     if owner_proxy:
+                        worker_unhealthy_since.pop(stream, None)
                         try:
                             proxy_address = resolve_proxy_address(owner_proxy)
                             new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
@@ -630,10 +633,29 @@ async def monitor_worker_health():
                                 f"Stream will wait for a new allocation trigger. Error: {e}"
                             )
                     else:
+                        now = time.time()
+                        first_unhealthy_at = worker_unhealthy_since.get(stream)
+                        if first_unhealthy_at is None:
+                            worker_unhealthy_since[stream] = now
+                            logger.warning(
+                                f"[WorkerHealth] Stream '{stream}' unhealthy but without proxy owner. "
+                                f"Deferring delete for {WORKER_UNHEALTHY_OWNER_GRACE_SECONDS}s grace window."
+                            )
+                            continue
+
+                        elapsed = now - first_unhealthy_at
+                        if elapsed < WORKER_UNHEALTHY_OWNER_GRACE_SECONDS:
+                            logger.warning(
+                                f"[WorkerHealth] Stream '{stream}' still without proxy owner "
+                                f"({elapsed:.1f}s/{WORKER_UNHEALTHY_OWNER_GRACE_SECONDS}s). Keeping worker for now."
+                            )
+                            continue
+
+                        worker_unhealthy_since.pop(stream, None)
                         stream_to_worker.pop(stream, None)
                         streams_pending_allocation.pop(stream, None)
                         logger.info(
-                            f"[WorkerHealth] Stream '{stream}' has no active proxy owner. "
+                            f"[WorkerHealth] Stream '{stream}' has no active proxy owner after grace period. "
                             "Worker mapping removed."
                         )
                     try:
