@@ -9,6 +9,7 @@ import time
 import logging
 import asyncio
 import json
+import copy
 from typing import Dict, Optional
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from fastapi.responses import Response
@@ -197,7 +198,9 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
     if not template or not template.spec or not template.spec.containers:
         raise RuntimeError("worker deployment template is invalid or has no containers")
 
-    pod_spec = template.spec
+    pod_spec = copy.deepcopy(template.spec)
+    pod_metadata = copy.deepcopy(template.metadata) if template.metadata else client.V1ObjectMeta()
+
     pod_spec.restart_policy = "Always"
 
     for c in pod_spec.containers:
@@ -207,8 +210,12 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
         env.append(client.V1EnvVar(name="PROXY_DNS", value=proxy_dns))
         c.env = env
 
-    labels = dict(template.metadata.labels or {}) if template.metadata else {}
+    labels = dict(pod_metadata.labels or {})
     labels.update({"app": "worker", "stream": stream})
+
+    logger.debug(
+        f"[Worker Pod Create] pod_name='{pod_name}' stream='{stream}' proxy_dns='{proxy_dns}'"
+    )
 
     pod_manifest = client.V1Pod(
         metadata=client.V1ObjectMeta(name=pod_name, namespace=NAMESPACE, labels=labels),
