@@ -57,6 +57,7 @@ STREAM_TTL_SECONDS = 180
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
 worker_health_failures: Dict[str, int] = {}
+worker_pod_uid_by_name: Dict[str, str] = {}
 proxy_ready_since: Dict[str, float] = {}
 
 STATE_CONFIGMAP_NAME = "controller-state"
@@ -384,6 +385,7 @@ async def monitor_stream_registry_health():
                             worker_to_stream.pop(worker_name, None)
                             worker_ready_since.pop(worker_name, None)
                             worker_health_failures.pop(worker_name, None)
+                            worker_pod_uid_by_name.pop(worker_name, None)
                             try:
                                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
                             except Exception as e:
@@ -567,17 +569,27 @@ async def monitor_worker_health():
             healthy = False
             try:
                 pod = core.read_namespaced_pod(name=worker_pod, namespace=NAMESPACE)
+                current_uid = ((pod.metadata.uid or "").strip() if pod and pod.metadata else "")
+                prev_uid = worker_pod_uid_by_name.get(worker_pod)
+                if prev_uid and current_uid and prev_uid != current_uid:
+                    worker_health_failures.pop(prev_uid, None)
+                    worker_health_failures[current_uid] = 0
+                if current_uid:
+                    worker_pod_uid_by_name[worker_pod] = current_uid
+
                 ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
                 if not ready:
                     worker_ready_since.pop(worker_pod, None)
-                    worker_health_failures.pop(worker_pod, None)
+                    if current_uid:
+                        worker_health_failures.pop(current_uid, None)
                     continue
 
                 now = time.time()
                 first_ready_at = worker_ready_since.get(worker_pod)
                 if first_ready_at is None:
                     worker_ready_since[worker_pod] = now
-                    worker_health_failures[worker_pod] = 0
+                    if current_uid:
+                        worker_health_failures[current_uid] = 0
                     logger.debug(f"[WorkerHealth] Worker '{worker_pod}' became Ready. Starting /health delay timer.")
                     continue
 
@@ -591,7 +603,8 @@ async def monitor_worker_health():
                 owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
                 if not owner_proxy:
                     logger.debug(f"[WorkerHealth] Stream '{stream}' has no proxy owner; skipping worker check.")
-                    worker_health_failures.pop(worker_pod, None)
+                    if current_uid:
+                        worker_health_failures.pop(current_uid, None)
                     continue
 
                 if not check_proxy_health(owner_proxy):
@@ -599,7 +612,8 @@ async def monitor_worker_health():
                         f"[WorkerHealth] Skipping worker '{worker_pod}' check because owner proxy "
                         f"'{owner_proxy}' is not healthy."
                     )
-                    worker_health_failures.pop(worker_pod, None)
+                    if current_uid:
+                        worker_health_failures.pop(current_uid, None)
                     continue
 
                 healthy = check_worker_health(worker_pod, pod.status.pod_ip)
@@ -607,11 +621,13 @@ async def monitor_worker_health():
                 healthy = False
 
             if healthy:
-                worker_health_failures[worker_pod] = 0
+                if current_uid:
+                    worker_health_failures[current_uid] = 0
                 continue
 
-            failures = worker_health_failures.get(worker_pod, 0) + 1
-            worker_health_failures[worker_pod] = failures
+            failures = worker_health_failures.get(current_uid, 0) + 1 if current_uid else 1
+            if current_uid:
+                worker_health_failures[current_uid] = failures
             logger.warning(
                 f"[WorkerHealth] Worker '{worker_pod}' failed healthcheck for stream '{stream}' "
                 f"({failures}/{WORKER_HEALTHCHECK_MAX_FAILURES})"
@@ -631,7 +647,9 @@ async def monitor_worker_health():
                     stream_to_worker.pop(stream, None)
                     worker_to_stream.pop(worker_pod, None)
                     worker_ready_since.pop(worker_pod, None)
-                    worker_health_failures.pop(worker_pod, None)
+                    old_uid = worker_pod_uid_by_name.pop(worker_pod, None)
+                    if old_uid:
+                        worker_health_failures.pop(old_uid, None)
                     streams_pending_allocation.pop(stream, None)
                     logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
                     try:
@@ -758,7 +776,9 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         del stream_to_worker[stream]
         del worker_to_stream[worker_name]
         worker_ready_since.pop(worker_name, None)
-        worker_health_failures.pop(worker_name, None)
+        old_uid = worker_pod_uid_by_name.pop(worker_name, None)
+        if old_uid:
+            worker_health_failures.pop(old_uid, None)
         
         if stream in stream_to_proxy:
             del stream_to_proxy[stream]
