@@ -985,7 +985,29 @@ def report_delivery_status(
         ffmpeg_process_running.labels(stream=stream).set(1)
     update_stream_uptime(stream)
     with allocation_lock:
-        register_or_refresh_stream(stream, proxy_pod)
+        previous_owner = (stream_registry.get(stream) or {}).get("proxy_pod")
+        ownership_updated = try_handover_stream_owner(stream, proxy_pod)
+        if not ownership_updated:
+            current_owner = (stream_registry.get(stream) or {}).get("proxy_pod")
+            logger.warning(
+                f"[DeliveryStatus] Owner conflict for stream '{stream}': "
+                f"reporter='{proxy_pod}' current_owner='{current_owner}'"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=f"stream '{stream}' owned by another proxy '{current_owner}'"
+            )
+
+        if previous_owner and previous_owner != proxy_pod:
+            logger.info(
+                f"[DeliveryStatus] Ownership handover accepted for stream '{stream}' "
+                f"from='{previous_owner}' to='{proxy_pod}'"
+            )
+        else:
+            logger.info(
+                f"[DeliveryStatus] Ownership refresh accepted for stream '{stream}' owner='{proxy_pod}'"
+            )
+
         persist_state_locked()
     return {'acknowledged': True, 'status': status}
 
