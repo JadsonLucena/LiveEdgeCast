@@ -49,10 +49,14 @@ PROXY_HEALTHCHECK_MAX_FAILURES = 3
 PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
 PROXY_HEALTHCHECK_MAX_CONCURRENCY = 20
 PROXY_HEALTHCHECK_JITTER_SECONDS = 1.5
+WORKER_HEALTHCHECK_INTERVAL_SECONDS = 3
+WORKER_HEALTHCHECK_MAX_FAILURES = 3
+WORKER_HEALTHCHECK_JITTER_SECONDS = 1.5
 WORKER_READY_HEALTH_DELAY_SECONDS = 3
 STREAM_TTL_SECONDS = 180
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
+worker_health_failures: Dict[str, int] = {}
 proxy_ready_since: Dict[str, float] = {}
 
 STATE_CONFIGMAP_NAME = "controller-state"
@@ -337,7 +341,7 @@ async def schedule_scale_down_if_idle():
 async def monitor_stream_registry_health():
     """
     Controller-driven health monitoring:
-    - A cada 5s verifica /health de cada proxy com stream ativa
+    - A cada 3s verifica /health de cada proxy com stream ativa
     - Após 3 falhas consecutivas, expira todas as streams daquele proxy
     """
     semaphore = asyncio.Semaphore(PROXY_HEALTHCHECK_MAX_CONCURRENCY)
@@ -379,6 +383,7 @@ async def monitor_stream_registry_health():
                         if worker_name:
                             worker_to_stream.pop(worker_name, None)
                             worker_ready_since.pop(worker_name, None)
+                            worker_health_failures.pop(worker_name, None)
                             try:
                                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
                             except Exception as e:
@@ -546,29 +551,33 @@ async def collect_infrastructure_metrics():
 
 
 async def monitor_worker_health():
-    """Controller-driven worker healthcheck every 3s + pending allocation retry."""
+    """Controller-driven worker healthcheck every 3s, with 3 consecutive failures threshold."""
     while True:
-        await asyncio.sleep(3)
+        await asyncio.sleep(WORKER_HEALTHCHECK_INTERVAL_SECONDS)
         to_replace = []
 
         with allocation_lock:
             allocations = list(stream_to_worker.items())
-            pending_streams = list(streams_pending_allocation.keys())
 
         # Health check for allocated workers
         for stream, worker_pod in allocations:
+            if WORKER_HEALTHCHECK_JITTER_SECONDS > 0:
+                await asyncio.sleep(random.uniform(0, WORKER_HEALTHCHECK_JITTER_SECONDS))
+
             healthy = False
             try:
                 pod = core.read_namespaced_pod(name=worker_pod, namespace=NAMESPACE)
                 ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
                 if not ready:
                     worker_ready_since.pop(worker_pod, None)
+                    worker_health_failures.pop(worker_pod, None)
                     continue
 
                 now = time.time()
                 first_ready_at = worker_ready_since.get(worker_pod)
                 if first_ready_at is None:
                     worker_ready_since[worker_pod] = now
+                    worker_health_failures[worker_pod] = 0
                     logger.debug(f"[WorkerHealth] Worker '{worker_pod}' became Ready. Starting /health delay timer.")
                     continue
 
@@ -579,11 +588,35 @@ async def monitor_worker_health():
                     )
                     continue
 
+                owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+                if not owner_proxy:
+                    logger.debug(f"[WorkerHealth] Stream '{stream}' has no proxy owner; skipping worker check.")
+                    worker_health_failures.pop(worker_pod, None)
+                    continue
+
+                if not check_proxy_health(owner_proxy):
+                    logger.debug(
+                        f"[WorkerHealth] Skipping worker '{worker_pod}' check because owner proxy "
+                        f"'{owner_proxy}' is not healthy."
+                    )
+                    worker_health_failures.pop(worker_pod, None)
+                    continue
+
                 healthy = check_worker_health(worker_pod, pod.status.pod_ip)
             except Exception:
                 healthy = False
 
-            if not healthy:
+            if healthy:
+                worker_health_failures[worker_pod] = 0
+                continue
+
+            failures = worker_health_failures.get(worker_pod, 0) + 1
+            worker_health_failures[worker_pod] = failures
+            logger.warning(
+                f"[WorkerHealth] Worker '{worker_pod}' failed healthcheck for stream '{stream}' "
+                f"({failures}/{WORKER_HEALTHCHECK_MAX_FAILURES})"
+            )
+            if failures >= WORKER_HEALTHCHECK_MAX_FAILURES:
                 to_replace.append((stream, worker_pod))
 
         # Não reaproveitar pods prontos para pendências; sempre criar pod novo na alocação explícita.
@@ -598,6 +631,7 @@ async def monitor_worker_health():
                     stream_to_worker.pop(stream, None)
                     worker_to_stream.pop(worker_pod, None)
                     worker_ready_since.pop(worker_pod, None)
+                    worker_health_failures.pop(worker_pod, None)
                     streams_pending_allocation.pop(stream, None)
                     logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
                     try:
@@ -724,6 +758,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         del stream_to_worker[stream]
         del worker_to_stream[worker_name]
         worker_ready_since.pop(worker_name, None)
+        worker_health_failures.pop(worker_name, None)
         
         if stream in stream_to_proxy:
             del stream_to_proxy[stream]
