@@ -634,7 +634,8 @@ def health():
 
 def allocate_worker(
     stream: str = Query(..., description="Stream name"),
-    proxy_pod: str = Query(None, description="Proxy pod name for pull-only architecture")
+    proxy_pod: str = Query(None, description="Proxy pod name for pull-only architecture"),
+    ownership_already_verified: bool = False,
 ):
     """
     Aloca um worker dedicado para uma stream.
@@ -651,7 +652,7 @@ def allocate_worker(
     with allocation_lock:
         cleanup_expired_streams()
 
-        if proxy_pod:
+        if proxy_pod and not ownership_already_verified:
             if not try_handover_stream_owner(stream, proxy_pod):
                 owner = stream_registry.get(stream, {}).get("proxy_pod")
                 persist_state_locked()
@@ -667,18 +668,18 @@ def allocate_worker(
         
         if stream in stream_to_worker:
             existing_worker = stream_to_worker[stream]
-            
+
             owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
             if not owner_proxy:
                 raise HTTPException(status_code=409, detail=f"stream '{stream}' has no proxy owner")
             proxy_address = resolve_proxy_address(owner_proxy)
-            
-            logger.info(f"[Allocate] Stream '{stream}' already has worker: {existing_worker} - Proxy: {proxy_address}")
+
+            logger.info(f"[Allocate] Idempotent replay for stream '{stream}' existing worker={existing_worker} proxy={proxy_address}")
             return {
                 "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
                 "name": existing_worker,
                 "proxy": proxy_address,
-                "status": "existing"
+                "status": "idempotent_replay"
             }
         
         # Modelo 1:1 (pod por stream): nunca reaproveitar worker já existente.
@@ -710,8 +711,8 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
     
     with allocation_lock:
         if stream not in stream_to_worker:
-            logger.warning(f"[Release] Stream '{stream}' not found in allocations")
-            
+            logger.info(f"[Release] Idempotent replay: stream '{stream}' not found in allocations")
+
             if stream in streams_pending_allocation:
                 del streams_pending_allocation[stream]
                 logger.info(f"[Release] Removed stream '{stream}' from pending allocation queue (never allocated)")
@@ -764,16 +765,28 @@ def register_stream(
 ):
     with allocation_lock:
         cleanup_expired_streams()
+        current = stream_registry.get(stream)
+        was_replay = current and current.get("proxy_pod") == proxy_pod
+
         if not try_handover_stream_owner(stream, proxy_pod):
             current_owner = stream_registry.get(stream, {}).get("proxy_pod")
             raise HTTPException(
                 status_code=409,
                 detail=f"stream '{stream}' already owned by proxy '{current_owner}'"
             )
+
         expires_at = stream_registry.get(stream, {}).get("expires_at")
         persist_state_locked()
+
+        if was_replay:
+            logger.info(f"[Register] Idempotent replay for stream '{stream}' on proxy '{proxy_pod}'")
+            status = "idempotent_replay"
+        else:
+            logger.info(f"[Register] State changed for stream '{stream}' owner='{proxy_pod}'")
+            status = "registered"
+
         return {
-            "status": "registered",
+            "status": status,
             "stream": stream,
             "proxy_pod": proxy_pod,
             "ttl_seconds": STREAM_TTL_SECONDS,
@@ -850,11 +863,17 @@ def stream_started(
     """Single controller entrypoint when proxy publish starts.
     Controller performs register/allocation/start orchestration.
     """
-    register_stream(stream=stream, proxy_pod=proxy_pod)
-    allocation = allocate_worker(stream=stream, proxy_pod=proxy_pod)
+    registration = register_stream(stream=stream, proxy_pod=proxy_pod)
+    allocation = allocate_worker(stream=stream, proxy_pod=proxy_pod, ownership_already_verified=True)
+
+    replay = registration.get("status") == "idempotent_replay" and allocation.get("status") == "idempotent_replay"
+    event_status = "idempotent_replay" if replay else "started_event_processed"
+    log_prefix = "Idempotent replay" if replay else "State changed"
+    logger.info(f"[StreamsStarted] {log_prefix} for stream '{stream}' proxy='{proxy_pod}'")
 
     return {
-        "status": "started_event_processed",
+        "status": event_status,
+        "registration": registration,
         "stream": stream,
         "allocation": allocation,
     }
@@ -874,7 +893,13 @@ async def stream_ended(
                 stream_to_proxy.pop(stream, None)
 
     release_result = await release_worker(stream=stream)
-    return {"status": "ended", "stream": stream, "release": release_result}
+    replay = release_result.get("status") == "not_found"
+    event_status = "idempotent_replay" if replay else "ended"
+    logger.info(
+        f"[StreamsEnded] {'Idempotent replay' if replay else 'State changed'} for stream '{stream}' "
+        f"proxy='{proxy_pod}' release_status='{release_result.get('status')}'"
+    )
+    return {"status": event_status, "stream": stream, "release": release_result}
 @app.get("/status")
 def get_status():
     """
