@@ -700,8 +700,16 @@ async def reconcile_streams_loop():
                     has_worker = stream in stream_to_worker
                 if current_owner != proxy_pod:
                     with allocation_lock:
-                        try_handover_stream_owner(stream, proxy_pod)
-                        persist_state_locked()
+                        handover_ok = try_handover_stream_owner(stream, proxy_pod)
+                        if handover_ok:
+                            persist_state_locked()
+                        else:
+                            logger.debug(
+                                f"[Reconcile] Ownership did not converge for stream '{stream}': "
+                                f"current_owner='{current_owner}' desired_owner='{proxy_pod}'"
+                            )
+                    if not handover_ok:
+                        continue
                 if not has_worker:
                     try:
                         allocate_worker(stream=stream, proxy_pod=proxy_pod)
@@ -709,6 +717,19 @@ async def reconcile_streams_loop():
                         logger.warning(f"[Reconcile] Failed allocate for '{stream}': {e}")
                         continue
                 with allocation_lock:
+                    effective_owner = stream_registry.get(stream, {}).get("proxy_pod")
+                    if effective_owner != proxy_pod:
+                        logger.debug(
+                            f"[Reconcile] Skip observed update for stream '{stream}' because owner "
+                            f"is '{effective_owner}' not desired '{proxy_pod}'"
+                        )
+                        continue
+                    effective_worker = stream_to_worker.get(stream)
+                    if not effective_worker:
+                        logger.debug(
+                            f"[Reconcile] Skip observed update for stream '{stream}' because no worker is allocated yet"
+                        )
+                        continue
                     current_desired = stream_desired_state.get(stream)
                     if not current_desired:
                         continue
@@ -718,8 +739,6 @@ async def reconcile_streams_loop():
                             f"(snapshot gen/state={desired.get('generation')}/{desired.get('state')} current="
                             f"{current_desired.get('generation')}/{current_desired.get('state')})"
                         )
-                        continue
-                    if current_desired.get("observedGeneration") == current_desired.get("generation"):
                         continue
                     if current_desired.get("observedGeneration") == current_desired.get("generation"):
                         continue
