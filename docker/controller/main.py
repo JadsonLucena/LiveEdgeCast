@@ -687,7 +687,7 @@ async def reconcile_streams_loop():
     while True:
         await asyncio.sleep(1)
         with allocation_lock:
-            desired_snapshot = dict(stream_desired_state)
+            desired_snapshot = copy.deepcopy(stream_desired_state)
 
         for stream, desired in desired_snapshot.items():
             state = desired.get("state")
