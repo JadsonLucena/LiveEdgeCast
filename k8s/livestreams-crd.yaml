@@ -1,0 +1,108 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: livestreams.media.liveedgecast.io
+spec:
+  group: media.liveedgecast.io
+  scope: Namespaced
+  names:
+    plural: livestreams
+    singular: livestream
+    kind: Livestream
+    shortNames:
+      - ls
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: StreamKey
+          type: string
+          jsonPath: .spec.streamKey
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: ProxyPod
+          type: string
+          jsonPath: .status.proxyPod
+        - name: WorkerPod
+          type: string
+          jsonPath: .status.workerPod
+        - name: Generation
+          type: integer
+          jsonPath: .status.generation
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            spec:
+              type: object
+              required:
+                - streamKey
+              properties:
+                streamKey:
+                  type: string
+                  minLength: 1
+                  description: Chave lógica da stream (identificador canônico no controller).
+            status:
+              type: object
+              description: Estado observado da stream pelo controller.
+              properties:
+                proxyPod:
+                  type: string
+                  description: Mapeia stream_to_proxy[stream] e stream_registry[stream].proxy_pod.
+                workerPod:
+                  type: string
+                  description: Mapeia stream_to_worker[stream]. Deve existir no máximo um worker por streamKey.
+                generation:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                  description: Mapeia stream_generation[stream]. Incrementa em handover aceito.
+                phase:
+                  type: string
+                  description: Fase resumida observada (ex. Pending, Assigned, Running, Degraded, Ended).
+                health:
+                  type: string
+                  description: Sinal consolidado de saúde derivado dos healthchecks de proxy/worker.
+                conditions:
+                  type: array
+                  description: Condições padrão para reconciliação e observabilidade.
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - lastTransitionTime
+                      - reason
+                      - message
+                    properties:
+                      type:
+                        type: string
+                        enum:
+                          - Ready
+                          - Assigned
+                          - Degraded
+                      status:
+                        type: string
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                        minimum: 0
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                        minLength: 1
+                      message:
+                        type: string
+                        minLength: 1
+      subresources:
+        status: {}

@@ -1,133 +1,95 @@
-# Stream Lifecycle and Reconciliation Flow
+# Fluxo de Ciclo de Vida e Reconciliação de Streams
 
-This document defines the full end-to-end lifecycle for a live stream in the current pull-only architecture.
+Este documento descreve o **comportamento atual** do sistema com base no código do controller/proxy/worker e no diagrama `diagrams/activity-flow.mmd` (fonte da verdade).
 
-## Components
+## Fluxo padrão
 
-- **Proxy**: receives RTMP publish from broadcaster and only notifies the Controller.
-- **Controller**: single source of truth for ownership, allocation, start/stop orchestration, health reconciliation, and failover decisions.
-- **Worker**: dedicated pod per stream key. Pulls from the assigned Proxy pod and pushes to YouTube.
-
-## Core State Model (Controller)
-
-Per stream key, the Controller maintains:
+### Início do Ciclo de Vida (Início da Publicação)
+- O cliente inicia a publicação RTMP no load balancer.
+- O load balancer encaminha o stream para o proxy menos utilizado (estratégia de balanceamento).
+- O proxy executa `on_publish_start.sh` via `exec_publish`.
+- O proxy notifica o controller em `POST /streams/started?stream=<STREAM_KEY>&proxy_pod=<PROXY_POD>`.
+- O controller registra ownership da stream e persiste estado.
+- O controller garante idempotência:
+  - se já existir worker para a stream, retorna `idempotent_replay`;
+  - se não existir, cria novo worker com `create_namespaced_pod`.
+- Na criação do worker, o controller injeta as variáveis de ambiente:
+  - `STREAM_KEY`
+  - `PROXY_DNS`
+- O controller atualiza e persiste mapeamentos internos de alocação (equivalente lógico):
 
 ```json
 {
-  "streamKey": {
-    "proxyPod": "string",
-    "workerPod": "string",
-    "generation": 1,
-    "expiresAt": 0
+  "streams": {
+    "<STREAM_KEY>": {
+      "proxyPod": "string",
+      "workerPod": "string"
+    }
   }
 }
 ```
 
-Important state structures:
+> Implementação atual do estado usa dicionários normalizados (`stream_registry`, `stream_to_proxy`, `stream_to_worker`, `worker_to_stream`, `stream_generation`) em vez de um único objeto `streams`.
 
-- `stream_registry`: stream -> current proxy owner + TTL expiration.
-- `stream_to_worker`: stream -> allocated worker pod.
-- `worker_to_stream`: worker pod -> stream.
-- `stream_generation`: stream -> generation token.
+- O worker executa `entrypoint.sh`, que inicia `worker_stream_runner.sh` e `nginx -g 'daemon off;'`.
+- O worker faz pull do proxy e push para o destino RTMP.
 
-## Start Lifecycle (Publish Start)
+### Fim do Ciclo de Vida (Fim da Publicação)
+- O cliente termina a publicação RTMP.
+- Após 60s de inatividade do publisher (`drop_idle_publisher 60s`), o proxy executa `on_publish_done.sh`.
+- O proxy notifica o controller em `POST /streams/ended?stream=<STREAM_KEY>&proxy_pod=<PROXY_POD>`.
+- O controller libera o worker.
+- O controller remove mapeamentos internos da stream (ownership/alocação/geração) e persiste estado.
 
-1. Broadcaster starts RTMP publish into a Proxy pod.
-2. Proxy executes `on_publish_start.sh`.
-3. Proxy calls:
-   - `POST /streams/started?stream=<key>&proxy_pod=<proxyPod>`
-4. Controller handles the full flow:
-   - registers/refreshes stream ownership in `stream_registry`;
-   - allocates an available worker or triggers scale-up if needed;
-   - if worker is already available, starts it immediately.
-5. Controller starts worker via `kubectl exec` passing:
-   - `STREAM_KEY`
-   - `STREAM_GENERATION`
-   - `PROXY_DNS`
-6. Worker runs `worker_stream_runner.sh` (single-shot):
-   - pulls from `rtmp://<PROXY_DNS>:1935/live/<STREAM_KEY>`;
-   - pushes to `${RTMP_PUSH_BASE_URL}/${STREAM_KEY}`;
-   - exits non-zero on failure (crash-fast).
+## Fluxo de Reconciliação
 
-## End Lifecycle (Publish End)
+Deve haver **somente um worker por `streamKey`**. A alocação é idempotente e protegida por lock no controller.
 
-1. Broadcaster stops publish in Proxy.
-2. Proxy executes `on_publish_done.sh`.
-3. Proxy calls:
-   - `POST /streams/ended?stream=<key>&proxy_pod=<proxyPod>`
-4. Controller performs all cleanup:
-   - removes registry ownership for the stream if applicable;
-   - releases worker allocation mapping;
-   - schedules scale-down when no streams are active.
+### Reconciliação de Saúde do Proxy
+- A verificação só começa quando o proxy está `Ready`.
+- Há delay pós-ready antes de contar falhas (`warming_up`).
+- Se o proxy estiver unhealthy/deletado, a saúde falha.
+- O controller deleta worker e expira ownership da(s) stream(s) após **3 falhas consecutivas** de healthcheck do proxy.
+- As tentativas rodam a cada **3s** com jitter de **1.5s**.
+- O healthcheck de worker só é executado quando o proxy owner está `healthy`.
 
-## Reconciliation Flow
+### Reconciliação de Saúde do Worker
+- A verificação só começa quando o worker está `Ready`.
+- Há delay pós-ready antes do primeiro `/health`.
+- O controller recria worker após **3 falhas consecutivas** de healthcheck do worker.
+- As tentativas rodam a cada **3s** com jitter de **1.5s**.
+- A contagem de falhas é atrelada ao **UID do worker**, reiniciando quando há troca de UID (auto-restart do Kubernetes, recreate ou handover).
+- O healthcheck do worker só ocorre quando o proxy owner está `healthy`.
+- O worker pode falhar por timeout RTMP do FFmpeg (~5s de `-rw_timeout`) e ser reiniciado automaticamente pelo Kubernetes até convergência.
 
-### Proxy Health Reconciliation
+## Regras de Handover
+- O proxy/nginx não deve permitir uso simultâneo da mesma stream key no mesmo pod (configuração `live on` no `nginx.conf`).
+- Se não houver mapeamento para a `streamKey`, o controller cria novo mapeamento.
+- Quando a `streamKey` já está em uso, o controller avalia elegibilidade de handover.
+- A troca de ownership (`proxyPod`) só ocorre se o proxy owner anterior estiver `unhealthy` ou deletado.
+- Em handover aceito, o controller incrementa `generation` e pode substituir o worker para atualizar `PROXY_DNS`.
 
-- Controller checks proxy health every 3s.
-- If a proxy becomes unhealthy and exceeds failure threshold:
-  - all impacted streams in `stream_registry` are expired;
-  - mapped workers consuming from that proxy are deleted;
-  - reallocation/restart is driven by subsequent stream events and reconciler loop.
+## Limpeza
+- A cada **60s**, o sweeper verifica workers órfãos.
+- Antes de deletar, revalida em lock (double-check) para evitar corrida.
+- Se continuar órfão, remove o pod.
 
-### Worker Health Reconciliation
-
-- Controller checks worker health every 3s.
-- For each allocated stream:
-  - validates worker pod readiness;
-  - validates stream processing signal.
-- If unhealthy:
-  - removes mapping;
-  - deletes defective worker pod;
-  - allows replacement via normal allocation flow.
-
-## Handover and Generation Rules
-
-When the same stream key is seen on another proxy pod:
-
-1. Controller evaluates ownership handover eligibility.
-2. If handover is accepted:
-   - increments `stream_generation`;
-   - updates stream owner to new proxy.
-3. Worker start requests may include generation check:
-   - if generation mismatches, Controller ignores stale start.
-
-This prevents split-brain and stale worker restarts from old ownership context.
-
-## Failure Strategy (Crash-Fast)
-
-- Worker does not run long local recovery loops.
-- Worker failures are intentional signals for replacement.
-- Controller is responsible for replacement and convergence.
-
-## TTL and Inactivity Rules
-
-- `STREAM_TTL_SECONDS = 180`.
-- If stream activity is not refreshed within TTL, registry entry expires.
-- Controller remains responsible for cleanup/reconciliation actions.
-
-## Observability
-
-Key metrics include:
-
-- stream delivery status/error counters;
-- proxy and worker health-related metrics;
-- `stream_assignment_info{stream, proxy_pod, worker_pod, generation}`.
-
-These metrics support per-stream tracking during normal operation, handover, and failover.
-
-## Responsibility Boundaries
+## Limites de Responsabilidade
 
 - **Proxy**:
-  - notify start (`/streams/started`)
-  - notify end (`/streams/ended`)
-  - no allocation/reconciliation decisions.
+  - notificar início (`/streams/started`)
+  - notificar fim (`/streams/ended`) após timeout de 60s de idle publisher
+  - não tomar decisões de alocação/reconciliação
 
 - **Worker**:
-  - execute pull/push for assigned stream.
-  - fail fast on any critical execution problem.
+  - executar pull/push para o fluxo atribuído
+  - falhar rapidamente em problemas críticos de execução
 
 - **Controller**:
-  - owns lifecycle orchestration;
-  - owns healthchecks and reconciliation;
-  - owns state persistence and generation safety.
+  - orquestrar ciclo de vida
+  - executar healthchecks e reconciliação
+  - persistir estado e garantir segurança de geração
+
+## Observação sobre TTL
+
+No fluxo atual, não há TTL temporal por `lastSeen` aplicado no controller. A “expiração” vigente é dirigida por falhas consecutivas de healthcheck do proxy (threshold de 3 falhas).
