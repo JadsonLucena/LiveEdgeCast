@@ -851,47 +851,8 @@ async def stream_ended(
         f"proxy='{proxy_pod}' release_status='{release_result.get('status')}'"
     )
     return {"status": event_status, "stream": stream, "release": release_result}
-@app.get("/status")
-def get_status():
-    """
-    Returns current allocation state.
-    Useful for debugging and monitoring.
-    """
-    with allocation_lock:
-        return {
-            "active_streams": len(stream_to_worker),
-            "registry_streams": len(stream_registry),
-            "allocations": [
-                {
-                    "stream": stream,
-                    "worker": worker
-                }
-                for stream, worker in stream_to_worker.items()
-            ],
-            "registry": [
-                {
-                    "stream": stream,
-                    "proxy_pod": data.get("proxy_pod")
-                }
-                for stream, data in stream_registry.items()
-            ]
-        }
-
-
 
 @app.get('/metrics')
 def metrics():
     return Response(generate_latest(), media_type='text/plain; version=0.0.4; charset=utf-8')
-
-@app.get('/debug/streams')
-def debug_streams():
-    with allocation_lock:
-        return {
-            stream: {
-                'proxy_pod': entry.get('proxy_pod'),
-                'worker_pod': stream_to_worker.get(stream),
-                'generation': stream_generation.get(stream, 1),
-            }
-            for stream, entry in stream_registry.items()
-        }
 
