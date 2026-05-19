@@ -30,7 +30,9 @@ flowchart TD
     V --> W{Worker healthy?}
     W -->|Sim| X[Zera falhas do worker por UID]
     W -->|Não| Y[Incrementa falhas do worker por UID]
-    Y --> Z{Falhas do worker >= 3?}
+    Y --> Y1[Worker pode crashar por timeout RTMP do FFmpeg (5s)
+e o Kubernetes reinicia automaticamente]
+    Y1 --> Z{Falhas do worker >= 3?}
     Z -->|Sim| AA[Controller recria worker, atualiza mapeamentos e persiste estado]
     Z -->|Não| Q
 
