@@ -726,44 +726,54 @@ def allocate_worker(
 
 async def release_worker(stream: str = Query(..., description="Stream name to release")):
     """
-    Libera worker alocado para uma stream.
-    Remove mapeamento stream→worker e estado associado.
+    Libera worker alocado para uma stream e SEMPRE limpa estado canônico residual.
+    Idempotente: se não houver worker, ainda remove ownership/mapeamentos restantes.
     """
-    
-    with allocation_lock:
-        if stream not in stream_to_worker:
-            logger.info(f"[Release] Idempotent replay: stream '{stream}' not found in allocations")
 
-            return {"status": "not_found", "stream": stream}
-        
-        worker_name = stream_to_worker[stream]
-        
-        del stream_to_worker[stream]
-        del worker_to_stream[worker_name]
-        worker_ready_since.pop(worker_name, None)
-        old_uid = worker_pod_uid_by_name.pop(worker_name, None)
-        if old_uid:
-            worker_health_failures.pop(old_uid, None)
-        
-        if stream in stream_to_proxy:
-            del stream_to_proxy[stream]
-        if stream in stream_registry:
-            del stream_registry[stream]
-        stream_generation.pop(stream, None)
-        
-        persist_state_locked()
-        
+    worker_name = None
+    changed = False
+    response_status = "not_found"
+
+    with allocation_lock:
+        worker_name = stream_to_worker.pop(stream, None)
+
+        if worker_name:
+            changed = True
+            response_status = "released"
+            worker_to_stream.pop(worker_name, None)
+            worker_ready_since.pop(worker_name, None)
+            old_uid = worker_pod_uid_by_name.pop(worker_name, None)
+            if old_uid:
+                worker_health_failures.pop(old_uid, None)
+
+        if stream_to_proxy.pop(stream, None) is not None:
+            changed = True
+        if stream_registry.pop(stream, None) is not None:
+            changed = True
+        if stream_generation.pop(stream, None) is not None:
+            changed = True
+
+        if changed:
+            persist_state_locked()
+
+    if worker_name:
         logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
         try:
             core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
         except ApiException as e:
             logger.warning(f"[Release] Failed deleting worker pod {worker_name}: {e}")
-
         return {
-            "status": "released",
+            "status": response_status,
             "stream": stream,
             "worker": worker_name
         }
+
+    if changed:
+        logger.info(f"[Release] Cleaned residual state for stream '{stream}' without active worker")
+        return {"status": "state_cleaned", "stream": stream}
+
+    logger.info(f"[Release] Idempotent replay: stream '{stream}' not found")
+    return {"status": "not_found", "stream": stream}
 
 
 def register_stream(
