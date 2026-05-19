@@ -311,7 +311,7 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
 
     owner_unhealthy = proxy_health_failures.get(current_owner, 0) >= PROXY_HEALTHCHECK_MAX_FAILURES
     if not owner_unhealthy:
-        owner_unhealthy = not check_proxy_health(current_owner)
+        owner_unhealthy = get_proxy_health_status(current_owner) == "unhealthy"
 
     if owner_unhealthy:
         logger.info(
@@ -360,14 +360,19 @@ async def monitor_stream_registry_health():
             await asyncio.sleep(random.uniform(0, PROXY_HEALTHCHECK_JITTER_SECONDS))
 
         async with semaphore:
-            is_healthy = await asyncio.to_thread(check_proxy_health, proxy_pod)
+            health_status = await asyncio.to_thread(get_proxy_health_status, proxy_pod)
 
         with allocation_lock:
-            if is_healthy:
+            if health_status == "healthy":
                 proxy_health_failures[proxy_pod] = 0
                 for stream, entry in stream_registry.items():
                     if entry.get("proxy_pod") == proxy_pod:
                         entry["expires_at"] = time.time() + STREAM_TTL_SECONDS
+            elif health_status in ("not_ready", "warming_up"):
+                logger.debug(
+                    f"[ProxyHealth] Proxy '{proxy_pod}' status is {health_status}; "
+                    "waiting before counting /health probe failures."
+                )
             else:
                 failures = proxy_health_failures.get(proxy_pod, 0) + 1
                 proxy_health_failures[proxy_pod] = failures
@@ -392,15 +397,17 @@ async def monitor_stream_registry_health():
                         if worker_name:
                             worker_to_stream.pop(worker_name, None)
                             worker_ready_since.pop(worker_name, None)
-                            worker_health_failures.pop(worker_name, None)
-                            worker_pod_uid_by_name.pop(worker_name, None)
+                            old_uid = worker_pod_uid_by_name.pop(worker_name, None)
+                            if old_uid:
+                                worker_health_failures.pop(old_uid, None)
                             try:
                                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
                             except Exception as e:
                                 logger.warning(f"[ProxyHealth] Failed deleting worker {worker_name}: {e}")
-                    
+
                     proxy_health_failures.pop(proxy_pod, None)
                     proxy_ready_since.pop(proxy_pod, None)
+                    persist_state_locked()
 
     while True:
         await asyncio.sleep(PROXY_HEALTHCHECK_INTERVAL_SECONDS)
@@ -425,14 +432,14 @@ def resolve_proxy_address(proxy_pod: str) -> str:
     return pod_ip
 
 
-def check_proxy_health(proxy_pod: str) -> bool:
-    """Checks proxy pod health after Ready plus proxy-specific stabilization delay."""
+def get_proxy_health_status(proxy_pod: str) -> str:
+    """Returns proxy health status without counting NotReady/warm-up as probe failures."""
     try:
         pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
         ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
         if not ready:
             proxy_ready_since.pop(proxy_pod, None)
-            return False
+            return "not_ready"
 
         now = time.time()
         first_ready_at = proxy_ready_since.get(proxy_pod)
@@ -442,19 +449,30 @@ def check_proxy_health(proxy_pod: str) -> bool:
                 f"[ProxyHealth] Proxy '{proxy_pod}' became Ready. Starting proxy delay timer "
                 f"({PROXY_READY_HEALTH_DELAY_SECONDS}s) before /health probe."
             )
-            return False
+            return "warming_up"
         if (now - first_ready_at) < PROXY_READY_HEALTH_DELAY_SECONDS:
             logger.debug(
                 f"[ProxyHealth] Waiting {PROXY_READY_HEALTH_DELAY_SECONDS}s after Ready for '{proxy_pod}' "
                 f"before probing /health ({now - first_ready_at:.1f}s elapsed)."
             )
-            return False
+            return "warming_up"
 
         target = resolve_proxy_address(proxy_pod)
         response = requests.get(f"http://{target}:8080/health", timeout=PROXY_HEALTHCHECK_TIMEOUT_SECONDS)
-        return response.status_code == 200
-    except Exception:
-        return False
+        return "healthy" if response.status_code == 200 else "unhealthy"
+    except ApiException as e:
+        if e.status == 404:
+            return "unhealthy"
+        logger.warning(f"[ProxyHealth] Failed to read proxy pod '{proxy_pod}': {e}")
+        return "unhealthy"
+    except Exception as e:
+        logger.warning(f"[ProxyHealth] Failed to check /health for proxy '{proxy_pod}': {e}")
+        return "unhealthy"
+
+
+def check_proxy_health(proxy_pod: str) -> bool:
+    """Checks proxy pod health after Ready plus proxy-specific stabilization delay."""
+    return get_proxy_health_status(proxy_pod) == "healthy"
 
 
 def check_worker_health(pod_name: str, pod_ip: Optional[str] = None) -> bool:
@@ -597,6 +615,7 @@ async def monitor_worker_health():
                 await asyncio.sleep(random.uniform(0, WORKER_HEALTHCHECK_JITTER_SECONDS))
 
             healthy = False
+            current_uid = ""
             try:
                 pod = core.read_namespaced_pod(name=worker_pod, namespace=NAMESPACE)
                 current_uid = ((pod.metadata.uid or "").strip() if pod and pod.metadata else "")
@@ -674,18 +693,50 @@ async def monitor_worker_health():
                     allocated = stream_to_worker.get(stream)
                     if allocated != worker_pod:
                         continue
-                    stream_to_worker.pop(stream, None)
+
+                    owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+                    if not owner_proxy:
+                        logger.warning(
+                            f"[WorkerHealth] Cannot replace worker '{worker_pod}' for stream '{stream}' "
+                            "because the stream has no proxy owner."
+                        )
+                        continue
+
+                    if get_proxy_health_status(owner_proxy) != "healthy":
+                        logger.info(
+                            f"[WorkerHealth] Delaying replacement of worker '{worker_pod}' for stream '{stream}' "
+                            f"because owner proxy '{owner_proxy}' is not healthy."
+                        )
+                        continue
+
+                    logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
+                    try:
+                        proxy_dns = resolve_proxy_address(owner_proxy)
+                        new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
+                    except Exception as e:
+                        logger.warning(
+                            f"[WorkerHealth] Failed to create replacement worker for stream '{stream}': {e}"
+                        )
+                        continue
+
+                    stream_to_worker[stream] = new_worker
                     worker_to_stream.pop(worker_pod, None)
+                    worker_to_stream[new_worker] = stream
                     worker_ready_since.pop(worker_pod, None)
                     old_uid = worker_pod_uid_by_name.pop(worker_pod, None)
                     if old_uid:
                         worker_health_failures.pop(old_uid, None)
                     streams_pending_allocation.pop(stream, None)
-                    logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
+
                     try:
                         core.delete_namespaced_pod(name=worker_pod, namespace=NAMESPACE, grace_period_seconds=0)
                     except Exception as e:
                         logger.warning(f"[WorkerHealth] Failed to delete pod {worker_pod}: {e}")
+
+                    logger.info(
+                        f"[WorkerHealth] Replaced unhealthy worker for stream '{stream}': "
+                        f"old='{worker_pod}' new='{new_worker}' proxy='{owner_proxy}'"
+                    )
                 persist_state_locked()
 
 @app.on_event("startup")
