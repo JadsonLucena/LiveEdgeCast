@@ -245,15 +245,18 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
         f"old='{old_worker}' new='{new_worker}' proxy_dns='{proxy_dns}'"
     )
     return new_worker
-def cleanup_expired_streams() -> None:
+def cleanup_expired_streams() -> bool:
     """
     Removes expired streams from the ephemeral registry.
     Also removes stream/proxy/worker mappings to keep state consistent.
+    Returns True when at least one stream is cleaned up.
     """
     now = time.time()
     expired = [stream for stream, entry in stream_registry.items() if entry.get("expires_at", 0) <= now]
+    changed = False
 
     for stream in expired:
+        changed = True
         stream_registry.pop(stream, None)
         stream_to_proxy.pop(stream, None)
 
@@ -270,6 +273,8 @@ def cleanup_expired_streams() -> None:
                 logger.warning(f"[Registry] Failed deleting expired worker {worker_name}: {e}")
 
         logger.info(f"[Registry] Stream '{stream}' expired after inactivity window")
+
+    return changed
 
 
 def register_or_refresh_stream(stream: str, proxy_pod: str):
@@ -411,8 +416,9 @@ async def monitor_stream_registry_health():
         await asyncio.sleep(PROXY_HEALTHCHECK_INTERVAL_SECONDS)
 
         with allocation_lock:
-            cleanup_expired_streams()
-            persist_state_locked()
+            changed = cleanup_expired_streams()
+            if changed:
+                persist_state_locked()
             proxies = {entry.get("proxy_pod") for entry in stream_registry.values() if entry.get("proxy_pod")}
 
         if proxies:
