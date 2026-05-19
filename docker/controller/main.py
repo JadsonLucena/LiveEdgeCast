@@ -670,16 +670,14 @@ def allocate_worker(
     """
     Aloca um worker dedicado para uma stream.
     Controller é a ÚNICA fonte da verdade para scale-up.
-    
-    Args:
-        stream: Nome da stream (YouTube key)
-        proxy_pod: Nome do pod do proxy que recebeu a stream (para Pull-Only)
-    
-    Retorna worker DNS + proxy DNS se disponível, ou None se ainda está escalando.
-    """
-    
-    with allocation_lock:
 
+    Estratégia de concorrência:
+    - usar lock apenas para decisões/mutação de estado interno
+    - executar I/O Kubernetes fora do lock
+    - revalidar estado ao voltar do I/O para evitar corridas
+    """
+
+    with allocation_lock:
         if proxy_pod and not ownership_already_verified:
             if not try_handover_stream_owner(stream, proxy_pod):
                 owner = stream_registry.get(stream, {}).get("proxy_pod")
@@ -690,38 +688,68 @@ def allocate_worker(
                 )
             persist_state_locked()
 
-        if stream in stream_to_worker:
-            existing_worker = stream_to_worker[stream]
+        existing_worker = stream_to_worker.get(stream)
+        owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+        generation_snapshot = stream_generation.get(stream)
 
-            owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-            if not owner_proxy:
-                raise HTTPException(status_code=409, detail=f"stream '{stream}' has no proxy owner")
-            proxy_address = resolve_proxy_address(owner_proxy)
+    if not owner_proxy:
+        raise HTTPException(status_code=409, detail=f"stream '{stream}' has no proxy owner")
 
-            logger.info(f"[Allocate] Idempotent replay for stream '{stream}' existing worker={existing_worker} proxy={proxy_address}")
+    proxy_address = resolve_proxy_address(owner_proxy)
+
+    if existing_worker:
+        logger.info(
+            f"[Allocate] Idempotent replay for stream '{stream}' "
+            f"existing worker={existing_worker} proxy={proxy_address}"
+        )
+        return {
+            "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
+            "name": existing_worker,
+            "proxy": proxy_address,
+            "status": "idempotent_replay"
+        }
+
+    pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
+
+    with allocation_lock:
+        current_worker = stream_to_worker.get(stream)
+        current_owner = stream_registry.get(stream, {}).get("proxy_pod")
+        current_generation = stream_generation.get(stream)
+
+        if current_worker:
+            logger.info(
+                f"[Allocate] Concurrent allocation detected for stream '{stream}'. "
+                f"Discarding newly created worker '{pod_name}' and keeping '{current_worker}'."
+            )
+            try:
+                core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+            except ApiException as e:
+                logger.warning(f"[Allocate] Failed deleting extra worker pod {pod_name}: {e}")
             return {
-                "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
-                "name": existing_worker,
+                "pod": f"{current_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
+                "name": current_worker,
                 "proxy": proxy_address,
                 "status": "idempotent_replay"
             }
-        
-        # Modelo 1:1 (pod por stream): nunca reaproveitar worker já existente.
-        # Isso evita reuso indevido entre sessões e simplifica o ciclo de vida.
 
-        owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-        if not owner_proxy:
-            raise HTTPException(status_code=409, detail=f"stream '{stream}' has no proxy owner")
-        proxy_address = resolve_proxy_address(owner_proxy)
+        if current_owner != owner_proxy or current_generation != generation_snapshot:
+            logger.warning(
+                f"[Allocate] Ownership changed while creating worker for stream '{stream}'. "
+                f"expected_owner='{owner_proxy}' current_owner='{current_owner}'. Deleting '{pod_name}'."
+            )
+            try:
+                core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+            except ApiException as e:
+                logger.warning(f"[Allocate] Failed deleting stale worker pod {pod_name}: {e}")
+            raise HTTPException(status_code=409, detail=f"stream '{stream}' ownership changed during allocation")
 
-        pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
         stream_to_worker[stream] = pod_name
         worker_to_stream[pod_name] = stream
         persist_state_locked()
 
-        worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
-        logger.info(f"[Allocate] Created dedicated worker pod {pod_name} for stream '{stream}'")
-        return {"pod": worker_dns, "name": pod_name, "proxy": proxy_address, "worker": pod_name, "status": "created"}
+    worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
+    logger.info(f"[Allocate] Created dedicated worker pod {pod_name} for stream '{stream}'")
+    return {"pod": worker_dns, "name": pod_name, "proxy": proxy_address, "worker": pod_name, "status": "created"}
 
 
 async def release_worker(stream: str = Query(..., description="Stream name to release")):
