@@ -475,11 +475,6 @@ def get_proxy_health_status(proxy_pod: str) -> str:
         return "unhealthy"
 
 
-def check_proxy_health(proxy_pod: str) -> bool:
-    """Checks proxy pod health after Ready plus proxy-specific stabilization delay."""
-    return get_proxy_health_status(proxy_pod) == "healthy"
-
-
 def check_worker_health(pod_name: str, pod_ip: Optional[str] = None) -> bool:
     try:
         target = pod_ip if pod_ip else f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
@@ -660,10 +655,11 @@ async def monitor_worker_health():
                         worker_health_failures.pop(current_uid, None)
                     continue
 
-                if not check_proxy_health(owner_proxy):
+                owner_proxy_health = get_proxy_health_status(owner_proxy)
+                if owner_proxy_health != "healthy":
                     logger.debug(
                         f"[WorkerHealth] Skipping worker '{worker_pod}' check because owner proxy "
-                        f"'{owner_proxy}' is not healthy."
+                        f"'{owner_proxy}' is {owner_proxy_health}."
                     )
                     if current_uid:
                         worker_health_failures.pop(current_uid, None)
