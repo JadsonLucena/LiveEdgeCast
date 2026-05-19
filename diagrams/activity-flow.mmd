@@ -43,14 +43,14 @@ flowchart TD
     AC -->|Sim| AE[Controller transfere ownership, incrementa geração e troca worker para atualizar PROXY_DNS]
     AE --> Q
 
-    Q --> AS[GC/Sweeper de órfãos (a cada 60s): lista workers não mapeados,
-revalida (double-check) e deleta órfãos]
+    Q --> AS["GC/Sweeper de órfãos (a cada 60s): lista workers não mapeados,
+revalida (double-check) e deleta órfãos"]
     AS --> Q
 
     P -->|Sim| AF[Proxy detecta idle publisher por 60s]
     AF --> AG[exec_publish_done chama on_publish_done.sh]
     AG --> AH[Proxy notifica Controller: POST /streams/ended?stream&proxy_pod]
-    AH --> AI[Controller release_worker: remove mapeamentos,
-deleta pod (se houver) e persiste estado]
+    AH --> AI["Controller release_worker: remove mapeamentos,
+deleta pod (se houver) e persiste estado"]
     U --> AJ([Fim])
     AI --> AJ
