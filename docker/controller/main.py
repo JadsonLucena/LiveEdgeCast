@@ -26,7 +26,6 @@ app = FastAPI()
 NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
 WORKER_SERVICE = "worker"
-SCALE_DOWN_DELAY = 180
 
 allocation_lock = threading.Lock()
 
@@ -40,7 +39,6 @@ stream_registry: Dict[str, Dict[str, float]] = {}
 
 streams_pending_allocation: Dict[str, float] = {}
 
-scale_down_task: Optional[asyncio.Task] = None
 registry_health_task: Optional[asyncio.Task] = None
 worker_health_task: Optional[asyncio.Task] = None
 PROXY_HEALTHCHECK_INTERVAL_SECONDS = 3
@@ -307,14 +305,6 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
     return False
 
 
-async def schedule_scale_down_if_idle():
-    """
-    Mantido por compatibilidade: no modelo atual (1 pod por stream),
-    não há scale-down de Deployment para executar.
-    """
-    await asyncio.sleep(SCALE_DOWN_DELAY)
-    logger.info("[AutoScaleDown] Skipped: worker Deployment scaling is disabled (per-stream pods).")
-
 
 async def monitor_stream_registry_health():
     """
@@ -466,15 +456,6 @@ def recover_state(
         logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
 
 
-
-def record_stream_start(stream: str):
-    now = time.time()
-    stream_start_time[stream] = now
-    stream_interruptions[stream] = 0
-    stream_downtime[stream] = 0.0
-    stream_start_timestamp.labels(stream=stream).set(now)
-    stream_uptime.labels(stream=stream).set(0)
-    stream_downtime_gauge.labels(stream=stream).set(0)
 
 def record_stream_end(stream: str):
     start = stream_start_time.get(stream)
@@ -740,7 +721,6 @@ def allocate_worker(
     
     Retorna worker DNS + proxy DNS se disponível, ou None se ainda está escalando.
     """
-    global scale_down_task
     
     with allocation_lock:
 
@@ -754,10 +734,6 @@ def allocate_worker(
                 )
             persist_state_locked()
 
-        if scale_down_task and not scale_down_task.done():
-            scale_down_task.cancel()
-            logger.info("[Allocate] Cancelled pending scale-down task (new allocation request)")
-        
         if stream in stream_to_worker:
             existing_worker = stream_to_worker[stream]
 
@@ -799,7 +775,6 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
     Remove mapeamento stream→worker.
     Agenda scale-down automático se todos workers ficarem idle.
     """
-    global scale_down_task
     
     with allocation_lock:
         if stream not in stream_to_worker:
@@ -840,13 +815,6 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         except ApiException as e:
             logger.warning(f"[Release] Failed deleting worker pod {worker_name}: {e}")
 
-        if scale_down_task and not scale_down_task.done():
-            scale_down_task.cancel()
-        
-        if len(stream_to_worker) == 0:
-            scale_down_task = asyncio.create_task(schedule_scale_down_if_idle())
-            logger.info(f"[Release] Scheduled auto scale-down in {SCALE_DOWN_DELAY}s")
-        
         return {
             "status": "released",
             "stream": stream,
@@ -887,26 +855,6 @@ def register_stream(
         }
 
 
-
-def resolve_stream(stream: str = Query(..., description="Stream name")):
-    proxy_pod = None
-    with allocation_lock:
-        entry = stream_registry.get(stream)
-
-        if not entry:
-            raise HTTPException(status_code=404, detail=f"stream '{stream}' not found")
-
-        proxy_pod = entry.get("proxy_pod")
-
-    if not proxy_pod:
-        raise HTTPException(status_code=404, detail=f"stream '{stream}' has no active proxy owner")
-    proxy_address = resolve_proxy_address(proxy_pod)
-
-    return {
-        "stream": stream,
-        "proxyPod": proxy_pod,
-        "proxyAddress": proxy_address
-    }
 
 
 
@@ -1056,33 +1004,3 @@ def debug_streams():
             }
     return result
 
-
-def get_stream_key(stream: str = Query(..., description="Stream name")):
-    """
-    Retorna a chave do YouTube E proxy DNS para uma stream específica.
-    
-    Esta função implementa a lógica de mapeamento stream → YouTube key + proxy.
-    Por padrão, usa o próprio stream name como chave.
-    
-    Em produção, você pode:
-    - Consultar um banco de dados
-    - Usar variáveis de ambiente
-    - Implementar lógica de mapeamento customizada
-    """
-    youtube_key = stream
-    
-    with allocation_lock:
-        proxy_pod = stream_to_proxy.get(stream)
-        if not proxy_pod:
-            raise HTTPException(status_code=404, detail=f"stream '{stream}' has no active proxy owner")
-        proxy_address = resolve_proxy_address(proxy_pod)
-
-    logger.debug(f"[StreamKey] Returning info for stream '{stream}': YouTube={youtube_key}, Proxy={proxy_address}")
-    
-    return {
-        "stream": stream,
-        "youtubeKey": youtube_key,
-        "proxyDns": proxy_address,
-        "proxyPod": proxy_pod,
-        "generation": stream_generation.get(stream, 1)
-    }
