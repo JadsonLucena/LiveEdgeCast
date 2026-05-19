@@ -39,6 +39,7 @@ stream_registry: Dict[str, Dict[str, float]] = {}
 
 registry_health_task: Optional[asyncio.Task] = None
 worker_health_task: Optional[asyncio.Task] = None
+worker_orphan_sweeper_task: Optional[asyncio.Task] = None
 PROXY_HEALTHCHECK_INTERVAL_SECONDS = 3
 PROXY_HEALTHCHECK_MAX_FAILURES = 3
 PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
@@ -48,6 +49,7 @@ WORKER_HEALTHCHECK_INTERVAL_SECONDS = 3
 WORKER_HEALTHCHECK_MAX_FAILURES = 3
 WORKER_HEALTHCHECK_JITTER_SECONDS = 1.5
 WORKER_READY_HEALTH_DELAY_SECONDS = 3  # Wait after worker Ready before worker /health probes.
+WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS = 60
 PROXY_READY_HEALTH_DELAY_SECONDS = 3  # Wait after proxy Ready before proxy /health probes.
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
@@ -637,23 +639,54 @@ async def monitor_worker_health():
                     )
                 persist_state_locked()
 
+
+async def sweep_orphan_workers():
+    """Safety-net: periodically delete worker pods that are not mapped in controller state."""
+    while True:
+        await asyncio.sleep(WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS)
+
+        try:
+            pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker").items
+        except Exception as e:
+            logger.warning(f"[OrphanSweeper] Failed to list worker pods: {e}")
+            continue
+
+        with allocation_lock:
+            mapped_workers = set(stream_to_worker.values())
+
+        for pod in pods:
+            pod_name = pod.metadata.name if pod and pod.metadata else None
+            if not pod_name:
+                continue
+            if pod_name in mapped_workers:
+                continue
+
+            logger.warning(f"[OrphanSweeper] Deleting orphan worker pod '{pod_name}'")
+            try:
+                core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+            except Exception as e:
+                logger.warning(f"[OrphanSweeper] Failed deleting orphan worker pod '{pod_name}': {e}")
+
 @app.on_event("startup")
 async def startup_event():
-    global registry_health_task, worker_health_task, metrics_collection_task
+    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
     time.sleep(5)
     recover_state()
     registry_health_task = asyncio.create_task(monitor_stream_registry_health())
     worker_health_task = asyncio.create_task(monitor_worker_health())
+    worker_orphan_sweeper_task = asyncio.create_task(sweep_orphan_workers())
     metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global registry_health_task, worker_health_task, metrics_collection_task
+    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
     if registry_health_task and not registry_health_task.done():
         registry_health_task.cancel()
     if worker_health_task and not worker_health_task.done():
         worker_health_task.cancel()
+    if worker_orphan_sweeper_task and not worker_orphan_sweeper_task.done():
+        worker_orphan_sweeper_task.cancel()
     if metrics_collection_task and not metrics_collection_task.done():
         metrics_collection_task.cancel()
 
@@ -894,4 +927,3 @@ async def stream_ended(
 @app.get('/metrics')
 def metrics():
     return Response(generate_latest(), media_type='text/plain; version=0.0.4; charset=utf-8')
-
