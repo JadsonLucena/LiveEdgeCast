@@ -661,6 +661,14 @@ async def sweep_orphan_workers():
             if pod_name in mapped_workers:
                 continue
 
+            # Double-check under lock right before deletion to avoid race with recent allocations.
+            with allocation_lock:
+                still_orphan = pod_name not in set(stream_to_worker.values())
+
+            if not still_orphan:
+                logger.debug(f"[OrphanSweeper] Pod '{pod_name}' became mapped before deletion; skipping.")
+                continue
+
             logger.warning(f"[OrphanSweeper] Deleting orphan worker pod '{pod_name}'")
             try:
                 core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
