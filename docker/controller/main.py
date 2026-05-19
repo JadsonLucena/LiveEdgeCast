@@ -26,8 +26,6 @@ app = FastAPI()
 NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
 WORKER_SERVICE = "worker"
-PROXY_HEADLESS_SERVICE = "proxy-headless"
-SCALE_DOWN_DELAY = 180
 
 allocation_lock = threading.Lock()
 
@@ -39,12 +37,9 @@ stream_to_proxy: Dict[str, str] = {}
 stream_generation: Dict[str, int] = {}
 stream_registry: Dict[str, Dict[str, float]] = {}
 
-streams_pending_allocation: Dict[str, float] = {}
-
-last_release_time: Optional[float] = None
-scale_down_task: Optional[asyncio.Task] = None
 registry_health_task: Optional[asyncio.Task] = None
 worker_health_task: Optional[asyncio.Task] = None
+worker_orphan_sweeper_task: Optional[asyncio.Task] = None
 PROXY_HEALTHCHECK_INTERVAL_SECONDS = 3
 PROXY_HEALTHCHECK_MAX_FAILURES = 3
 PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
@@ -54,8 +49,8 @@ WORKER_HEALTHCHECK_INTERVAL_SECONDS = 3
 WORKER_HEALTHCHECK_MAX_FAILURES = 3
 WORKER_HEALTHCHECK_JITTER_SECONDS = 1.5
 WORKER_READY_HEALTH_DELAY_SECONDS = 3  # Wait after worker Ready before worker /health probes.
+WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS = 60
 PROXY_READY_HEALTH_DELAY_SECONDS = 3  # Wait after proxy Ready before proxy /health probes.
-STREAM_TTL_SECONDS = 180
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
 worker_health_failures: Dict[str, int] = {}
@@ -66,25 +61,8 @@ STATE_CONFIGMAP_NAME = "controller-state"
 STATE_CONFIGMAP_KEY = "state.json"
 STATE_SCHEMA_VERSION = 2
 
-stream_start_time: Dict[str, float] = {}
-stream_interruptions: Dict[str, int] = {}
-stream_downtime: Dict[str, float] = {}
-
 metrics_collection_task: Optional[asyncio.Task] = None
 
-stream_delivery_errors = Counter('stream_delivery_errors_total','Total delivery errors to YouTube',['reason'])
-stream_bitrate_output = Gauge('stream_bitrate_output_mbps','Bitrate being sent to YouTube in Mbps',['stream'])
-stream_bitrate_input = Gauge('stream_bitrate_input_mbps','Bitrate received from proxy in Mbps',['stream'])
-stream_delivery_status = Gauge('stream_delivery_status','Delivery status: 0=error, 1=warning, 2=ok',['stream'])
-stream_start_timestamp = Gauge('stream_start_time','Unix timestamp when stream started',['stream'])
-stream_uptime = Gauge('stream_uptime_seconds','How long stream has been active in seconds',['stream'])
-stream_session_duration = Gauge('stream_session_duration_seconds','Total stream session duration in seconds',['stream'])
-stream_interruptions_counter = Counter('stream_interruptions_total','Total number of times stream was interrupted',['stream'])
-stream_downtime_gauge = Gauge('stream_downtime_total_seconds','Total accumulated downtime in seconds',['stream'])
-stream_current_downtime = Gauge('stream_current_downtime_seconds','Current downtime if stream is down, 0 otherwise',['stream'])
-ffmpeg_restart_counter = Counter('ffmpeg_restart_total','Total FFmpeg process restarts',['stream'])
-ffmpeg_process_running = Gauge('ffmpeg_process_running','Is FFmpeg currently running (0 or 1)',['stream'])
-stream_last_error_reason_gauge = Gauge('stream_last_error_reason','Last error reason code',['stream'])
 pod_cpu_usage_percent = Gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',['pod','namespace'])
 pod_memory_usage_bytes = Gauge('pod_memory_usage_bytes','Pod memory usage in bytes',['pod','namespace'])
 pod_memory_usage_percent = Gauge('pod_memory_usage_percent','Pod memory usage as percent of limit',['pod','namespace'])
@@ -93,12 +71,10 @@ pod_ready_status = Gauge('pod_ready_status','Is pod ready (0 or 1)',['pod','name
 proxy_active_connections = Gauge('proxy_active_connections','Active RTMP connections to proxy',['proxy_pod'])
 proxy_bandwidth_mbps = Gauge('proxy_bandwidth_mbps','Current proxy bandwidth in Mbps',['proxy_pod'])
 worker_pods_available = Gauge('worker_pods_available','Available worker pods for allocation',['namespace'])
-allocation_queue_length = Gauge('allocation_queue_length','Number of streams waiting for worker allocation')
 stream_proxy_handover_counter = Counter('stream_proxy_handover_total','Total proxy handovers accepted by controller',['stream'])
 handover_attempts_total = Counter('handover_attempts_total', 'Total proxy handover attempts', ['stream'])
 handover_success_total = Counter('handover_success_total', 'Total successful proxy handovers', ['stream'])
 handover_conflict_total = Counter('handover_conflict_total', 'Total conflicting proxy handovers denied', ['stream'])
-stream_assignment_info = Gauge('stream_assignment_info', 'Current stream assignment by proxy/worker', ['stream','proxy_pod','worker_pod','generation'])
 
 try:
     config.load_incluster_config()
@@ -123,7 +99,6 @@ def persist_state_locked() -> None:
         "stream_to_proxy": stream_to_proxy,
         "stream_registry": stream_registry,
         "stream_generation": stream_generation,
-        "streams_pending_allocation": streams_pending_allocation,
     }
     body = client.V1ConfigMap(
         metadata=client.V1ObjectMeta(name=STATE_CONFIGMAP_NAME, namespace=NAMESPACE),
@@ -176,8 +151,6 @@ def restore_persisted_state_locked() -> bool:
     stream_registry.update(data.get("stream_registry", {}))
     stream_generation.clear()
     stream_generation.update(data.get("stream_generation", {}))
-    streams_pending_allocation.clear()
-    streams_pending_allocation.update(data.get("streams_pending_allocation", {}))
     return True
 
 
@@ -248,46 +221,19 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
         f"old='{old_worker}' new='{new_worker}' proxy_dns='{proxy_dns}'"
     )
     return new_worker
-def cleanup_expired_streams() -> None:
-    """
-    Removes expired streams from the ephemeral registry.
-    Also removes stream_to_proxy to keep state consistent.
-    """
-    now = time.time()
-    expired = [stream for stream, entry in stream_registry.items() if entry.get("expires_at", 0) <= now]
-
-    for stream in expired:
-        stream_registry.pop(stream, None)
-        stream_to_proxy.pop(stream, None)
-        logger.info(f"[Registry] Stream '{stream}' expired after inactivity window")
-
 
 def register_or_refresh_stream(stream: str, proxy_pod: str):
     """
-    Creates or refreshes the stream ephemeral registry on proxy.
+    Creates or refreshes canonical stream ownership on proxy.
     """
-    expires_at = time.time() + STREAM_TTL_SECONDS
     if stream not in stream_generation:
         stream_generation[stream] = 1
     stream_registry[stream] = {
         "proxy_pod": proxy_pod,
-        "expires_at": expires_at
     }
     stream_to_proxy[stream] = proxy_pod
     proxy_health_failures[proxy_pod] = 0
-    return expires_at
-
-
-def register_or_refresh_stream_if_owner_matches(stream: str, proxy_pod: str):
-    """
-    Refreshes registry only if:
-    - stream does not exist yet, or
-    - stream already belongs to the same proxy_pod
-    """
-    current = stream_registry.get(stream)
-    if current and current.get("proxy_pod") != proxy_pod:
-        return None
-    return register_or_refresh_stream(stream, proxy_pod)
+    return None
 
 
 def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
@@ -311,7 +257,7 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
 
     owner_unhealthy = proxy_health_failures.get(current_owner, 0) >= PROXY_HEALTHCHECK_MAX_FAILURES
     if not owner_unhealthy:
-        owner_unhealthy = not check_proxy_health(current_owner)
+        owner_unhealthy = get_proxy_health_status(current_owner) == "unhealthy"
 
     if owner_unhealthy:
         logger.info(
@@ -338,14 +284,6 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
     return False
 
 
-async def schedule_scale_down_if_idle():
-    """
-    Mantido por compatibilidade: no modelo atual (1 pod por stream),
-    não há scale-down de Deployment para executar.
-    """
-    await asyncio.sleep(SCALE_DOWN_DELAY)
-    logger.info("[AutoScaleDown] Skipped: worker Deployment scaling is disabled (per-stream pods).")
-
 
 async def monitor_stream_registry_health():
     """
@@ -360,14 +298,16 @@ async def monitor_stream_registry_health():
             await asyncio.sleep(random.uniform(0, PROXY_HEALTHCHECK_JITTER_SECONDS))
 
         async with semaphore:
-            is_healthy = await asyncio.to_thread(check_proxy_health, proxy_pod)
+            health_status = await asyncio.to_thread(get_proxy_health_status, proxy_pod)
 
         with allocation_lock:
-            if is_healthy:
+            if health_status == "healthy":
                 proxy_health_failures[proxy_pod] = 0
-                for stream, entry in stream_registry.items():
-                    if entry.get("proxy_pod") == proxy_pod:
-                        entry["expires_at"] = time.time() + STREAM_TTL_SECONDS
+            elif health_status == "warming_up":
+                logger.debug(
+                    f"[ProxyHealth] Proxy '{proxy_pod}' is warming up; "
+                    "waiting before counting /health probe failures."
+                )
             else:
                 failures = proxy_health_failures.get(proxy_pod, 0) + 1
                 proxy_health_failures[proxy_pod] = failures
@@ -392,21 +332,22 @@ async def monitor_stream_registry_health():
                         if worker_name:
                             worker_to_stream.pop(worker_name, None)
                             worker_ready_since.pop(worker_name, None)
-                            worker_health_failures.pop(worker_name, None)
-                            worker_pod_uid_by_name.pop(worker_name, None)
+                            old_uid = worker_pod_uid_by_name.pop(worker_name, None)
+                            if old_uid:
+                                worker_health_failures.pop(old_uid, None)
                             try:
                                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
                             except Exception as e:
                                 logger.warning(f"[ProxyHealth] Failed deleting worker {worker_name}: {e}")
-                    
+
                     proxy_health_failures.pop(proxy_pod, None)
                     proxy_ready_since.pop(proxy_pod, None)
+                    persist_state_locked()
 
     while True:
         await asyncio.sleep(PROXY_HEALTHCHECK_INTERVAL_SECONDS)
 
         with allocation_lock:
-            cleanup_expired_streams()
             proxies = {entry.get("proxy_pod") for entry in stream_registry.values() if entry.get("proxy_pod")}
 
         if proxies:
@@ -425,14 +366,14 @@ def resolve_proxy_address(proxy_pod: str) -> str:
     return pod_ip
 
 
-def check_proxy_health(proxy_pod: str) -> bool:
-    """Checks proxy pod health after Ready plus proxy-specific stabilization delay."""
+def get_proxy_health_status(proxy_pod: str) -> str:
+    """Returns proxy health status without counting NotReady/warm-up as probe failures."""
     try:
         pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
         ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
         if not ready:
             proxy_ready_since.pop(proxy_pod, None)
-            return False
+            return "not_ready"
 
         now = time.time()
         first_ready_at = proxy_ready_since.get(proxy_pod)
@@ -442,19 +383,25 @@ def check_proxy_health(proxy_pod: str) -> bool:
                 f"[ProxyHealth] Proxy '{proxy_pod}' became Ready. Starting proxy delay timer "
                 f"({PROXY_READY_HEALTH_DELAY_SECONDS}s) before /health probe."
             )
-            return False
+            return "warming_up"
         if (now - first_ready_at) < PROXY_READY_HEALTH_DELAY_SECONDS:
             logger.debug(
                 f"[ProxyHealth] Waiting {PROXY_READY_HEALTH_DELAY_SECONDS}s after Ready for '{proxy_pod}' "
                 f"before probing /health ({now - first_ready_at:.1f}s elapsed)."
             )
-            return False
+            return "warming_up"
 
         target = resolve_proxy_address(proxy_pod)
         response = requests.get(f"http://{target}:8080/health", timeout=PROXY_HEALTHCHECK_TIMEOUT_SECONDS)
-        return response.status_code == 200
-    except Exception:
-        return False
+        return "healthy" if response.status_code == 200 else "unhealthy"
+    except ApiException as e:
+        if e.status == 404:
+            return "unhealthy"
+        logger.warning(f"[ProxyHealth] Failed to read proxy pod '{proxy_pod}': {e}")
+        return "unhealthy"
+    except Exception as e:
+        logger.warning(f"[ProxyHealth] Failed to check /health for proxy '{proxy_pod}': {e}")
+        return "unhealthy"
 
 
 def check_worker_health(pod_name: str, pod_ip: Optional[str] = None) -> bool:
@@ -488,34 +435,6 @@ def recover_state(
         logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
 
 
-
-def record_stream_start(stream: str):
-    now = time.time()
-    stream_start_time[stream] = now
-    stream_interruptions[stream] = 0
-    stream_downtime[stream] = 0.0
-    stream_start_timestamp.labels(stream=stream).set(now)
-    stream_uptime.labels(stream=stream).set(0)
-    stream_downtime_gauge.labels(stream=stream).set(0)
-
-def record_stream_end(stream: str):
-    start = stream_start_time.get(stream)
-    if not start:
-        return
-    duration = time.time() - start
-    stream_session_duration.labels(stream=stream).set(duration)
-
-def update_stream_uptime(stream: str):
-    start = stream_start_time.get(stream)
-    if not start:
-        return
-    uptime = (time.time() - start) - stream_downtime.get(stream, 0.0)
-    stream_uptime.labels(stream=stream).set(max(0, uptime))
-
-def record_interruption(stream: str):
-    stream_interruptions[stream] = stream_interruptions.get(stream, 0) + 1
-    stream_interruptions_counter.labels(stream=stream).inc()
-
 def get_pod_metrics(pod_name: str, namespace: str) -> dict:
     try:
         pod = core.read_namespaced_pod(name=pod_name, namespace=namespace)
@@ -548,7 +467,6 @@ def collect_pod_metrics():
 
 def collect_allocation_metrics():
     with allocation_lock:
-        allocation_queue_length.set(len(streams_pending_allocation))
         try:
             pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker").items
             ready = 0
@@ -582,7 +500,6 @@ async def monitor_worker_health():
                 stream: entry.get("proxy_pod")
                 for stream, entry in stream_registry.items()
             }
-            pending_streams = list(streams_pending_allocation.keys())
 
         # Health check for allocated workers
         for stream, worker_pod in allocations:
@@ -597,6 +514,7 @@ async def monitor_worker_health():
                 await asyncio.sleep(random.uniform(0, WORKER_HEALTHCHECK_JITTER_SECONDS))
 
             healthy = False
+            current_uid = ""
             try:
                 pod = core.read_namespaced_pod(name=worker_pod, namespace=NAMESPACE)
                 current_uid = ((pod.metadata.uid or "").strip() if pod and pod.metadata else "")
@@ -604,6 +522,7 @@ async def monitor_worker_health():
                 if prev_uid and current_uid and prev_uid != current_uid:
                     worker_health_failures.pop(prev_uid, None)
                     worker_health_failures[current_uid] = 0
+                    worker_ready_since.pop(worker_pod, None)
                 if current_uid:
                     worker_pod_uid_by_name[worker_pod] = current_uid
 
@@ -637,10 +556,11 @@ async def monitor_worker_health():
                         worker_health_failures.pop(current_uid, None)
                     continue
 
-                if not check_proxy_health(owner_proxy):
+                owner_proxy_health = get_proxy_health_status(owner_proxy)
+                if owner_proxy_health != "healthy":
                     logger.debug(
                         f"[WorkerHealth] Skipping worker '{worker_pod}' check because owner proxy "
-                        f"'{owner_proxy}' is not healthy."
+                        f"'{owner_proxy}' is {owner_proxy_health}."
                     )
                     if current_uid:
                         worker_health_failures.pop(current_uid, None)
@@ -674,37 +594,107 @@ async def monitor_worker_health():
                     allocated = stream_to_worker.get(stream)
                     if allocated != worker_pod:
                         continue
-                    stream_to_worker.pop(stream, None)
+
+                    owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+                    if not owner_proxy:
+                        logger.warning(
+                            f"[WorkerHealth] Cannot replace worker '{worker_pod}' for stream '{stream}' "
+                            "because the stream has no proxy owner."
+                        )
+                        continue
+
+                    if get_proxy_health_status(owner_proxy) != "healthy":
+                        logger.info(
+                            f"[WorkerHealth] Delaying replacement of worker '{worker_pod}' for stream '{stream}' "
+                            f"because owner proxy '{owner_proxy}' is not healthy."
+                        )
+                        continue
+
+                    logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
+                    try:
+                        proxy_dns = resolve_proxy_address(owner_proxy)
+                        new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
+                    except Exception as e:
+                        logger.warning(
+                            f"[WorkerHealth] Failed to create replacement worker for stream '{stream}': {e}"
+                        )
+                        continue
+
+                    stream_to_worker[stream] = new_worker
                     worker_to_stream.pop(worker_pod, None)
+                    worker_to_stream[new_worker] = stream
                     worker_ready_since.pop(worker_pod, None)
                     old_uid = worker_pod_uid_by_name.pop(worker_pod, None)
                     if old_uid:
                         worker_health_failures.pop(old_uid, None)
-                    streams_pending_allocation.pop(stream, None)
-                    logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
+            
                     try:
                         core.delete_namespaced_pod(name=worker_pod, namespace=NAMESPACE, grace_period_seconds=0)
                     except Exception as e:
                         logger.warning(f"[WorkerHealth] Failed to delete pod {worker_pod}: {e}")
+
+                    logger.info(
+                        f"[WorkerHealth] Replaced unhealthy worker for stream '{stream}': "
+                        f"old='{worker_pod}' new='{new_worker}' proxy='{owner_proxy}'"
+                    )
                 persist_state_locked()
+
+
+async def sweep_orphan_workers():
+    """Safety-net: periodically delete worker pods that are not mapped in controller state."""
+    while True:
+        await asyncio.sleep(WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS)
+
+        try:
+            pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker").items
+        except Exception as e:
+            logger.warning(f"[OrphanSweeper] Failed to list worker pods: {e}")
+            continue
+
+        with allocation_lock:
+            mapped_workers = set(stream_to_worker.values())
+
+        for pod in pods:
+            pod_name = pod.metadata.name if pod and pod.metadata else None
+            if not pod_name:
+                continue
+            if pod_name in mapped_workers:
+                continue
+
+            # Double-check under lock right before deletion to avoid race with recent allocations.
+            with allocation_lock:
+                still_orphan = pod_name not in set(stream_to_worker.values())
+
+            if not still_orphan:
+                logger.debug(f"[OrphanSweeper] Pod '{pod_name}' became mapped before deletion; skipping.")
+                continue
+
+            logger.warning(f"[OrphanSweeper] Deleting orphan worker pod '{pod_name}'")
+            try:
+                core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+            except Exception as e:
+                logger.warning(f"[OrphanSweeper] Failed deleting orphan worker pod '{pod_name}': {e}")
 
 @app.on_event("startup")
 async def startup_event():
-    global registry_health_task, worker_health_task, metrics_collection_task
+    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
     time.sleep(5)
     recover_state()
     registry_health_task = asyncio.create_task(monitor_stream_registry_health())
     worker_health_task = asyncio.create_task(monitor_worker_health())
+    worker_orphan_sweeper_task = asyncio.create_task(sweep_orphan_workers())
     metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global registry_health_task, worker_health_task, metrics_collection_task
+    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
     if registry_health_task and not registry_health_task.done():
         registry_health_task.cancel()
     if worker_health_task and not worker_health_task.done():
         worker_health_task.cancel()
+    if worker_orphan_sweeper_task and not worker_orphan_sweeper_task.done():
+        worker_orphan_sweeper_task.cancel()
     if metrics_collection_task and not metrics_collection_task.done():
         metrics_collection_task.cancel()
 
@@ -722,18 +712,14 @@ def allocate_worker(
     """
     Aloca um worker dedicado para uma stream.
     Controller é a ÚNICA fonte da verdade para scale-up.
-    
-    Args:
-        stream: Nome da stream (YouTube key)
-        proxy_pod: Nome do pod do proxy que recebeu a stream (para Pull-Only)
-    
-    Retorna worker DNS + proxy DNS se disponível, ou None se ainda está escalando.
-    """
-    global scale_down_task
-    
-    with allocation_lock:
-        cleanup_expired_streams()
 
+    Estratégia de concorrência:
+    - usar lock apenas para decisões/mutação de estado interno
+    - executar I/O Kubernetes fora do lock
+    - revalidar estado ao voltar do I/O para evitar corridas
+    """
+
+    with allocation_lock:
         if proxy_pod and not ownership_already_verified:
             if not try_handover_stream_owner(stream, proxy_pod):
                 owner = stream_registry.get(stream, {}).get("proxy_pod")
@@ -744,104 +730,120 @@ def allocate_worker(
                 )
             persist_state_locked()
 
-        if scale_down_task and not scale_down_task.done():
-            scale_down_task.cancel()
-            logger.info("[Allocate] Cancelled pending scale-down task (new allocation request)")
-        
-        if stream in stream_to_worker:
-            existing_worker = stream_to_worker[stream]
+        existing_worker = stream_to_worker.get(stream)
+        owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+        generation_snapshot = stream_generation.get(stream)
 
-            owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-            if not owner_proxy:
-                raise HTTPException(status_code=409, detail=f"stream '{stream}' has no proxy owner")
-            proxy_address = resolve_proxy_address(owner_proxy)
+    if not owner_proxy:
+        raise HTTPException(status_code=409, detail=f"stream '{stream}' has no proxy owner")
 
-            logger.info(f"[Allocate] Idempotent replay for stream '{stream}' existing worker={existing_worker} proxy={proxy_address}")
+    proxy_address = resolve_proxy_address(owner_proxy)
+
+    if existing_worker:
+        logger.info(
+            f"[Allocate] Idempotent replay for stream '{stream}' "
+            f"existing worker={existing_worker} proxy={proxy_address}"
+        )
+        return {
+            "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
+            "name": existing_worker,
+            "proxy": proxy_address,
+            "status": "idempotent_replay"
+        }
+
+    pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
+
+    with allocation_lock:
+        current_worker = stream_to_worker.get(stream)
+        current_owner = stream_registry.get(stream, {}).get("proxy_pod")
+        current_generation = stream_generation.get(stream)
+
+        if current_worker:
+            logger.info(
+                f"[Allocate] Concurrent allocation detected for stream '{stream}'. "
+                f"Discarding newly created worker '{pod_name}' and keeping '{current_worker}'."
+            )
+            try:
+                core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+            except ApiException as e:
+                logger.warning(f"[Allocate] Failed deleting extra worker pod {pod_name}: {e}")
             return {
-                "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
-                "name": existing_worker,
+                "pod": f"{current_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
+                "name": current_worker,
                 "proxy": proxy_address,
                 "status": "idempotent_replay"
             }
-        
-        # Modelo 1:1 (pod por stream): nunca reaproveitar worker já existente.
-        # Isso evita reuso indevido entre sessões e simplifica o ciclo de vida.
-        streams_pending_allocation.pop(stream, None)
 
-        owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-        if not owner_proxy:
-            raise HTTPException(status_code=409, detail=f"stream '{stream}' has no proxy owner")
-        proxy_address = resolve_proxy_address(owner_proxy)
+        if current_owner != owner_proxy or current_generation != generation_snapshot:
+            logger.warning(
+                f"[Allocate] Ownership changed while creating worker for stream '{stream}'. "
+                f"expected_owner='{owner_proxy}' current_owner='{current_owner}'. Deleting '{pod_name}'."
+            )
+            try:
+                core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+            except ApiException as e:
+                logger.warning(f"[Allocate] Failed deleting stale worker pod {pod_name}: {e}")
+            raise HTTPException(status_code=409, detail=f"stream '{stream}' ownership changed during allocation")
 
-        pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
         stream_to_worker[stream] = pod_name
         worker_to_stream[pod_name] = stream
         persist_state_locked()
 
-        worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
-        logger.info(f"[Allocate] Created dedicated worker pod {pod_name} for stream '{stream}'")
-        return {"pod": worker_dns, "name": pod_name, "proxy": proxy_address, "worker": pod_name, "status": "created"}
+    worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
+    logger.info(f"[Allocate] Created dedicated worker pod {pod_name} for stream '{stream}'")
+    return {"pod": worker_dns, "name": pod_name, "proxy": proxy_address, "worker": pod_name, "status": "created"}
 
 
 async def release_worker(stream: str = Query(..., description="Stream name to release")):
     """
-    Libera worker alocado para uma stream.
-    Remove mapeamento stream→worker.
-    Agenda scale-down automático se todos workers ficarem idle.
+    Libera worker alocado para uma stream e SEMPRE limpa estado canônico residual.
+    Idempotente: se não houver worker, ainda remove ownership/mapeamentos restantes.
     """
-    global scale_down_task
-    
-    with allocation_lock:
-        if stream not in stream_to_worker:
-            logger.info(f"[Release] Idempotent replay: stream '{stream}' not found in allocations")
 
-            if stream in streams_pending_allocation:
-                del streams_pending_allocation[stream]
-                logger.info(f"[Release] Removed stream '{stream}' from pending allocation queue (never allocated)")
-                persist_state_locked()
-            
-            return {"status": "not_found", "stream": stream}
-        
-        worker_name = stream_to_worker[stream]
-        
-        del stream_to_worker[stream]
-        del worker_to_stream[worker_name]
-        worker_ready_since.pop(worker_name, None)
-        old_uid = worker_pod_uid_by_name.pop(worker_name, None)
-        if old_uid:
-            worker_health_failures.pop(old_uid, None)
-        
-        if stream in stream_to_proxy:
-            del stream_to_proxy[stream]
-        if stream in stream_registry:
-            del stream_registry[stream]
-        stream_generation.pop(stream, None)
-        
-        if stream in streams_pending_allocation:
-            del streams_pending_allocation[stream]
-            logger.info(f"[Release] Removed stream '{stream}' from pending allocation queue")
-        
-        persist_state_locked()
-        
-        record_stream_end(stream)
+    worker_name = None
+    changed = False
+    response_status = "not_found"
+
+    with allocation_lock:
+        worker_name = stream_to_worker.pop(stream, None)
+
+        if worker_name:
+            changed = True
+            response_status = "released"
+            worker_to_stream.pop(worker_name, None)
+            worker_ready_since.pop(worker_name, None)
+            old_uid = worker_pod_uid_by_name.pop(worker_name, None)
+            if old_uid:
+                worker_health_failures.pop(old_uid, None)
+
+        if stream_to_proxy.pop(stream, None) is not None:
+            changed = True
+        if stream_registry.pop(stream, None) is not None:
+            changed = True
+        if stream_generation.pop(stream, None) is not None:
+            changed = True
+
+        if changed:
+            persist_state_locked()
+
+    if worker_name:
         logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
         try:
             core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
         except ApiException as e:
             logger.warning(f"[Release] Failed deleting worker pod {worker_name}: {e}")
-
-        if scale_down_task and not scale_down_task.done():
-            scale_down_task.cancel()
-        
-        if len(stream_to_worker) == 0:
-            scale_down_task = asyncio.create_task(schedule_scale_down_if_idle())
-            logger.info(f"[Release] Scheduled auto scale-down in {SCALE_DOWN_DELAY}s")
-        
         return {
-            "status": "released",
+            "status": response_status,
             "stream": stream,
             "worker": worker_name
         }
+
+    if changed:
+        logger.info(f"[Release] Cleaned residual state for stream '{stream}' without active worker")
+        return {"status": "state_cleaned", "stream": stream}
+
+    logger.info(f"[Release] Idempotent replay: stream '{stream}' not found")
+    return {"status": "not_found", "stream": stream}
 
 
 def register_stream(
@@ -849,7 +851,6 @@ def register_stream(
     proxy_pod: str = Query(..., description="Proxy pod name")
 ):
     with allocation_lock:
-        cleanup_expired_streams()
         current = stream_registry.get(stream)
         was_replay = current and current.get("proxy_pod") == proxy_pod
 
@@ -860,7 +861,6 @@ def register_stream(
                 detail=f"stream '{stream}' already owned by proxy '{current_owner}'"
             )
 
-        expires_at = stream_registry.get(stream, {}).get("expires_at")
         persist_state_locked()
 
         if was_replay:
@@ -874,66 +874,12 @@ def register_stream(
             "status": status,
             "stream": stream,
             "proxy_pod": proxy_pod,
-            "ttl_seconds": STREAM_TTL_SECONDS,
             "healthcheck_interval_seconds": PROXY_HEALTHCHECK_INTERVAL_SECONDS,
-            "max_failed_healthchecks": PROXY_HEALTHCHECK_MAX_FAILURES,
-            "expires_at": expires_at
+            "max_failed_healthchecks": PROXY_HEALTHCHECK_MAX_FAILURES
         }
 
 
-def heartbeat_stream(
-    stream: str = Query(..., description="Stream name"),
-    proxy_pod: str = Query(..., description="Proxy pod name")
-):
-    raise HTTPException(status_code=410, detail="heartbeat disabled: controller performs healthchecks")
 
-
-def resolve_stream(stream: str = Query(..., description="Stream name")):
-    proxy_pod = None
-    expires_at = None
-
-    with allocation_lock:
-        cleanup_expired_streams()
-        entry = stream_registry.get(stream)
-
-        if not entry:
-            raise HTTPException(status_code=404, detail=f"stream '{stream}' not found")
-
-        proxy_pod = entry.get("proxy_pod")
-        expires_at = entry.get("expires_at")
-
-    if not proxy_pod:
-        raise HTTPException(status_code=404, detail=f"stream '{stream}' has no active proxy owner")
-    proxy_address = resolve_proxy_address(proxy_pod)
-
-    return {
-        "stream": stream,
-        "proxyPod": proxy_pod,
-        "proxyAddress": proxy_address,
-        "expiresAt": expires_at
-    }
-
-
-def release_stream_registry(
-    stream: str = Query(..., description="Stream name"),
-    proxy_pod: str = Query(None, description="Proxy pod name")
-):
-    with allocation_lock:
-        cleanup_expired_streams()
-        current = stream_registry.get(stream)
-        if not current:
-            return {"status": "not_found", "stream": stream}
-
-        if proxy_pod and current.get("proxy_pod") != proxy_pod:
-            raise HTTPException(
-                status_code=409,
-                detail=f"stream '{stream}' owned by another proxy '{current.get('proxy_pod')}'"
-            )
-
-        stream_registry.pop(stream, None)
-        stream_to_proxy.pop(stream, None)
-        persist_state_locked()
-        return {"status": "released", "stream": stream}
 
 
 
@@ -985,133 +931,7 @@ async def stream_ended(
         f"proxy='{proxy_pod}' release_status='{release_result.get('status')}'"
     )
     return {"status": event_status, "stream": stream, "release": release_result}
-@app.get("/status")
-def get_status():
-    """
-    Returns current allocation state.
-    Useful for debugging and monitoring.
-    """
-    with allocation_lock:
-        cleanup_expired_streams()
-        return {
-            "active_streams": len(stream_to_worker),
-            "registry_streams": len(stream_registry),
-            "allocations": [
-                {
-                    "stream": stream,
-                    "worker": worker
-                }
-                for stream, worker in stream_to_worker.items()
-            ],
-            "registry": [
-                {
-                    "stream": stream,
-                    "proxy_pod": data.get("proxy_pod"),
-                    "expires_at": data.get("expires_at")
-                }
-                for stream, data in stream_registry.items()
-            ]
-        }
-
-
-@app.post("/streams/delivery-status")
-def report_delivery_status(
-    stream: str = Query(...),
-    proxy_pod: str = Query(...),
-    status: str = Query(...),
-    reason: str = Query(None),
-    bitrate_input: float = Query(0),
-    bitrate_output: float = Query(0),
-):
-    now = time.time()
-    bitrate_input_mbps = bitrate_input / 1024.0
-    bitrate_output_mbps = bitrate_output / 1024.0
-    stream_delivery_status.labels(stream=stream).set({'ok':2,'warning':1,'error':0}.get(status,0))
-    if bitrate_input_mbps > 0:
-        stream_bitrate_input.labels(stream=stream).set(bitrate_input_mbps)
-    if bitrate_output_mbps > 0:
-        stream_bitrate_output.labels(stream=stream).set(bitrate_output_mbps)
-    if status == 'error':
-        stream_delivery_errors.labels(reason=reason or 'unknown').inc()
-        ffmpeg_process_running.labels(stream=stream).set(0)
-        stream_last_error_reason_gauge.labels(stream=stream).set(1)
-        record_interruption(stream)
-    else:
-        ffmpeg_process_running.labels(stream=stream).set(1)
-    update_stream_uptime(stream)
-    with allocation_lock:
-        previous_owner = (stream_registry.get(stream) or {}).get("proxy_pod")
-        ownership_updated = try_handover_stream_owner(stream, proxy_pod)
-        if not ownership_updated:
-            current_owner = (stream_registry.get(stream) or {}).get("proxy_pod")
-            logger.warning(
-                f"[DeliveryStatus] Owner conflict for stream '{stream}': "
-                f"reporter='{proxy_pod}' current_owner='{current_owner}'"
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=f"stream '{stream}' owned by another proxy '{current_owner}'"
-            )
-
-        if previous_owner and previous_owner != proxy_pod:
-            logger.info(
-                f"[DeliveryStatus] Ownership handover accepted for stream '{stream}' "
-                f"from='{previous_owner}' to='{proxy_pod}'"
-            )
-        else:
-            logger.info(
-                f"[DeliveryStatus] Ownership refresh accepted for stream '{stream}' owner='{proxy_pod}'"
-            )
-
-        persist_state_locked()
-    return {'acknowledged': True, 'status': status}
-
 
 @app.get('/metrics')
 def metrics():
     return Response(generate_latest(), media_type='text/plain; version=0.0.4; charset=utf-8')
-
-@app.get('/debug/streams')
-def debug_streams():
-    result = {}
-    with allocation_lock:
-        for stream in stream_registry:
-            start = stream_start_time.get(stream, 0)
-            result[stream] = {
-                'status': 'unknown',
-                'uptime_seconds': time.time() - start if start else 0,
-                'interruptions': stream_interruptions.get(stream, 0),
-            }
-    return result
-
-
-def get_stream_key(stream: str = Query(..., description="Stream name")):
-    """
-    Retorna a chave do YouTube E proxy DNS para uma stream específica.
-    
-    Esta função implementa a lógica de mapeamento stream → YouTube key + proxy.
-    Por padrão, usa o próprio stream name como chave.
-    
-    Em produção, você pode:
-    - Consultar um banco de dados
-    - Usar variáveis de ambiente
-    - Implementar lógica de mapeamento customizada
-    """
-    youtube_key = stream
-    
-    with allocation_lock:
-        cleanup_expired_streams()
-        proxy_pod = stream_to_proxy.get(stream)
-        if not proxy_pod:
-            raise HTTPException(status_code=404, detail=f"stream '{stream}' has no active proxy owner")
-        proxy_address = resolve_proxy_address(proxy_pod)
-
-    logger.debug(f"[StreamKey] Returning info for stream '{stream}': YouTube={youtube_key}, Proxy={proxy_address}")
-    
-    return {
-        "stream": stream,
-        "youtubeKey": youtube_key,
-        "proxyDns": proxy_address,
-        "proxyPod": proxy_pod,
-        "generation": stream_generation.get(stream, 1)
-    }

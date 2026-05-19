@@ -114,9 +114,9 @@ print_bootstrap_metrics() {
     | tail -n 1 \
     | sed -E 's/.*allocated in ([0-9.]+)s.*/\1/' || true)"
   if [[ -n "$alloc_secs" ]]; then
-    echo "metric allocate->start-worker ~= ${alloc_secs}s (controller pending queue timing)"
+    echo "metric allocate->streams/started ~= ${alloc_secs}s (controller pending queue timing)"
   else
-    yellow "WARN: could not derive allocate->start-worker timing from controller logs"
+    yellow "WARN: could not derive allocate->streams/started timing from controller logs"
   fi
 
   local spawn_ts first_input_ts first_push_ts
@@ -212,7 +212,7 @@ if [[ "$WORKER_COUNT" == "0" ]]; then
   fi
   if [[ "$WORKER_DESIRED" == "0" ]]; then
     yellow "DIAG: deployment/worker está com spec.replicas=0. O worker não foi solicitado para escalar ainda."
-    yellow "DIAG: provável causa -> fluxo de alocação não chegou ao controller (/allocate) para essa stream."
+    yellow "DIAG: provável causa -> fluxo canônico de start não chegou ao controller (/streams/started) para essa stream."
   fi
 
   echo ""
@@ -249,7 +249,7 @@ if [[ -n "$PROXY_POD_FOR_NET" ]]; then
   check_warn "proxy has curl and jq for publish hooks" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1"
   check_warn "on_publish_start script targets current namespace controller" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "grep -En 'CONTROLLER_API=' /scripts/on_publish_start.sh | grep -Eq 'controller\\.${NAMESPACE}\\.svc\\.cluster\\.local|controller\\.media\\.svc\\.cluster\\.local'"
   if [[ -n "$STREAM_NAME" ]]; then
-    check_warn "manual allocate probe from proxy (stream)" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "PROXY_POD=\$(hostname); curl -sS -o /tmp/alloc_probe_${STREAM_NAME}.json -w '%{http_code}' \"http://controller.${NAMESPACE}.svc.cluster.local:8000/allocate?stream=${STREAM_NAME}&proxy_pod=\$PROXY_POD\" | grep -Eq '200'"
+    check_warn "manual streams/started probe from proxy (stream)" kubectl exec -n "$NAMESPACE" "$PROXY_POD_FOR_NET" -- sh -lc "PROXY_POD=\$(hostname); curl -sS -o /tmp/alloc_probe_${STREAM_NAME}.json -w '%{http_code}' \"http://controller.${NAMESPACE}.svc.cluster.local:8000/streams/started?stream=${STREAM_NAME}&proxy_pod=\$PROXY_POD\" | grep -Eq '200'"
   fi
 else
   yellow "WARN: no proxy pod resolved for connectivity checks"
@@ -263,8 +263,8 @@ if [[ -z "$CTRL_POD" ]]; then
 fi
 if [[ -n "$CTRL_POD" ]]; then
   check_warn "controller /health" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/health; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/health; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'ok'"
-  check_warn "controller /metrics has stream gauges" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/metrics; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/metrics; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'stream_delivery_status|stream_uptime_seconds|recovery_attempt_total'"
-  check_warn "controller OpenAPI has /allocate route" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/openapi.json; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/openapi.json; else echo 'missing curl/wget'; exit 1; fi | grep -Eq '\"/allocate\"'"
+  check_warn "controller /metrics has base gauges" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/metrics; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/metrics; else echo 'missing curl/wget'; exit 1; fi | grep -Eq 'worker_pods_available|handover_attempts_total'"
+  check_warn "controller OpenAPI has /streams/started route" kubectl exec -n "$NAMESPACE" "$CTRL_POD" -- sh -lc "if command -v curl >/dev/null 2>&1; then curl -fsS http://127.0.0.1:8000/openapi.json; elif command -v wget >/dev/null 2>&1; then wget -qO- http://127.0.0.1:8000/openapi.json; else echo 'missing curl/wget'; exit 1; fi | grep -Eq '\"/streams/started\"'"
 else
   yellow "WARN: could not resolve controller pod by label; skipping in-pod endpoint checks"
 fi
@@ -273,21 +273,21 @@ echo ""
 echo "=== Controller logs (allocation lifecycle) ==="
 if [[ -n "$CTRL_POD" ]]; then
   if [[ -n "$STREAM_NAME" ]]; then
-    log_snippet "$CTRL_POD" "$STREAM_NAME|Allocate|Release|StartWorker|start-worker|Delivery|Recovery|pending allocation|Registry|ProxyHealth|/start-worker"
+    log_snippet "$CTRL_POD" "$STREAM_NAME|Allocate|Release|StartWorker|streams/started|Delivery|Recovery|allocation|Registry|ProxyHealth|/streams/started"
   else
-    log_snippet "$CTRL_POD" "Allocate|Release|StartWorker|start-worker|Delivery|Recovery|pending allocation|Registry|ProxyHealth|/start-worker"
+    log_snippet "$CTRL_POD" "Allocate|Release|StartWorker|streams/started|Delivery|Recovery|allocation|Registry|ProxyHealth|/streams/started"
   fi
 fi
 
 echo ""
-echo "=== Controller start-worker troubleshooting timeline ==="
+echo "=== Controller streams/started troubleshooting timeline ==="
 if [[ -n "$CTRL_POD" ]]; then
   if [[ -n "$STREAM_NAME" ]]; then
     kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" \
-      | filter_stream "$STREAM_NAME|\\[StartWorker\\]\\[Timeline\\]|/start-worker|worker_mismatch|already_started"
+      | filter_stream "$STREAM_NAME|\\[StartWorker\\]\\[Timeline\\]|/streams/started|worker_mismatch|already_started"
   else
     kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" \
-      | filter_stream "\\[StartWorker\\]\\[Timeline\\]|/start-worker|worker_mismatch|already_started"
+      | filter_stream "\\[StartWorker\\]\\[Timeline\\]|/streams/started|worker_mismatch|already_started"
   fi
 fi
 
@@ -297,11 +297,11 @@ if [[ -n "$CTRL_POD" ]]; then
   if [[ -n "$STREAM_NAME" ]]; then
     kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" \
       | grep -Eiv "\\[DEBUG\\] \\[request\\] response body" \
-      | filter_stream "$STREAM_NAME|error|exception|traceback|failed|forbidden|timeout|start-worker|allocate|scaled deployment|waiting for worker|released worker"
+      | filter_stream "$STREAM_NAME|error|exception|traceback|failed|forbidden|timeout|streams/started|allocate|created dedicated worker|released worker"
   else
     kubectl logs -n "$NAMESPACE" "$CTRL_POD" --since="$SINCE" \
       | grep -Eiv "\\[DEBUG\\] \\[request\\] response body" \
-      | filter_stream "error|exception|traceback|failed|forbidden|timeout|start-worker|allocate|scaled deployment|waiting for worker|released worker"
+      | filter_stream "error|exception|traceback|failed|forbidden|timeout|streams/started|allocate|created dedicated worker|released worker"
   fi
 fi
 
@@ -314,7 +314,7 @@ if [[ "$WORKER_COUNT" == "0" ]]; then
   echo "=== Quick interpretation ==="
   if [[ "$WORKER_DESIRED" == "0" ]]; then
     yellow "Sem worker porque replicas desejadas do deployment continuam em 0."
-    yellow "Próximo passo: verificar se proxy chamou o endpoint /allocate no controller para a stream."
+    yellow "Próximo passo: verificar se proxy chamou o endpoint /streams/started no controller para a stream."
   else
     yellow "Deployment pede worker (replicas > 0), mas pods não subiram. Verifique eventos de scheduling/imagem."
   fi
@@ -325,9 +325,9 @@ echo "=== Proxy logs (publish hooks + routing) ==="
 for pod in $(kubectl get pods -n "$NAMESPACE" -l "$PROXY_SELECTOR" -o name); do
   echo "--- $pod ---"
   if [[ -n "$STREAM_NAME" ]]; then
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "on_publish_start|on_publish_done|$STREAM_NAME|allocat|worker|heartbeat|error|warn"
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "on_publish_start|on_publish_done|$STREAM_NAME|streams/started|streams/ended|worker|error|warn"
   else
-    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "on_publish_start|on_publish_done|allocat|worker|heartbeat|error|warn"
+    kubectl logs -n "$NAMESPACE" "$pod" --since="$SINCE" | filter_stream "on_publish_start|on_publish_done|streams/started|streams/ended|worker|error|warn"
   fi
 done
 
@@ -407,7 +407,7 @@ cat <<'CHECKLIST'
 [ ] Controller log has "StartWorker" success for selected worker.
 [ ] Worker log has recovery loop start and FFmpeg start for stream.
 [ ] Worker log shows no repeated FFmpeg/network errors for your stream.
-[ ] Controller /metrics includes stream_delivery_status and recovery_attempt_total.
+[ ] Controller /metrics includes worker_pods_available and handover_attempts_total.
 [ ] On stream stop, proxy has "on_publish_done" and controller has "Release".
 CHECKLIST
 
