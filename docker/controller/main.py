@@ -684,97 +684,102 @@ async def sweep_orphan_workers():
 
 async def reconcile_streams_loop():
     """Move allocation/release decisions to operator reconciliation loop."""
-    while True:
-        await asyncio.sleep(1)
-        with allocation_lock:
-            desired_snapshot = copy.deepcopy(stream_desired_state)
+    try:
+        while True:
+            await asyncio.sleep(1)
+            with allocation_lock:
+                desired_snapshot = copy.deepcopy(stream_desired_state)
 
-        for stream, desired in desired_snapshot.items():
-            state = desired.get("state")
-            if desired.get("observedGeneration") == desired.get("generation"):
-                continue
-            if state == "started":
-                proxy_pod = desired.get("proxy_pod")
-                if not proxy_pod:
+            for stream, desired in desired_snapshot.items():
+                state = desired.get("state")
+                if desired.get("observedGeneration") == desired.get("generation"):
                     continue
-                with allocation_lock:
-                    current_owner = stream_registry.get(stream, {}).get("proxy_pod")
-                    has_worker = stream in stream_to_worker
-                if current_owner != proxy_pod:
+                if state == "started":
+                    proxy_pod = desired.get("proxy_pod")
+                    if not proxy_pod:
+                        continue
                     with allocation_lock:
-                        handover_ok = try_handover_stream_owner(stream, proxy_pod)
-                        if handover_ok:
-                            persist_state_locked()
-                        else:
+                        current_owner = stream_registry.get(stream, {}).get("proxy_pod")
+                        has_worker = stream in stream_to_worker
+                    if current_owner != proxy_pod:
+                        with allocation_lock:
+                            handover_ok = try_handover_stream_owner(stream, proxy_pod)
+                            if handover_ok:
+                                persist_state_locked()
+                            else:
+                                logger.debug(
+                                    f"[Reconcile] Ownership did not converge for stream '{stream}': "
+                                    f"current_owner='{current_owner}' desired_owner='{proxy_pod}'"
+                                )
+                        if not handover_ok:
+                            continue
+                    if not has_worker:
+                        try:
+                            await asyncio.to_thread(allocate_worker, stream=stream, proxy_pod=proxy_pod)
+                        except Exception as e:
+                            logger.warning(f"[Reconcile] Failed allocate for '{stream}': {e}")
+                            continue
+                    with allocation_lock:
+                        effective_owner = stream_registry.get(stream, {}).get("proxy_pod")
+                        if effective_owner != proxy_pod:
                             logger.debug(
-                                f"[Reconcile] Ownership did not converge for stream '{stream}': "
-                                f"current_owner='{current_owner}' desired_owner='{proxy_pod}'"
+                                f"[Reconcile] Skip observed update for stream '{stream}' because owner "
+                                f"is '{effective_owner}' not desired '{proxy_pod}'"
                             )
-                    if not handover_ok:
-                        continue
-                if not has_worker:
-                    try:
-                        await asyncio.to_thread(allocate_worker, stream=stream, proxy_pod=proxy_pod)
-                    except Exception as e:
-                        logger.warning(f"[Reconcile] Failed allocate for '{stream}': {e}")
-                        continue
-                with allocation_lock:
-                    effective_owner = stream_registry.get(stream, {}).get("proxy_pod")
-                    if effective_owner != proxy_pod:
-                        logger.debug(
-                            f"[Reconcile] Skip observed update for stream '{stream}' because owner "
-                            f"is '{effective_owner}' not desired '{proxy_pod}'"
-                        )
-                        continue
-                    effective_worker = stream_to_worker.get(stream)
-                    if not effective_worker:
-                        logger.debug(
-                            f"[Reconcile] Skip observed update for stream '{stream}' because no worker is allocated yet"
-                        )
-                        continue
-                    current_desired = stream_desired_state.get(stream)
-                    if not current_desired:
-                        continue
-                    if current_desired.get("generation") != desired.get("generation") or current_desired.get("state") != desired.get("state"):
-                        logger.debug(
-                            f"[Reconcile] Skip observed update for stream '{stream}' due to newer desired state "
-                            f"(snapshot gen/state={desired.get('generation')}/{desired.get('state')} current="
-                            f"{current_desired.get('generation')}/{current_desired.get('state')})"
-                        )
-                        continue
-                    if current_desired.get("observedGeneration") == current_desired.get("generation"):
-                        continue
-                    if current_desired.get("observedGeneration") == current_desired.get("generation"):
-                        continue
-                    current_desired["observedGeneration"] = current_desired.get("generation")
-                    current_desired["observedAt"] = time.time()
-                    stream_desired_state[stream] = current_desired
-                    persist_state_locked()
-            elif state == "ended":
-                with allocation_lock:
-                    has_worker = stream in stream_to_worker
-                    has_registry = stream in stream_registry
-                if has_worker or has_registry:
-                    try:
-                        await release_worker(stream=stream)
-                    except Exception as e:
-                        logger.warning(f"[Reconcile] Failed release for '{stream}': {e}")
-                        continue
-                with allocation_lock:
-                    current_desired = stream_desired_state.get(stream)
-                    if not current_desired:
-                        continue
-                    if current_desired.get("generation") != desired.get("generation") or current_desired.get("state") != desired.get("state"):
-                        logger.debug(
-                            f"[Reconcile] Skip observed update for stream '{stream}' due to newer desired state "
-                            f"(snapshot gen/state={desired.get('generation')}/{desired.get('state')} current="
-                            f"{current_desired.get('generation')}/{current_desired.get('state')})"
-                        )
-                        continue
-                    current_desired["observedGeneration"] = current_desired.get("generation")
-                    current_desired["observedAt"] = time.time()
-                    stream_desired_state[stream] = current_desired
-                    persist_state_locked()
+                            continue
+                        effective_worker = stream_to_worker.get(stream)
+                        if not effective_worker:
+                            logger.debug(
+                                f"[Reconcile] Skip observed update for stream '{stream}' because no worker is allocated yet"
+                            )
+                            continue
+                        current_desired = stream_desired_state.get(stream)
+                        if not current_desired:
+                            continue
+                        if current_desired.get("generation") != desired.get("generation") or current_desired.get("state") != desired.get("state"):
+                            logger.debug(
+                                f"[Reconcile] Skip observed update for stream '{stream}' due to newer desired state "
+                                f"(snapshot gen/state={desired.get('generation')}/{desired.get('state')} current="
+                                f"{current_desired.get('generation')}/{current_desired.get('state')})"
+                            )
+                            continue
+                        if current_desired.get("observedGeneration") == current_desired.get("generation"):
+                            continue
+                        if current_desired.get("observedGeneration") == current_desired.get("generation"):
+                            continue
+                        current_desired["observedGeneration"] = current_desired.get("generation")
+                        current_desired["observedAt"] = time.time()
+                        stream_desired_state[stream] = current_desired
+                        persist_state_locked()
+                elif state == "ended":
+                    with allocation_lock:
+                        has_worker = stream in stream_to_worker
+                        has_registry = stream in stream_registry
+                    if has_worker or has_registry:
+                        try:
+                            await release_worker(stream=stream)
+                        except Exception as e:
+                            logger.warning(f"[Reconcile] Failed release for '{stream}': {e}")
+                            continue
+                    with allocation_lock:
+                        current_desired = stream_desired_state.get(stream)
+                        if not current_desired:
+                            continue
+                        if current_desired.get("generation") != desired.get("generation") or current_desired.get("state") != desired.get("state"):
+                            logger.debug(
+                                f"[Reconcile] Skip observed update for stream '{stream}' due to newer desired state "
+                                f"(snapshot gen/state={desired.get('generation')}/{desired.get('state')} current="
+                                f"{current_desired.get('generation')}/{current_desired.get('state')})"
+                            )
+                            continue
+                        current_desired["observedGeneration"] = current_desired.get("generation")
+                        current_desired["observedAt"] = time.time()
+                        stream_desired_state[stream] = current_desired
+                        persist_state_locked()
+
+    except asyncio.CancelledError:
+        logger.info("[Reconcile] Reconciliation loop cancelled")
+        raise
 
 @app.on_event("startup")
 async def startup_event():
@@ -801,6 +806,10 @@ async def shutdown_event():
         metrics_collection_task.cancel()
     if reconcile_task and not reconcile_task.done():
         reconcile_task.cancel()
+        try:
+            await reconcile_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/health")
