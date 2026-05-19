@@ -27,14 +27,14 @@ O projeto já implementa parte importante da arquitetura **pull-only** (Proxy re
 ## Diferenças/gaps frente ao fluxo desejado
 
 1. **Timeout de 3 minutos sem cliente no Proxy**
-   - Atualmente o encerramento depende principalmente do `on_publish_done` do NGINX + lógica de TTL/heartbeat no Controller.
+   - Atualmente o encerramento depende principalmente do `on_publish_done` do NGINX + reconciliação de saúde no Controller.
    - Regra exata “3 minutos sem transmitir => Proxy informa Controller para remover Worker” precisa ser consolidada como contrato explícito (evitar depender de caminhos indiretos).
 
 2. **Worker deve crashar em até 5s sem conseguir consumir**
    - Hoje o `worker_recovery_loop.sh` faz retry por até 8 tentativas/120s. Isso conflita com a estratégia “let’s crash rápido”.
 
 3. **FFmpeg iniciar com o servidor/pod (startup args)**
-   - Hoje o Worker só inicia FFmpeg após chamada `/start-worker` via Controller.
+   - Hoje o Worker só inicia FFmpeg após chamada `/streams/started` via Controller.
    - Requisito pede startup imediato com argumentos de origem/destino no pod.
 
 4. **Health checks centralizados no Controller a cada 3s (proxy e worker)**
