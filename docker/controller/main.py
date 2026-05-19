@@ -714,7 +714,7 @@ async def reconcile_streams_loop():
                         continue
                 if not has_worker:
                     try:
-                        allocate_worker(stream=stream, proxy_pod=proxy_pod)
+                        await asyncio.to_thread(allocate_worker, stream=stream, proxy_pod=proxy_pod)
                     except Exception as e:
                         logger.warning(f"[Reconcile] Failed allocate for '{stream}': {e}")
                         continue
