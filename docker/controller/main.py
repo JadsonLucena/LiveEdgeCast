@@ -578,9 +578,21 @@ async def monitor_worker_health():
 
         with allocation_lock:
             allocations = list(stream_to_worker.items())
+            stream_owner_snapshot = {
+                stream: entry.get("proxy_pod")
+                for stream, entry in stream_registry.items()
+            }
+            pending_streams = list(streams_pending_allocation.keys())
 
         # Health check for allocated workers
         for stream, worker_pod in allocations:
+            owner_proxy = stream_owner_snapshot.get(stream)
+            if not owner_proxy:
+                logger.debug(
+                    f"[WorkerHealth] Stream '{stream}' has no owner proxy in snapshot; skipping worker '{worker_pod}' health action."
+                )
+                continue
+
             if WORKER_HEALTHCHECK_JITTER_SECONDS > 0:
                 await asyncio.sleep(random.uniform(0, WORKER_HEALTHCHECK_JITTER_SECONDS))
 
