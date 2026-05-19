@@ -37,8 +37,6 @@ stream_to_proxy: Dict[str, str] = {}
 stream_generation: Dict[str, int] = {}
 stream_registry: Dict[str, Dict[str, float]] = {}
 
-streams_pending_allocation: Dict[str, float] = {}
-
 registry_health_task: Optional[asyncio.Task] = None
 worker_health_task: Optional[asyncio.Task] = None
 PROXY_HEALTHCHECK_INTERVAL_SECONDS = 3
@@ -61,17 +59,8 @@ STATE_CONFIGMAP_NAME = "controller-state"
 STATE_CONFIGMAP_KEY = "state.json"
 STATE_SCHEMA_VERSION = 2
 
-stream_start_time: Dict[str, float] = {}
-stream_interruptions: Dict[str, int] = {}
-stream_downtime: Dict[str, float] = {}
-
 metrics_collection_task: Optional[asyncio.Task] = None
 
-stream_start_timestamp = Gauge('stream_start_time','Unix timestamp when stream started',['stream'])
-stream_uptime = Gauge('stream_uptime_seconds','How long stream has been active in seconds',['stream'])
-stream_session_duration = Gauge('stream_session_duration_seconds','Total stream session duration in seconds',['stream'])
-stream_interruptions_counter = Counter('stream_interruptions_total','Total number of times stream was interrupted',['stream'])
-stream_downtime_gauge = Gauge('stream_downtime_total_seconds','Total accumulated downtime in seconds',['stream'])
 pod_cpu_usage_percent = Gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',['pod','namespace'])
 pod_memory_usage_bytes = Gauge('pod_memory_usage_bytes','Pod memory usage in bytes',['pod','namespace'])
 pod_memory_usage_percent = Gauge('pod_memory_usage_percent','Pod memory usage as percent of limit',['pod','namespace'])
@@ -80,7 +69,6 @@ pod_ready_status = Gauge('pod_ready_status','Is pod ready (0 or 1)',['pod','name
 proxy_active_connections = Gauge('proxy_active_connections','Active RTMP connections to proxy',['proxy_pod'])
 proxy_bandwidth_mbps = Gauge('proxy_bandwidth_mbps','Current proxy bandwidth in Mbps',['proxy_pod'])
 worker_pods_available = Gauge('worker_pods_available','Available worker pods for allocation',['namespace'])
-allocation_queue_length = Gauge('allocation_queue_length','Number of streams waiting for worker allocation')
 stream_proxy_handover_counter = Counter('stream_proxy_handover_total','Total proxy handovers accepted by controller',['stream'])
 handover_attempts_total = Counter('handover_attempts_total', 'Total proxy handover attempts', ['stream'])
 handover_success_total = Counter('handover_success_total', 'Total successful proxy handovers', ['stream'])
@@ -109,7 +97,6 @@ def persist_state_locked() -> None:
         "stream_to_proxy": stream_to_proxy,
         "stream_registry": stream_registry,
         "stream_generation": stream_generation,
-        "streams_pending_allocation": streams_pending_allocation,
     }
     body = client.V1ConfigMap(
         metadata=client.V1ObjectMeta(name=STATE_CONFIGMAP_NAME, namespace=NAMESPACE),
@@ -162,8 +149,6 @@ def restore_persisted_state_locked() -> bool:
     stream_registry.update(data.get("stream_registry", {}))
     stream_generation.clear()
     stream_generation.update(data.get("stream_generation", {}))
-    streams_pending_allocation.clear()
-    streams_pending_allocation.update(data.get("streams_pending_allocation", {}))
     return True
 
 
@@ -448,13 +433,6 @@ def recover_state(
         logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
 
 
-
-def record_stream_end(stream: str):
-    start = stream_start_time.get(stream)
-    if not start:
-        return
-    duration = time.time() - start
-    stream_session_duration.labels(stream=stream).set(duration)
 def get_pod_metrics(pod_name: str, namespace: str) -> dict:
     try:
         pod = core.read_namespaced_pod(name=pod_name, namespace=namespace)
@@ -487,7 +465,6 @@ def collect_pod_metrics():
 
 def collect_allocation_metrics():
     with allocation_lock:
-        allocation_queue_length.set(len(streams_pending_allocation))
         try:
             pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker").items
             ready = 0
@@ -647,8 +624,7 @@ async def monitor_worker_health():
                     old_uid = worker_pod_uid_by_name.pop(worker_pod, None)
                     if old_uid:
                         worker_health_failures.pop(old_uid, None)
-                    streams_pending_allocation.pop(stream, None)
-
+            
                     try:
                         core.delete_namespaced_pod(name=worker_pod, namespace=NAMESPACE, grace_period_seconds=0)
                     except Exception as e:
@@ -732,7 +708,6 @@ def allocate_worker(
         
         # Modelo 1:1 (pod por stream): nunca reaproveitar worker já existente.
         # Isso evita reuso indevido entre sessões e simplifica o ciclo de vida.
-        streams_pending_allocation.pop(stream, None)
 
         owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
         if not owner_proxy:
@@ -752,19 +727,13 @@ def allocate_worker(
 async def release_worker(stream: str = Query(..., description="Stream name to release")):
     """
     Libera worker alocado para uma stream.
-    Remove mapeamento stream→worker.
-    Agenda scale-down automático se todos workers ficarem idle.
+    Remove mapeamento stream→worker e estado associado.
     """
     
     with allocation_lock:
         if stream not in stream_to_worker:
             logger.info(f"[Release] Idempotent replay: stream '{stream}' not found in allocations")
 
-            if stream in streams_pending_allocation:
-                del streams_pending_allocation[stream]
-                logger.info(f"[Release] Removed stream '{stream}' from pending allocation queue (never allocated)")
-                persist_state_locked()
-            
             return {"status": "not_found", "stream": stream}
         
         worker_name = stream_to_worker[stream]
@@ -782,13 +751,8 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
             del stream_registry[stream]
         stream_generation.pop(stream, None)
         
-        if stream in streams_pending_allocation:
-            del streams_pending_allocation[stream]
-            logger.info(f"[Release] Removed stream '{stream}' from pending allocation queue")
-        
         persist_state_locked()
         
-        record_stream_end(stream)
         logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
         try:
             core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
@@ -921,14 +885,13 @@ def metrics():
 
 @app.get('/debug/streams')
 def debug_streams():
-    result = {}
     with allocation_lock:
-        for stream in stream_registry:
-            start = stream_start_time.get(stream, 0)
-            result[stream] = {
-                'status': 'unknown',
-                'uptime_seconds': time.time() - start if start else 0,
-                'interruptions': stream_interruptions.get(stream, 0),
+        return {
+            stream: {
+                'proxy_pod': entry.get('proxy_pod'),
+                'worker_pod': stream_to_worker.get(stream),
+                'generation': stream_generation.get(stream, 1),
             }
-    return result
+            for stream, entry in stream_registry.items()
+        }
 
