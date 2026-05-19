@@ -26,7 +26,6 @@ app = FastAPI()
 NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
 WORKER_SERVICE = "worker"
-PROXY_HEADLESS_SERVICE = "proxy-headless"
 SCALE_DOWN_DELAY = 180
 
 allocation_lock = threading.Lock()
@@ -41,7 +40,6 @@ stream_registry: Dict[str, Dict[str, float]] = {}
 
 streams_pending_allocation: Dict[str, float] = {}
 
-last_release_time: Optional[float] = None
 scale_down_task: Optional[asyncio.Task] = None
 registry_health_task: Optional[asyncio.Task] = None
 worker_health_task: Optional[asyncio.Task] = None
@@ -98,7 +96,6 @@ stream_proxy_handover_counter = Counter('stream_proxy_handover_total','Total pro
 handover_attempts_total = Counter('handover_attempts_total', 'Total proxy handover attempts', ['stream'])
 handover_success_total = Counter('handover_success_total', 'Total successful proxy handovers', ['stream'])
 handover_conflict_total = Counter('handover_conflict_total', 'Total conflicting proxy handovers denied', ['stream'])
-stream_assignment_info = Gauge('stream_assignment_info', 'Current stream assignment by proxy/worker', ['stream','proxy_pod','worker_pod','generation'])
 
 try:
     config.load_incluster_config()
@@ -289,18 +286,6 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
     stream_to_proxy[stream] = proxy_pod
     proxy_health_failures[proxy_pod] = 0
     return expires_at
-
-
-def register_or_refresh_stream_if_owner_matches(stream: str, proxy_pod: str):
-    """
-    Refreshes registry only if:
-    - stream does not exist yet, or
-    - stream already belongs to the same proxy_pod
-    """
-    current = stream_registry.get(stream)
-    if current and current.get("proxy_pod") != proxy_pod:
-        return None
-    return register_or_refresh_stream(stream, proxy_pod)
 
 
 def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
@@ -614,7 +599,6 @@ async def monitor_worker_health():
                 stream: entry.get("proxy_pod")
                 for stream, entry in stream_registry.items()
             }
-            pending_streams = list(streams_pending_allocation.keys())
 
         # Health check for allocated workers
         for stream, worker_pod in allocations:
