@@ -10,8 +10,8 @@ flowchart TD
     G -->|Sim| H[Controller mantém monitoramento de saúde]
     H --> G
 
-    G -->|Não| I[Controller corrige automaticamente
-(recria Worker ou troca Proxy quando necessário)]
+    G -->|Não| I["Controller corrige automaticamente
+(recria Worker ou troca Proxy quando necessário)"]
     I --> F
 
     F --> J[Cliente encerra a transmissão]
