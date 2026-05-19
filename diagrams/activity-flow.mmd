@@ -5,54 +5,58 @@ flowchart TD
     D --> E[exec_publish chama on_publish_start.sh]
     E --> F[Proxy notifica Controller: POST /streams/started?stream&proxy_pod]
 
-    F --> G[Controller registra stream ownership e persiste estado]
-    G --> H{Já existe worker para a streamKey?}
-    H -->|Sim| I[Resposta idempotent_replay]
-    H -->|Não| J[Controller resolve PROXY_DNS e cria worker via create_namespaced_pod]
-    J --> K[Controller injeta env STREAM_KEY e PROXY_DNS]
-    K --> L[Controller atualiza mapeamentos stream/proxy/worker e persiste estado]
-    I --> M[Worker ativo para a stream]
-    L --> M
+    F --> G[Controller valida payload e grava desired state started com generation/timestamps]
+    G --> H[Controller persiste estado e responde accepted/idempotent_replay]
+    H --> I[Loop de reconciliação observa desired state]
 
-    M --> N[Worker entrypoint.sh inicia worker_stream_runner.sh e nginx em foreground]
-    N --> O[Worker faz pull do proxy e push para o destino RTMP]
+    I --> J{desired state = started?}
+    J -->|Sim| K[Concilia ownership/handover da stream]
+    K --> L{Já existe worker para a streamKey?}
+    L -->|Sim| M[Marca observedGeneration/observedAt]
+    L -->|Não| N[Resolve PROXY_DNS e cria worker via create_namespaced_pod]
+    N --> O[Injeta env STREAM_KEY e PROXY_DNS]
+    O --> P[Atualiza mapeamentos stream/proxy/worker, persiste estado]
+    P --> M
 
-    O --> P{Cliente encerrou publicação?}
-    P -->|Não| Q["Reconciliação contínua (3s + jitter 1.5s)"]
+    M --> Q[Worker entrypoint.sh inicia worker_stream_runner.sh e nginx em foreground]
+    Q --> R[Worker faz pull do proxy e push para o destino RTMP]
 
-    Q --> R{Proxy owner está healthy?}
-    R -->|Não| S[Incrementa falhas do proxy owner]
-    S --> T{Falhas do proxy owner >= 3?}
-    T -->|Sim| U[Controller remove ownership/mapeamentos, deleta worker e persiste estado]
-    T -->|Não| Q
+    R --> S{Cliente encerrou publicação?}
+    S -->|Não| T[Reconciliação contínua + health loops]
 
-    R -->|Sim| V[Checa health do worker somente se worker estiver Ready + delay pós-ready]
-    V --> W{Worker healthy?}
-    W -->|Sim| X[Zera falhas do worker por UID]
-    W -->|Não| Y[Incrementa falhas do worker por UID]
-    Y --> Y1["Worker pode crashar por timeout RTMP do FFmpeg (5s)
-e o Kubernetes reinicia automaticamente"]
-    Y1 --> Z{Falhas do worker >= 3?}
-    Z -->|Sim| AA[Controller recria worker, atualiza mapeamentos e persiste estado]
-    Z -->|Não| Q
+    T --> U{Proxy owner está healthy?}
+    U -->|Não| V[Incrementa falhas do proxy owner]
+    V --> W{Falhas do proxy owner >= 3?}
+    W -->|Sim| X[Remove ownership/mapeamentos, deleta worker e persiste estado]
+    W -->|Não| T
 
-    X --> AB{Houve nova tentativa da mesma streamKey em outro proxy?}
-    AA --> AB
-    AB -->|Não| Q
-    AB -->|Sim| AC{Proxy owner atual está unhealthy ou deletado?}
-    AC -->|Não| AD[Controller nega handover]
-    AD --> Q
-    AC -->|Sim| AE[Controller transfere ownership, incrementa geração e troca worker para atualizar PROXY_DNS]
-    AE --> Q
+    U -->|Sim| Y[Checa health do worker somente se Ready + delay pós-ready]
+    Y --> Z{Worker healthy?}
+    Z -->|Sim| AA[Zera falhas do worker por UID]
+    Z -->|Não| AB[Incrementa falhas do worker por UID]
+    AB --> AC{Falhas do worker >= 3?}
+    AC -->|Sim| AD[Recria worker, atualiza mapeamentos e persiste estado]
+    AC -->|Não| T
 
-    Q --> AS["GC/Sweeper de órfãos (a cada 60s): lista workers não mapeados,
-revalida (double-check) e deleta órfãos"]
-    AS --> Q
+    AA --> AE{Nova tentativa mesma streamKey em outro proxy?}
+    AD --> AE
+    AE -->|Não| T
+    AE -->|Sim| AF{Owner atual unhealthy/deletado?}
+    AF -->|Não| AG[Nega handover]
+    AG --> T
+    AF -->|Sim| AH[Transfere ownership, incrementa geração e troca worker para atualizar PROXY_DNS]
+    AH --> T
 
-    P -->|Sim| AF[Proxy detecta idle publisher por 60s]
-    AF --> AG[exec_publish_done chama on_publish_done.sh]
-    AG --> AH[Proxy notifica Controller: POST /streams/ended?stream&proxy_pod]
-    AH --> AI["Controller release_worker: remove mapeamentos,
-deleta pod (se houver) e persiste estado"]
-    U --> AJ([Fim])
-    AI --> AJ
+    T --> AI[GC/Sweeper de órfãos: deleta workers não mapeados]
+    AI --> T
+
+    S -->|Sim| AJ[Proxy detecta idle publisher por 60s]
+    AJ --> AK[exec_publish_done chama on_publish_done.sh]
+    AK --> AL[Proxy notifica Controller: POST /streams/ended?stream&proxy_pod]
+    AL --> AM[Controller valida payload e grava desired state ended com generation/timestamps]
+    AM --> AN[Controller persiste estado e responde accepted/idempotent_replay]
+    AN --> AO[Loop de reconciliação observa desired ended e executa release_worker]
+    AO --> AP[Remove mapeamentos, deleta pod se houver e persiste estado]
+
+    X --> AQ([Fim])
+    AP --> AQ
