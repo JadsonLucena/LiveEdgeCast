@@ -1,57 +1,49 @@
 flowchart TD
-    A[Cliente inicia publish RTMP no LB] --> B[LB HAProxy balance leastconn]
-    B --> C[Proxy recebe stream /live/{streamKey}]
-    C --> D[NGINX exec_publish -> on_publish_start.sh]
-    D --> E[POST /streams/started?stream&proxy_pod]
+    A([Início]) --> B[Cliente inicia publish RTMP no Load Balancer]
+    B --> C[HAProxy seleciona proxy com leastconn e encaminha stream]
+    C --> D[Proxy NGINX recebe /live/{streamKey}]
+    D --> E[exec_publish chama on_publish_start.sh]
+    E --> F[Proxy notifica Controller: POST /streams/started?stream&proxy_pod]
 
-    E --> F{Controller register_stream\ntry_handover_stream_owner}
-    F -->|novo owner ou replay| G[Atualiza stream_registry + stream_to_proxy\npersist_state_locked]
-    F -->|conflito ownership| Z1[HTTP 409]
+    F --> G[Controller registra stream ownership e persiste estado]
+    G --> H{Já existe worker para a streamKey?}
+    H -->|Sim| I[Resposta idempotent_replay]
+    H -->|Não| J[Controller resolve PROXY_DNS e cria worker via create_namespaced_pod]
+    J --> K[Controller injeta env STREAM_KEY e PROXY_DNS]
+    K --> L[Controller atualiza mapeamentos stream/proxy/worker e persiste estado]
+    I --> M[Worker ativo para a stream]
+    L --> M
 
-    G --> H{allocate_worker\nstream já tem worker?}
-    H -->|sim| I[Retorna idempotent_replay]
-    H -->|não| J[resolve_proxy_address(owner)]
-    J --> K[create_worker_pod_for_stream]
-    K --> L[Injeta env STREAM_KEY e PROXY_DNS]
-    L --> M[core.create_namespaced_pod]
-    M --> N[Atualiza stream_to_worker + worker_to_stream\npersist_state_locked]
+    M --> N[Worker entrypoint.sh inicia worker_stream_runner.sh e nginx em foreground]
+    N --> O[Worker faz pull do proxy e push para o destino RTMP]
 
-    N --> O[Worker entrypoint.sh]
-    O --> P[Inicia worker_stream_runner.sh + nginx daemon off]
-    P --> Q[FFmpeg pull rtmp://PROXY_DNS/live/STREAM_KEY]
-    Q --> R[FFmpeg push RTMP destino]
+    O --> P{Cliente encerrou publicação?}
+    P -->|Não| Q[Reconciliação contínua (3s + jitter 1.5s)]
+    Q --> R{Proxy owner está healthy?}
+    R -->|Não| S[Incrementa falhas do proxy owner]
+    S --> T{Falhas do proxy owner >= 3?}
+    T -->|Sim| U[Controller remove ownership/mapeamentos, deleta worker e persiste estado]
+    T -->|Não| Q
 
-    %% Fim canônico
-    S[Cliente para publish] --> T[Proxy drop_idle_publisher 60s]
-    T --> U[exec_publish_done -> on_publish_done.sh]
-    U --> V[POST /streams/ended?stream&proxy_pod]
-    V --> W[Controller stream_ended]
-    W --> X[release_worker: remove mappings + delete pod\npersist_state_locked]
+    R -->|Sim| V[Checa health do worker somente se worker estiver Ready + delay pós-ready]
+    V --> W{Worker healthy?}
+    W -->|Sim| X[Zera falhas do worker por UID]
+    W -->|Não| Y[Incrementa falhas do worker por UID]
+    Y --> Z{Falhas do worker >= 3?}
+    Z -->|Sim| AA[Controller recria worker, atualiza mapeamentos e persiste estado]
+    Z -->|Não| Q
+    X --> AB{Houve nova tentativa da mesma streamKey em outro proxy?}
+    AA --> AB
+    AB -->|Não| P
+    AB -->|Sim| AC{Proxy owner atual está unhealthy ou deletado?}
+    AC -->|Não| AD[Controller nega handover]
+    AD --> P
+    AC -->|Sim| AE[Controller transfere ownership, incrementa geração e troca worker para atualizar PROXY_DNS]
+    AE --> P
 
-    %% Reconciliação Proxy
-    subgraph PROXY_RECON[Reconciliação de Saúde do Proxy]
-      P1[Loop a cada 3s + jitter 1.5s] --> P2[get_proxy_health_status(proxy)]
-      P2 -->|not_ready/warming_up| P3[Não conta falha]
-      P2 -->|healthy| P4[Zera proxy_health_failures]
-      P2 -->|unhealthy| P5[Incrementa falhas]
-      P5 -->|>=3| P6[Expira ownership da stream\nremove registry/proxy/worker mappings\ndeleta worker pod\npersist_state_locked]
-    end
-
-    %% Reconciliação Worker
-    subgraph WORKER_RECON[Reconciliação de Saúde do Worker]
-      W1[Loop a cada 3s + jitter 1.5s] --> W2[Lê pod worker + UID]
-      W2 --> W3{Worker Ready + delay pós-ready?}
-      W3 -->|não| W4[Reseta/pausa contagem]
-      W3 -->|sim| W5{Owner proxy healthy?}
-      W5 -->|não| W6[Skip check worker]
-      W5 -->|sim| W7[check_worker_health /health]
-      W7 -->|healthy| W8[Zera falhas por UID]
-      W7 -->|falha| W9[Incrementa falhas por UID]
-      W9 -->|>=3| W10[Cria worker novo\natualiza mappings\ndeleta worker antigo\npersist_state_locked]
-    end
-
-    %% Handover
-    Y1[Mesmo streamKey em outro proxy] --> Y2[try_handover_stream_owner]
-    Y2 -->|owner atual unhealthy/deletado| Y3[Transfere ownership\nstream_generation++]
-    Y3 --> Y4[Se já houver worker: replace_worker_pod_for_stream_locked\npara atualizar PROXY_DNS]
-    Y2 -->|owner saudável| Y5[nega handover 409]
+    P -->|Sim| AF[Proxy detecta idle publisher por 60s]
+    AF --> AG[exec_publish_done chama on_publish_done.sh]
+    AG --> AH[Proxy notifica Controller: POST /streams/ended?stream&proxy_pod]
+    AH --> AI[Controller release_worker: remove mapeamentos, deleta pod e persiste estado]
+    U --> AJ([Fim])
+    AI --> AJ
