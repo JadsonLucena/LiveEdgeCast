@@ -67,19 +67,11 @@ stream_downtime: Dict[str, float] = {}
 
 metrics_collection_task: Optional[asyncio.Task] = None
 
-stream_delivery_errors = Counter('stream_delivery_errors_total','Total delivery errors to YouTube',['reason'])
-stream_bitrate_output = Gauge('stream_bitrate_output_mbps','Bitrate being sent to YouTube in Mbps',['stream'])
-stream_bitrate_input = Gauge('stream_bitrate_input_mbps','Bitrate received from proxy in Mbps',['stream'])
-stream_delivery_status = Gauge('stream_delivery_status','Delivery status: 0=error, 1=warning, 2=ok',['stream'])
 stream_start_timestamp = Gauge('stream_start_time','Unix timestamp when stream started',['stream'])
 stream_uptime = Gauge('stream_uptime_seconds','How long stream has been active in seconds',['stream'])
 stream_session_duration = Gauge('stream_session_duration_seconds','Total stream session duration in seconds',['stream'])
 stream_interruptions_counter = Counter('stream_interruptions_total','Total number of times stream was interrupted',['stream'])
 stream_downtime_gauge = Gauge('stream_downtime_total_seconds','Total accumulated downtime in seconds',['stream'])
-stream_current_downtime = Gauge('stream_current_downtime_seconds','Current downtime if stream is down, 0 otherwise',['stream'])
-ffmpeg_restart_counter = Counter('ffmpeg_restart_total','Total FFmpeg process restarts',['stream'])
-ffmpeg_process_running = Gauge('ffmpeg_process_running','Is FFmpeg currently running (0 or 1)',['stream'])
-stream_last_error_reason_gauge = Gauge('stream_last_error_reason','Last error reason code',['stream'])
 pod_cpu_usage_percent = Gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',['pod','namespace'])
 pod_memory_usage_bytes = Gauge('pod_memory_usage_bytes','Pod memory usage in bytes',['pod','namespace'])
 pod_memory_usage_percent = Gauge('pod_memory_usage_percent','Pod memory usage as percent of limit',['pod','namespace'])
@@ -463,18 +455,6 @@ def record_stream_end(stream: str):
         return
     duration = time.time() - start
     stream_session_duration.labels(stream=stream).set(duration)
-
-def update_stream_uptime(stream: str):
-    start = stream_start_time.get(stream)
-    if not start:
-        return
-    uptime = (time.time() - start) - stream_downtime.get(stream, 0.0)
-    stream_uptime.labels(stream=stream).set(max(0, uptime))
-
-def record_interruption(stream: str):
-    stream_interruptions[stream] = stream_interruptions.get(stream, 0) + 1
-    stream_interruptions_counter.labels(stream=stream).inc()
-
 def get_pod_metrics(pod_name: str, namespace: str) -> dict:
     try:
         pod = core.read_namespaced_pod(name=pod_name, namespace=namespace)
@@ -933,58 +913,6 @@ def get_status():
             ]
         }
 
-
-@app.post("/streams/delivery-status")
-def report_delivery_status(
-    stream: str = Query(...),
-    proxy_pod: str = Query(...),
-    status: str = Query(...),
-    reason: str = Query(None),
-    bitrate_input: float = Query(0),
-    bitrate_output: float = Query(0),
-):
-    now = time.time()
-    bitrate_input_mbps = bitrate_input / 1024.0
-    bitrate_output_mbps = bitrate_output / 1024.0
-    stream_delivery_status.labels(stream=stream).set({'ok':2,'warning':1,'error':0}.get(status,0))
-    if bitrate_input_mbps > 0:
-        stream_bitrate_input.labels(stream=stream).set(bitrate_input_mbps)
-    if bitrate_output_mbps > 0:
-        stream_bitrate_output.labels(stream=stream).set(bitrate_output_mbps)
-    if status == 'error':
-        stream_delivery_errors.labels(reason=reason or 'unknown').inc()
-        ffmpeg_process_running.labels(stream=stream).set(0)
-        stream_last_error_reason_gauge.labels(stream=stream).set(1)
-        record_interruption(stream)
-    else:
-        ffmpeg_process_running.labels(stream=stream).set(1)
-    update_stream_uptime(stream)
-    with allocation_lock:
-        previous_owner = (stream_registry.get(stream) or {}).get("proxy_pod")
-        ownership_updated = try_handover_stream_owner(stream, proxy_pod)
-        if not ownership_updated:
-            current_owner = (stream_registry.get(stream) or {}).get("proxy_pod")
-            logger.warning(
-                f"[DeliveryStatus] Owner conflict for stream '{stream}': "
-                f"reporter='{proxy_pod}' current_owner='{current_owner}'"
-            )
-            raise HTTPException(
-                status_code=409,
-                detail=f"stream '{stream}' owned by another proxy '{current_owner}'"
-            )
-
-        if previous_owner and previous_owner != proxy_pod:
-            logger.info(
-                f"[DeliveryStatus] Ownership handover accepted for stream '{stream}' "
-                f"from='{previous_owner}' to='{proxy_pod}'"
-            )
-        else:
-            logger.info(
-                f"[DeliveryStatus] Ownership refresh accepted for stream '{stream}' owner='{proxy_pod}'"
-            )
-
-        persist_state_locked()
-    return {'acknowledged': True, 'status': status}
 
 
 @app.get('/metrics')
