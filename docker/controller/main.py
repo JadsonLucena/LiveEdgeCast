@@ -940,17 +940,20 @@ def stream_started(
     now = time.time()
     with allocation_lock:
         current = stream_desired_state.get(stream, {})
-        generation = int(current.get("generation", 0)) + 1
         replay = current.get("state") == "started" and current.get("proxy_pod") == proxy_pod
-        stream_desired_state[stream] = {
-            "state": "started",
-            "proxy_pod": proxy_pod,
-            "generation": generation,
-            "observedGeneration": current.get("observedGeneration", 0),
-            "updatedAt": now,
-            "lastStartedAt": now
-        }
-        persist_state_locked()
+        if replay:
+            generation = int(current.get("generation", 0))
+        else:
+            generation = int(current.get("generation", 0)) + 1
+            stream_desired_state[stream] = {
+                "state": "started",
+                "proxy_pod": proxy_pod,
+                "generation": generation,
+                "observedGeneration": current.get("observedGeneration", 0),
+                "updatedAt": now,
+                "lastStartedAt": now
+            }
+            persist_state_locked()
     return {"status": "idempotent_replay" if replay else "accepted", "stream": stream, "generation": generation}
 
 
@@ -962,17 +965,21 @@ async def stream_ended(
     now = time.time()
     with allocation_lock:
         current = stream_desired_state.get(stream, {})
-        generation = int(current.get("generation", 0)) + 1
-        replay = current.get("state") == "ended"
-        stream_desired_state[stream] = {
-            "state": "ended",
-            "proxy_pod": proxy_pod or current.get("proxy_pod"),
-            "generation": generation,
-            "observedGeneration": current.get("observedGeneration", 0),
-            "updatedAt": now,
-            "lastEndedAt": now
-        }
-        persist_state_locked()
+        desired_proxy = proxy_pod or current.get("proxy_pod")
+        replay = current.get("state") == "ended" and current.get("proxy_pod") == desired_proxy
+        if replay:
+            generation = int(current.get("generation", 0))
+        else:
+            generation = int(current.get("generation", 0)) + 1
+            stream_desired_state[stream] = {
+                "state": "ended",
+                "proxy_pod": desired_proxy,
+                "generation": generation,
+                "observedGeneration": current.get("observedGeneration", 0),
+                "updatedAt": now,
+                "lastEndedAt": now
+            }
+            persist_state_locked()
     return {"status": "idempotent_replay" if replay else "accepted", "stream": stream, "generation": generation}
 
 @app.get('/metrics')
