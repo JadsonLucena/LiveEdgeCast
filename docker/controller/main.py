@@ -36,10 +36,12 @@ worker_to_stream: Dict[str, str] = {}
 stream_to_proxy: Dict[str, str] = {}
 stream_generation: Dict[str, int] = {}
 stream_registry: Dict[str, Dict[str, float]] = {}
+stream_desired_state: Dict[str, Dict[str, object]] = {}
 
 registry_health_task: Optional[asyncio.Task] = None
 worker_health_task: Optional[asyncio.Task] = None
 worker_orphan_sweeper_task: Optional[asyncio.Task] = None
+reconcile_task: Optional[asyncio.Task] = None
 PROXY_HEALTHCHECK_INTERVAL_SECONDS = 3
 PROXY_HEALTHCHECK_MAX_FAILURES = 3
 PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
@@ -99,6 +101,7 @@ def persist_state_locked() -> None:
         "stream_to_proxy": stream_to_proxy,
         "stream_registry": stream_registry,
         "stream_generation": stream_generation,
+        "stream_desired_state": stream_desired_state,
     }
     body = client.V1ConfigMap(
         metadata=client.V1ObjectMeta(name=STATE_CONFIGMAP_NAME, namespace=NAMESPACE),
@@ -151,6 +154,8 @@ def restore_persisted_state_locked() -> bool:
     stream_registry.update(data.get("stream_registry", {}))
     stream_generation.clear()
     stream_generation.update(data.get("stream_generation", {}))
+    stream_desired_state.clear()
+    stream_desired_state.update(data.get("stream_desired_state", {}))
     return True
 
 
@@ -675,20 +680,70 @@ async def sweep_orphan_workers():
             except Exception as e:
                 logger.warning(f"[OrphanSweeper] Failed deleting orphan worker pod '{pod_name}': {e}")
 
+
+
+async def reconcile_streams_loop():
+    """Move allocation/release decisions to operator reconciliation loop."""
+    while True:
+        await asyncio.sleep(1)
+        with allocation_lock:
+            desired_snapshot = dict(stream_desired_state)
+
+        for stream, desired in desired_snapshot.items():
+            state = desired.get("state")
+            if state == "started":
+                proxy_pod = desired.get("proxy_pod")
+                if not proxy_pod:
+                    continue
+                with allocation_lock:
+                    current_owner = stream_registry.get(stream, {}).get("proxy_pod")
+                    has_worker = stream in stream_to_worker
+                if current_owner != proxy_pod:
+                    with allocation_lock:
+                        try_handover_stream_owner(stream, proxy_pod)
+                        persist_state_locked()
+                if not has_worker:
+                    try:
+                        allocate_worker(stream=stream, proxy_pod=proxy_pod)
+                    except Exception as e:
+                        logger.warning(f"[Reconcile] Failed allocate for '{stream}': {e}")
+                        continue
+                with allocation_lock:
+                    desired["observedGeneration"] = desired.get("generation")
+                    desired["observedAt"] = time.time()
+                    stream_desired_state[stream] = desired
+                    persist_state_locked()
+            elif state == "ended":
+                with allocation_lock:
+                    has_worker = stream in stream_to_worker
+                    has_registry = stream in stream_registry
+                if has_worker or has_registry:
+                    try:
+                        await release_worker(stream=stream)
+                    except Exception as e:
+                        logger.warning(f"[Reconcile] Failed release for '{stream}': {e}")
+                        continue
+                with allocation_lock:
+                    desired["observedGeneration"] = desired.get("generation")
+                    desired["observedAt"] = time.time()
+                    stream_desired_state[stream] = desired
+                    persist_state_locked()
+
 @app.on_event("startup")
 async def startup_event():
-    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
+    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task, reconcile_task
     time.sleep(5)
     recover_state()
     registry_health_task = asyncio.create_task(monitor_stream_registry_health())
     worker_health_task = asyncio.create_task(monitor_worker_health())
     worker_orphan_sweeper_task = asyncio.create_task(sweep_orphan_workers())
     metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
+    reconcile_task = asyncio.create_task(reconcile_streams_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
+    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task, reconcile_task
     if registry_health_task and not registry_health_task.done():
         registry_health_task.cancel()
     if worker_health_task and not worker_health_task.done():
@@ -697,6 +752,8 @@ async def shutdown_event():
         worker_orphan_sweeper_task.cancel()
     if metrics_collection_task and not metrics_collection_task.done():
         metrics_collection_task.cancel()
+    if reconcile_task and not reconcile_task.done():
+        reconcile_task.cancel()
 
 
 @app.get("/health")
@@ -707,7 +764,6 @@ def health():
 def allocate_worker(
     stream: str = Query(..., description="Stream name"),
     proxy_pod: str = Query(None, description="Proxy pod name for pull-only architecture"),
-    ownership_already_verified: bool = False,
 ):
     """
     Aloca um worker dedicado para uma stream.
@@ -720,7 +776,7 @@ def allocate_worker(
     """
 
     with allocation_lock:
-        if proxy_pod and not ownership_already_verified:
+        if proxy_pod:
             if not try_handover_stream_owner(stream, proxy_pod):
                 owner = stream_registry.get(stream, {}).get("proxy_pod")
                 persist_state_locked()
@@ -846,40 +902,6 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
     return {"status": "not_found", "stream": stream}
 
 
-def register_stream(
-    stream: str = Query(..., description="Stream name"),
-    proxy_pod: str = Query(..., description="Proxy pod name")
-):
-    with allocation_lock:
-        current = stream_registry.get(stream)
-        was_replay = current and current.get("proxy_pod") == proxy_pod
-
-        if not try_handover_stream_owner(stream, proxy_pod):
-            current_owner = stream_registry.get(stream, {}).get("proxy_pod")
-            raise HTTPException(
-                status_code=409,
-                detail=f"stream '{stream}' already owned by proxy '{current_owner}'"
-            )
-
-        persist_state_locked()
-
-        if was_replay:
-            logger.info(f"[Register] Idempotent replay for stream '{stream}' on proxy '{proxy_pod}'")
-            status = "idempotent_replay"
-        else:
-            logger.info(f"[Register] State changed for stream '{stream}' owner='{proxy_pod}'")
-            status = "registered"
-
-        return {
-            "status": status,
-            "stream": stream,
-            "proxy_pod": proxy_pod,
-            "healthcheck_interval_seconds": PROXY_HEALTHCHECK_INTERVAL_SECONDS,
-            "max_failed_healthchecks": PROXY_HEALTHCHECK_MAX_FAILURES
-        }
-
-
-
 
 
 
@@ -891,46 +913,43 @@ def stream_started(
     stream: str = Query(..., description="Stream name"),
     proxy_pod: str = Query(..., description="Proxy pod that received publish")
 ):
-    """Single controller entrypoint when proxy publish starts.
-    Controller performs register/allocation/start orchestration.
-    """
-    registration = register_stream(stream=stream, proxy_pod=proxy_pod)
-    allocation = allocate_worker(stream=stream, proxy_pod=proxy_pod, ownership_already_verified=True)
+    now = time.time()
+    with allocation_lock:
+        current = stream_desired_state.get(stream, {})
+        generation = int(current.get("generation", 0)) + 1
+        replay = current.get("state") == "started" and current.get("proxy_pod") == proxy_pod
+        stream_desired_state[stream] = {
+            "state": "started",
+            "proxy_pod": proxy_pod,
+            "generation": generation,
+            "observedGeneration": current.get("observedGeneration", 0),
+            "updatedAt": now,
+            "lastStartedAt": now
+        }
+        persist_state_locked()
+    return {"status": "idempotent_replay" if replay else "accepted", "stream": stream, "generation": generation}
 
-    replay = registration.get("status") == "idempotent_replay" and allocation.get("status") == "idempotent_replay"
-    event_status = "idempotent_replay" if replay else "started_event_processed"
-    log_prefix = "Idempotent replay" if replay else "State changed"
-    logger.info(f"[StreamsStarted] {log_prefix} for stream '{stream}' proxy='{proxy_pod}'")
 
-    return {
-        "status": event_status,
-        "registration": registration,
-        "stream": stream,
-        "allocation": allocation,
-    }
 @app.post("/streams/ended")
 async def stream_ended(
     stream: str = Query(..., description="Stream name"),
     proxy_pod: str = Query(None, description="Proxy pod that ended publish")
 ):
-    """Single controller entrypoint when proxy publish ends.
-    Controller performs full cleanup (registry + worker release).
-    """
+    now = time.time()
     with allocation_lock:
-        if proxy_pod:
-            current = stream_registry.get(stream)
-            if current and current.get("proxy_pod") == proxy_pod:
-                stream_registry.pop(stream, None)
-                stream_to_proxy.pop(stream, None)
-
-    release_result = await release_worker(stream=stream)
-    replay = release_result.get("status") == "not_found"
-    event_status = "idempotent_replay" if replay else "ended"
-    logger.info(
-        f"[StreamsEnded] {'Idempotent replay' if replay else 'State changed'} for stream '{stream}' "
-        f"proxy='{proxy_pod}' release_status='{release_result.get('status')}'"
-    )
-    return {"status": event_status, "stream": stream, "release": release_result}
+        current = stream_desired_state.get(stream, {})
+        generation = int(current.get("generation", 0)) + 1
+        replay = current.get("state") == "ended"
+        stream_desired_state[stream] = {
+            "state": "ended",
+            "proxy_pod": proxy_pod or current.get("proxy_pod"),
+            "generation": generation,
+            "observedGeneration": current.get("observedGeneration", 0),
+            "updatedAt": now,
+            "lastEndedAt": now
+        }
+        persist_state_locked()
+    return {"status": "idempotent_replay" if replay else "accepted", "stream": stream, "generation": generation}
 
 @app.get('/metrics')
 def metrics():
