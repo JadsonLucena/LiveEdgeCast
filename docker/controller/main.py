@@ -691,6 +691,8 @@ async def reconcile_streams_loop():
 
         for stream, desired in desired_snapshot.items():
             state = desired.get("state")
+            if desired.get("observedGeneration") == desired.get("generation"):
+                continue
             if state == "started":
                 proxy_pod = desired.get("proxy_pod")
                 if not proxy_pod:
@@ -739,6 +741,8 @@ async def reconcile_streams_loop():
                             f"(snapshot gen/state={desired.get('generation')}/{desired.get('state')} current="
                             f"{current_desired.get('generation')}/{current_desired.get('state')})"
                         )
+                        continue
+                    if current_desired.get("observedGeneration") == current_desired.get("generation"):
                         continue
                     if current_desired.get("observedGeneration") == current_desired.get("generation"):
                         continue
