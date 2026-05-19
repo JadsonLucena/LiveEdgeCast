@@ -53,7 +53,8 @@ PROXY_HEALTHCHECK_JITTER_SECONDS = 1.5
 WORKER_HEALTHCHECK_INTERVAL_SECONDS = 3
 WORKER_HEALTHCHECK_MAX_FAILURES = 3
 WORKER_HEALTHCHECK_JITTER_SECONDS = 1.5
-WORKER_READY_HEALTH_DELAY_SECONDS = 3
+WORKER_READY_HEALTH_DELAY_SECONDS = 3  # Wait after worker Ready before worker /health probes.
+PROXY_READY_HEALTH_DELAY_SECONDS = 3  # Wait after proxy Ready before proxy /health probes.
 STREAM_TTL_SECONDS = 180
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
@@ -425,6 +426,7 @@ def resolve_proxy_address(proxy_pod: str) -> str:
 
 
 def check_proxy_health(proxy_pod: str) -> bool:
+    """Checks proxy pod health after Ready plus proxy-specific stabilization delay."""
     try:
         pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
         ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
@@ -436,8 +438,16 @@ def check_proxy_health(proxy_pod: str) -> bool:
         first_ready_at = proxy_ready_since.get(proxy_pod)
         if first_ready_at is None:
             proxy_ready_since[proxy_pod] = now
+            logger.debug(
+                f"[ProxyHealth] Proxy '{proxy_pod}' became Ready. Starting proxy delay timer "
+                f"({PROXY_READY_HEALTH_DELAY_SECONDS}s) before /health probe."
+            )
             return False
-        if (now - first_ready_at) < WORKER_READY_HEALTH_DELAY_SECONDS:
+        if (now - first_ready_at) < PROXY_READY_HEALTH_DELAY_SECONDS:
+            logger.debug(
+                f"[ProxyHealth] Waiting {PROXY_READY_HEALTH_DELAY_SECONDS}s after Ready for '{proxy_pod}' "
+                f"before probing /health ({now - first_ready_at:.1f}s elapsed)."
+            )
             return False
 
         target = resolve_proxy_address(proxy_pod)
@@ -560,6 +570,7 @@ async def collect_infrastructure_metrics():
 
 
 async def monitor_worker_health():
+    """Worker health monitor using worker-specific Ready-to-/health delay before probing."""
     """Controller-driven worker healthcheck every 3s, with 3 consecutive failures threshold."""
     while True:
         await asyncio.sleep(WORKER_HEALTHCHECK_INTERVAL_SECONDS)
@@ -597,12 +608,12 @@ async def monitor_worker_health():
                     worker_ready_since[worker_pod] = now
                     if current_uid:
                         worker_health_failures[current_uid] = 0
-                    logger.debug(f"[WorkerHealth] Worker '{worker_pod}' became Ready. Starting /health delay timer.")
+                    logger.debug(f"[WorkerHealth] Worker '{worker_pod}' became Ready. Starting worker delay timer ({WORKER_READY_HEALTH_DELAY_SECONDS}s) before /health probe.")
                     continue
 
                 if (now - first_ready_at) < WORKER_READY_HEALTH_DELAY_SECONDS:
                     logger.debug(
-                        f"[WorkerHealth] Waiting {WORKER_READY_HEALTH_DELAY_SECONDS}s after Ready for '{worker_pod}' "
+                        f"[WorkerHealth] Waiting worker delay of {WORKER_READY_HEALTH_DELAY_SECONDS}s after Ready for '{worker_pod}' "
                         f"before probing /health ({now - first_ready_at:.1f}s elapsed)."
                     )
                     continue
