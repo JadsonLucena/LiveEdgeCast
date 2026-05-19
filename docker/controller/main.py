@@ -719,6 +719,10 @@ async def reconcile_streams_loop():
                             f"{current_desired.get('generation')}/{current_desired.get('state')})"
                         )
                         continue
+                    if current_desired.get("observedGeneration") == current_desired.get("generation"):
+                        continue
+                    if current_desired.get("observedGeneration") == current_desired.get("generation"):
+                        continue
                     current_desired["observedGeneration"] = current_desired.get("generation")
                     current_desired["observedAt"] = time.time()
                     stream_desired_state[stream] = current_desired
