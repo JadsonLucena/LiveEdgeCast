@@ -19,6 +19,7 @@ flowchart TD
 
     O --> P{Cliente encerrou publicação?}
     P -->|Não| Q["Reconciliação contínua (3s + jitter 1.5s)"]
+
     Q --> R{Proxy owner está healthy?}
     R -->|Não| S[Incrementa falhas do proxy owner]
     S --> T{Falhas do proxy owner >= 3?}
@@ -32,18 +33,24 @@ flowchart TD
     Y --> Z{Falhas do worker >= 3?}
     Z -->|Sim| AA[Controller recria worker, atualiza mapeamentos e persiste estado]
     Z -->|Não| Q
+
     X --> AB{Houve nova tentativa da mesma streamKey em outro proxy?}
     AA --> AB
-    AB -->|Não| P
+    AB -->|Não| Q
     AB -->|Sim| AC{Proxy owner atual está unhealthy ou deletado?}
     AC -->|Não| AD[Controller nega handover]
-    AD --> P
+    AD --> Q
     AC -->|Sim| AE[Controller transfere ownership, incrementa geração e troca worker para atualizar PROXY_DNS]
-    AE --> P
+    AE --> Q
+
+    Q --> AS[GC/Sweeper de órfãos (a cada 60s): lista workers não mapeados,
+revalida (double-check) e deleta órfãos]
+    AS --> Q
 
     P -->|Sim| AF[Proxy detecta idle publisher por 60s]
     AF --> AG[exec_publish_done chama on_publish_done.sh]
     AG --> AH[Proxy notifica Controller: POST /streams/ended?stream&proxy_pod]
-    AH --> AI[Controller release_worker: remove mapeamentos, deleta pod e persiste estado]
+    AH --> AI[Controller release_worker: remove mapeamentos,
+deleta pod (se houver) e persiste estado]
     U --> AJ([Fim])
     AI --> AJ
