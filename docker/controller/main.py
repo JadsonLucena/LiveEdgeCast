@@ -244,13 +244,6 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
         f"old='{old_worker}' new='{new_worker}' proxy_dns='{proxy_dns}'"
     )
     return new_worker
-def cleanup_expired_streams() -> bool:
-    """
-    TTL-based cleanup disabled.
-    Lifecycle cleanup is driven by explicit ended events and health reconciliation.
-    """
-    return False
-
 
 def register_or_refresh_stream(stream: str, proxy_pod: str):
     """
@@ -386,9 +379,6 @@ async def monitor_stream_registry_health():
         await asyncio.sleep(PROXY_HEALTHCHECK_INTERVAL_SECONDS)
 
         with allocation_lock:
-            changed = cleanup_expired_streams()
-            if changed:
-                persist_state_locked()
             proxies = {entry.get("proxy_pod") for entry in stream_registry.values() if entry.get("proxy_pod")}
 
         if proxies:
@@ -753,7 +743,6 @@ def allocate_worker(
     global scale_down_task
     
     with allocation_lock:
-        cleanup_expired_streams()
 
         if proxy_pod and not ownership_already_verified:
             if not try_handover_stream_owner(stream, proxy_pod):
@@ -870,7 +859,6 @@ def register_stream(
     proxy_pod: str = Query(..., description="Proxy pod name")
 ):
     with allocation_lock:
-        cleanup_expired_streams()
         current = stream_registry.get(stream)
         was_replay = current and current.get("proxy_pod") == proxy_pod
 
@@ -899,17 +887,10 @@ def register_stream(
         }
 
 
-def heartbeat_stream(
-    stream: str = Query(..., description="Stream name"),
-    proxy_pod: str = Query(..., description="Proxy pod name")
-):
-    raise HTTPException(status_code=410, detail="heartbeat disabled: controller performs healthchecks")
-
 
 def resolve_stream(stream: str = Query(..., description="Stream name")):
     proxy_pod = None
     with allocation_lock:
-        cleanup_expired_streams()
         entry = stream_registry.get(stream)
 
         if not entry:
@@ -927,27 +908,6 @@ def resolve_stream(stream: str = Query(..., description="Stream name")):
         "proxyAddress": proxy_address
     }
 
-
-def release_stream_registry(
-    stream: str = Query(..., description="Stream name"),
-    proxy_pod: str = Query(None, description="Proxy pod name")
-):
-    with allocation_lock:
-        cleanup_expired_streams()
-        current = stream_registry.get(stream)
-        if not current:
-            return {"status": "not_found", "stream": stream}
-
-        if proxy_pod and current.get("proxy_pod") != proxy_pod:
-            raise HTTPException(
-                status_code=409,
-                detail=f"stream '{stream}' owned by another proxy '{current.get('proxy_pod')}'"
-            )
-
-        stream_registry.pop(stream, None)
-        stream_to_proxy.pop(stream, None)
-        persist_state_locked()
-        return {"status": "released", "stream": stream}
 
 
 
@@ -1006,7 +966,6 @@ def get_status():
     Useful for debugging and monitoring.
     """
     with allocation_lock:
-        cleanup_expired_streams()
         return {
             "active_streams": len(stream_to_worker),
             "registry_streams": len(stream_registry),
@@ -1113,7 +1072,6 @@ def get_stream_key(stream: str = Query(..., description="Stream name")):
     youtube_key = stream
     
     with allocation_lock:
-        cleanup_expired_streams()
         proxy_pod = stream_to_proxy.get(stream)
         if not proxy_pod:
             raise HTTPException(status_code=404, detail=f"stream '{stream}' has no active proxy owner")
