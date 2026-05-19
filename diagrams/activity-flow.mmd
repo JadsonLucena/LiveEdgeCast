@@ -1,7 +1,7 @@
 flowchart TD
     A([Início]) --> B[Cliente inicia publish RTMP no Load Balancer]
     B --> C[HAProxy seleciona proxy com leastconn e encaminha stream]
-    C --> D[Proxy NGINX recebe /live/{streamKey}]
+    C --> D[Proxy NGINX recebe /live/:streamKey]
     D --> E[exec_publish chama on_publish_start.sh]
     E --> F[Proxy notifica Controller: POST /streams/started?stream&proxy_pod]
 
@@ -18,7 +18,7 @@ flowchart TD
     N --> O[Worker faz pull do proxy e push para o destino RTMP]
 
     O --> P{Cliente encerrou publicação?}
-    P -->|Não| Q[Reconciliação contínua (3s + jitter 1.5s)]
+    P -->|Não| Q["Reconciliação contínua (3s + jitter 1.5s)"]
     Q --> R{Proxy owner está healthy?}
     R -->|Não| S[Incrementa falhas do proxy owner]
     S --> T{Falhas do proxy owner >= 3?}
