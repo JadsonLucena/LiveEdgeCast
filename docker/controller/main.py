@@ -709,9 +709,19 @@ async def reconcile_streams_loop():
                         logger.warning(f"[Reconcile] Failed allocate for '{stream}': {e}")
                         continue
                 with allocation_lock:
-                    desired["observedGeneration"] = desired.get("generation")
-                    desired["observedAt"] = time.time()
-                    stream_desired_state[stream] = desired
+                    current_desired = stream_desired_state.get(stream)
+                    if not current_desired:
+                        continue
+                    if current_desired.get("generation") != desired.get("generation") or current_desired.get("state") != desired.get("state"):
+                        logger.debug(
+                            f"[Reconcile] Skip observed update for stream '{stream}' due to newer desired state "
+                            f"(snapshot gen/state={desired.get('generation')}/{desired.get('state')} current="
+                            f"{current_desired.get('generation')}/{current_desired.get('state')})"
+                        )
+                        continue
+                    current_desired["observedGeneration"] = current_desired.get("generation")
+                    current_desired["observedAt"] = time.time()
+                    stream_desired_state[stream] = current_desired
                     persist_state_locked()
             elif state == "ended":
                 with allocation_lock:
@@ -724,9 +734,19 @@ async def reconcile_streams_loop():
                         logger.warning(f"[Reconcile] Failed release for '{stream}': {e}")
                         continue
                 with allocation_lock:
-                    desired["observedGeneration"] = desired.get("generation")
-                    desired["observedAt"] = time.time()
-                    stream_desired_state[stream] = desired
+                    current_desired = stream_desired_state.get(stream)
+                    if not current_desired:
+                        continue
+                    if current_desired.get("generation") != desired.get("generation") or current_desired.get("state") != desired.get("state"):
+                        logger.debug(
+                            f"[Reconcile] Skip observed update for stream '{stream}' due to newer desired state "
+                            f"(snapshot gen/state={desired.get('generation')}/{desired.get('state')} current="
+                            f"{current_desired.get('generation')}/{current_desired.get('state')})"
+                        )
+                        continue
+                    current_desired["observedGeneration"] = current_desired.get("generation")
+                    current_desired["observedAt"] = time.time()
+                    stream_desired_state[stream] = current_desired
                     persist_state_locked()
 
 @app.on_event("startup")
