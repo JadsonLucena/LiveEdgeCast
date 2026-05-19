@@ -53,7 +53,6 @@ WORKER_HEALTHCHECK_MAX_FAILURES = 3
 WORKER_HEALTHCHECK_JITTER_SECONDS = 1.5
 WORKER_READY_HEALTH_DELAY_SECONDS = 3  # Wait after worker Ready before worker /health probes.
 PROXY_READY_HEALTH_DELAY_SECONDS = 3  # Wait after proxy Ready before proxy /health probes.
-STREAM_TTL_SECONDS = 180
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
 worker_health_failures: Dict[str, int] = {}
@@ -247,50 +246,24 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
     return new_worker
 def cleanup_expired_streams() -> bool:
     """
-    Removes expired streams from the ephemeral registry.
-    Also removes stream/proxy/worker mappings to keep state consistent.
-    Returns True when at least one stream is cleaned up.
+    TTL-based cleanup disabled.
+    Lifecycle cleanup is driven by explicit ended events and health reconciliation.
     """
-    now = time.time()
-    expired = [stream for stream, entry in stream_registry.items() if entry.get("expires_at", 0) <= now]
-    changed = False
-
-    for stream in expired:
-        changed = True
-        stream_registry.pop(stream, None)
-        stream_to_proxy.pop(stream, None)
-
-        worker_name = stream_to_worker.pop(stream, None)
-        if worker_name:
-            worker_to_stream.pop(worker_name, None)
-            worker_ready_since.pop(worker_name, None)
-            old_uid = worker_pod_uid_by_name.pop(worker_name, None)
-            if old_uid:
-                worker_health_failures.pop(old_uid, None)
-            try:
-                core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
-            except Exception as e:
-                logger.warning(f"[Registry] Failed deleting expired worker {worker_name}: {e}")
-
-        logger.info(f"[Registry] Stream '{stream}' expired after inactivity window")
-
-    return changed
+    return False
 
 
 def register_or_refresh_stream(stream: str, proxy_pod: str):
     """
-    Creates or refreshes the stream ephemeral registry on proxy.
+    Creates or refreshes canonical stream ownership on proxy.
     """
-    expires_at = time.time() + STREAM_TTL_SECONDS
     if stream not in stream_generation:
         stream_generation[stream] = 1
     stream_registry[stream] = {
         "proxy_pod": proxy_pod,
-        "expires_at": expires_at
     }
     stream_to_proxy[stream] = proxy_pod
     proxy_health_failures[proxy_pod] = 0
-    return expires_at
+    return None
 
 
 def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
@@ -368,9 +341,6 @@ async def monitor_stream_registry_health():
         with allocation_lock:
             if health_status == "healthy":
                 proxy_health_failures[proxy_pod] = 0
-                for stream, entry in stream_registry.items():
-                    if entry.get("proxy_pod") == proxy_pod:
-                        entry["expires_at"] = time.time() + STREAM_TTL_SECONDS
             elif health_status == "warming_up":
                 logger.debug(
                     f"[ProxyHealth] Proxy '{proxy_pod}' is warming up; "
@@ -911,7 +881,6 @@ def register_stream(
                 detail=f"stream '{stream}' already owned by proxy '{current_owner}'"
             )
 
-        expires_at = stream_registry.get(stream, {}).get("expires_at")
         persist_state_locked()
 
         if was_replay:
@@ -925,10 +894,8 @@ def register_stream(
             "status": status,
             "stream": stream,
             "proxy_pod": proxy_pod,
-            "ttl_seconds": STREAM_TTL_SECONDS,
             "healthcheck_interval_seconds": PROXY_HEALTHCHECK_INTERVAL_SECONDS,
-            "max_failed_healthchecks": PROXY_HEALTHCHECK_MAX_FAILURES,
-            "expires_at": expires_at
+            "max_failed_healthchecks": PROXY_HEALTHCHECK_MAX_FAILURES
         }
 
 
@@ -941,8 +908,6 @@ def heartbeat_stream(
 
 def resolve_stream(stream: str = Query(..., description="Stream name")):
     proxy_pod = None
-    expires_at = None
-
     with allocation_lock:
         cleanup_expired_streams()
         entry = stream_registry.get(stream)
@@ -951,7 +916,6 @@ def resolve_stream(stream: str = Query(..., description="Stream name")):
             raise HTTPException(status_code=404, detail=f"stream '{stream}' not found")
 
         proxy_pod = entry.get("proxy_pod")
-        expires_at = entry.get("expires_at")
 
     if not proxy_pod:
         raise HTTPException(status_code=404, detail=f"stream '{stream}' has no active proxy owner")
@@ -960,8 +924,7 @@ def resolve_stream(stream: str = Query(..., description="Stream name")):
     return {
         "stream": stream,
         "proxyPod": proxy_pod,
-        "proxyAddress": proxy_address,
-        "expiresAt": expires_at
+        "proxyAddress": proxy_address
     }
 
 
@@ -1057,8 +1020,7 @@ def get_status():
             "registry": [
                 {
                     "stream": stream,
-                    "proxy_pod": data.get("proxy_pod"),
-                    "expires_at": data.get("expires_at")
+                    "proxy_pod": data.get("proxy_pod")
                 }
                 for stream, data in stream_registry.items()
             ]
