@@ -693,6 +693,18 @@ async def reconcile_streams_loop():
             for stream, desired in desired_snapshot.items():
                 state = desired.get("state")
                 if desired.get("observedGeneration") == desired.get("generation"):
+                    if state == "ended":
+                        with allocation_lock:
+                            current_desired = stream_desired_state.get(stream)
+                            if (
+                                current_desired
+                                and current_desired.get("state") == "ended"
+                                and current_desired.get("generation") == desired.get("generation")
+                                and current_desired.get("observedGeneration") == desired.get("generation")
+                            ):
+                                stream_desired_state.pop(stream, None)
+                                persist_state_locked()
+                                logger.debug(f"[Reconcile] Garbage-collected observed ended desired state for stream '{stream}'")
                     continue
                 if state == "started":
                     proxy_pod = desired.get("proxy_pod")
