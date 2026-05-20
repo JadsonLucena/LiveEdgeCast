@@ -757,8 +757,6 @@ async def reconcile_streams_loop():
                             continue
                         if current_desired.get("observedGeneration") == current_desired.get("generation"):
                             continue
-                        if current_desired.get("observedGeneration") == current_desired.get("generation"):
-                            continue
                         current_desired["observedGeneration"] = current_desired.get("generation")
                         current_desired["observedAt"] = time.time()
                         stream_desired_state[stream] = current_desired
@@ -784,6 +782,8 @@ async def reconcile_streams_loop():
                                 f"{current_desired.get('generation')}/{current_desired.get('state')})"
                             )
                             continue
+                        if current_desired.get("observedGeneration") == current_desired.get("generation"):
+                            continue
                         current_desired["observedGeneration"] = current_desired.get("generation")
                         current_desired["observedAt"] = time.time()
                         stream_desired_state[stream] = current_desired
@@ -796,7 +796,7 @@ async def reconcile_streams_loop():
 @app.on_event("startup")
 async def startup_event():
     global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task, reconcile_task
-    time.sleep(5)
+    await asyncio.sleep(5)
     recover_state()
     registry_health_task = asyncio.create_task(monitor_stream_registry_health())
     worker_health_task = asyncio.create_task(monitor_worker_health())
