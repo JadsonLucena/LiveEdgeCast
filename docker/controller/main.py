@@ -801,7 +801,7 @@ async def reconcile_streams_loop():
                         has_registry = stream in stream_registry
                     if has_worker or has_registry:
                         try:
-                            await release_worker(stream=stream)
+                            await asyncio.to_thread(release_worker_sync, stream=stream)
                         except Exception as e:
                             logger.warning(f"[Reconcile] Failed release for '{stream}': {e}")
                             continue
@@ -963,7 +963,7 @@ def allocate_worker(
     return {"pod": worker_dns, "name": pod_name, "proxy": proxy_address, "worker": pod_name, "status": "created"}
 
 
-async def release_worker(stream: str = Query(..., description="Stream name to release")):
+def release_worker_sync(stream: str):
     """
     Libera worker alocado para uma stream e SEMPRE limpa estado canônico residual.
     Idempotente: se não houver worker, ainda remove ownership/mapeamentos restantes.
@@ -1015,10 +1015,8 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
     return {"status": "not_found", "stream": stream}
 
 
-
-
-
-
+async def release_worker(stream: str = Query(..., description="Stream name to release")):
+    return await asyncio.to_thread(release_worker_sync, stream)
 
 
 @app.post("/streams/started")
