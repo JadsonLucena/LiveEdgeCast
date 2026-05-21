@@ -843,7 +843,7 @@ async def startup_event():
     global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task, reconcile_task
     for attempt in range(1, STARTUP_RECOVERY_MAX_ATTEMPTS + 1):
         try:
-            recover_state()
+            await asyncio.to_thread(recover_state)
             break
         except Exception as e:
             if attempt == STARTUP_RECOVERY_MAX_ATTEMPTS:
