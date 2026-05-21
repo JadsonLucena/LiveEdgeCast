@@ -727,16 +727,37 @@ async def reconcile_streams_loop():
                         current_owner = stream_registry.get(stream, {}).get("proxy_pod")
                         has_worker = stream in stream_to_worker
                     if current_owner != proxy_pod:
+                        owner_unhealthy = True
+                        if current_owner:
+                            failures = proxy_health_failures.get(current_owner, 0)
+                            if failures < PROXY_HEALTHCHECK_MAX_FAILURES:
+                                owner_health = await asyncio.to_thread(get_proxy_health_status, current_owner)
+                                owner_unhealthy = owner_health == "unhealthy"
+
                         with allocation_lock:
-                            handover_ok = try_handover_stream_owner(stream, proxy_pod)
-                            if handover_ok:
+                            latest_owner = stream_registry.get(stream, {}).get("proxy_pod")
+                            if latest_owner == proxy_pod:
+                                handover_ok = True
+                            elif latest_owner != current_owner:
+                                handover_ok = False
+                            elif owner_unhealthy:
+                                handover_attempts_total.labels(stream=stream).inc()
+                                stream_generation[stream] = stream_generation.get(stream, 1) + 1
+                                register_or_refresh_stream(stream, proxy_pod)
+                                handover_success_total.labels(stream=stream).inc()
+                                stream_proxy_handover_counter.labels(stream=stream).inc()
                                 persist_state_locked()
+                                handover_ok = True
                             else:
-                                logger.debug(
-                                    f"[Reconcile] Ownership did not converge for stream '{stream}': "
-                                    f"current_owner='{current_owner}' desired_owner='{proxy_pod}'"
-                                )
+                                handover_attempts_total.labels(stream=stream).inc()
+                                handover_conflict_total.labels(stream=stream).inc()
+                                handover_ok = False
+
                         if not handover_ok:
+                            logger.debug(
+                                f"[Reconcile] Ownership did not converge for stream '{stream}': "
+                                f"current_owner='{current_owner}' desired_owner='{proxy_pod}'"
+                            )
                             continue
                     if not has_worker:
                         try:
