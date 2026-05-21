@@ -744,6 +744,17 @@ async def reconcile_streams_loop():
                                 handover_attempts_total.labels(stream=stream).inc()
                                 stream_generation[stream] = stream_generation.get(stream, 1) + 1
                                 register_or_refresh_stream(stream, proxy_pod)
+                                if stream in stream_to_worker:
+                                    try:
+                                        proxy_dns = resolve_proxy_address(proxy_pod)
+                                        replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"[Reconcile] Failed replacing worker after handover for stream '{stream}': {e}"
+                                        )
+                                        handover_conflict_total.labels(stream=stream).inc()
+                                        handover_ok = False
+                                        continue
                                 handover_success_total.labels(stream=stream).inc()
                                 stream_proxy_handover_counter.labels(stream=stream).inc()
                                 persist_state_locked()
