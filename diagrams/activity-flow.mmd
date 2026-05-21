@@ -5,7 +5,7 @@ flowchart TD
     D --> E[exec_publish chama on_publish_start.sh]
     E --> F[Proxy notifica Controller: POST /streams/started?stream&proxy_pod]
 
-    F --> G[Controller valida payload e grava desired state started com generation/timestamps]
+    F --> G[Controller registra desired state started com generation/timestamps]
     G --> H[Controller persiste estado e responde accepted/idempotent_replay]
     H --> I[Loop de reconciliação observa desired state]
 
@@ -53,7 +53,7 @@ flowchart TD
     S -->|Sim| AJ[Proxy detecta idle publisher por 60s]
     AJ --> AK[exec_publish_done chama on_publish_done.sh]
     AK --> AL[Proxy notifica Controller: POST /streams/ended?stream&proxy_pod]
-    AL --> AM[Controller valida payload e grava desired state ended com generation/timestamps]
+    AL --> AM[Controller registra desired state ended com generation/timestamps]
     AM --> AN[Controller persiste estado e responde accepted/idempotent_replay]
     AN --> AO[Loop de reconciliação observa desired ended e executa release_worker]
     AO --> AP[Remove mapeamentos, deleta pod se houver e persiste estado]
