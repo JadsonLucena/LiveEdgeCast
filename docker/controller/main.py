@@ -331,9 +331,20 @@ async def monitor_stream_registry_health():
                     for stream in impacted_streams:
                         stream_registry.pop(stream, None)
                         stream_to_proxy.pop(stream, None)
+                        current_desired = stream_desired_state.get(stream, {})
+                        generation = int(current_desired.get("generation", 0)) + 1
+                        stream_desired_state[stream] = {
+                            "state": "ended",
+                            "proxy_pod": proxy_pod,
+                            "generation": generation,
+                            "observedGeneration": current_desired.get("observedGeneration", 0),
+                            "updatedAt": time.time(),
+                            "lastEndedAt": time.time(),
+                            "reason": "proxy_unhealthy_expired",
+                        }
                         logger.info(
                             f"[Registry] Stream '{stream}' expired after "
-                            f"{PROXY_HEALTHCHECK_MAX_FAILURES} failed proxy healthchecks"
+                            f"{PROXY_HEALTHCHECK_MAX_FAILURES} failed proxy healthchecks; marked desired state as ended"
                         )
                         worker_name = stream_to_worker.pop(stream, None)
                         if worker_name:
