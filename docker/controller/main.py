@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query
 from kubernetes import client, config
 from kubernetes.client.exceptions import ApiException
 import random
@@ -89,6 +89,11 @@ except:
 
 apps = client.AppsV1Api()
 core = client.CoreV1Api()
+
+
+class AllocationConflictError(Exception):
+    """Domain-level allocation conflict/error used by reconciliation logic."""
+
 
 
 
@@ -919,10 +924,7 @@ def allocate_worker(
             if not try_handover_stream_owner(stream, proxy_pod):
                 owner = stream_registry.get(stream, {}).get("proxy_pod")
                 persist_state_locked()
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"stream '{stream}' owned by proxy '{owner}'"
-                )
+                raise AllocationConflictError(f"stream '{stream}' owned by proxy '{owner}'")
             persist_state_locked()
 
         existing_worker = stream_to_worker.get(stream)
@@ -930,7 +932,7 @@ def allocate_worker(
         generation_snapshot = stream_generation.get(stream)
 
     if not owner_proxy:
-        raise HTTPException(status_code=409, detail=f"stream '{stream}' has no proxy owner")
+        raise AllocationConflictError(f"stream '{stream}' has no proxy owner")
 
     proxy_address = resolve_proxy_address(owner_proxy)
 
@@ -978,7 +980,7 @@ def allocate_worker(
                 core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
             except ApiException as e:
                 logger.warning(f"[Allocate] Failed deleting stale worker pod {pod_name}: {e}")
-            raise HTTPException(status_code=409, detail=f"stream '{stream}' ownership changed during allocation")
+            raise AllocationConflictError(f"stream '{stream}' ownership changed during allocation")
 
         stream_to_worker[stream] = pod_name
         worker_to_stream[pod_name] = stream
