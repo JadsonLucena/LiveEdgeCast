@@ -91,20 +91,21 @@ apps = client.AppsV1Api()
 core = client.CoreV1Api()
 
 
-def persist_state_locked() -> None:
-    """
-    Persists critical controller state to a ConfigMap to survive pod restart/crash.
-    Must be called only while holding allocation_lock.
-    """
-    payload = {
+
+
+def build_state_payload_locked() -> Dict[str, object]:
+    return {
         "schema_version": STATE_SCHEMA_VERSION,
-        "stream_to_worker": stream_to_worker,
-        "worker_to_stream": worker_to_stream,
-        "stream_to_proxy": stream_to_proxy,
-        "stream_registry": stream_registry,
-        "stream_generation": stream_generation,
-        "stream_desired_state": stream_desired_state,
+        "stream_to_worker": dict(stream_to_worker),
+        "worker_to_stream": dict(worker_to_stream),
+        "stream_to_proxy": dict(stream_to_proxy),
+        "stream_registry": copy.deepcopy(stream_registry),
+        "stream_generation": dict(stream_generation),
+        "stream_desired_state": copy.deepcopy(stream_desired_state),
     }
+
+
+def persist_state_payload(payload: Dict[str, object]) -> None:
     body = client.V1ConfigMap(
         metadata=client.V1ObjectMeta(name=STATE_CONFIGMAP_NAME, namespace=NAMESPACE),
         data={STATE_CONFIGMAP_KEY: json.dumps(payload)}
@@ -120,6 +121,14 @@ def persist_state_locked() -> None:
             core.create_namespaced_config_map(namespace=NAMESPACE, body=body)
         else:
             raise
+
+def persist_state_locked() -> None:
+    """
+    Persists critical controller state to a ConfigMap to survive pod restart/crash.
+    Must be called only while holding allocation_lock.
+    """
+    payload = build_state_payload_locked()
+    persist_state_payload(payload)
 
 
 def restore_persisted_state_locked() -> bool:
@@ -700,6 +709,7 @@ async def reconcile_streams_loop():
     try:
         while True:
             await asyncio.sleep(1)
+            reconcile_dirty = False
             with allocation_lock:
                 desired_snapshot = copy.deepcopy(stream_desired_state)
 
@@ -716,7 +726,7 @@ async def reconcile_streams_loop():
                                 and current_desired.get("observedGeneration") == desired.get("generation")
                             ):
                                 stream_desired_state.pop(stream, None)
-                                persist_state_locked()
+                                reconcile_dirty = True
                                 logger.debug(f"[Reconcile] Garbage-collected observed ended desired state for stream '{stream}'")
                     continue
                 if state == "started":
@@ -757,7 +767,7 @@ async def reconcile_streams_loop():
                                         continue
                                 handover_success_total.labels(stream=stream).inc()
                                 stream_proxy_handover_counter.labels(stream=stream).inc()
-                                persist_state_locked()
+                                reconcile_dirty = True
                                 handover_ok = True
                             else:
                                 handover_attempts_total.labels(stream=stream).inc()
@@ -805,7 +815,7 @@ async def reconcile_streams_loop():
                         current_desired["observedGeneration"] = current_desired.get("generation")
                         current_desired["observedAt"] = time.time()
                         stream_desired_state[stream] = current_desired
-                        persist_state_locked()
+                        reconcile_dirty = True
                 elif state == "ended":
                     with allocation_lock:
                         has_worker = stream in stream_to_worker
@@ -832,7 +842,12 @@ async def reconcile_streams_loop():
                         current_desired["observedGeneration"] = current_desired.get("generation")
                         current_desired["observedAt"] = time.time()
                         stream_desired_state[stream] = current_desired
-                        persist_state_locked()
+                        reconcile_dirty = True
+
+            if reconcile_dirty:
+                with allocation_lock:
+                    payload = build_state_payload_locked()
+                await asyncio.to_thread(persist_state_payload, payload)
 
     except asyncio.CancelledError:
         logger.info("[Reconcile] Reconciliation loop cancelled")
