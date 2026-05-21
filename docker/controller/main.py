@@ -52,6 +52,8 @@ WORKER_HEALTHCHECK_MAX_FAILURES = 3
 WORKER_HEALTHCHECK_JITTER_SECONDS = 1.5
 WORKER_READY_HEALTH_DELAY_SECONDS = 3  # Wait after worker Ready before worker /health probes.
 WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS = 60
+STARTUP_RECOVERY_MAX_ATTEMPTS = 10
+STARTUP_RECOVERY_RETRY_SECONDS = 1
 PROXY_READY_HEALTH_DELAY_SECONDS = 3  # Wait after proxy Ready before proxy /health probes.
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
@@ -796,8 +798,19 @@ async def reconcile_streams_loop():
 @app.on_event("startup")
 async def startup_event():
     global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task, reconcile_task
-    await asyncio.sleep(5)
-    recover_state()
+    for attempt in range(1, STARTUP_RECOVERY_MAX_ATTEMPTS + 1):
+        try:
+            recover_state()
+            break
+        except Exception as e:
+            if attempt == STARTUP_RECOVERY_MAX_ATTEMPTS:
+                raise
+            logger.warning(
+                f"[Startup] State recovery attempt {attempt}/{STARTUP_RECOVERY_MAX_ATTEMPTS} failed: {e}. "
+                f"Retrying in {STARTUP_RECOVERY_RETRY_SECONDS}s"
+            )
+            await asyncio.sleep(STARTUP_RECOVERY_RETRY_SECONDS)
+
     registry_health_task = asyncio.create_task(monitor_stream_registry_health())
     worker_health_task = asyncio.create_task(monitor_worker_health())
     worker_orphan_sweeper_task = asyncio.create_task(sweep_orphan_workers())
