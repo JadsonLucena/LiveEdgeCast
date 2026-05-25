@@ -19,6 +19,7 @@ To start the project, use the provided script:
 
 ```sh
 ./tools/up.sh
+pkill -f "kubectl.*port-forward.*1935" 2>/dev/null; pkill -f "kubectl.*port-forward.*8080" 2>/dev/null; sleep 2 && kubectl port-forward -n media svc/proxy 1935:1935 >/dev/null 2>&1 & kubectl port-forward -n media svc/proxy 8080:8080 >/dev/null 2>&1 & sleep 3 && echo "Port-forwards configurados!" && netstat -tlnp 2>/dev/null | grep -E "1935|8080" | grep LISTEN || ss -tlnp | grep -E "1935|8080" & kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090 >/dev/null 2>&1 & sleep 3 && echo "Prometheus port-forward configurado!"
 ```
 
 To stop the project, use:

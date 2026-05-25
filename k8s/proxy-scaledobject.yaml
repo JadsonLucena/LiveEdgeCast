@@ -1,0 +1,69 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: proxy-scaler
+  namespace: media
+spec:
+  scaleTargetRef:
+    kind: Deployment
+    name: proxy
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  cooldownPeriod: 300
+  pollingInterval: 10
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          selectPolicy: Max
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+        scaleDown:
+          stabilizationWindowSeconds: 420
+          selectPolicy: Min
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: rtmp_proxy_inbound_mbps
+        query: |
+          sum(rate(container_network_receive_bytes_total{namespace="media",pod=~"proxy-.*"}[1m])) / (1000*1000) or vector(0)
+        threshold: "800"
+    
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: rtmp_proxy_avg_inbound_mbps_per_pod
+        query: |
+          (
+            sum(rate(container_network_receive_bytes_total{namespace="media",pod=~"proxy-.*"}[1m])) / (1000*1000)
+          )
+          /
+          clamp_min(
+            count(container_memory_working_set_bytes{namespace="media",pod=~"proxy-.*"}),
+            1
+          )
+        threshold: "250"
+
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: rtmp_proxy_cpu_usage
+        query: |
+          sum(rate(container_cpu_usage_seconds_total{namespace="media",pod=~"proxy-.*"}[1m])) / sum(container_spec_cpu_quota{namespace="media",pod=~"proxy-.*"}/container_spec_cpu_period{namespace="media",pod=~"proxy-.*"}) * 100 or vector(0)
+        threshold: "80"
+    
+    - type: prometheus
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+        metricName: rtmp_proxy_memory_usage
+        query: |
+          sum(container_memory_working_set_bytes{namespace="media",pod=~"proxy-.*"}) / sum(container_spec_memory_limit_bytes{namespace="media",pod=~"proxy-.*"}) * 100 or vector(0)
+        threshold: "80"

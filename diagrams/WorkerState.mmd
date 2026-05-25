@@ -1,0 +1,32 @@
+stateDiagram-v2
+    [*] --> Pending
+
+    state Pending {
+        [*] --> PodStarting
+        PodStarting --> Ready : Pod Ready\n(no clients)
+        Ready --> PodStarting : Pod restart
+    }
+
+    Pending --> Idle : Primeiro Ready\n(nclients == 0)
+
+    Idle --> Allocated : Controller /allocate\nmap stream→worker
+    Allocated --> Streaming : FFmpeg conecta\nRTMP publish /live/streamX
+
+    Streaming --> Idle : Cliente encerra stream\nFFmpeg killed\nnclients == 0\nController /release
+
+    Streaming --> Terminating : Pod being deleted\n(by autoscale or cluster)
+    Terminating --> [*]
+
+    Idle --> Terminating : Scale-down / delete\nworker sem streams
+
+    note right of Idle
+      Worker Ready e sem clientes RTMP
+      Pode ser alocado para qualquer stream
+      (stream_to_worker não o aponta)
+    end note
+
+    note right of Streaming
+      Worker com 1 conexão RTMP ativa
+      max_connections = 1
+      Reservado para uma única stream
+    end note

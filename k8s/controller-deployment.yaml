@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller
+  namespace: media
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: controller }
+  template:
+    metadata:
+      labels: { app: controller }
+    spec:
+      serviceAccountName: controller
+      containers:
+        - name: controller
+          image: liveedgecast-controller:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 8
+            periodSeconds: 5
+            failureThreshold: 6

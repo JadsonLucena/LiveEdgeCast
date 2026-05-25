@@ -1,0 +1,20 @@
+flowchart TD
+    A([Início da transmissão]) --> B[Cliente envia vídeo ao Load Balancer]
+    B --> C[Load Balancer escolhe um Proxy disponível]
+    C --> D[Proxy avisa o Controller que a transmissão começou]
+
+    D --> E[Controller cria e configura um Worker dedicado]
+    E --> F[Worker recebe o stream do Proxy e publica no destino]
+
+    F --> G{Transmissão continua estável?}
+    G -->|Sim| H[Controller mantém monitoramento de saúde]
+    H --> G
+
+    G -->|Não| I["Controller corrige automaticamente
+(recria Worker ou troca Proxy quando necessário)"]
+    I --> F
+
+    F --> J[Cliente encerra a transmissão]
+    J --> K[Proxy avisa o Controller que a transmissão terminou]
+    K --> L[Controller remove Worker e limpa o estado]
+    L --> M([Fim])

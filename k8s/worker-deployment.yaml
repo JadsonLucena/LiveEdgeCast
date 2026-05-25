@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: media
+spec:
+  replicas: 0
+  selector:
+    matchLabels: { app: worker }
+  template:
+    metadata:
+      labels: { app: worker }
+    spec:
+      containers:
+        - name: rtmp
+          image: liveedgecast-worker:latest
+          imagePullPolicy: Never
+          env:
+            - name: RTMP_PUSH_BASE_URL
+              value: "rtmp://a.rtmp.youtube.com/live2"
+          ports:
+            - containerPort: 1935
+              name: rtmp
+              protocol: TCP
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          readinessProbe:
+            tcpSocket: { port: 1935 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: 1935 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
