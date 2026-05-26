@@ -16,8 +16,14 @@ log() {
 write_health_state() {
   local state="$1"
   local message="$2"
-  printf '%s\n' "$state" > "$HEALTH_FILE"
-  printf 'state=%s stream=%s ts=%s msg=%s\n' "$state" "$STREAM_KEY" "$(date -Iseconds)" "$message" > "$HEALTH_META_FILE"
+  local health_tmp="${HEALTH_FILE}.tmp"
+  local meta_tmp="${HEALTH_META_FILE}.tmp"
+
+  printf '%s\n' "$state" > "$health_tmp"
+  printf 'state=%s stream=%s ts=%s msg=%s\n' "$state" "$STREAM_KEY" "$(date -Iseconds)" "$message" > "$meta_tmp"
+
+  mv -f "$health_tmp" "$HEALTH_FILE"
+  mv -f "$meta_tmp" "$HEALTH_META_FILE"
 }
 
 read_progress_out_time_us() {
