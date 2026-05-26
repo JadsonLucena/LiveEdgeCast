@@ -435,9 +435,19 @@ def check_worker_health(pod_name: str, pod_ip: Optional[str] = None) -> bool:
     try:
         target = pod_ip if pod_ip else f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
         response = requests.get(f"http://{target}:8080/health", timeout=2)
-        return response.status_code == 200
+        state = (response.text or "").strip().lower()
+
+        if response.status_code != 200:
+            logger.debug(f"[WorkerHealth] Worker '{pod_name}' /health returned status={response.status_code}.")
+            return False
+
+        if state != "healthy":
+            logger.debug(f"[WorkerHealth] Worker '{pod_name}' media health state is '{state or 'unknown'}'.")
+            return False
+
+        return True
     except Exception as e:
-        logger.warning(f"Failed to check /health for {pod_name}: {e}")
+        logger.debug(f"Failed to check /health for {pod_name}: {e}")
         return False
 
 
