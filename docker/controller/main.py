@@ -949,23 +949,26 @@ async def stream_ended(
         current_owner = current.get("proxy_pod") if current else None
         current_generation = stream_generation.get(stream)
 
-    owner_mismatch = bool(proxy_pod and current_owner and current_owner != proxy_pod)
-    generation_mismatch = bool(generation is not None and current_generation is not None and generation != current_generation)
-
-    if owner_mismatch or generation_mismatch:
-        logger.warning(
-            f"[StreamsEnded] Ignoring stale ended event for stream '{stream}' "
-            f"proxy='{proxy_pod}' generation='{generation}' "
-            f"current_owner='{current_owner}' current_generation='{current_generation}'"
+        owner_mismatch = bool(proxy_pod and current_owner and current_owner != proxy_pod)
+        generation_mismatch = bool(
+            generation is not None and
+            current_generation is not None and
+            generation != current_generation
         )
-        return {
-            "status": "stale_event_ignored",
-            "stream": stream,
-            "current_owner": current_owner,
-            "current_generation": current_generation,
-        }
 
-    with allocation_lock:
+        if owner_mismatch or generation_mismatch:
+            logger.warning(
+                f"[StreamsEnded] Ignoring stale ended event for stream '{stream}' "
+                f"proxy='{proxy_pod}' generation='{generation}' "
+                f"current_owner='{current_owner}' current_generation='{current_generation}'"
+            )
+            return {
+                "status": "stale_event_ignored",
+                "stream": stream,
+                "current_owner": current_owner,
+                "current_generation": current_generation,
+            }
+
         if current_owner and (not proxy_pod or current_owner == proxy_pod):
             stream_registry.pop(stream, None)
             stream_to_proxy.pop(stream, None)
