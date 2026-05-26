@@ -831,37 +831,43 @@ def allocate_worker(
     return {"pod": worker_dns, "name": pod_name, "proxy": proxy_address, "worker": pod_name, "status": "created"}
 
 
+def release_stream_state_locked(stream: str):
+    """Remove all per-stream state under allocation_lock and return release metadata."""
+    worker_name = None
+    changed = False
+    response_status = "not_found"
+
+    worker_name = stream_to_worker.pop(stream, None)
+
+    if worker_name:
+        changed = True
+        response_status = "released"
+        worker_to_stream.pop(worker_name, None)
+        worker_ready_since.pop(worker_name, None)
+        old_uid = worker_pod_uid_by_name.pop(worker_name, None)
+        if old_uid:
+            worker_health_failures.pop(old_uid, None)
+
+    if stream_to_proxy.pop(stream, None) is not None:
+        changed = True
+    if stream_registry.pop(stream, None) is not None:
+        changed = True
+    if stream_generation.pop(stream, None) is not None:
+        changed = True
+
+    if changed:
+        persist_state_locked()
+
+    return worker_name, changed, response_status
+
+
 async def release_worker(stream: str = Query(..., description="Stream name to release")):
     """
     Libera worker alocado para uma stream e SEMPRE limpa estado canônico residual.
     Idempotente: se não houver worker, ainda remove ownership/mapeamentos restantes.
     """
-
-    worker_name = None
-    changed = False
-    response_status = "not_found"
-
     with allocation_lock:
-        worker_name = stream_to_worker.pop(stream, None)
-
-        if worker_name:
-            changed = True
-            response_status = "released"
-            worker_to_stream.pop(worker_name, None)
-            worker_ready_since.pop(worker_name, None)
-            old_uid = worker_pod_uid_by_name.pop(worker_name, None)
-            if old_uid:
-                worker_health_failures.pop(old_uid, None)
-
-        if stream_to_proxy.pop(stream, None) is not None:
-            changed = True
-        if stream_registry.pop(stream, None) is not None:
-            changed = True
-        if stream_generation.pop(stream, None) is not None:
-            changed = True
-
-        if changed:
-            persist_state_locked()
+        worker_name, changed, response_status = release_stream_state_locked(stream)
 
     if worker_name:
         logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
@@ -959,28 +965,41 @@ async def stream_ended(
         current_owner = current.get("proxy_pod") if current else None
         current_generation = stream_generation.get(stream)
 
-    owner_mismatch = bool(proxy_pod and current_owner and current_owner != proxy_pod)
-    generation_mismatch = bool(generation is not None and current_generation is not None and generation != current_generation)
-
-    if owner_mismatch or generation_mismatch:
-        logger.warning(
-            f"[StreamsEnded] Ignoring stale ended event for stream '{stream}' "
-            f"proxy='{proxy_pod}' generation='{generation}' "
-            f"current_owner='{current_owner}' current_generation='{current_generation}'"
+        owner_mismatch = bool(proxy_pod and current_owner and current_owner != proxy_pod)
+        generation_mismatch = bool(
+            generation is not None and
+            current_generation is not None and
+            generation != current_generation
         )
-        return {
-            "status": "stale_event_ignored",
-            "stream": stream,
-            "current_owner": current_owner,
-            "current_generation": current_generation,
-        }
 
-    with allocation_lock:
-        if current_owner and (not proxy_pod or current_owner == proxy_pod):
-            stream_registry.pop(stream, None)
-            stream_to_proxy.pop(stream, None)
+        if owner_mismatch or generation_mismatch:
+            logger.warning(
+                f"[StreamsEnded] Ignoring stale ended event for stream '{stream}' "
+                f"proxy='{proxy_pod}' generation='{generation}' "
+                f"current_owner='{current_owner}' current_generation='{current_generation}'"
+            )
+            return {
+                "status": "stale_event_ignored",
+                "stream": stream,
+                "current_owner": current_owner,
+                "current_generation": current_generation,
+            }
 
-    release_result = await release_worker(stream=stream)
+        worker_name, changed, response_status = release_stream_state_locked(stream)
+
+    if worker_name:
+        logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
+        try:
+            core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
+        except ApiException as e:
+            logger.warning(f"[Release] Failed deleting worker pod {worker_name}: {e}")
+        release_result = {"status": response_status, "stream": stream, "worker": worker_name}
+    elif changed:
+        logger.info(f"[Release] Cleaned residual state for stream '{stream}' without active worker")
+        release_result = {"status": "state_cleaned", "stream": stream}
+    else:
+        logger.info(f"[Release] Idempotent replay: stream '{stream}' not found")
+        release_result = {"status": "not_found", "stream": stream}
     replay = release_result.get("status") == "not_found"
     event_status = "idempotent_replay" if replay else "ended"
     logger.info(
