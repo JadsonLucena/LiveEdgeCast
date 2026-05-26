@@ -11,6 +11,7 @@ import asyncio
 import json
 import copy
 from typing import Dict, Optional
+from xml.etree import ElementTree as ET
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from fastapi.responses import Response
 
@@ -236,6 +237,30 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
     return None
 
 
+
+
+def is_stream_active_on_proxy(proxy_pod: str, stream: str) -> bool:
+    """Checks NGINX RTMP stats to confirm whether stream is still active on a proxy."""
+    try:
+        target = resolve_proxy_address(proxy_pod)
+        response = requests.get(f"http://{target}:8080/stats", timeout=PROXY_HEALTHCHECK_TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            logger.warning(
+                f"[Handover] Unable to verify stream activity on proxy '{proxy_pod}'. "
+                f"/stats status_code={response.status_code}"
+            )
+            return True
+
+        root = ET.fromstring(response.text)
+        for node in root.findall('.//application/live/stream/name'):
+            if (node.text or '').strip() == stream:
+                return True
+        return False
+    except Exception as e:
+        logger.warning(f"[Handover] Failed parsing /stats for proxy '{proxy_pod}': {e}")
+        # Fail-safe: if we cannot prove stream is gone, keep ownership with current proxy.
+        return True
+
 def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
     """
     Ownership rule with safe handover:
@@ -259,10 +284,12 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
     if not owner_unhealthy:
         owner_unhealthy = get_proxy_health_status(current_owner) == "unhealthy"
 
-    if owner_unhealthy:
+    owner_stream_active = is_stream_active_on_proxy(current_owner, stream)
+
+    if owner_unhealthy or not owner_stream_active:
         logger.info(
             f"[Handover] Stream '{stream}' ownership moved from '{current_owner}' "
-            f"to '{candidate_proxy_pod}' (owner_unhealthy={owner_unhealthy})"
+            f"to '{candidate_proxy_pod}' (owner_unhealthy={owner_unhealthy}, owner_stream_active={owner_stream_active})"
         )
         stream_generation[stream] = stream_generation.get(stream, 1) + 1
         register_or_refresh_stream(stream, candidate_proxy_pod)
@@ -279,7 +306,7 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
     handover_conflict_total.labels(stream=stream).inc()
     logger.warning(
         f"[Handover] Denied ownership change for stream '{stream}' from '{current_owner}' "
-        f"to '{candidate_proxy_pod}' (owner_unhealthy={owner_unhealthy})"
+        f"to '{candidate_proxy_pod}' (owner_unhealthy={owner_unhealthy}, owner_stream_active={owner_stream_active})"
     )
     return False
 
@@ -911,24 +938,44 @@ def stream_started(
 @app.post("/streams/ended")
 async def stream_ended(
     stream: str = Query(..., description="Stream name"),
-    proxy_pod: str = Query(None, description="Proxy pod that ended publish")
+    proxy_pod: str = Query(None, description="Proxy pod that ended publish"),
+    generation: int = Query(None, description="Optional stream generation tied to publish session")
 ):
     """Single controller entrypoint when proxy publish ends.
-    Controller performs full cleanup (registry + worker release).
+    Cleanup is applied only if the ended event still matches current stream ownership/session.
     """
     with allocation_lock:
-        if proxy_pod:
-            current = stream_registry.get(stream)
-            if current and current.get("proxy_pod") == proxy_pod:
-                stream_registry.pop(stream, None)
-                stream_to_proxy.pop(stream, None)
+        current = stream_registry.get(stream)
+        current_owner = current.get("proxy_pod") if current else None
+        current_generation = stream_generation.get(stream)
+
+    owner_mismatch = bool(proxy_pod and current_owner and current_owner != proxy_pod)
+    generation_mismatch = bool(generation is not None and current_generation is not None and generation != current_generation)
+
+    if owner_mismatch or generation_mismatch:
+        logger.warning(
+            f"[StreamsEnded] Ignoring stale ended event for stream '{stream}' "
+            f"proxy='{proxy_pod}' generation='{generation}' "
+            f"current_owner='{current_owner}' current_generation='{current_generation}'"
+        )
+        return {
+            "status": "stale_event_ignored",
+            "stream": stream,
+            "current_owner": current_owner,
+            "current_generation": current_generation,
+        }
+
+    with allocation_lock:
+        if current_owner and (not proxy_pod or current_owner == proxy_pod):
+            stream_registry.pop(stream, None)
+            stream_to_proxy.pop(stream, None)
 
     release_result = await release_worker(stream=stream)
     replay = release_result.get("status") == "not_found"
     event_status = "idempotent_replay" if replay else "ended"
     logger.info(
         f"[StreamsEnded] {'Idempotent replay' if replay else 'State changed'} for stream '{stream}' "
-        f"proxy='{proxy_pod}' release_status='{release_result.get('status')}'"
+        f"proxy='{proxy_pod}' generation='{generation}' release_status='{release_result.get('status')}'"
     )
     return {"status": event_status, "stream": stream, "release": release_result}
 
