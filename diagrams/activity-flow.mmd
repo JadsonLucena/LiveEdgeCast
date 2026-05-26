@@ -26,11 +26,15 @@ flowchart TD
     T -->|Sim| U[Controller remove ownership/mapeamentos, deleta worker e persiste estado]
     T -->|Não| Q
 
-    R -->|Sim| V[Checa health do worker somente se worker estiver Ready + delay pós-ready]
-    V --> W{Worker healthy?}
+    R -->|Sim| V[Checa /health do worker somente se worker estiver Ready + delay pós-ready]
+    V --> V1[Worker /health lê /tmp/worker-health
+(estado escrito pelo runner do FFmpeg)]
+    V1 --> W{Worker healthy?}
     W -->|Sim| X[Zera falhas do worker por UID]
     W -->|Não| Y[Incrementa falhas do worker por UID]
-    Y --> Y1["Worker pode crashar por timeout RTMP do FFmpeg (5s)
+    Y --> Y0["/health pode ficar unhealthy se não houver progresso
+de mídia por HEALTH_STALE_SECONDS (default 15s)"]
+    Y0 --> Y1["Worker pode crashar por timeout RTMP do FFmpeg (5s)
 e o Kubernetes reinicia automaticamente"]
     Y1 --> Z{Falhas do worker >= 3?}
     Z -->|Sim| AA[Controller recria worker, atualiza mapeamentos e persiste estado]
