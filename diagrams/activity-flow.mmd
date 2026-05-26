@@ -33,7 +33,7 @@ flowchart TD
     W -->|Sim| X[Zera falhas do worker por UID]
     W -->|Não| Y[Incrementa falhas do worker por UID]
     Y --> Y0["/health pode ficar unhealthy se não houver progresso
-de mídia por HEALTH_STALE_SECONDS (default 15s)"]
+do FFmpeg (out_time_us) por HEALTH_STALE_SECONDS (default 15s)"]
     Y0 --> Y1["Worker pode crashar por timeout RTMP do FFmpeg (5s)
 e o Kubernetes reinicia automaticamente"]
     Y1 --> Z{Falhas do worker >= 3?}
