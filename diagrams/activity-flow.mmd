@@ -40,19 +40,23 @@ e o Kubernetes reinicia automaticamente"]
     AA --> AB
     AB -->|Não| Q
     AB -->|Sim| AC{Proxy owner atual está unhealthy ou deletado?}
-    AC -->|Não| AD[Controller nega handover]
-    AD --> Q
-    AC -->|Sim| AE[Controller transfere ownership, incrementa geração e troca worker para atualizar PROXY_DNS]
+    AC -->|Não| AD{Stream ainda ativa no owner em /stats?}
+    AD -->|Sim| AE[Controller nega handover (evita reconexão prematura)]
     AE --> Q
+    AD -->|Não| AF[Controller transfere ownership, incrementa geração e troca worker para atualizar PROXY_DNS]
+    AF --> Q
 
     Q --> AS["GC/Sweeper de órfãos (a cada 60s): lista workers não mapeados,
 revalida (double-check) e deleta órfãos"]
     AS --> Q
 
-    P -->|Sim| AF[Proxy detecta idle publisher por 60s]
-    AF --> AG[exec_publish_done chama on_publish_done.sh]
-    AG --> AH[Proxy notifica Controller: POST /streams/ended?stream&proxy_pod]
-    AH --> AI["Controller release_worker: remove mapeamentos,
-deleta pod (se houver) e persiste estado"]
-    U --> AJ([Fim])
-    AI --> AJ
+    P -->|Sim| AG[Proxy detecta idle publisher por 60s]
+    AG --> AH[exec_publish_done chama on_publish_done.sh]
+    AH --> AI[Proxy notifica Controller: POST /streams/ended?stream&proxy_pod&generation]
+    AI --> AJ{Evento /ended pertence ao owner/generation atual?}
+    AJ -->|Não| AK[Controller ignora stale_event_ignored e mantém alocação atual]
+    AK --> Q
+    AJ -->|Sim| AL[Controller release_worker: remove mapeamentos,
+deleta pod (se houver) e persiste estado]
+    U --> AM([Fim])
+    AL --> AM
