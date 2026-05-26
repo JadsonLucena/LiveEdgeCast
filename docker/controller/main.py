@@ -975,10 +975,7 @@ async def stream_ended(
                 "current_generation": current_generation,
             }
 
-        if current_owner and (not proxy_pod or current_owner == proxy_pod):
-            worker_name, changed, response_status = release_stream_state_locked(stream)
-        else:
-            worker_name, changed, response_status = None, False, "not_found"
+        worker_name, changed, response_status = release_stream_state_locked(stream)
 
     if worker_name:
         logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
