@@ -1,0 +1,11 @@
+# PromQL útil
+- Cold start P50/P95/P99: `histogram_quantile(0.95, sum by (le)(rate(worker_ready_duration_seconds_bucket[5m])))`
+- Worker active duration: `sum(rate(stream_release_duration_seconds_sum[5m])) / sum(rate(stream_release_duration_seconds_count[5m]))`
+- Sucesso de alocação: `sum(rate(worker_create_requests_total{status="success"}[5m])) / sum(rate(worker_create_requests_total[5m]))`
+- Taxa handover: `sum(rate(handover_attempts_total{result="accepted"}[5m])) / sum(rate(handover_attempts_total[5m]))`
+- Órfãos removidos: `increase(worker_orphan_deleted_total[1h])`
+- MTTR worker: `histogram_quantile(0.95, sum by (le)(rate(worker_recovery_duration_seconds_bucket[15m])))`
+- CPU/Mem/Rede: usar `container_cpu_usage_seconds_total`, `container_memory_working_set_bytes`, `container_network_receive_bytes_total`, `container_network_transmit_bytes_total`
+- Proxies ativos: `sum(proxy_rtmp_stream_active)`
+- Workers ativos: `sum(stream_allocation_active_total)`
+- Streams ativas: `sum(stream_active_total)`

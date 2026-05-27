@@ -3,6 +3,8 @@ set -euo pipefail
 
 STREAM_KEY="${STREAM_KEY:-}"
 PID_FILE="/tmp/ffmpeg_${STREAM_KEY}.pid"
+PROGRESS_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress"
+EXIT_FILE="/tmp/ffmpeg_${STREAM_KEY}.exit"
 
 log() {
   echo "[$(date)] [worker_stream_runner] $1"
@@ -25,6 +27,8 @@ log "Launching FFmpeg (pull=$PROXY_RTMP push=$TARGET_RTMP)"
 
 ffmpeg \
   -loglevel warning \
+  -progress "$PROGRESS_FILE" \
+  -nostats \
   -rw_timeout 5000000 \
   -i "$PROXY_RTMP" \
   -c:v copy \
@@ -42,6 +46,7 @@ else
 fi
 
 rm -f "$PID_FILE"
+echo "$EXIT_CODE" > "$EXIT_FILE"
 
 if [ "$EXIT_CODE" -ne 0 ]; then
   log "FFmpeg exited with code $EXIT_CODE. Crashing worker for controller replacement."
