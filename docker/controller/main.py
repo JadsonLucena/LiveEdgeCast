@@ -820,9 +820,11 @@ def allocate_worker(
     Controller é a ÚNICA fonte da verdade para scale-up.
 
     Estratégia de concorrência:
-    - usar lock apenas para decisões/mutação de estado interno
-    - executar I/O Kubernetes fora do lock
+    - usar lock para decisões/mutação de estado interno
+    - executar criação/consulta principal de worker/proxy fora do lock
     - revalidar estado ao voltar do I/O para evitar corridas
+    - exceção: a verificação de ownership/handover roda sob o lock para manter
+      transições atômicas e pode consultar Kubernetes/HTTP ao avaliar saúde do owner
     """
     started_at = time.monotonic()
     metric_status = "error"
