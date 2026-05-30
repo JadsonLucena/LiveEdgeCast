@@ -75,6 +75,10 @@ stream_proxy_handover_counter = Counter('stream_proxy_handover_total','Total pro
 handover_attempts_total = Counter('handover_attempts_total', 'Total proxy handover attempts', ['stream'])
 handover_success_total = Counter('handover_success_total', 'Total successful proxy handovers', ['stream'])
 handover_conflict_total = Counter('handover_conflict_total', 'Total conflicting proxy handovers denied', ['stream'])
+stream_started_events_total = Counter('stream_started_events_total', 'Total /streams/started events', ['status', 'reason'])
+stream_ended_events_total = Counter('stream_ended_events_total', 'Total /streams/ended events', ['status', 'reason'])
+stale_ended_events_ignored_total = Counter('stale_ended_events_ignored_total', 'Total stale /streams/ended events ignored without cleanup', ['status', 'reason'])
+idempotent_replay_total = Counter('idempotent_replay_total', 'Total idempotent replays', ['status', 'reason'])
 
 try:
     config.load_incluster_config()
@@ -899,6 +903,9 @@ def stream_started(
 
     replay = registration.get("status") == "idempotent_replay" and allocation.get("status") == "idempotent_replay"
     event_status = "idempotent_replay" if replay else "started_event_processed"
+    stream_started_events_total.labels(status=event_status, reason=("idempotent_replay" if replay else "state_transition")).inc()
+    if replay:
+        idempotent_replay_total.labels(status="replay", reason="streams_started").inc()
     log_prefix = "Idempotent replay" if replay else "State changed"
     logger.info(f"[StreamsStarted] {log_prefix} for stream '{stream}' proxy='{proxy_pod}'")
 
@@ -922,10 +929,27 @@ async def stream_ended(
             if current and current.get("proxy_pod") == proxy_pod:
                 stream_registry.pop(stream, None)
                 stream_to_proxy.pop(stream, None)
+            elif current and current.get("proxy_pod") != proxy_pod:
+                current_owner = current.get("proxy_pod")
+                stale_ended_events_ignored_total.labels(status="ignored", reason="proxy_owner_mismatch").inc()
+                stream_ended_events_total.labels(status="ignored", reason="stale_owner_mismatch").inc()
+                logger.info(
+                    f"[StreamsEnded] Ignored stale ended event for stream '{stream}' "
+                    f"from proxy='{proxy_pod}' current_owner='{current_owner}'"
+                )
+                return {
+                    "status": "stale_ended_ignored",
+                    "stream": stream,
+                    "proxy_pod": proxy_pod,
+                    "current_owner": current_owner,
+                }
 
     release_result = await release_worker(stream=stream)
     replay = release_result.get("status") == "not_found"
     event_status = "idempotent_replay" if replay else "ended"
+    stream_ended_events_total.labels(status=event_status, reason=("idempotent_replay" if replay else "state_transition")).inc()
+    if replay:
+        idempotent_replay_total.labels(status="replay", reason="streams_ended").inc()
     logger.info(
         f"[StreamsEnded] {'Idempotent replay' if replay else 'State changed'} for stream '{stream}' "
         f"proxy='{proxy_pod}' release_status='{release_result.get('status')}'"
