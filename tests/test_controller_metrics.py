@@ -19,10 +19,20 @@ def reset_state():
     main.stream_to_proxy.clear()
     main.stream_registry.clear()
     main.stream_generation.clear()
+    main.worker_create_started_at.clear()
 
 
 def counter_value(counter, **labels):
     return counter.labels(**labels)._value.get()
+
+
+def sample_value(metric, name, labels=None):
+    labels = labels or {}
+    for family in metric.collect():
+        for sample in family.samples:
+            if sample.name == name and sample.labels == labels:
+                return sample.value
+    return 0
 
 
 def test_stream_started_success_and_replay_metrics():
@@ -47,6 +57,16 @@ def test_stream_started_success_and_replay_metrics():
 
 def test_stream_started_conflict():
     reset_state()
+    event_labels = {"event": "started", "status": "error", "reason": "HTTPException"}
+    started_error_labels = {"status": "error", "reason": "HTTPException"}
+    event_before = counter_value(main.stream_event_to_controller_total, **event_labels)
+    started_error_before = counter_value(main.stream_started_events_total, **started_error_labels)
+    event_duration_before = sample_value(
+        main.stream_event_to_controller_seconds,
+        "stream_event_to_controller_seconds_count",
+        {"event": "started"},
+    )
+
     with patch.object(main, 'persist_state_locked', return_value=None), \
          patch.object(main, 'get_proxy_health_status', return_value='healthy'):
         main.register_stream(stream='live', proxy_pod='proxy-1')
@@ -55,6 +75,14 @@ def test_stream_started_conflict():
 
         assert exc_info.value.status_code == 409
         assert exc_info.value.detail == "stream 'live' already owned by proxy 'proxy-1'"
+
+    assert counter_value(main.stream_event_to_controller_total, **event_labels) == event_before + 1
+    assert counter_value(main.stream_started_events_total, **started_error_labels) == started_error_before + 1
+    assert sample_value(
+        main.stream_event_to_controller_seconds,
+        "stream_event_to_controller_seconds_count",
+        {"event": "started"},
+    ) == event_duration_before + 1
 
 
 def test_stream_ended_stale_event_is_ignored_without_releasing_active_state():
@@ -100,6 +128,13 @@ def test_release_worker_api_error_metric_path():
     reset_state()
     main.stream_to_worker['live'] = 'worker-a'
     main.worker_to_stream['worker-a'] = 'live'
+    release_labels = {"status": "warning", "reason": "delete_failed"}
+    release_before = counter_value(main.stream_release_total, **release_labels)
+    release_duration_before = sample_value(main.stream_release_duration_seconds, "stream_release_duration_seconds_count")
+
     with patch.object(main, 'persist_state_locked', return_value=None), \
          patch.object(main.core, 'delete_namespaced_pod', side_effect=ApiException(status=500)):
         assert asyncio.run(main.release_worker(stream='live'))['status'] == 'released'
+
+    assert counter_value(main.stream_release_total, **release_labels) == release_before + 1
+    assert sample_value(main.stream_release_duration_seconds, "stream_release_duration_seconds_count") == release_duration_before + 1
