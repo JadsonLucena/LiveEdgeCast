@@ -1139,6 +1139,7 @@ async def stream_ended(
                 if current and current.get("proxy_pod") == proxy_pod:
                     stream_registry.pop(stream, None)
                     stream_to_proxy.pop(stream, None)
+                    persist_state_locked()
                 elif current and current.get("proxy_pod") != proxy_pod:
                     current_owner = current.get("proxy_pod")
                     stale_ended_events_ignored_total.labels(status="ignored", reason="proxy_owner_mismatch").inc()

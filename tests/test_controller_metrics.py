@@ -115,6 +115,29 @@ def test_stream_ended_stale_event_is_ignored_without_releasing_active_state():
     assert main.worker_to_stream['worker-a'] == 'live'
 
 
+def test_stream_ended_persists_owner_removal_before_release():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_to_proxy['live'] = 'proxy-1'
+    call_order = []
+
+    async def release_worker_side_effect(stream):
+        call_order.append('release')
+        return {'status': 'released', 'stream': stream, 'worker': 'worker-a'}
+
+    def persist_state_side_effect():
+        call_order.append('persist')
+
+    with patch.object(main, 'persist_state_locked', side_effect=persist_state_side_effect), \
+         patch.object(main, 'release_worker', new_callable=AsyncMock, side_effect=release_worker_side_effect):
+        result = asyncio.run(main.stream_ended(stream='live', proxy_pod='proxy-1'))
+
+    assert result['status'] == 'ended'
+    assert call_order == ['persist', 'release']
+    assert 'live' not in main.stream_registry
+    assert 'live' not in main.stream_to_proxy
+
+
 def test_stream_ended_idempotent_replay():
     reset_state()
     ended_labels = {"status": "idempotent_replay", "reason": "idempotent_replay"}
