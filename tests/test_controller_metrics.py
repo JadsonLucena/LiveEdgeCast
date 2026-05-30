@@ -205,3 +205,26 @@ def test_allocate_worker_clears_ready_timestamp_for_stale_ownership_discard():
     assert exc_info.value.status_code == 409
     assert 'worker-new' not in main.worker_create_started_at
     delete_pod.assert_called_once_with(name='worker-new', namespace=main.NAMESPACE, grace_period_seconds=0)
+
+
+def test_handover_worker_replacement_clears_old_ready_timestamp():
+    reset_state()
+    main.stream_to_worker['live'] = 'worker-old'
+    main.worker_to_stream['worker-old'] = 'live'
+    main.worker_create_started_at['worker-old'] = 123.0
+
+    def create_worker_side_effect(stream, proxy_dns):
+        main.worker_create_started_at['worker-new'] = 456.0
+        return 'worker-new'
+
+    with patch.object(main, 'create_worker_pod_for_stream', side_effect=create_worker_side_effect), \
+         patch.object(main.core, 'delete_namespaced_pod') as delete_pod:
+        result = main.replace_worker_pod_for_stream_locked(stream='live', proxy_dns='10.0.0.2')
+
+    assert result == 'worker-new'
+    assert main.stream_to_worker['live'] == 'worker-new'
+    assert main.worker_to_stream['worker-new'] == 'live'
+    assert 'worker-old' not in main.worker_to_stream
+    assert 'worker-old' not in main.worker_create_started_at
+    assert main.worker_create_started_at['worker-new'] == 456.0
+    delete_pod.assert_called_once_with(name='worker-old', namespace=main.NAMESPACE, grace_period_seconds=0)
