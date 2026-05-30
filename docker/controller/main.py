@@ -609,6 +609,7 @@ async def monitor_worker_health():
                         worker_health_failures.pop(prev_uid, None)
                         worker_health_failures[current_uid] = 0
                         worker_ready_since.pop(worker_pod, None)
+                        worker_create_started_at.pop(worker_pod, None)
                     if current_uid:
                         worker_pod_uid_by_name[worker_pod] = current_uid
 

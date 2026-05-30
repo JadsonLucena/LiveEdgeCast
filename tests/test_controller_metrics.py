@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -232,6 +233,39 @@ def test_allocate_worker_clears_ready_timestamp_for_stale_ownership_discard():
     assert exc_info.value.status_code == 409
     assert 'worker-new' not in main.worker_create_started_at
     delete_pod.assert_called_once_with(name='worker-new', namespace=main.NAMESPACE, grace_period_seconds=0)
+
+
+def test_worker_uid_change_clears_stale_create_timestamp():
+    reset_state()
+    main.stream_to_worker['live'] = 'worker-a'
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.worker_pod_uid_by_name['worker-a'] = 'uid-old'
+    main.worker_health_failures['uid-old'] = 2
+    main.worker_ready_since['worker-a'] = 111.0
+    main.worker_create_started_at['worker-a'] = 123.0
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(uid='uid-new'),
+        status=SimpleNamespace(conditions=[SimpleNamespace(type='Ready', status='False')]),
+    )
+
+    async def sleep_side_effect(*args, **kwargs):
+        if sleep_side_effect.calls == 0:
+            sleep_side_effect.calls += 1
+            return None
+        raise asyncio.CancelledError
+
+    sleep_side_effect.calls = 0
+
+    with patch.object(main, 'WORKER_HEALTHCHECK_JITTER_SECONDS', 0), \
+         patch.object(main.asyncio, 'sleep', side_effect=sleep_side_effect), \
+         patch.object(main.core, 'read_namespaced_pod', return_value=pod):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main.monitor_worker_health())
+
+    assert main.worker_pod_uid_by_name['worker-a'] == 'uid-new'
+    assert 'uid-old' not in main.worker_health_failures
+    assert 'worker-a' not in main.worker_ready_since
+    assert 'worker-a' not in main.worker_create_started_at
 
 
 def test_handover_worker_replacement_clears_old_per_pod_tracking():
