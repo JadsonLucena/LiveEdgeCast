@@ -206,7 +206,7 @@ def test_allocate_worker_clears_ready_timestamp_for_stale_ownership_discard():
     delete_pod.assert_called_once_with(name='worker-new', namespace=main.NAMESPACE, grace_period_seconds=0)
 
 
-def test_handover_worker_replacement_clears_old_ready_timestamp():
+def test_handover_worker_replacement_clears_old_create_timestamp():
     reset_state()
     main.stream_to_worker['live'] = 'worker-old'
     main.worker_to_stream['worker-old'] = 'live'
