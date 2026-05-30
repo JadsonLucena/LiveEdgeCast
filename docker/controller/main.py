@@ -595,39 +595,38 @@ async def monitor_worker_health():
             try:
                 pod = core.read_namespaced_pod(name=worker_pod, namespace=NAMESPACE)
                 current_uid = ((pod.metadata.uid or "").strip() if pod and pod.metadata else "")
-                prev_uid = worker_pod_uid_by_name.get(worker_pod)
-                if prev_uid and current_uid and prev_uid != current_uid:
-                    worker_health_failures.pop(prev_uid, None)
-                    worker_health_failures[current_uid] = 0
-                    worker_ready_since.pop(worker_pod, None)
-                if current_uid:
-                    worker_pod_uid_by_name[worker_pod] = current_uid
+                with allocation_lock:
+                    prev_uid = worker_pod_uid_by_name.get(worker_pod)
+                    if prev_uid and current_uid and prev_uid != current_uid:
+                        worker_health_failures.pop(prev_uid, None)
+                        worker_health_failures[current_uid] = 0
+                        worker_ready_since.pop(worker_pod, None)
+                    if current_uid:
+                        worker_pod_uid_by_name[worker_pod] = current_uid
 
                 ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
                 if not ready:
-                    worker_ready_since.pop(worker_pod, None)
-                    if current_uid:
-                        worker_health_failures.pop(current_uid, None)
+                    with allocation_lock:
+                        worker_ready_since.pop(worker_pod, None)
+                        if current_uid:
+                            worker_health_failures.pop(current_uid, None)
                     continue
 
                 now = time.time()
                 create_started_at = None
-                first_ready_at = worker_ready_since.get(worker_pod)
+                with allocation_lock:
+                    first_ready_at = worker_ready_since.get(worker_pod)
+                    if first_ready_at is None:
+                        worker_ready_since[worker_pod] = now
+                        create_started_at = worker_create_started_at.pop(worker_pod, None)
+                        if current_uid:
+                            worker_health_failures[current_uid] = 0
                 if first_ready_at is None:
-                    with allocation_lock:
-                        first_ready_at = worker_ready_since.get(worker_pod)
-                        if first_ready_at is None:
-                            worker_ready_since[worker_pod] = now
-                            create_started_at = worker_create_started_at.pop(worker_pod, None)
-                    if first_ready_at is not None:
-                        continue
                     if create_started_at is not None:
                         worker_ready_duration_seconds.observe(time.monotonic() - create_started_at)
                         worker_ready_total.labels(status="ready", reason="pod_ready").inc()
                     else:
                         worker_ready_total.labels(status="ready", reason="start_time_unknown").inc()
-                    if current_uid:
-                        worker_health_failures[current_uid] = 0
                     logger.debug(f"[WorkerHealth] Worker '{worker_pod}' became Ready. Starting worker delay timer ({WORKER_READY_HEALTH_DELAY_SECONDS}s) before /health probe.")
                     continue
 
@@ -638,11 +637,13 @@ async def monitor_worker_health():
                     )
                     continue
 
-                owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
+                with allocation_lock:
+                    owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
                 if not owner_proxy:
                     logger.debug(f"[WorkerHealth] Stream '{stream}' has no proxy owner; skipping worker check.")
                     if current_uid:
-                        worker_health_failures.pop(current_uid, None)
+                        with allocation_lock:
+                            worker_health_failures.pop(current_uid, None)
                     continue
 
                 owner_proxy_health = get_proxy_health_status(owner_proxy)
@@ -652,7 +653,8 @@ async def monitor_worker_health():
                         f"'{owner_proxy}' is {owner_proxy_health}."
                     )
                     if current_uid:
-                        worker_health_failures.pop(current_uid, None)
+                        with allocation_lock:
+                            worker_health_failures.pop(current_uid, None)
                     continue
 
                 healthy = check_worker_health(worker_pod, pod.status.pod_ip)
@@ -661,12 +663,16 @@ async def monitor_worker_health():
 
             if healthy:
                 if current_uid:
-                    worker_health_failures[current_uid] = 0
+                    with allocation_lock:
+                        worker_health_failures[current_uid] = 0
                 continue
 
-            failures = worker_health_failures.get(current_uid, 0) + 1 if current_uid else 1
             if current_uid:
-                worker_health_failures[current_uid] = failures
+                with allocation_lock:
+                    failures = worker_health_failures.get(current_uid, 0) + 1
+                    worker_health_failures[current_uid] = failures
+            else:
+                failures = 1
             logger.warning(
                 f"[WorkerHealth] Worker '{worker_pod}' failed healthcheck for stream '{stream}' "
                 f"({failures}/{WORKER_HEALTHCHECK_MAX_FAILURES})"
