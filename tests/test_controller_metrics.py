@@ -138,3 +138,50 @@ def test_release_worker_api_error_metric_path():
 
     assert counter_value(main.stream_release_total, **release_labels) == release_before + 1
     assert sample_value(main.stream_release_duration_seconds, "stream_release_duration_seconds_count") == release_duration_before + 1
+
+
+def test_allocate_worker_clears_ready_timestamp_for_concurrent_discard():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_to_proxy['live'] = 'proxy-1'
+    main.stream_generation['live'] = 1
+
+    def create_worker_side_effect(stream, proxy_dns):
+        main.worker_create_started_at['worker-new'] = 123.0
+        main.stream_to_worker['live'] = 'worker-existing'
+        main.worker_to_stream['worker-existing'] = 'live'
+        return 'worker-new'
+
+    with patch.object(main, 'persist_state_locked', return_value=None), \
+         patch.object(main, 'resolve_proxy_address', return_value='10.0.0.1'), \
+         patch.object(main, 'create_worker_pod_for_stream', side_effect=create_worker_side_effect), \
+         patch.object(main.core, 'delete_namespaced_pod') as delete_pod:
+        result = main.allocate_worker(stream='live', proxy_pod='proxy-1', ownership_already_verified=True)
+
+    assert result['status'] == 'idempotent_replay'
+    assert result['name'] == 'worker-existing'
+    assert 'worker-new' not in main.worker_create_started_at
+    delete_pod.assert_called_once_with(name='worker-new', namespace=main.NAMESPACE, grace_period_seconds=0)
+
+
+def test_allocate_worker_clears_ready_timestamp_for_stale_ownership_discard():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_to_proxy['live'] = 'proxy-1'
+    main.stream_generation['live'] = 1
+
+    def create_worker_side_effect(stream, proxy_dns):
+        main.worker_create_started_at['worker-new'] = 123.0
+        main.stream_generation['live'] = 2
+        return 'worker-new'
+
+    with patch.object(main, 'persist_state_locked', return_value=None), \
+         patch.object(main, 'resolve_proxy_address', return_value='10.0.0.1'), \
+         patch.object(main, 'create_worker_pod_for_stream', side_effect=create_worker_side_effect), \
+         patch.object(main.core, 'delete_namespaced_pod') as delete_pod:
+        with pytest.raises(main.HTTPException) as exc_info:
+            main.allocate_worker(stream='live', proxy_pod='proxy-1', ownership_already_verified=True)
+
+    assert exc_info.value.status_code == 409
+    assert 'worker-new' not in main.worker_create_started_at
+    delete_pod.assert_called_once_with(name='worker-new', namespace=main.NAMESPACE, grace_period_seconds=0)

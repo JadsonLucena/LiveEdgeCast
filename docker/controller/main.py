@@ -863,6 +863,7 @@ def allocate_worker(
                     f"[Allocate] Concurrent allocation detected for stream '{stream}'. "
                     f"Discarding newly created worker '{pod_name}' and keeping '{current_worker}'."
                 )
+                worker_create_started_at.pop(pod_name, None)
                 try:
                     core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
                 except ApiException as e:
@@ -881,6 +882,7 @@ def allocate_worker(
                     f"[Allocate] Ownership changed while creating worker for stream '{stream}'. "
                     f"expected_owner='{owner_proxy}' current_owner='{current_owner}'. Deleting '{pod_name}'."
                 )
+                worker_create_started_at.pop(pod_name, None)
                 try:
                     core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
                 except ApiException as e:
