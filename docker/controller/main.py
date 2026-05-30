@@ -419,15 +419,18 @@ def get_proxy_health_status(proxy_pod: str) -> str:
         pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
         ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
         if not ready:
-            proxy_ready_since.pop(proxy_pod, None)
+            with allocation_lock:
+                proxy_ready_since.pop(proxy_pod, None)
             metric_status = "not_ready"
             metric_reason = "pod_not_ready"
             return "not_ready"
 
         now = time.time()
-        first_ready_at = proxy_ready_since.get(proxy_pod)
+        with allocation_lock:
+            first_ready_at = proxy_ready_since.get(proxy_pod)
+            if first_ready_at is None:
+                proxy_ready_since[proxy_pod] = now
         if first_ready_at is None:
-            proxy_ready_since[proxy_pod] = now
             logger.debug(
                 f"[ProxyHealth] Proxy '{proxy_pod}' became Ready. Starting proxy delay timer "
                 f"({PROXY_READY_HEALTH_DELAY_SECONDS}s) before /health probe."
