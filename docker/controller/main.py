@@ -684,66 +684,94 @@ async def monitor_worker_health():
 
         # Handle unhealthy workers
         if to_replace:
-            with allocation_lock:
-                for stream, worker_pod in to_replace:
+            for stream, worker_pod in to_replace:
+                with allocation_lock:
                     allocated = stream_to_worker.get(stream)
-                    if allocated != worker_pod:
-                        continue
-
                     owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-                    if not owner_proxy:
-                        logger.warning(
-                            f"[WorkerHealth] Cannot replace worker '{worker_pod}' for stream '{stream}' "
-                            "because the stream has no proxy owner."
-                        )
-                        continue
 
-                    if get_proxy_health_status(owner_proxy) != "healthy":
-                        logger.info(
-                            f"[WorkerHealth] Delaying replacement of worker '{worker_pod}' for stream '{stream}' "
-                            f"because owner proxy '{owner_proxy}' is not healthy."
-                        )
-                        continue
+                if allocated != worker_pod:
+                    continue
 
-                    logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
-                    recovery_started_at = time.monotonic()
-                    recovery_status = "error"
-                    recovery_reason = "exception"
-                    try:
-                        proxy_dns = resolve_proxy_address(owner_proxy)
-                        new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
-                    except Exception as e:
-                        recovery_reason = type(e).__name__
-                        worker_recovery_duration_seconds.observe(time.monotonic() - recovery_started_at)
-                        worker_recovery_total.labels(status=recovery_status, reason=recovery_reason).inc()
-                        logger.warning(
-                            f"[WorkerHealth] Failed to create replacement worker for stream '{stream}': {e}"
-                        )
-                        continue
+                if not owner_proxy:
+                    logger.warning(
+                        f"[WorkerHealth] Cannot replace worker '{worker_pod}' for stream '{stream}' "
+                        "because the stream has no proxy owner."
+                    )
+                    continue
 
-                    stream_to_worker[stream] = new_worker
-                    worker_to_stream.pop(worker_pod, None)
-                    worker_to_stream[new_worker] = stream
-                    worker_ready_since.pop(worker_pod, None)
-                    worker_create_started_at.pop(worker_pod, None)
-                    old_uid = worker_pod_uid_by_name.pop(worker_pod, None)
-                    if old_uid:
-                        worker_health_failures.pop(old_uid, None)
-            
-                    try:
-                        core.delete_namespaced_pod(name=worker_pod, namespace=NAMESPACE, grace_period_seconds=0)
-                    except Exception as e:
-                        logger.warning(f"[WorkerHealth] Failed to delete pod {worker_pod}: {e}")
+                if get_proxy_health_status(owner_proxy) != "healthy":
+                    logger.info(
+                        f"[WorkerHealth] Delaying replacement of worker '{worker_pod}' for stream '{stream}' "
+                        f"because owner proxy '{owner_proxy}' is not healthy."
+                    )
+                    continue
 
-                    recovery_status = "success"
-                    recovery_reason = "replaced"
+                logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
+                recovery_started_at = time.monotonic()
+                recovery_status = "error"
+                recovery_reason = "exception"
+                try:
+                    proxy_dns = resolve_proxy_address(owner_proxy)
+                    new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
+                except Exception as e:
+                    recovery_reason = type(e).__name__
+                    worker_recovery_duration_seconds.observe(time.monotonic() - recovery_started_at)
+                    worker_recovery_total.labels(status=recovery_status, reason=recovery_reason).inc()
+                    logger.warning(
+                        f"[WorkerHealth] Failed to create replacement worker for stream '{stream}': {e}"
+                    )
+                    continue
+
+                discard_new_worker = False
+                old_worker_to_delete = None
+                with allocation_lock:
+                    allocated = stream_to_worker.get(stream)
+                    current_owner = stream_registry.get(stream, {}).get("proxy_pod")
+                    if allocated != worker_pod or current_owner != owner_proxy:
+                        worker_create_started_at.pop(new_worker, None)
+                        discard_new_worker = True
+                    else:
+                        stream_to_worker[stream] = new_worker
+                        worker_to_stream.pop(worker_pod, None)
+                        worker_to_stream[new_worker] = stream
+                        worker_ready_since.pop(worker_pod, None)
+                        worker_create_started_at.pop(worker_pod, None)
+                        old_uid = worker_pod_uid_by_name.pop(worker_pod, None)
+                        if old_uid:
+                            worker_health_failures.pop(old_uid, None)
+                        persist_state_locked()
+                        old_worker_to_delete = worker_pod
+
+                if discard_new_worker:
+                    recovery_status = "warning"
+                    recovery_reason = "stale_state"
                     worker_recovery_duration_seconds.observe(time.monotonic() - recovery_started_at)
                     worker_recovery_total.labels(status=recovery_status, reason=recovery_reason).inc()
                     logger.info(
-                        f"[WorkerHealth] Replaced unhealthy worker for stream '{stream}': "
-                        f"old='{worker_pod}' new='{new_worker}' proxy='{owner_proxy}'"
+                        f"[WorkerHealth] Discarding replacement worker '{new_worker}' for stream '{stream}' "
+                        f"because allocation changed while recovery was creating it."
                     )
-                persist_state_locked()
+                    try:
+                        core.delete_namespaced_pod(name=new_worker, namespace=NAMESPACE, grace_period_seconds=0)
+                    except Exception as e:
+                        logger.warning(f"[WorkerHealth] Failed to delete stale replacement pod {new_worker}: {e}")
+                    continue
+
+                if old_worker_to_delete:
+                    try:
+                        core.delete_namespaced_pod(name=old_worker_to_delete, namespace=NAMESPACE, grace_period_seconds=0)
+                    except Exception as e:
+                        logger.warning(f"[WorkerHealth] Failed to delete pod {old_worker_to_delete}: {e}")
+
+                recovery_status = "success"
+                recovery_reason = "replaced"
+                worker_recovery_duration_seconds.observe(time.monotonic() - recovery_started_at)
+                worker_recovery_total.labels(status=recovery_status, reason=recovery_reason).inc()
+                logger.info(
+                    f"[WorkerHealth] Replaced unhealthy worker for stream '{stream}': "
+                    f"old='{worker_pod}' new='{new_worker}' proxy='{owner_proxy}'"
+                )
+
 
 
 async def sweep_orphan_workers():
