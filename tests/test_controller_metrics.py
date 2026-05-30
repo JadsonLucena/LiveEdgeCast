@@ -1,7 +1,7 @@
 import asyncio
 import importlib.util
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from kubernetes.client.exceptions import ApiException
 
 with patch('kubernetes.config.load_incluster_config', return_value=None), \
@@ -40,12 +40,28 @@ def test_stream_started_conflict():
             assert getattr(e, 'status_code', None) == 409
 
 
-def test_stream_ended_stale_and_idempotent_replay():
+def test_stream_ended_stale_event_is_ignored_without_releasing_active_state():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_to_proxy['live'] = 'proxy-1'
+    main.stream_to_worker['live'] = 'worker-a'
+    main.worker_to_stream['worker-a'] = 'live'
+
+    with patch.object(main, 'release_worker', new_callable=AsyncMock) as release_worker:
+        result = asyncio.run(main.stream_ended(stream='live', proxy_pod='proxy-2'))
+
+    assert result['status'] == 'stale_ended_ignored'
+    assert result['current_owner'] == 'proxy-1'
+    release_worker.assert_not_called()
+    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-1'}
+    assert main.stream_to_proxy['live'] == 'proxy-1'
+    assert main.stream_to_worker['live'] == 'worker-a'
+    assert main.worker_to_stream['worker-a'] == 'live'
+
+
+def test_stream_ended_idempotent_replay():
     reset_state()
     with patch.object(main, 'persist_state_locked', return_value=None):
-        main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
-        main.stream_to_proxy['live'] = 'proxy-1'
-        assert asyncio.run(main.stream_ended(stream='live', proxy_pod='proxy-2'))['status'] == 'ended'
         assert asyncio.run(main.stream_ended(stream='missing', proxy_pod='proxy-2'))['status'] == 'idempotent_replay'
 
 

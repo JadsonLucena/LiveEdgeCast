@@ -77,6 +77,7 @@ handover_success_total = Counter('handover_success_total', 'Total successful pro
 handover_conflict_total = Counter('handover_conflict_total', 'Total conflicting proxy handovers denied', ['stream'])
 stream_started_events_total = Counter('stream_started_events_total', 'Total /streams/started events', ['status', 'reason'])
 stream_ended_events_total = Counter('stream_ended_events_total', 'Total /streams/ended events', ['status', 'reason'])
+stale_ended_events_ignored_total = Counter('stale_ended_events_ignored_total', 'Total stale /streams/ended events ignored without cleanup', ['status', 'reason'])
 idempotent_replay_total = Counter('idempotent_replay_total', 'Total idempotent replays', ['status', 'reason'])
 
 try:
@@ -929,7 +930,19 @@ async def stream_ended(
                 stream_registry.pop(stream, None)
                 stream_to_proxy.pop(stream, None)
             elif current and current.get("proxy_pod") != proxy_pod:
-                idempotent_replay_total.labels(status="ignored", reason="stale_ended_event").inc()
+                current_owner = current.get("proxy_pod")
+                stale_ended_events_ignored_total.labels(status="ignored", reason="proxy_owner_mismatch").inc()
+                stream_ended_events_total.labels(status="ignored", reason="stale_owner_mismatch").inc()
+                logger.info(
+                    f"[StreamsEnded] Ignored stale ended event for stream '{stream}' "
+                    f"from proxy='{proxy_pod}' current_owner='{current_owner}'"
+                )
+                return {
+                    "status": "stale_ended_ignored",
+                    "stream": stream,
+                    "proxy_pod": proxy_pod,
+                    "current_owner": current_owner,
+                }
 
     release_result = await release_worker(stream=stream)
     replay = release_result.get("status") == "not_found"
