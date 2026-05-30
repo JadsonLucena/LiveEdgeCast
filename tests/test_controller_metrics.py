@@ -2,6 +2,8 @@ import asyncio
 import importlib.util
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+
+import pytest
 from kubernetes.client.exceptions import ApiException
 
 with patch('kubernetes.config.load_incluster_config', return_value=None), \
@@ -48,11 +50,11 @@ def test_stream_started_conflict():
     with patch.object(main, 'persist_state_locked', return_value=None), \
          patch.object(main, 'get_proxy_health_status', return_value='healthy'):
         main.register_stream(stream='live', proxy_pod='proxy-1')
-        try:
+        with pytest.raises(main.HTTPException) as exc_info:
             main.stream_started(stream='live', proxy_pod='proxy-2')
-            assert False
-        except Exception as e:
-            assert getattr(e, 'status_code', None) == 409
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail == "stream 'live' already owned by proxy 'proxy-1'"
 
 
 def test_stream_ended_stale_event_is_ignored_without_releasing_active_state():
