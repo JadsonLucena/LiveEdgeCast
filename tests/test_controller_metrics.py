@@ -140,7 +140,6 @@ def test_release_worker_api_error_metric_path():
     assert sample_value(main.stream_release_duration_seconds, "stream_release_duration_seconds_count") == release_duration_before + 1
 
 
-
 def test_release_worker_pod_not_found_is_idempotent_metric_path():
     reset_state()
     main.stream_to_worker['live'] = 'worker-a'

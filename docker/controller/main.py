@@ -996,6 +996,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 metric_reason = "released"
             except ApiException as e:
                 if e.status == 404:
+                    metric_status = "success"
                     metric_reason = "pod_already_deleted"
                     logger.info(f"[Release] Worker pod {worker_name} was already deleted")
                 else:
