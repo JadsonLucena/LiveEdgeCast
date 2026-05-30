@@ -27,7 +27,7 @@ NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
 WORKER_SERVICE = "worker"
 
-allocation_lock = threading.Lock()
+allocation_lock = threading.RLock()
 
 stream_to_worker: Dict[str, str] = {}
 
@@ -225,7 +225,8 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
         )
 
         core.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
-        worker_create_started_at[pod_name] = started_at
+        with allocation_lock:
+            worker_create_started_at[pod_name] = started_at
         metric_status = "success"
         metric_reason = "created"
         return pod_name
@@ -610,10 +611,16 @@ async def monitor_worker_health():
                     continue
 
                 now = time.time()
+                create_started_at = None
                 first_ready_at = worker_ready_since.get(worker_pod)
                 if first_ready_at is None:
-                    worker_ready_since[worker_pod] = now
-                    create_started_at = worker_create_started_at.pop(worker_pod, None)
+                    with allocation_lock:
+                        first_ready_at = worker_ready_since.get(worker_pod)
+                        if first_ready_at is None:
+                            worker_ready_since[worker_pod] = now
+                            create_started_at = worker_create_started_at.pop(worker_pod, None)
+                    if first_ready_at is not None:
+                        continue
                     if create_started_at is not None:
                         worker_ready_duration_seconds.observe(time.monotonic() - create_started_at)
                         worker_ready_total.labels(status="ready", reason="pod_ready").inc()
