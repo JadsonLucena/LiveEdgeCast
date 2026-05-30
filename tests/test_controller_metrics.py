@@ -19,6 +19,9 @@ def reset_state():
     main.stream_to_proxy.clear()
     main.stream_registry.clear()
     main.stream_generation.clear()
+    main.worker_ready_since.clear()
+    main.worker_health_failures.clear()
+    main.worker_pod_uid_by_name.clear()
     main.worker_create_started_at.clear()
 
 
@@ -206,11 +209,14 @@ def test_allocate_worker_clears_ready_timestamp_for_stale_ownership_discard():
     delete_pod.assert_called_once_with(name='worker-new', namespace=main.NAMESPACE, grace_period_seconds=0)
 
 
-def test_handover_worker_replacement_clears_old_create_timestamp():
+def test_handover_worker_replacement_clears_old_per_pod_tracking():
     reset_state()
     main.stream_to_worker['live'] = 'worker-old'
     main.worker_to_stream['worker-old'] = 'live'
+    main.worker_ready_since['worker-old'] = 111.0
     main.worker_create_started_at['worker-old'] = 123.0
+    main.worker_pod_uid_by_name['worker-old'] = 'uid-old'
+    main.worker_health_failures['uid-old'] = 2
 
     def create_worker_side_effect(stream, proxy_dns):
         main.worker_create_started_at['worker-new'] = 456.0
@@ -224,6 +230,9 @@ def test_handover_worker_replacement_clears_old_create_timestamp():
     assert main.stream_to_worker['live'] == 'worker-new'
     assert main.worker_to_stream['worker-new'] == 'live'
     assert 'worker-old' not in main.worker_to_stream
+    assert 'worker-old' not in main.worker_ready_since
     assert 'worker-old' not in main.worker_create_started_at
+    assert 'worker-old' not in main.worker_pod_uid_by_name
+    assert 'uid-old' not in main.worker_health_failures
     assert main.worker_create_started_at['worker-new'] == 456.0
     delete_pod.assert_called_once_with(name='worker-old', namespace=main.NAMESPACE, grace_period_seconds=0)

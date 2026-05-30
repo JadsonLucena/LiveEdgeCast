@@ -249,7 +249,11 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
     stream_to_worker[stream] = new_worker
     worker_to_stream.pop(old_worker, None)
     worker_to_stream[new_worker] = stream
+    worker_ready_since.pop(old_worker, None)
     worker_create_started_at.pop(old_worker, None)
+    old_uid = worker_pod_uid_by_name.pop(old_worker, None)
+    if old_uid:
+        worker_health_failures.pop(old_uid, None)
 
     try:
         core.delete_namespaced_pod(name=old_worker, namespace=NAMESPACE, grace_period_seconds=0)
