@@ -964,9 +964,13 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
                 metric_reason = "released"
             except ApiException as e:
-                metric_status = "warning"
-                metric_reason = "delete_failed"
-                logger.warning(f"[Release] Failed deleting worker pod {worker_name}: {e}")
+                if e.status == 404:
+                    metric_reason = "pod_already_deleted"
+                    logger.info(f"[Release] Worker pod {worker_name} was already deleted")
+                else:
+                    metric_status = "warning"
+                    metric_reason = "delete_failed"
+                    logger.warning(f"[Release] Failed deleting worker pod {worker_name}: {e}")
             return {
                 "status": response_status,
                 "stream": stream,

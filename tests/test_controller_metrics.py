@@ -140,6 +140,26 @@ def test_release_worker_api_error_metric_path():
     assert sample_value(main.stream_release_duration_seconds, "stream_release_duration_seconds_count") == release_duration_before + 1
 
 
+
+def test_release_worker_pod_not_found_is_idempotent_metric_path():
+    reset_state()
+    main.stream_to_worker['live'] = 'worker-a'
+    main.worker_to_stream['worker-a'] = 'live'
+    already_deleted_labels = {"status": "success", "reason": "pod_already_deleted"}
+    failed_labels = {"status": "warning", "reason": "delete_failed"}
+    already_deleted_before = counter_value(main.stream_release_total, **already_deleted_labels)
+    failed_before = counter_value(main.stream_release_total, **failed_labels)
+
+    with patch.object(main, 'persist_state_locked', return_value=None), \
+         patch.object(main.core, 'delete_namespaced_pod', side_effect=ApiException(status=404)), \
+         patch.object(main.logger, 'warning') as warning_log:
+        assert asyncio.run(main.release_worker(stream='live'))['status'] == 'released'
+
+    assert counter_value(main.stream_release_total, **already_deleted_labels) == already_deleted_before + 1
+    assert counter_value(main.stream_release_total, **failed_labels) == failed_before
+    warning_log.assert_not_called()
+
+
 def test_allocate_worker_clears_ready_timestamp_for_concurrent_discard():
     reset_state()
     main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
