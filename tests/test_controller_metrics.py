@@ -19,6 +19,7 @@ def reset_state():
     main.stream_to_proxy.clear()
     main.stream_registry.clear()
     main.stream_generation.clear()
+    main.proxy_health_failures.clear()
     main.proxy_ready_since.clear()
     main.worker_ready_since.clear()
     main.worker_health_failures.clear()
