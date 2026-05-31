@@ -1,7 +1,9 @@
 import asyncio
 import importlib.util
+import json
+import logging
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -26,6 +28,7 @@ def reset_state():
     main.worker_health_failures.clear()
     main.worker_pod_uid_by_name.clear()
     main.worker_create_started_at.clear()
+    main.reset_controlled_metric_metadata_cache()
 
 
 def counter_value(counter, **labels):
@@ -36,9 +39,324 @@ def sample_value(metric, name, labels=None):
     labels = labels or {}
     for family in metric.collect():
         for sample in family.samples:
-            if sample.name == name and sample.labels == labels:
+            if sample.name == name and all(sample.labels.get(k) == v for k, v in labels.items()):
                 return sample.value
     return 0
+
+
+def test_metadata_extraction_precedence_and_sanitization(monkeypatch):
+    monkeypatch.setenv('LIVEEDGECAST_TENANT', 'env-tenant')
+    monkeypatch.setenv('LIVEEDGECAST_ENVIRONMENT', 'prod')
+    monkeypatch.setenv('LIVEEDGECAST_REGION', 'us-west-2')
+    request = SimpleNamespace(
+        headers={
+            'x-liveedgecast-tenant': ' header tenant ',
+        },
+        query_params={
+            'tenant': 'query-tenant',
+            'environment': 'stage*blue',
+        },
+    )
+
+    metadata = main.extract_request_metadata(request)
+
+    assert metadata.labels == {
+        'tenant': 'header_tenant',
+        'environment': 'stage_blue',
+        'region': 'us-west-2',
+    }
+    assert metadata.sources == {
+        'tenant': 'header',
+        'environment': 'query',
+        'region': 'env',
+    }
+
+
+def test_request_metadata_is_immutable():
+    metadata = main.default_request_metadata()
+
+    assert isinstance(metadata.labels, MappingProxyType)
+    with pytest.raises(TypeError):
+        metadata.labels['tenant'] = 'changed'
+
+
+def test_blank_higher_priority_metadata_falls_back(monkeypatch):
+    monkeypatch.setenv('LIVEEDGECAST_TENANT', 'env-tenant')
+    request = SimpleNamespace(
+        headers={
+            'x-liveedgecast-tenant': '   ',
+        },
+        query_params={
+            'tenant': 'query-tenant',
+        },
+    )
+
+    metadata = main.extract_request_metadata(request)
+
+    assert metadata.labels['tenant'] == 'query-tenant'
+    assert metadata.sources['tenant'] == 'query'
+
+
+def test_blank_metadata_uses_default_when_no_fallback(monkeypatch):
+    monkeypatch.delenv('LIVEEDGECAST_TENANT', raising=False)
+    monkeypatch.delenv('CONTROLLER_METADATA_TENANT', raising=False)
+    request = SimpleNamespace(
+        headers={
+            'x-liveedgecast-tenant': '   ',
+        },
+        query_params={
+            'tenant': '',
+        },
+    )
+
+    metadata = main.extract_request_metadata(request)
+
+    assert metadata.labels['tenant'] == 'unknown'
+    assert metadata.sources['tenant'] == 'default'
+
+
+def test_metric_wrapper_rejects_incorrect_positional_label_count():
+    with pytest.raises(ValueError, match="Incorrect label count"):
+        main.stream_registration_total.labels('success', 'reason', 'tenant-only', 'environment-only')
+
+
+def test_metric_wrapper_rejects_mixed_positional_and_keyword_labels():
+    with pytest.raises(ValueError, match="Cannot mix"):
+        main.stream_registration_total.labels('success', reason='mixed')
+
+
+def test_labeled_metric_rejects_direct_inc_and_observe():
+    with pytest.raises(ValueError, match="Direct inc"):
+        main.stream_registration_total.inc()
+    with pytest.raises(ValueError, match="Direct observe"):
+        main.stream_event_to_controller_seconds.observe(0.1)
+
+
+def test_unlabeled_counter_direct_inc_uses_controlled_metadata(monkeypatch):
+    main.reset_controlled_metric_metadata_cache()
+    monkeypatch.setenv('LIVEEDGECAST_TENANT', 'counter-tenant')
+    counter = main.controller_counter('test_direct_inc_counter', 'Test direct inc counter')
+    labels = {
+        'tenant': 'counter-tenant',
+        'environment': 'unknown',
+        'region': 'unknown',
+    }
+    before = sample_value(counter, 'test_direct_inc_counter_total', labels)
+
+    counter.inc()
+
+    assert sample_value(counter, 'test_direct_inc_counter_total', labels) == before + 1
+
+
+def test_app_lifespan_starts_and_cancels_background_tasks():
+    tasks = []
+
+    class FakeTask:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+        def __await__(self):
+            async def cancelled_result():
+                return None
+
+            return cancelled_result().__await__()
+
+    def create_task_side_effect(coro):
+        coro.close()
+        task = FakeTask()
+        tasks.append(task)
+        return task
+
+    async def run_lifespan():
+        async with main.app_lifespan(SimpleNamespace()):
+            assert len(tasks) == 4
+            assert all(not task.cancelled for task in tasks)
+
+    with patch.object(main.asyncio, 'sleep', new_callable=AsyncMock), \
+         patch.object(main, 'recover_state') as recover_state, \
+         patch.object(main.asyncio, 'create_task', side_effect=create_task_side_effect):
+        asyncio.run(run_lifespan())
+
+    recover_state.assert_called_once_with()
+    assert len(tasks) == 4
+    assert all(task.cancelled for task in tasks)
+
+
+def test_fastapi_middleware_sets_context_for_asgi_request(monkeypatch):
+    monkeypatch.setenv('LIVEEDGECAST_REGION', 'env-region')
+
+    if not any(getattr(route, 'path', None) == '/__metadata_test__' for route in main.app.routes):
+        @main.app.get('/__metadata_test__')
+        def metadata_test_route():
+            metadata = main.current_request_metadata.get()
+            return {
+                'labels': dict(metadata.labels),
+                'sources': dict(metadata.sources),
+            }
+
+    async def request_app():
+        messages = []
+        received = False
+        scope = {
+            'type': 'http',
+            'asgi': {'version': '3.0'},
+            'http_version': '1.1',
+            'method': 'GET',
+            'scheme': 'http',
+            'path': '/__metadata_test__',
+            'raw_path': b'/__metadata_test__',
+            'query_string': b'environment=stage',
+            'headers': [
+                (b'host', b'testserver'),
+                (b'x-liveedgecast-tenant', b'tenant-a'),
+            ],
+            'client': ('testclient', 50000),
+            'server': ('testserver', 80),
+        }
+
+        async def receive():
+            nonlocal received
+            if not received:
+                received = True
+                return {'type': 'http.request', 'body': b'', 'more_body': False}
+            return {'type': 'http.disconnect'}
+
+        async def send(message):
+            messages.append(message)
+
+        await main.app(scope, receive, send)
+        return messages
+
+    messages = asyncio.run(request_app())
+    status = next(message['status'] for message in messages if message['type'] == 'http.response.start')
+    body = b''.join(
+        message.get('body', b'')
+        for message in messages
+        if message['type'] == 'http.response.body'
+    )
+
+    assert status == 200
+    assert json.loads(body) == {
+        'labels': {
+            'tenant': 'tenant-a',
+            'environment': 'stage',
+            'region': 'env-region',
+        },
+        'sources': {
+            'tenant': 'header',
+            'environment': 'query',
+            'region': 'env',
+        },
+    }
+    assert main.current_request_metadata.get().labels == {
+        'tenant': 'unknown',
+        'environment': 'unknown',
+        'region': 'unknown',
+    }
+
+
+def test_structured_formatter_includes_request_metadata():
+    metadata = main.RequestMetadata(
+        labels={'tenant': 'tenant-a', 'environment': 'stage', 'region': 'us-east-1'},
+        sources={'tenant': 'header', 'environment': 'query', 'region': 'env'},
+    )
+    record = logging.LogRecord(
+        name='controller_main',
+        level=logging.INFO,
+        pathname='docker/controller/main.py',
+        lineno=1,
+        msg='metadata check',
+        args=(),
+        exc_info=None,
+    )
+    token = main.current_request_metadata.set(metadata)
+    try:
+        payload = json.loads(main.StructuredMetadataFormatter().format(record))
+    finally:
+        main.current_request_metadata.reset(token)
+
+    assert payload['metadata'] == metadata.labels
+    assert payload['metadata_sources'] == metadata.sources
+
+
+def test_observability_metadata_middleware_sets_and_resets_context(monkeypatch):
+    monkeypatch.setenv('LIVEEDGECAST_REGION', 'env-region')
+    request = SimpleNamespace(
+        headers={'x-liveedgecast-tenant': 'tenant-a'},
+        query_params={'environment': 'stage'},
+    )
+    seen_metadata = None
+
+    async def call_next(_request):
+        nonlocal seen_metadata
+        seen_metadata = main.current_request_metadata.get()
+        return {'status': 'ok'}
+
+    result = asyncio.run(main.observability_metadata_middleware(request, call_next))
+
+    assert result == {'status': 'ok'}
+    assert seen_metadata.labels == {
+        'tenant': 'tenant-a',
+        'environment': 'stage',
+        'region': 'env-region',
+    }
+    assert main.current_request_metadata.get().labels == {
+        'tenant': 'unknown',
+        'environment': 'unknown',
+        'region': 'unknown',
+    }
+
+
+def test_metrics_ignore_request_metadata_context_and_use_controlled_env(monkeypatch):
+    main.reset_controlled_metric_metadata_cache()
+    monkeypatch.setenv('LIVEEDGECAST_TENANT', 'configured-tenant')
+    monkeypatch.setenv('LIVEEDGECAST_ENVIRONMENT', 'prod')
+    monkeypatch.setenv('LIVEEDGECAST_REGION', 'us-east-1')
+    metadata = main.RequestMetadata(
+        labels={'tenant': 'request-tenant', 'environment': 'request-env', 'region': 'request-region'},
+        sources={'tenant': 'header', 'environment': 'header', 'region': 'header'},
+    )
+    labels = {'status': 'success', 'reason': 'metadata_context'}
+    controlled_labels = {
+        **labels,
+        'tenant': 'configured-tenant',
+        'environment': 'prod',
+        'region': 'us-east-1',
+    }
+    request_labels = {
+        **labels,
+        'tenant': 'request-tenant',
+        'environment': 'request-env',
+        'region': 'request-region',
+    }
+    before = sample_value(
+        main.stream_registration_total,
+        'stream_registration_total',
+        controlled_labels,
+    )
+    token = main.current_request_metadata.set(metadata)
+    try:
+        main.stream_registration_total.labels(**labels).inc()
+        main.stream_registration_total.labels(**request_labels).inc()
+    finally:
+        main.current_request_metadata.reset(token)
+
+    assert sample_value(
+        main.stream_registration_total,
+        'stream_registration_total',
+        controlled_labels,
+    ) == before + 2
+    assert sample_value(
+        main.stream_registration_total,
+        'stream_registration_total',
+        request_labels,
+    ) == 0
 
 
 def test_stream_started_success_and_replay_metrics():
