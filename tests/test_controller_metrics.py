@@ -125,6 +125,11 @@ def test_metric_wrapper_rejects_mixed_positional_and_keyword_labels():
         main.stream_registration_total.labels('success', reason='mixed')
 
 
+def test_labeled_metric_rejects_direct_observe():
+    with pytest.raises(ValueError, match="Direct observe"):
+        main.stream_event_to_controller_seconds.observe(0.1)
+
+
 def test_app_lifespan_starts_and_cancels_background_tasks():
     tasks = []
 
@@ -137,6 +142,12 @@ def test_app_lifespan_starts_and_cancels_background_tasks():
 
         def cancel(self):
             self.cancelled = True
+
+        def __await__(self):
+            async def cancelled_result():
+                return None
+
+            return cancelled_result().__await__()
 
     def create_task_side_effect(coro):
         coro.close()
@@ -157,6 +168,79 @@ def test_app_lifespan_starts_and_cancels_background_tasks():
     recover_state.assert_called_once_with()
     assert len(tasks) == 4
     assert all(task.cancelled for task in tasks)
+
+
+def test_fastapi_middleware_sets_context_for_asgi_request(monkeypatch):
+    monkeypatch.setenv('LIVEEDGECAST_REGION', 'env-region')
+
+    if not any(getattr(route, 'path', None) == '/__metadata_test__' for route in main.app.routes):
+        @main.app.get('/__metadata_test__')
+        def metadata_test_route():
+            metadata = main.current_request_metadata.get()
+            return {
+                'labels': dict(metadata.labels),
+                'sources': dict(metadata.sources),
+            }
+
+    async def request_app():
+        messages = []
+        received = False
+        scope = {
+            'type': 'http',
+            'asgi': {'version': '3.0'},
+            'http_version': '1.1',
+            'method': 'GET',
+            'scheme': 'http',
+            'path': '/__metadata_test__',
+            'raw_path': b'/__metadata_test__',
+            'query_string': b'environment=stage',
+            'headers': [
+                (b'host', b'testserver'),
+                (b'x-liveedgecast-tenant', b'tenant-a'),
+            ],
+            'client': ('testclient', 50000),
+            'server': ('testserver', 80),
+        }
+
+        async def receive():
+            nonlocal received
+            if not received:
+                received = True
+                return {'type': 'http.request', 'body': b'', 'more_body': False}
+            return {'type': 'http.disconnect'}
+
+        async def send(message):
+            messages.append(message)
+
+        await main.app(scope, receive, send)
+        return messages
+
+    messages = asyncio.run(request_app())
+    status = next(message['status'] for message in messages if message['type'] == 'http.response.start')
+    body = b''.join(
+        message.get('body', b'')
+        for message in messages
+        if message['type'] == 'http.response.body'
+    )
+
+    assert status == 200
+    assert json.loads(body) == {
+        'labels': {
+            'tenant': 'tenant-a',
+            'environment': 'stage',
+            'region': 'env-region',
+        },
+        'sources': {
+            'tenant': 'header',
+            'environment': 'query',
+            'region': 'env',
+        },
+    }
+    assert main.current_request_metadata.get().labels == {
+        'tenant': 'unknown',
+        'environment': 'unknown',
+        'region': 'unknown',
+    }
 
 
 def test_structured_formatter_includes_request_metadata():

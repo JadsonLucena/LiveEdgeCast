@@ -181,9 +181,13 @@ class ControlledMetadataMetric:
         return self._metric.labels(*labelvalues)
 
     def observe(self, amount, *args, **kwargs):
+        if self._base_label_count != 0:
+            raise ValueError("Direct observe is only valid for metrics without base labels; call labels(...).observe(...) instead")
         return self.labels().observe(amount, *args, **kwargs)
 
     def set(self, value):
+        if self._base_label_count != 0:
+            raise ValueError("Direct set is only valid for metrics without base labels; call labels(...).set(...) instead")
         return self.labels().set(value)
 
     def collect(self):
@@ -246,9 +250,15 @@ async def app_lifespan(_app: FastAPI):
     try:
         yield
     finally:
-        for task in (registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task):
-            if task and not task.done():
-                task.cancel()
+        pending_tasks = [
+            task
+            for task in (registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task)
+            if task and not task.done()
+        ]
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
 
 app = FastAPI(lifespan=app_lifespan)

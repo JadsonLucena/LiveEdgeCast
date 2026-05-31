@@ -57,7 +57,8 @@ include two metadata objects:
 Controller metrics include the allowed metadata label names in addition to their
 original metric-specific labels, but metric label values never come from HTTP
 headers or query parameters. Metrics use only the controlled configuration branch
-(environment variables) and then the controlled default (`unknown`). This prevents
+(environment variables) and then the controlled default (`unknown`), resolved once
+per controller process for hot metric paths. This prevents
 request-controlled values from creating unbounded Prometheus time series while
 logs remain auditable for request-supplied metadata. If your log backend
 automatically indexes JSON fields, do not promote request-sourced `metadata.*`
