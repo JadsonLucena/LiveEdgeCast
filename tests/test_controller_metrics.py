@@ -120,6 +120,45 @@ def test_metric_wrapper_rejects_incorrect_positional_label_count():
         main.stream_registration_total.labels('success', 'reason', 'tenant-only', 'environment-only')
 
 
+def test_metric_wrapper_rejects_mixed_positional_and_keyword_labels():
+    with pytest.raises(ValueError, match="Cannot mix"):
+        main.stream_registration_total.labels('success', reason='mixed')
+
+
+def test_app_lifespan_starts_and_cancels_background_tasks():
+    tasks = []
+
+    class FakeTask:
+        def __init__(self):
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+
+    def create_task_side_effect(coro):
+        coro.close()
+        task = FakeTask()
+        tasks.append(task)
+        return task
+
+    async def run_lifespan():
+        async with main.app_lifespan(SimpleNamespace()):
+            assert len(tasks) == 4
+            assert all(not task.cancelled for task in tasks)
+
+    with patch.object(main.asyncio, 'sleep', new_callable=AsyncMock), \
+         patch.object(main, 'recover_state') as recover_state, \
+         patch.object(main.asyncio, 'create_task', side_effect=create_task_side_effect):
+        asyncio.run(run_lifespan())
+
+    recover_state.assert_called_once_with()
+    assert len(tasks) == 4
+    assert all(task.cancelled for task in tasks)
+
+
 def test_structured_formatter_includes_request_metadata():
     metadata = main.RequestMetadata(
         labels={'tenant': 'tenant-a', 'environment': 'stage', 'region': 'us-east-1'},

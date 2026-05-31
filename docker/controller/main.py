@@ -12,6 +12,7 @@ import json
 import copy
 import os
 import re
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -144,51 +145,56 @@ def get_current_request_metadata() -> RequestMetadata:
     return metadata
 
 
-def with_metric_metadata(metric, base_label_count: int):
-    """Attach controlled metadata labels to a prometheus_client metric.
+class ControlledMetadataMetric:
+    """Wrapper that appends controlled metadata labels to a prometheus_client metric.
 
-    The returned metric keeps the prometheus_client API surface used in this
-    module, but request-supplied metadata labels are always overwritten with
-    controlled env/default values to avoid unbounded Prometheus cardinality.
+    Request-supplied metadata labels are always overwritten with controlled
+    env/default values to avoid unbounded Prometheus cardinality.
     """
-    original_labels = metric.labels
 
-    def labels_with_metadata(*labelvalues, **labelkwargs):
+    def __init__(self, metric, base_label_count: int):
+        self._metric = metric
+        self._base_label_count = base_label_count
+
+    def labels(self, *labelvalues, **labelkwargs):
+        if labelvalues and labelkwargs:
+            raise ValueError("Cannot mix positional and keyword labels")
+
         metadata_labels = metric_metadata_labels()
         if labelkwargs:
             enriched = dict(labelkwargs)
             for key, value in metadata_labels.items():
                 enriched[key] = value
-            return original_labels(**enriched)
+            return self._metric.labels(**enriched)
 
         metadata_values = tuple(metadata_labels[name] for name in METADATA_LABEL_NAMES)
-        if len(labelvalues) == base_label_count:
+        if len(labelvalues) == self._base_label_count:
             labelvalues = tuple(labelvalues) + metadata_values
-        elif len(labelvalues) == base_label_count + len(METADATA_LABEL_NAMES):
-            labelvalues = tuple(labelvalues[:base_label_count]) + metadata_values
+        elif len(labelvalues) == self._base_label_count + len(METADATA_LABEL_NAMES):
+            labelvalues = tuple(labelvalues[:self._base_label_count]) + metadata_values
         else:
-            expected_with_metadata = base_label_count + len(METADATA_LABEL_NAMES)
+            expected_with_metadata = self._base_label_count + len(METADATA_LABEL_NAMES)
             raise ValueError(
                 f"Incorrect label count: got {len(labelvalues)}, "
-                f"expected {base_label_count} base labels or {expected_with_metadata} labels including metadata"
+                f"expected {self._base_label_count} base labels or {expected_with_metadata} labels including metadata"
             )
-        return original_labels(*labelvalues)
+        return self._metric.labels(*labelvalues)
 
-    metric.labels = labels_with_metadata
+    def observe(self, amount, *args, **kwargs):
+        return self.labels().observe(amount, *args, **kwargs)
 
-    if base_label_count == 0 and hasattr(metric, "observe"):
-        def observe_with_metadata(amount, *args, **kwargs):
-            return metric.labels().observe(amount, *args, **kwargs)
+    def set(self, value):
+        return self.labels().set(value)
 
-        metric.observe = observe_with_metadata
+    def collect(self):
+        return self._metric.collect()
 
-    if base_label_count == 0 and hasattr(metric, "set"):
-        def set_with_metadata(value):
-            return metric.labels().set(value)
+    def __getattr__(self, name: str):
+        return getattr(self._metric, name)
 
-        metric.set = set_with_metadata
 
-    return metric
+def with_metric_metadata(metric, base_label_count: int):
+    return ControlledMetadataMetric(metric, base_label_count)
 
 
 def controller_counter(name: str, description: str, base_labels=()):
@@ -228,7 +234,24 @@ if not logger.handlers:
 for handler in logger.handlers:
     handler.setFormatter(StructuredMetadataFormatter(datefmt='%Y-%m-%d %H:%M:%S'))
 
-app = FastAPI()
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
+    await asyncio.sleep(5)
+    recover_state()
+    registry_health_task = asyncio.create_task(monitor_stream_registry_health())
+    worker_health_task = asyncio.create_task(monitor_worker_health())
+    worker_orphan_sweeper_task = asyncio.create_task(sweep_orphan_workers())
+    metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
+    try:
+        yield
+    finally:
+        for task in (registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task):
+            if task and not task.done():
+                task.cancel()
+
+
+app = FastAPI(lifespan=app_lifespan)
 
 
 @app.middleware("http")
@@ -1033,30 +1056,6 @@ async def sweep_orphan_workers():
                 core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
             except Exception as e:
                 logger.warning(f"[OrphanSweeper] Failed deleting orphan worker pod '{pod_name}': {e}")
-
-@app.on_event("startup")
-async def startup_event():
-    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
-    time.sleep(5)
-    recover_state()
-    registry_health_task = asyncio.create_task(monitor_stream_registry_health())
-    worker_health_task = asyncio.create_task(monitor_worker_health())
-    worker_orphan_sweeper_task = asyncio.create_task(sweep_orphan_workers())
-    metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
-    if registry_health_task and not registry_health_task.done():
-        registry_health_task.cancel()
-    if worker_health_task and not worker_health_task.done():
-        worker_health_task.cancel()
-    if worker_orphan_sweeper_task and not worker_orphan_sweeper_task.done():
-        worker_orphan_sweeper_task.cancel()
-    if metrics_collection_task and not metrics_collection_task.done():
-        metrics_collection_task.cancel()
-
 
 @app.get("/health")
 def health():
