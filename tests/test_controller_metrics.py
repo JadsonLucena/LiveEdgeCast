@@ -36,9 +36,59 @@ def sample_value(metric, name, labels=None):
     labels = labels or {}
     for family in metric.collect():
         for sample in family.samples:
-            if sample.name == name and sample.labels == labels:
+            if sample.name == name and all(sample.labels.get(k) == v for k, v in labels.items()):
                 return sample.value
     return 0
+
+
+def test_metadata_extraction_precedence_and_sanitization(monkeypatch):
+    monkeypatch.setenv('LIVEEDGECAST_TENANT', 'env-tenant')
+    monkeypatch.setenv('LIVEEDGECAST_ENVIRONMENT', 'prod')
+    monkeypatch.setenv('LIVEEDGECAST_REGION', 'us-west-2')
+    request = SimpleNamespace(
+        headers={
+            'x-liveedgecast-tenant': ' header tenant ',
+        },
+        query_params={
+            'tenant': 'query-tenant',
+            'environment': 'stage*blue',
+        },
+    )
+
+    metadata = main.extract_request_metadata(request)
+
+    assert metadata.labels == {
+        'tenant': 'header_tenant',
+        'environment': 'stage_blue',
+        'region': 'us-west-2',
+    }
+    assert metadata.sources == {
+        'tenant': 'header',
+        'environment': 'query',
+        'region': 'env',
+    }
+
+
+def test_metrics_use_current_metadata_context():
+    metadata = main.RequestMetadata(
+        labels={'tenant': 'tenant-a', 'environment': 'prod', 'region': 'us-east-1'},
+        sources={'tenant': 'header', 'environment': 'header', 'region': 'header'},
+    )
+    labels = {'status': 'success', 'reason': 'metadata_context'}
+    before = counter_value(main.stream_registration_total, **labels)
+    token = main.current_request_metadata.set(metadata)
+    try:
+        main.stream_registration_total.labels(**labels).inc()
+    finally:
+        main.current_request_metadata.reset(token)
+
+    assert counter_value(
+        main.stream_registration_total,
+        **labels,
+        tenant='tenant-a',
+        environment='prod',
+        region='us-east-1',
+    ) == before + 1
 
 
 def test_stream_started_success_and_replay_metrics():

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
 from kubernetes import client, config
 from kubernetes.client.exceptions import ApiException
 import random
@@ -10,18 +10,188 @@ import logging
 import asyncio
 import json
 import copy
-from typing import Dict, Optional
+import os
+import re
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from fastapi.responses import Response
 
+
+METADATA_LABEL_NAMES: Tuple[str, ...] = ("tenant", "environment", "region")
+METADATA_DEFAULT_VALUE = "unknown"
+METADATA_HEADER_PREFIXES: Tuple[str, ...] = ("x-liveedgecast", "x")
+METADATA_QUERY_PREFIX = "metadata_"
+METADATA_ENV_PREFIXES: Tuple[str, ...] = ("LIVEEDGECAST", "CONTROLLER_METADATA")
+METADATA_ALLOWED_VALUE = re.compile(r"[^a-zA-Z0-9_.:-]+")
+METADATA_MAX_LENGTH = 64
+
+
+@dataclass(frozen=True)
+class RequestMetadata:
+    labels: Dict[str, str]
+    sources: Dict[str, str]
+
+
+def sanitize_metadata_value(value: Optional[str]) -> str:
+    if value is None:
+        return METADATA_DEFAULT_VALUE
+    sanitized = METADATA_ALLOWED_VALUE.sub("_", value.strip())[:METADATA_MAX_LENGTH]
+    return sanitized or METADATA_DEFAULT_VALUE
+
+
+def default_request_metadata() -> RequestMetadata:
+    return RequestMetadata(
+        labels={name: METADATA_DEFAULT_VALUE for name in METADATA_LABEL_NAMES},
+        sources={name: "default" for name in METADATA_LABEL_NAMES},
+    )
+
+
+current_request_metadata: ContextVar[RequestMetadata] = ContextVar(
+    "current_request_metadata",
+    default=default_request_metadata(),
+)
+
+
+def extract_request_metadata(request: Optional[Request] = None) -> RequestMetadata:
+    """
+    Extracts low-cardinality observability metadata with a single precedence rule:
+    HTTP headers > query parameters > environment variables > controlled default.
+    """
+    labels: Dict[str, str] = {}
+    sources: Dict[str, str] = {}
+
+    for name in METADATA_LABEL_NAMES:
+        raw_value = None
+        source = "default"
+
+        if request is not None:
+            for prefix in METADATA_HEADER_PREFIXES:
+                header_name = f"{prefix}-{name}"
+                candidate = request.headers.get(header_name)
+                if candidate:
+                    raw_value = candidate
+                    source = "header"
+                    break
+
+        if raw_value is None and request is not None:
+            for query_name in (name, f"{METADATA_QUERY_PREFIX}{name}"):
+                candidate = request.query_params.get(query_name)
+                if candidate:
+                    raw_value = candidate
+                    source = "query"
+                    break
+
+        if raw_value is None:
+            env_suffix = name.upper()
+            for prefix in METADATA_ENV_PREFIXES:
+                candidate = os.getenv(f"{prefix}_{env_suffix}")
+                if candidate:
+                    raw_value = candidate
+                    source = "env"
+                    break
+
+        labels[name] = sanitize_metadata_value(raw_value)
+        sources[name] = source if raw_value is not None else "default"
+
+    return RequestMetadata(labels=labels, sources=sources)
+
+
+def metric_label_names(*base_labels: str) -> Tuple[str, ...]:
+    return tuple(base_labels) + METADATA_LABEL_NAMES
+
+
+def metric_metadata_labels() -> Dict[str, str]:
+    return dict(get_current_request_metadata().labels)
+
+
+def get_current_request_metadata() -> RequestMetadata:
+    metadata = current_request_metadata.get()
+    if all(source == "default" for source in metadata.sources.values()):
+        return extract_request_metadata(None)
+    return metadata
+
+
+def with_metric_metadata(metric, base_label_count: int):
+    original_labels = metric.labels
+
+    def labels_with_metadata(*labelvalues, **labelkwargs):
+        if labelkwargs:
+            enriched = dict(labelkwargs)
+            for key, value in metric_metadata_labels().items():
+                enriched.setdefault(key, value)
+            return original_labels(**enriched)
+
+        if len(labelvalues) == base_label_count:
+            labelvalues = tuple(labelvalues) + tuple(metric_metadata_labels()[name] for name in METADATA_LABEL_NAMES)
+        return original_labels(*labelvalues)
+
+    metric.labels = labels_with_metadata
+
+    if base_label_count == 0 and hasattr(metric, "observe"):
+        def observe_with_metadata(amount, *args, **kwargs):
+            return metric.labels().observe(amount, *args, **kwargs)
+
+        metric.observe = observe_with_metadata
+
+    if base_label_count == 0 and hasattr(metric, "set"):
+        def set_with_metadata(value):
+            return metric.labels().set(value)
+
+        metric.set = set_with_metadata
+
+    return metric
+
+
+def controller_counter(name: str, description: str, base_labels=()):
+    return with_metric_metadata(Counter(name, description, metric_label_names(*base_labels)), len(base_labels))
+
+
+def controller_gauge(name: str, description: str, base_labels=()):
+    return with_metric_metadata(Gauge(name, description, metric_label_names(*base_labels)), len(base_labels))
+
+
+def controller_histogram(name: str, description: str, base_labels=()):
+    return with_metric_metadata(Histogram(name, description, metric_label_names(*base_labels)), len(base_labels))
+
+
+class StructuredMetadataFormatter(logging.Formatter):
+    def format(self, record):
+        metadata = get_current_request_metadata()
+        payload = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "function": record.funcName,
+            "message": record.getMessage(),
+            "metadata": metadata.labels,
+            "metadata_sources": metadata.sources,
+        }
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, sort_keys=True)
+
+
 logging.basicConfig(
     level=logging.DEBUG,
-    format='[%(asctime)s] [%(levelname)s] [%(funcName)s] %(message)s',
+    format='%(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+for handler in logging.getLogger().handlers:
+    handler.setFormatter(StructuredMetadataFormatter(datefmt='%Y-%m-%d %H:%M:%S'))
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+
+@app.middleware("http")
+async def observability_metadata_middleware(request: Request, call_next):
+    token = current_request_metadata.set(extract_request_metadata(request))
+    try:
+        return await call_next(request)
+    finally:
+        current_request_metadata.reset(token)
 
 NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
@@ -63,40 +233,40 @@ STATE_SCHEMA_VERSION = 2
 
 metrics_collection_task: Optional[asyncio.Task] = None
 
-pod_cpu_usage_percent = Gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',['pod','namespace'])
-pod_memory_usage_bytes = Gauge('pod_memory_usage_bytes','Pod memory usage in bytes',['pod','namespace'])
-pod_memory_usage_percent = Gauge('pod_memory_usage_percent','Pod memory usage as percent of limit',['pod','namespace'])
-pod_network_io_bytes_total = Counter('pod_network_io_bytes_total','Total network I/O bytes',['pod','direction'])
-pod_ready_status = Gauge('pod_ready_status','Is pod ready (0 or 1)',['pod','namespace'])
-proxy_active_connections = Gauge('proxy_active_connections','Active RTMP connections to proxy',['proxy_pod'])
-proxy_bandwidth_mbps = Gauge('proxy_bandwidth_mbps','Current proxy bandwidth in Mbps',['proxy_pod'])
-worker_pods_available = Gauge('worker_pods_available','Available worker pods for allocation',['namespace'])
-stream_proxy_handover_counter = Counter('stream_proxy_handover_total','Total proxy handovers accepted by controller',['stream'])
-handover_attempts_total = Counter('handover_attempts_total', 'Total proxy handover attempts', ['stream'])
-handover_success_total = Counter('handover_success_total', 'Total successful proxy handovers', ['stream'])
-handover_conflict_total = Counter('handover_conflict_total', 'Total conflicting proxy handovers denied', ['stream'])
-stream_started_events_total = Counter('stream_started_events_total', 'Total /streams/started events', ['status', 'reason'])
-stream_ended_events_total = Counter('stream_ended_events_total', 'Total /streams/ended events', ['status', 'reason'])
-stale_ended_events_ignored_total = Counter('stale_ended_events_ignored_total', 'Total stale /streams/ended events ignored without cleanup', ['status', 'reason'])
-idempotent_replay_total = Counter('idempotent_replay_total', 'Total idempotent replays', ['status', 'reason'])
-stream_event_to_controller_seconds = Histogram('stream_event_to_controller_seconds', 'Duration of stream event controller handling in seconds', ['event'])
-stream_registration_duration_seconds = Histogram('stream_registration_duration_seconds', 'Duration of stream registration handling in seconds')
-stream_allocation_duration_seconds = Histogram('stream_allocation_duration_seconds', 'Duration of stream worker allocation handling in seconds')
-worker_create_duration_seconds = Histogram('worker_create_duration_seconds', 'Duration of worker pod creation calls in seconds')
-worker_ready_duration_seconds = Histogram('worker_ready_duration_seconds', 'Duration from worker pod creation request to first Ready observation in seconds')
-stream_release_duration_seconds = Histogram('stream_release_duration_seconds', 'Duration of stream worker release handling in seconds')
-worker_recovery_duration_seconds = Histogram('worker_recovery_duration_seconds', 'Duration of unhealthy worker recovery attempts in seconds')
-proxy_healthcheck_duration_seconds = Histogram('proxy_healthcheck_duration_seconds', 'Duration of proxy healthcheck evaluation in seconds')
-worker_healthcheck_duration_seconds = Histogram('worker_healthcheck_duration_seconds', 'Duration of worker /health probes in seconds')
-stream_event_to_controller_total = Counter('stream_event_to_controller_total', 'Total stream events handled by controller', ['event', 'status', 'reason'])
-stream_registration_total = Counter('stream_registration_total', 'Total stream registration attempts', ['status', 'reason'])
-stream_allocation_total = Counter('stream_allocation_total', 'Total stream allocation attempts', ['status', 'reason'])
-worker_create_total = Counter('worker_create_total', 'Total worker pod creation attempts', ['status', 'reason'])
-worker_ready_total = Counter('worker_ready_total', 'Total worker ready observations', ['status', 'reason'])
-stream_release_total = Counter('stream_release_total', 'Total stream release attempts', ['status', 'reason'])
-worker_recovery_total = Counter('worker_recovery_total', 'Total worker recovery attempts', ['status', 'reason'])
-proxy_healthcheck_total = Counter('proxy_healthcheck_total', 'Total proxy healthcheck evaluations', ['status', 'reason'])
-worker_healthcheck_total = Counter('worker_healthcheck_total', 'Total worker healthcheck probes', ['status', 'reason'])
+pod_cpu_usage_percent = controller_gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',('pod','namespace'))
+pod_memory_usage_bytes = controller_gauge('pod_memory_usage_bytes','Pod memory usage in bytes',('pod','namespace'))
+pod_memory_usage_percent = controller_gauge('pod_memory_usage_percent','Pod memory usage as percent of limit',('pod','namespace'))
+pod_network_io_bytes_total = controller_counter('pod_network_io_bytes_total','Total network I/O bytes',('pod','direction'))
+pod_ready_status = controller_gauge('pod_ready_status','Is pod ready (0 or 1)',('pod','namespace'))
+proxy_active_connections = controller_gauge('proxy_active_connections','Active RTMP connections to proxy',('proxy_pod',))
+proxy_bandwidth_mbps = controller_gauge('proxy_bandwidth_mbps','Current proxy bandwidth in Mbps',('proxy_pod',))
+worker_pods_available = controller_gauge('worker_pods_available','Available worker pods for allocation',('namespace',))
+stream_proxy_handover_counter = controller_counter('stream_proxy_handover_total','Total proxy handovers accepted by controller',('stream',))
+handover_attempts_total = controller_counter('handover_attempts_total', 'Total proxy handover attempts', ('stream',))
+handover_success_total = controller_counter('handover_success_total', 'Total successful proxy handovers', ('stream',))
+handover_conflict_total = controller_counter('handover_conflict_total', 'Total conflicting proxy handovers denied', ('stream',))
+stream_started_events_total = controller_counter('stream_started_events_total', 'Total /streams/started events', ('status', 'reason'))
+stream_ended_events_total = controller_counter('stream_ended_events_total', 'Total /streams/ended events', ('status', 'reason'))
+stale_ended_events_ignored_total = controller_counter('stale_ended_events_ignored_total', 'Total stale /streams/ended events ignored without cleanup', ('status', 'reason'))
+idempotent_replay_total = controller_counter('idempotent_replay_total', 'Total idempotent replays', ('status', 'reason'))
+stream_event_to_controller_seconds = controller_histogram('stream_event_to_controller_seconds', 'Duration of stream event controller handling in seconds', ('event',))
+stream_registration_duration_seconds = controller_histogram('stream_registration_duration_seconds', 'Duration of stream registration handling in seconds')
+stream_allocation_duration_seconds = controller_histogram('stream_allocation_duration_seconds', 'Duration of stream worker allocation handling in seconds')
+worker_create_duration_seconds = controller_histogram('worker_create_duration_seconds', 'Duration of worker pod creation calls in seconds')
+worker_ready_duration_seconds = controller_histogram('worker_ready_duration_seconds', 'Duration from worker pod creation request to first Ready observation in seconds')
+stream_release_duration_seconds = controller_histogram('stream_release_duration_seconds', 'Duration of stream worker release handling in seconds')
+worker_recovery_duration_seconds = controller_histogram('worker_recovery_duration_seconds', 'Duration of unhealthy worker recovery attempts in seconds')
+proxy_healthcheck_duration_seconds = controller_histogram('proxy_healthcheck_duration_seconds', 'Duration of proxy healthcheck evaluation in seconds')
+worker_healthcheck_duration_seconds = controller_histogram('worker_healthcheck_duration_seconds', 'Duration of worker /health probes in seconds')
+stream_event_to_controller_total = controller_counter('stream_event_to_controller_total', 'Total stream events handled by controller', ('event', 'status', 'reason'))
+stream_registration_total = controller_counter('stream_registration_total', 'Total stream registration attempts', ('status', 'reason'))
+stream_allocation_total = controller_counter('stream_allocation_total', 'Total stream allocation attempts', ('status', 'reason'))
+worker_create_total = controller_counter('worker_create_total', 'Total worker pod creation attempts', ('status', 'reason'))
+worker_ready_total = controller_counter('worker_ready_total', 'Total worker ready observations', ('status', 'reason'))
+stream_release_total = controller_counter('stream_release_total', 'Total stream release attempts', ('status', 'reason'))
+worker_recovery_total = controller_counter('worker_recovery_total', 'Total worker recovery attempts', ('status', 'reason'))
+proxy_healthcheck_total = controller_counter('proxy_healthcheck_total', 'Total proxy healthcheck evaluations', ('status', 'reason'))
+worker_healthcheck_total = controller_counter('worker_healthcheck_total', 'Total worker healthcheck probes', ('status', 'reason'))
 worker_create_started_at: Dict[str, float] = {}
 
 try:
