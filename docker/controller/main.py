@@ -59,6 +59,15 @@ current_request_metadata: ContextVar[RequestMetadata] = ContextVar(
     "current_request_metadata",
     default=default_request_metadata(),
 )
+controlled_metric_metadata_cache: Optional[Tuple[Tuple[Optional[str], ...], RequestMetadata]] = None
+
+
+def controlled_metadata_env_snapshot() -> Tuple[Optional[str], ...]:
+    return tuple(
+        os.getenv(f"{prefix}_{name.upper()}")
+        for name in METADATA_LABEL_NAMES
+        for prefix in METADATA_ENV_PREFIXES
+    )
 
 
 def extract_request_metadata(request: Optional[Request] = None) -> RequestMetadata:
@@ -109,9 +118,18 @@ def metric_label_names(*base_labels: str) -> Tuple[str, ...]:
     return tuple(base_labels) + METADATA_LABEL_NAMES
 
 
+def controlled_metric_metadata() -> RequestMetadata:
+    """Returns cached metric metadata from controlled env/default sources only."""
+    global controlled_metric_metadata_cache
+    env_snapshot = controlled_metadata_env_snapshot()
+    if controlled_metric_metadata_cache is None or controlled_metric_metadata_cache[0] != env_snapshot:
+        controlled_metric_metadata_cache = (env_snapshot, extract_request_metadata(None))
+    return controlled_metric_metadata_cache[1]
+
+
 def metric_metadata_labels() -> Dict[str, str]:
     """Returns controlled metric label values that never come from request input."""
-    return dict(extract_request_metadata(None).labels)
+    return dict(controlled_metric_metadata().labels)
 
 
 def get_current_request_metadata() -> RequestMetadata:
@@ -122,6 +140,12 @@ def get_current_request_metadata() -> RequestMetadata:
 
 
 def with_metric_metadata(metric, base_label_count: int):
+    """Attach controlled metadata labels to a prometheus_client metric.
+
+    The returned metric keeps the prometheus_client API surface used in this
+    module, but request-supplied metadata labels are always overwritten with
+    controlled env/default values to avoid unbounded Prometheus cardinality.
+    """
     original_labels = metric.labels
 
     def labels_with_metadata(*labelvalues, **labelkwargs):
@@ -137,6 +161,12 @@ def with_metric_metadata(metric, base_label_count: int):
             labelvalues = tuple(labelvalues) + metadata_values
         elif len(labelvalues) == base_label_count + len(METADATA_LABEL_NAMES):
             labelvalues = tuple(labelvalues[:base_label_count]) + metadata_values
+        else:
+            expected_with_metadata = base_label_count + len(METADATA_LABEL_NAMES)
+            raise ValueError(
+                f"Incorrect label count: got {len(labelvalues)}, "
+                f"expected {base_label_count} base labels or {expected_with_metadata} labels including metadata"
+            )
         return original_labels(*labelvalues)
 
     metric.labels = labels_with_metadata
@@ -185,14 +215,13 @@ class StructuredMetadataFormatter(logging.Formatter):
         return json.dumps(payload, sort_keys=True)
 
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-for handler in logging.getLogger().handlers:
-    handler.setFormatter(StructuredMetadataFormatter(datefmt='%Y-%m-%d %H:%M:%S'))
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.propagate = False
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler())
+for handler in logger.handlers:
+    handler.setFormatter(StructuredMetadataFormatter(datefmt='%Y-%m-%d %H:%M:%S'))
 
 app = FastAPI()
 
@@ -217,7 +246,7 @@ worker_to_stream: Dict[str, str] = {}
 
 stream_to_proxy: Dict[str, str] = {}
 stream_generation: Dict[str, int] = {}
-stream_registry: Dict[str, Dict[str, float]] = {}
+stream_registry: Dict[str, Dict[str, str]] = {}
 
 registry_health_task: Optional[asyncio.Task] = None
 worker_health_task: Optional[asyncio.Task] = None

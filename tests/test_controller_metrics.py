@@ -1,5 +1,7 @@
 import asyncio
 import importlib.util
+import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -26,6 +28,7 @@ def reset_state():
     main.worker_health_failures.clear()
     main.worker_pod_uid_by_name.clear()
     main.worker_create_started_at.clear()
+    main.controlled_metric_metadata_cache = None
 
 
 def counter_value(counter, **labels):
@@ -102,6 +105,63 @@ def test_blank_metadata_uses_default_when_no_fallback(monkeypatch):
 
     assert metadata.labels['tenant'] == 'unknown'
     assert metadata.sources['tenant'] == 'default'
+
+
+def test_metric_wrapper_rejects_incorrect_positional_label_count():
+    with pytest.raises(ValueError, match="Incorrect label count"):
+        main.stream_registration_total.labels('success', 'reason', 'tenant-only', 'environment-only')
+
+
+def test_structured_formatter_includes_request_metadata():
+    metadata = main.RequestMetadata(
+        labels={'tenant': 'tenant-a', 'environment': 'stage', 'region': 'us-east-1'},
+        sources={'tenant': 'header', 'environment': 'query', 'region': 'env'},
+    )
+    record = logging.LogRecord(
+        name='controller_main',
+        level=logging.INFO,
+        pathname='docker/controller/main.py',
+        lineno=1,
+        msg='metadata check',
+        args=(),
+        exc_info=None,
+    )
+    token = main.current_request_metadata.set(metadata)
+    try:
+        payload = json.loads(main.StructuredMetadataFormatter().format(record))
+    finally:
+        main.current_request_metadata.reset(token)
+
+    assert payload['metadata'] == metadata.labels
+    assert payload['metadata_sources'] == metadata.sources
+
+
+def test_observability_metadata_middleware_sets_and_resets_context(monkeypatch):
+    monkeypatch.setenv('LIVEEDGECAST_REGION', 'env-region')
+    request = SimpleNamespace(
+        headers={'x-liveedgecast-tenant': 'tenant-a'},
+        query_params={'environment': 'stage'},
+    )
+    seen_metadata = None
+
+    async def call_next(_request):
+        nonlocal seen_metadata
+        seen_metadata = main.current_request_metadata.get()
+        return {'status': 'ok'}
+
+    result = asyncio.run(main.observability_metadata_middleware(request, call_next))
+
+    assert result == {'status': 'ok'}
+    assert seen_metadata.labels == {
+        'tenant': 'tenant-a',
+        'environment': 'stage',
+        'region': 'env-region',
+    }
+    assert main.current_request_metadata.get().labels == {
+        'tenant': 'unknown',
+        'environment': 'unknown',
+        'region': 'unknown',
+    }
 
 
 def test_metrics_ignore_request_metadata_context_and_use_controlled_env(monkeypatch):

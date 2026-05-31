@@ -6,7 +6,9 @@ and controlled metadata labels to controller-owned Prometheus metrics emitted by
 
 ## Allowed metadata labels
 
-Only these labels are propagated to metrics:
+Only these label names are propagated to metrics. Metric label values are
+resolved only from environment variables or the controlled default; header and
+query values are log-only.
 
 | Label | Purpose | Controlled default |
 | --- | --- | --- |
@@ -44,7 +46,8 @@ supply `X-Tenant` by header while `region` falls back to `LIVEEDGECAST_REGION`.
 
 ## Metrics and logs
 
-All controller logs are emitted as JSON and include two metadata objects:
+Controller logs emitted by `docker/controller/main.py` are JSON-formatted and
+include two metadata objects:
 
 - `metadata`: the resolved `tenant`, `environment`, and `region` values using
   the full precedence above.
