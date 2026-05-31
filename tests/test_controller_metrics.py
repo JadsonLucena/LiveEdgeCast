@@ -125,9 +125,27 @@ def test_metric_wrapper_rejects_mixed_positional_and_keyword_labels():
         main.stream_registration_total.labels('success', reason='mixed')
 
 
-def test_labeled_metric_rejects_direct_observe():
+def test_labeled_metric_rejects_direct_inc_and_observe():
+    with pytest.raises(ValueError, match="Direct inc"):
+        main.stream_registration_total.inc()
     with pytest.raises(ValueError, match="Direct observe"):
         main.stream_event_to_controller_seconds.observe(0.1)
+
+
+def test_unlabeled_counter_direct_inc_uses_controlled_metadata(monkeypatch):
+    main.reset_controlled_metric_metadata_cache()
+    monkeypatch.setenv('LIVEEDGECAST_TENANT', 'counter-tenant')
+    counter = main.controller_counter('test_direct_inc_counter', 'Test direct inc counter')
+    labels = {
+        'tenant': 'counter-tenant',
+        'environment': 'unknown',
+        'region': 'unknown',
+    }
+    before = sample_value(counter, 'test_direct_inc_counter_total', labels)
+
+    counter.inc()
+
+    assert sample_value(counter, 'test_direct_inc_counter_total', labels) == before + 1
 
 
 def test_app_lifespan_starts_and_cancels_background_tasks():

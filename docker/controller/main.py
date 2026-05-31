@@ -180,14 +180,28 @@ class ControlledMetadataMetric:
             )
         return self._metric.labels(*labelvalues)
 
+    def inc(self, amount: float = 1, exemplar: Optional[Dict[str, str]] = None):
+        if self._base_label_count != 0:
+            raise ValueError(
+                "Direct inc is only valid for metrics without base labels; "
+                "call labels(...).inc(...) instead"
+            )
+        return self.labels().inc(amount, exemplar=exemplar)
+
     def observe(self, amount, *args, **kwargs):
         if self._base_label_count != 0:
-            raise ValueError("Direct observe is only valid for metrics without base labels; call labels(...).observe(...) instead")
+            raise ValueError(
+                "Direct observe is only valid for metrics without base labels; "
+                "call labels(...).observe(...) instead"
+            )
         return self.labels().observe(amount, *args, **kwargs)
 
     def set(self, value):
         if self._base_label_count != 0:
-            raise ValueError("Direct set is only valid for metrics without base labels; call labels(...).set(...) instead")
+            raise ValueError(
+                "Direct set is only valid for metrics without base labels; "
+                "call labels(...).set(...) instead"
+            )
         return self.labels().set(value)
 
     def collect(self):
