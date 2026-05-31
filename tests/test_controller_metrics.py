@@ -3,7 +3,7 @@ import importlib.util
 import json
 import logging
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -28,7 +28,7 @@ def reset_state():
     main.worker_health_failures.clear()
     main.worker_pod_uid_by_name.clear()
     main.worker_create_started_at.clear()
-    main.controlled_metric_metadata_cache = None
+    main.reset_controlled_metric_metadata_cache()
 
 
 def counter_value(counter, **labels):
@@ -70,6 +70,14 @@ def test_metadata_extraction_precedence_and_sanitization(monkeypatch):
         'environment': 'query',
         'region': 'env',
     }
+
+
+def test_request_metadata_is_immutable():
+    metadata = main.default_request_metadata()
+
+    assert isinstance(metadata.labels, MappingProxyType)
+    with pytest.raises(TypeError):
+        metadata.labels['tenant'] = 'changed'
 
 
 def test_blank_higher_priority_metadata_falls_back(monkeypatch):
@@ -165,6 +173,7 @@ def test_observability_metadata_middleware_sets_and_resets_context(monkeypatch):
 
 
 def test_metrics_ignore_request_metadata_context_and_use_controlled_env(monkeypatch):
+    main.reset_controlled_metric_metadata_cache()
     monkeypatch.setenv('LIVEEDGECAST_TENANT', 'configured-tenant')
     monkeypatch.setenv('LIVEEDGECAST_ENVIRONMENT', 'prod')
     monkeypatch.setenv('LIVEEDGECAST_REGION', 'us-east-1')

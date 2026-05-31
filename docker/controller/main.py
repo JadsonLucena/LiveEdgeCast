@@ -14,7 +14,8 @@ import os
 import re
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from types import MappingProxyType
+from typing import Dict, Mapping, Optional, Tuple
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from fastapi.responses import Response
 
@@ -30,8 +31,12 @@ METADATA_MAX_LENGTH = 64
 
 @dataclass(frozen=True)
 class RequestMetadata:
-    labels: Dict[str, str]
-    sources: Dict[str, str]
+    labels: Mapping[str, str]
+    sources: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "labels", MappingProxyType(dict(self.labels)))
+        object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
 
 
 def sanitize_metadata_value(value: Optional[str]) -> str:
@@ -59,15 +64,7 @@ current_request_metadata: ContextVar[RequestMetadata] = ContextVar(
     "current_request_metadata",
     default=default_request_metadata(),
 )
-controlled_metric_metadata_cache: Optional[Tuple[Tuple[Optional[str], ...], RequestMetadata]] = None
-
-
-def controlled_metadata_env_snapshot() -> Tuple[Optional[str], ...]:
-    return tuple(
-        os.getenv(f"{prefix}_{name.upper()}")
-        for name in METADATA_LABEL_NAMES
-        for prefix in METADATA_ENV_PREFIXES
-    )
+controlled_metric_metadata_cache: Optional[RequestMetadata] = None
 
 
 def extract_request_metadata(request: Optional[Request] = None) -> RequestMetadata:
@@ -118,13 +115,21 @@ def metric_label_names(*base_labels: str) -> Tuple[str, ...]:
     return tuple(base_labels) + METADATA_LABEL_NAMES
 
 
-def controlled_metric_metadata() -> RequestMetadata:
-    """Returns cached metric metadata from controlled env/default sources only."""
+def reset_controlled_metric_metadata_cache() -> None:
     global controlled_metric_metadata_cache
-    env_snapshot = controlled_metadata_env_snapshot()
-    if controlled_metric_metadata_cache is None or controlled_metric_metadata_cache[0] != env_snapshot:
-        controlled_metric_metadata_cache = (env_snapshot, extract_request_metadata(None))
-    return controlled_metric_metadata_cache[1]
+    controlled_metric_metadata_cache = None
+
+
+def controlled_metric_metadata() -> RequestMetadata:
+    """Returns metric metadata from controlled env/default sources only.
+
+    Environment variables are process-level configuration for the controller pod,
+    so metric label values are resolved once and cached for hot paths.
+    """
+    global controlled_metric_metadata_cache
+    if controlled_metric_metadata_cache is None:
+        controlled_metric_metadata_cache = extract_request_metadata(None)
+    return controlled_metric_metadata_cache
 
 
 def metric_metadata_labels() -> Dict[str, str]:
@@ -207,8 +212,8 @@ class StructuredMetadataFormatter(logging.Formatter):
             "logger": record.name,
             "function": record.funcName,
             "message": record.getMessage(),
-            "metadata": metadata.labels,
-            "metadata_sources": metadata.sources,
+            "metadata": dict(metadata.labels),
+            "metadata_sources": dict(metadata.sources),
         }
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)

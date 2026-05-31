@@ -59,4 +59,7 @@ original metric-specific labels, but metric label values never come from HTTP
 headers or query parameters. Metrics use only the controlled configuration branch
 (environment variables) and then the controlled default (`unknown`). This prevents
 request-controlled values from creating unbounded Prometheus time series while
-logs remain auditable for request-supplied metadata.
+logs remain auditable for request-supplied metadata. If your log backend
+automatically indexes JSON fields, do not promote request-sourced `metadata.*`
+values (`metadata_sources` of `header` or `query`) to labels/indexes without an
+allowlist.
