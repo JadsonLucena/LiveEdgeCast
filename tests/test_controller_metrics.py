@@ -104,26 +104,49 @@ def test_blank_metadata_uses_default_when_no_fallback(monkeypatch):
     assert metadata.sources['tenant'] == 'default'
 
 
-def test_metrics_use_current_metadata_context():
+def test_metrics_ignore_request_metadata_context_and_use_controlled_env(monkeypatch):
+    monkeypatch.setenv('LIVEEDGECAST_TENANT', 'configured-tenant')
+    monkeypatch.setenv('LIVEEDGECAST_ENVIRONMENT', 'prod')
+    monkeypatch.setenv('LIVEEDGECAST_REGION', 'us-east-1')
     metadata = main.RequestMetadata(
-        labels={'tenant': 'tenant-a', 'environment': 'prod', 'region': 'us-east-1'},
+        labels={'tenant': 'request-tenant', 'environment': 'request-env', 'region': 'request-region'},
         sources={'tenant': 'header', 'environment': 'header', 'region': 'header'},
     )
     labels = {'status': 'success', 'reason': 'metadata_context'}
-    before = counter_value(main.stream_registration_total, **labels)
+    controlled_labels = {
+        **labels,
+        'tenant': 'configured-tenant',
+        'environment': 'prod',
+        'region': 'us-east-1',
+    }
+    request_labels = {
+        **labels,
+        'tenant': 'request-tenant',
+        'environment': 'request-env',
+        'region': 'request-region',
+    }
+    before = sample_value(
+        main.stream_registration_total,
+        'stream_registration_total',
+        controlled_labels,
+    )
     token = main.current_request_metadata.set(metadata)
     try:
         main.stream_registration_total.labels(**labels).inc()
+        main.stream_registration_total.labels(**request_labels).inc()
     finally:
         main.current_request_metadata.reset(token)
 
-    assert counter_value(
+    assert sample_value(
         main.stream_registration_total,
-        **labels,
-        tenant='tenant-a',
-        environment='prod',
-        region='us-east-1',
-    ) == before + 1
+        'stream_registration_total',
+        controlled_labels,
+    ) == before + 2
+    assert sample_value(
+        main.stream_registration_total,
+        'stream_registration_total',
+        request_labels,
+    ) == 0
 
 
 def test_stream_started_success_and_replay_metrics():

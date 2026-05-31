@@ -1,7 +1,7 @@
 # Controller metrics observability metadata
 
-The controller attaches the same low-cardinality observability metadata to every
-controller-owned Prometheus metric and to every structured log line emitted by
+The controller attaches low-cardinality observability metadata to structured logs
+and controlled metadata labels to controller-owned Prometheus metrics emitted by
 `docker/controller/main.py`.
 
 ## Allowed metadata labels
@@ -20,9 +20,9 @@ empty resolved values become `unknown`, unsupported characters are replaced with
 `_`, and values are capped at 64 characters. This keeps labels bounded and
 prevents accidental high-cardinality metadata from becoming Prometheus labels.
 
-## Precedence
+## Structured log metadata precedence
 
-For each allowed label, the controller resolves metadata in this exact order:
+For each allowed label in structured logs, the controller resolves metadata in this exact order:
 
 1. **HTTP headers**
    - `X-LiveEdgeCast-Tenant`, `X-Tenant`
@@ -44,14 +44,16 @@ supply `X-Tenant` by header while `region` falls back to `LIVEEDGECAST_REGION`.
 
 ## Metrics and logs
 
-All controller metrics include the allowed metadata labels in addition to their
-original metric-specific labels. Background tasks that do not originate from an
-HTTP request use the environment-variable/default branch of the same resolver.
-
 All controller logs are emitted as JSON and include two metadata objects:
 
-- `metadata`: the resolved `tenant`, `environment`, and `region` values.
+- `metadata`: the resolved `tenant`, `environment`, and `region` values using
+  the full precedence above.
 - `metadata_sources`: the source selected for each field (`header`, `query`,
   `env`, or `default`).
 
-This makes the metadata path auditable while keeping metric labels stable.
+Controller metrics include the allowed metadata label names in addition to their
+original metric-specific labels, but metric label values never come from HTTP
+headers or query parameters. Metrics use only the controlled configuration branch
+(environment variables) and then the controlled default (`unknown`). This prevents
+request-controlled values from creating unbounded Prometheus time series while
+logs remain auditable for request-supplied metadata.

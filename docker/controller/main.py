@@ -110,7 +110,8 @@ def metric_label_names(*base_labels: str) -> Tuple[str, ...]:
 
 
 def metric_metadata_labels() -> Dict[str, str]:
-    return dict(get_current_request_metadata().labels)
+    """Returns controlled metric label values that never come from request input."""
+    return dict(extract_request_metadata(None).labels)
 
 
 def get_current_request_metadata() -> RequestMetadata:
@@ -124,14 +125,18 @@ def with_metric_metadata(metric, base_label_count: int):
     original_labels = metric.labels
 
     def labels_with_metadata(*labelvalues, **labelkwargs):
+        metadata_labels = metric_metadata_labels()
         if labelkwargs:
             enriched = dict(labelkwargs)
-            for key, value in metric_metadata_labels().items():
-                enriched.setdefault(key, value)
+            for key, value in metadata_labels.items():
+                enriched[key] = value
             return original_labels(**enriched)
 
+        metadata_values = tuple(metadata_labels[name] for name in METADATA_LABEL_NAMES)
         if len(labelvalues) == base_label_count:
-            labelvalues = tuple(labelvalues) + tuple(metric_metadata_labels()[name] for name in METADATA_LABEL_NAMES)
+            labelvalues = tuple(labelvalues) + metadata_values
+        elif len(labelvalues) == base_label_count + len(METADATA_LABEL_NAMES):
+            labelvalues = tuple(labelvalues[:base_label_count]) + metadata_values
         return original_labels(*labelvalues)
 
     metric.labels = labels_with_metadata
