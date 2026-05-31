@@ -14,10 +14,11 @@ Only these labels are propagated to metrics:
 | `environment` | Deployment environment such as `dev`, `stage`, or `prod`. | `unknown` |
 | `region` | Deployment region or locality bucket. | `unknown` |
 
-Values are sanitized before use in labels and logs: empty values become
-`unknown`, unsupported characters are replaced with `_`, and values are capped at
-64 characters. This keeps labels bounded and prevents accidental high-cardinality
-metadata from becoming Prometheus labels.
+Blank values are ignored during precedence resolution so the resolver can fall
+back to the next source. Values are sanitized before use in labels and logs:
+empty resolved values become `unknown`, unsupported characters are replaced with
+`_`, and values are capped at 64 characters. This keeps labels bounded and
+prevents accidental high-cardinality metadata from becoming Prometheus labels.
 
 ## Precedence
 

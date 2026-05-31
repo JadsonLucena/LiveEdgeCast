@@ -69,6 +69,41 @@ def test_metadata_extraction_precedence_and_sanitization(monkeypatch):
     }
 
 
+def test_blank_higher_priority_metadata_falls_back(monkeypatch):
+    monkeypatch.setenv('LIVEEDGECAST_TENANT', 'env-tenant')
+    request = SimpleNamespace(
+        headers={
+            'x-liveedgecast-tenant': '   ',
+        },
+        query_params={
+            'tenant': 'query-tenant',
+        },
+    )
+
+    metadata = main.extract_request_metadata(request)
+
+    assert metadata.labels['tenant'] == 'query-tenant'
+    assert metadata.sources['tenant'] == 'query'
+
+
+def test_blank_metadata_uses_default_when_no_fallback(monkeypatch):
+    monkeypatch.delenv('LIVEEDGECAST_TENANT', raising=False)
+    monkeypatch.delenv('CONTROLLER_METADATA_TENANT', raising=False)
+    request = SimpleNamespace(
+        headers={
+            'x-liveedgecast-tenant': '   ',
+        },
+        query_params={
+            'tenant': '',
+        },
+    )
+
+    metadata = main.extract_request_metadata(request)
+
+    assert metadata.labels['tenant'] == 'unknown'
+    assert metadata.sources['tenant'] == 'default'
+
+
 def test_metrics_use_current_metadata_context():
     metadata = main.RequestMetadata(
         labels={'tenant': 'tenant-a', 'environment': 'prod', 'region': 'us-east-1'},

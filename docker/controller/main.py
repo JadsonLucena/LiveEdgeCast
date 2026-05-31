@@ -41,6 +41,13 @@ def sanitize_metadata_value(value: Optional[str]) -> str:
     return sanitized or METADATA_DEFAULT_VALUE
 
 
+def non_blank_metadata_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def default_request_metadata() -> RequestMetadata:
     return RequestMetadata(
         labels={name: METADATA_DEFAULT_VALUE for name in METADATA_LABEL_NAMES},
@@ -69,16 +76,16 @@ def extract_request_metadata(request: Optional[Request] = None) -> RequestMetada
         if request is not None:
             for prefix in METADATA_HEADER_PREFIXES:
                 header_name = f"{prefix}-{name}"
-                candidate = request.headers.get(header_name)
-                if candidate:
+                candidate = non_blank_metadata_value(request.headers.get(header_name))
+                if candidate is not None:
                     raw_value = candidate
                     source = "header"
                     break
 
         if raw_value is None and request is not None:
             for query_name in (name, f"{METADATA_QUERY_PREFIX}{name}"):
-                candidate = request.query_params.get(query_name)
-                if candidate:
+                candidate = non_blank_metadata_value(request.query_params.get(query_name))
+                if candidate is not None:
                     raw_value = candidate
                     source = "query"
                     break
@@ -86,8 +93,8 @@ def extract_request_metadata(request: Optional[Request] = None) -> RequestMetada
         if raw_value is None:
             env_suffix = name.upper()
             for prefix in METADATA_ENV_PREFIXES:
-                candidate = os.getenv(f"{prefix}_{env_suffix}")
-                if candidate:
+                candidate = non_blank_metadata_value(os.getenv(f"{prefix}_{env_suffix}"))
+                if candidate is not None:
                     raw_value = candidate
                     source = "env"
                     break
