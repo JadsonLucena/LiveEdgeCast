@@ -1184,12 +1184,13 @@ def cleanup_stale_proxy_rtmp_stats_metrics(active_proxy_pods: Iterable[str]) -> 
 
 
 def list_proxy_pods_for_stats() -> List[Tuple[str, str]]:
+def list_proxy_pods_for_stats() -> List[Tuple[str, str]]:
     pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=proxy").items
     proxy_pods: List[Tuple[str, str]] = []
     for pod in pods:
         name = (pod.metadata.name or "").strip() if pod.metadata else ""
         pod_ip = (pod.status.pod_ip or "").strip() if pod.status else ""
-        if name:
+        if name and pod_ip:
             proxy_pods.append((name, pod_ip))
     return proxy_pods
 
