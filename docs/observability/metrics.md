@@ -64,3 +64,31 @@ logs remain auditable for request-supplied metadata. If your log backend
 automatically indexes JSON fields, do not promote request-sourced `metadata.*`
 values (`metadata_sources` of `header` or `query`) to labels/indexes without an
 allowlist.
+
+## Proxy RTMP `/stats` metrics
+
+The controller also starts a background asynchronous scraper for every pod labeled
+`app=proxy` in the `media` namespace. Each interval it queries
+`http://<proxy-pod-ip>:8080/stats`, parses either the default NGINX RTMP XML
+output or a JSON representation of the same shape, and publishes per-proxy
+aggregate gauges:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `proxy_rtmp_active_streams` | `proxy_pod` plus controlled metadata | Number of active `<stream>` entries on the proxy. |
+| `proxy_rtmp_active_publishers` | `proxy_pod` plus controlled metadata | Number of RTMP clients marked as publishers by the `/stats` payload. |
+| `proxy_rtmp_active_clients` | `proxy_pod` plus controlled metadata | Number of RTMP `<client>` entries on the proxy. |
+| `proxy_rtmp_stream_active` | `proxy_pod` plus controlled metadata | `1` when at least one stream is active on the proxy, otherwise `0`. |
+| `proxy_rtmp_stats_up` | `proxy_pod` plus controlled metadata | `1` when the latest per-proxy `/stats` scrape succeeded, otherwise `0`. |
+| `proxy_rtmp_stats_scrape_errors_total` | `proxy_pod` plus controlled metadata | Total failures fetching or parsing an individual proxy `/stats` response. |
+| `proxy_rtmp_stats_discovery_errors_total` | Controlled metadata only | Total failures listing proxy pods before per-proxy scraping can start. |
+
+The scraper intentionally aggregates by `proxy_pod` only. NGINX RTMP stream names
+can contain the `streamKey`, so stream names are parsed only to count aggregate
+activity and are never emitted as Prometheus labels. If a per-proxy scrape fails,
+the controller sets `proxy_rtmp_stats_up` to `0`, increments
+`proxy_rtmp_stats_scrape_errors_total`, and keeps the last successful activity
+values instead of converting an unknown scrape result into zero active streams.
+When a proxy pod disappears from Kubernetes discovery, the controller removes
+that pod's RTMP metric series to avoid stale values after rollouts or
+reschedules.
