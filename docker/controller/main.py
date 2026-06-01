@@ -742,18 +742,17 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
         )
         stream_generation[stream] = stream_generation.get(stream, 1) + 1
         register_or_refresh_stream(stream, candidate_proxy_pod)
+        # PROXY_DNS é env de Pod; para atualizar em reconexão/handover, recria o worker.
+        proxy_dns = resolve_proxy_address(candidate_proxy_pod)
+        if stream in stream_to_worker:
+            replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
+
         log_controller_event(
             "handover_accepted",
             stream=stream,
             proxy_pod=candidate_proxy_pod,
             status="accepted",
         )
-
-        # PROXY_DNS é env de Pod; para atualizar em reconexão/handover, recria o worker.
-        proxy_dns = resolve_proxy_address(candidate_proxy_pod)
-        if stream in stream_to_worker:
-            replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
-
         handover_success_total.inc()
         stream_proxy_handover_counter.inc()
         return True
@@ -1508,11 +1507,13 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
     metric_reason = "not_found"
 
     worker_name = None
+    owner_proxy = None
     changed = False
     response_status = "not_found"
 
     try:
         with allocation_lock:
+            owner_proxy = stream_registry.get(stream, {}).get("proxy_pod") or stream_to_proxy.get(stream)
             worker_name = stream_to_worker.pop(stream, None)
 
             if worker_name:
@@ -1543,6 +1544,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 log_controller_event(
                     "worker_deleted",
                     stream=stream,
+                    proxy_pod=owner_proxy,
                     worker_pod=worker_name,
                     started_at=started_at,
                     status="deleted",
@@ -1555,6 +1557,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                     log_controller_event(
                         "worker_deleted",
                         stream=stream,
+                        proxy_pod=owner_proxy,
                         worker_pod=worker_name,
                         started_at=started_at,
                         status="already_deleted",
@@ -1565,6 +1568,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                     log_controller_event(
                         "worker_deleted",
                         stream=stream,
+                        proxy_pod=owner_proxy,
                         worker_pod=worker_name,
                         started_at=started_at,
                         status="delete_failed",

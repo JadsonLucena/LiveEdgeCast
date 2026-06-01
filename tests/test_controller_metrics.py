@@ -44,6 +44,26 @@ def sample_value(metric, name, labels=None):
     return 0
 
 
+class JsonCaptureHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.events = []
+        self.setFormatter(main.StructuredMetadataFormatter())
+
+    def emit(self, record):
+        self.events.append(json.loads(self.format(record)))
+
+
+def capture_controller_events(action):
+    handler = JsonCaptureHandler()
+    main.logger.addHandler(handler)
+    try:
+        result = action()
+    finally:
+        main.logger.removeHandler(handler)
+    return result, handler.events
+
+
 def test_metadata_extraction_precedence_and_sanitization(monkeypatch):
     monkeypatch.setenv('LIVEEDGECAST_TENANT', 'env-tenant')
     monkeypatch.setenv('LIVEEDGECAST_ENVIRONMENT', 'prod')
@@ -514,8 +534,17 @@ def test_stream_ended_stale_event_is_ignored_without_releasing_active_state():
     ended_before = counter_value(main.stream_ended_events_total, **ended_labels)
 
     with patch.object(main, 'release_worker', new_callable=AsyncMock) as release_worker:
-        result = asyncio.run(main.stream_ended(stream='live', proxy_pod='proxy-2'))
+        result, events = capture_controller_events(
+            lambda: asyncio.run(main.stream_ended(stream='live', proxy_pod='proxy-2'))
+        )
 
+    event_types = [event['event_type'] for event in events]
+    assert 'stream_ended_received' in event_types
+    assert 'stale_event_ignored' in event_types
+    stale_event = next(event for event in events if event['event_type'] == 'stale_event_ignored')
+    assert stale_event['stream'] == 'live'
+    assert stale_event['proxy_pod'] == 'proxy-2'
+    assert stale_event['status'] == 'ignored'
     assert result['status'] == 'stale_ended_ignored'
     assert counter_value(main.stale_ended_events_ignored_total, **stale_labels) == stale_before + 1
     assert counter_value(main.stream_ended_events_total, **ended_labels) == ended_before + 1
@@ -597,6 +626,99 @@ def test_release_worker_pod_not_found_is_idempotent_metric_path():
     assert counter_value(main.stream_release_total, **already_deleted_labels) == already_deleted_before + 1
     assert counter_value(main.stream_release_total, **failed_labels) == failed_before
     warning_log.assert_not_called()
+
+
+def test_create_worker_pod_emits_worker_create_events_without_stream_label():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_to_proxy['live'] = 'proxy-1'
+    main.stream_generation['live'] = 1
+    container = SimpleNamespace(env=[])
+    template = SimpleNamespace(
+        spec=SimpleNamespace(containers=[container]),
+        metadata=SimpleNamespace(labels={'app': 'worker'}),
+    )
+    deployment = SimpleNamespace(spec=SimpleNamespace(template=template))
+
+    with patch.object(main, 'random_suffix', return_value='abcde'), \
+         patch.object(main.apps, 'read_namespaced_deployment', return_value=deployment), \
+         patch.object(main.core, 'create_namespaced_pod') as create_pod:
+        pod_name, events = capture_controller_events(
+            lambda: main.create_worker_pod_for_stream(stream='live', proxy_dns='10.0.0.1')
+        )
+
+    assert pod_name == 'worker-live-abcde'
+    pod_manifest = create_pod.call_args.kwargs['body']
+    assert pod_manifest.metadata.labels == {'app': 'worker'}
+    event_types = [event['event_type'] for event in events]
+    assert 'worker_create_requested' in event_types
+    assert 'worker_created' in event_types
+    for event_type in ('worker_create_requested', 'worker_created'):
+        event = next(event for event in events if event['event_type'] == event_type)
+        assert event['stream'] == 'live'
+        assert event['proxy_pod'] == 'proxy-1'
+        assert event['worker_pod'] == 'worker-live-abcde'
+
+
+def test_release_worker_delete_event_includes_proxy_context():
+    reset_state()
+    main.stream_to_worker['live'] = 'worker-a'
+    main.worker_to_stream['worker-a'] = 'live'
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_to_proxy['live'] = 'proxy-1'
+    main.stream_generation['live'] = 1
+
+    with patch.object(main, 'persist_state_locked', return_value=None), \
+         patch.object(main.core, 'delete_namespaced_pod'):
+        result, events = capture_controller_events(lambda: asyncio.run(main.release_worker(stream='live')))
+
+    assert result['status'] == 'released'
+    delete_event = next(event for event in events if event['event_type'] == 'worker_deleted')
+    assert delete_event['stream'] == 'live'
+    assert delete_event['proxy_pod'] == 'proxy-1'
+    assert delete_event['worker_pod'] == 'worker-a'
+    assert delete_event['status'] == 'deleted'
+
+
+def test_handover_accepted_emitted_after_worker_replacement_succeeds():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
+    main.stream_to_proxy['live'] = 'proxy-old'
+    main.stream_to_worker['live'] = 'worker-old'
+    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
+
+    with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
+         patch.object(main, 'replace_worker_pod_for_stream_locked', return_value='worker-new') as replace_worker:
+        result, events = capture_controller_events(
+            lambda: main.try_handover_stream_owner('live', 'proxy-new')
+        )
+
+    assert result is True
+    replace_worker.assert_called_once_with(stream='live', proxy_dns='10.0.0.2')
+    accepted_event = next(event for event in events if event['event_type'] == 'handover_accepted')
+    assert accepted_event['stream'] == 'live'
+    assert accepted_event['proxy_pod'] == 'proxy-new'
+    assert accepted_event['status'] == 'accepted'
+
+
+def test_handover_accepted_not_emitted_when_worker_replacement_fails():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
+    main.stream_to_proxy['live'] = 'proxy-old'
+    main.stream_to_worker['live'] = 'worker-old'
+    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
+
+    handler = JsonCaptureHandler()
+    main.logger.addHandler(handler)
+    try:
+        with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
+             patch.object(main, 'replace_worker_pod_for_stream_locked', side_effect=RuntimeError('replace failed')):
+            with pytest.raises(RuntimeError, match='replace failed'):
+                main.try_handover_stream_owner('live', 'proxy-new')
+    finally:
+        main.logger.removeHandler(handler)
+
+    assert 'handover_accepted' not in [event['event_type'] for event in handler.events]
 
 
 def test_allocate_worker_clears_ready_timestamp_for_concurrent_discard():
