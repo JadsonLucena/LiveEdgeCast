@@ -597,14 +597,22 @@ def test_release_worker_api_error_metric_path():
     reset_state()
     main.stream_to_worker['live'] = 'worker-a'
     main.worker_to_stream['worker-a'] = 'live'
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_to_proxy['live'] = 'proxy-1'
     release_labels = {"status": "warning", "reason": "delete_failed"}
     release_before = counter_value(main.stream_release_total, **release_labels)
     release_duration_before = sample_value(main.stream_release_duration_seconds, "stream_release_duration_seconds_count")
 
     with patch.object(main, 'persist_state_locked', return_value=None), \
          patch.object(main.core, 'delete_namespaced_pod', side_effect=ApiException(status=500)):
-        assert asyncio.run(main.release_worker(stream='live'))['status'] == 'released'
+        result, events = capture_controller_events(lambda: asyncio.run(main.release_worker(stream='live')))
 
+    assert result['status'] == 'released'
+    delete_event = next(event for event in events if event['event_type'] == 'worker_deleted')
+    assert delete_event['stream'] == 'live'
+    assert delete_event['proxy_pod'] == 'proxy-1'
+    assert delete_event['worker_pod'] == 'worker-a'
+    assert delete_event['status'] == 'delete_failed'
     assert counter_value(main.stream_release_total, **release_labels) == release_before + 1
     assert sample_value(main.stream_release_duration_seconds, "stream_release_duration_seconds_count") == release_duration_before + 1
 
@@ -719,6 +727,48 @@ def test_handover_accepted_not_emitted_when_worker_replacement_fails():
         main.logger.removeHandler(handler)
 
     assert 'handover_accepted' not in [event['event_type'] for event in handler.events]
+    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-old'}
+    assert main.stream_to_proxy['live'] == 'proxy-old'
+    assert main.stream_to_worker['live'] == 'worker-old'
+    assert 'proxy-new' not in main.proxy_health_failures
+
+
+def test_handover_accepted_with_real_worker_replacement_updates_worker_state():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
+    main.stream_to_proxy['live'] = 'proxy-old'
+    main.stream_generation['live'] = 1
+    main.stream_to_worker['live'] = 'worker-old'
+    main.worker_to_stream['worker-old'] = 'live'
+    main.worker_ready_since['worker-old'] = 111.0
+    main.worker_create_started_at['worker-old'] = 222.0
+    main.worker_pod_uid_by_name['worker-old'] = 'uid-old'
+    main.worker_health_failures['uid-old'] = 2
+    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
+
+    with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
+         patch.object(main, 'create_worker_pod_for_stream', return_value='worker-new'), \
+         patch.object(main.core, 'delete_namespaced_pod') as delete_pod:
+        result, events = capture_controller_events(
+            lambda: main.try_handover_stream_owner('live', 'proxy-new')
+        )
+
+    assert result is True
+    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-new'}
+    assert main.stream_to_proxy['live'] == 'proxy-new'
+    assert main.stream_generation['live'] == 2
+    assert main.stream_to_worker['live'] == 'worker-new'
+    assert main.worker_to_stream['worker-new'] == 'live'
+    assert 'worker-old' not in main.worker_to_stream
+    assert 'worker-old' not in main.worker_ready_since
+    assert 'worker-old' not in main.worker_create_started_at
+    assert 'uid-old' not in main.worker_health_failures
+    delete_pod.assert_called_once_with(name='worker-old', namespace=main.NAMESPACE, grace_period_seconds=0)
+    accepted_event = next(event for event in events if event['event_type'] == 'handover_accepted')
+    assert accepted_event['stream'] == 'live'
+    assert accepted_event['proxy_pod'] == 'proxy-new'
+    assert accepted_event['generation'] == 2
+    assert accepted_event['status'] == 'accepted'
 
 
 def test_allocate_worker_clears_ready_timestamp_for_concurrent_discard():

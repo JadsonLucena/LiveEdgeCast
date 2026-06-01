@@ -740,12 +740,56 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
             f"[Handover] Stream '{stream}' ownership moved from '{current_owner}' "
             f"to '{candidate_proxy_pod}' (owner_unhealthy={owner_unhealthy})"
         )
-        stream_generation[stream] = stream_generation.get(stream, 1) + 1
-        register_or_refresh_stream(stream, candidate_proxy_pod)
-        # PROXY_DNS é env de Pod; para atualizar em reconexão/handover, recria o worker.
-        proxy_dns = resolve_proxy_address(candidate_proxy_pod)
-        if stream in stream_to_worker:
-            replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
+        previous_generation_present = stream in stream_generation
+        previous_generation = stream_generation.get(stream)
+        previous_registry = dict(current)
+        previous_proxy_present = stream in stream_to_proxy
+        previous_proxy = stream_to_proxy.get(stream)
+        previous_candidate_failures_present = candidate_proxy_pod in proxy_health_failures
+        previous_candidate_failures = proxy_health_failures.get(candidate_proxy_pod)
+        worker_state_snapshot = {
+            "stream_to_worker": dict(stream_to_worker),
+            "worker_to_stream": dict(worker_to_stream),
+            "worker_ready_since": dict(worker_ready_since),
+            "worker_create_started_at": dict(worker_create_started_at),
+            "worker_pod_uid_by_name": dict(worker_pod_uid_by_name),
+            "worker_health_failures": dict(worker_health_failures),
+        }
+
+        try:
+            stream_generation[stream] = stream_generation.get(stream, 1) + 1
+            register_or_refresh_stream(stream, candidate_proxy_pod)
+            # PROXY_DNS é env de Pod; para atualizar em reconexão/handover, recria o worker.
+            proxy_dns = resolve_proxy_address(candidate_proxy_pod)
+            if stream in stream_to_worker:
+                replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
+        except Exception:
+            if previous_generation_present:
+                stream_generation[stream] = previous_generation
+            else:
+                stream_generation.pop(stream, None)
+            stream_registry[stream] = previous_registry
+            if previous_proxy_present:
+                stream_to_proxy[stream] = previous_proxy
+            else:
+                stream_to_proxy.pop(stream, None)
+            if previous_candidate_failures_present:
+                proxy_health_failures[candidate_proxy_pod] = previous_candidate_failures
+            else:
+                proxy_health_failures.pop(candidate_proxy_pod, None)
+            stream_to_worker.clear()
+            stream_to_worker.update(worker_state_snapshot["stream_to_worker"])
+            worker_to_stream.clear()
+            worker_to_stream.update(worker_state_snapshot["worker_to_stream"])
+            worker_ready_since.clear()
+            worker_ready_since.update(worker_state_snapshot["worker_ready_since"])
+            worker_create_started_at.clear()
+            worker_create_started_at.update(worker_state_snapshot["worker_create_started_at"])
+            worker_pod_uid_by_name.clear()
+            worker_pod_uid_by_name.update(worker_state_snapshot["worker_pod_uid_by_name"])
+            worker_health_failures.clear()
+            worker_health_failures.update(worker_state_snapshot["worker_health_failures"])
+            raise
 
         log_controller_event(
             "handover_accepted",
