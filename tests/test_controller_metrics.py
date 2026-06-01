@@ -313,7 +313,7 @@ def test_structured_formatter_includes_request_metadata():
 def test_log_context_extraction_precedence_and_sanitization(monkeypatch):
     monkeypatch.setenv('LIVEEDGECAST_EXPERIMENT_ID', 'env-experiment')
     monkeypatch.setenv('CONTROLLER_SCENARIO', 'env-scenario')
-    monkeypatch.setenv('RUN_ID', 'env-run')
+    monkeypatch.setenv('CONTROLLER_RUN_ID', 'env-run')
     request = SimpleNamespace(
         headers={
             'x-liveedgecast-experiment-id': ' header experiment ',
@@ -335,6 +335,15 @@ def test_log_context_extraction_precedence_and_sanitization(monkeypatch):
         'scenario': 'query',
         'run_id': 'env',
     }
+
+
+def test_log_context_ignores_unprefixed_env(monkeypatch):
+    monkeypatch.setenv('RUN_ID', 'generic-run')
+
+    context = main.extract_log_context(SimpleNamespace(headers={}, query_params={}))
+
+    assert context.values['run_id'] == 'unknown'
+    assert context.sources['run_id'] == 'default'
 
 
 def test_structured_formatter_includes_required_event_fields_and_log_context():
@@ -381,7 +390,7 @@ def test_structured_formatter_includes_required_event_fields_and_log_context():
 
 def test_observability_metadata_middleware_sets_and_resets_context(monkeypatch):
     monkeypatch.setenv('LIVEEDGECAST_REGION', 'env-region')
-    monkeypatch.setenv('RUN_ID', 'env-run')
+    monkeypatch.setenv('CONTROLLER_RUN_ID', 'env-run')
     request = SimpleNamespace(
         headers={
             'x-liveedgecast-tenant': 'tenant-a',
@@ -731,6 +740,46 @@ def test_handover_accepted_not_emitted_when_worker_replacement_fails():
     assert main.stream_to_proxy['live'] == 'proxy-old'
     assert main.stream_to_worker['live'] == 'worker-old'
     assert 'proxy-new' not in main.proxy_health_failures
+
+
+def test_handover_rollback_deletes_new_worker_after_partial_replacement_failure():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
+    main.stream_to_proxy['live'] = 'proxy-old'
+    main.stream_generation['live'] = 1
+    main.stream_to_worker['live'] = 'worker-old'
+    main.worker_to_stream['worker-old'] = 'live'
+    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
+
+    def partial_replacement(stream, proxy_dns):
+        main.stream_to_worker[stream] = 'worker-new'
+        main.worker_to_stream.pop('worker-old', None)
+        main.worker_to_stream['worker-new'] = stream
+        raise RuntimeError('delete old failed')
+
+    handler = JsonCaptureHandler()
+    main.logger.addHandler(handler)
+    try:
+        with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
+             patch.object(main, 'replace_worker_pod_for_stream_locked', side_effect=partial_replacement), \
+             patch.object(main.core, 'delete_namespaced_pod') as delete_pod:
+            with pytest.raises(RuntimeError, match='delete old failed'):
+                main.try_handover_stream_owner('live', 'proxy-new')
+    finally:
+        main.logger.removeHandler(handler)
+
+    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-old'}
+    assert main.stream_to_proxy['live'] == 'proxy-old'
+    assert main.stream_generation['live'] == 1
+    assert main.stream_to_worker['live'] == 'worker-old'
+    assert main.worker_to_stream['worker-old'] == 'live'
+    assert 'worker-new' not in main.worker_to_stream
+    delete_pod.assert_called_once_with(name='worker-new', namespace=main.NAMESPACE, grace_period_seconds=0)
+    cleanup_event = next(event for event in handler.events if event['event_type'] == 'worker_deleted')
+    assert cleanup_event['stream'] == 'live'
+    assert cleanup_event['proxy_pod'] == 'proxy-new'
+    assert cleanup_event['worker_pod'] == 'worker-new'
+    assert cleanup_event['status'] == 'deleted'
 
 
 def test_handover_accepted_with_real_worker_replacement_updates_worker_state():

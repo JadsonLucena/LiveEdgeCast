@@ -43,7 +43,7 @@ LOG_EVENT_FIELDS: Tuple[str, ...] = (
     "status",
 )
 LOG_CONTEXT_FIELDS: Tuple[str, ...] = ("experiment_id", "scenario", "run_id")
-LOG_CONTEXT_ENV_PREFIXES: Tuple[str, ...] = ("LIVEEDGECAST", "CONTROLLER", "")
+LOG_CONTEXT_ENV_PREFIXES: Tuple[str, ...] = ("LIVEEDGECAST", "CONTROLLER")
 LOG_CONTEXT_DEFAULT_VALUE = "unknown"
 
 
@@ -714,7 +714,7 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
 
 def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
     """
-    Ownership rule with safe handover:
+    Ownership rule with safe handover. Must be called while holding allocation_lock.
     - idempotent: if already owned by candidate_proxy_pod, just refresh
     - handover allowed if previous owner is ineligible by any criterion:
       proxy unhealthy/dead
@@ -764,6 +764,12 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
             if stream in stream_to_worker:
                 replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
         except Exception:
+            created_worker_to_delete = None
+            current_worker = stream_to_worker.get(stream)
+            previous_worker = worker_state_snapshot["stream_to_worker"].get(stream)
+            if current_worker and current_worker != previous_worker:
+                created_worker_to_delete = current_worker
+
             if previous_generation_present:
                 stream_generation[stream] = previous_generation
             else:
@@ -789,6 +795,28 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
             worker_pod_uid_by_name.update(worker_state_snapshot["worker_pod_uid_by_name"])
             worker_health_failures.clear()
             worker_health_failures.update(worker_state_snapshot["worker_health_failures"])
+            if created_worker_to_delete:
+                try:
+                    core.delete_namespaced_pod(name=created_worker_to_delete, namespace=NAMESPACE, grace_period_seconds=0)
+                    log_controller_event(
+                        "worker_deleted",
+                        stream=stream,
+                        proxy_pod=candidate_proxy_pod,
+                        worker_pod=created_worker_to_delete,
+                        status="deleted",
+                    )
+                except Exception as cleanup_error:
+                    log_controller_event(
+                        "worker_deleted",
+                        stream=stream,
+                        proxy_pod=candidate_proxy_pod,
+                        worker_pod=created_worker_to_delete,
+                        status="delete_failed",
+                        level=logging.WARNING,
+                    )
+                    logger.warning(
+                        f"[Handover] Failed deleting rolled-back worker pod {created_worker_to_delete}: {cleanup_error}"
+                    )
             raise
 
         log_controller_event(
@@ -1373,6 +1401,7 @@ async def sweep_orphan_workers():
                 continue
 
             logger.warning(f"[OrphanSweeper] Deleting orphan worker pod '{pod_name}'")
+            # Orphan workers have no stream/proxy mapping; required event keys remain present with null context.
             try:
                 core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
                 log_controller_event("worker_deleted", worker_pod=pod_name, status="deleted")
