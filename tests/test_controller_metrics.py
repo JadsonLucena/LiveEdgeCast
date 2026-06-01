@@ -259,6 +259,11 @@ def test_fastapi_middleware_sets_context_for_asgi_request(monkeypatch):
         'environment': 'unknown',
         'region': 'unknown',
     }
+    assert main.current_log_context.get().values == {
+        'experiment_id': 'unknown',
+        'scenario': 'unknown',
+        'run_id': 'unknown',
+    }
 
 
 def test_structured_formatter_includes_request_metadata():
@@ -285,17 +290,95 @@ def test_structured_formatter_includes_request_metadata():
     assert payload['metadata_sources'] == metadata.sources
 
 
+def test_log_context_extraction_precedence_and_sanitization(monkeypatch):
+    monkeypatch.setenv('LIVEEDGECAST_EXPERIMENT_ID', 'env-experiment')
+    monkeypatch.setenv('CONTROLLER_SCENARIO', 'env-scenario')
+    monkeypatch.setenv('RUN_ID', 'env-run')
+    request = SimpleNamespace(
+        headers={
+            'x-liveedgecast-experiment-id': ' header experiment ',
+        },
+        query_params={
+            'scenario': 'query*scenario',
+        },
+    )
+
+    context = main.extract_log_context(request)
+
+    assert context.values == {
+        'experiment_id': 'header_experiment',
+        'scenario': 'query_scenario',
+        'run_id': 'env-run',
+    }
+    assert context.sources == {
+        'experiment_id': 'header',
+        'scenario': 'query',
+        'run_id': 'env',
+    }
+
+
+def test_structured_formatter_includes_required_event_fields_and_log_context():
+    context = main.LogContext(
+        values={'experiment_id': 'experiment-a', 'scenario': 'handover', 'run_id': 'run-42'},
+        sources={'experiment_id': 'header', 'scenario': 'query', 'run_id': 'env'},
+    )
+    record = logging.LogRecord(
+        name='controller_main',
+        level=logging.INFO,
+        pathname='docker/controller/main.py',
+        lineno=1,
+        msg='event check',
+        args=(),
+        exc_info=None,
+    )
+    record.event_type = 'publish_received'
+    record.stream = 'live'
+    record.generation = 3
+    record.proxy_pod = 'proxy-1'
+    record.worker_pod = 'worker-1'
+    record.duration_ms = 12.5
+    record.status = 'received'
+    token = main.current_log_context.set(context)
+    try:
+        payload = json.loads(main.StructuredMetadataFormatter().format(record))
+    finally:
+        main.current_log_context.reset(token)
+
+    assert list(payload)[:len(main.LOG_EVENT_FIELDS)] == list(main.LOG_EVENT_FIELDS)
+    assert {field: payload[field] for field in main.LOG_EVENT_FIELDS if field != 'timestamp'} == {
+        'event_type': 'publish_received',
+        'stream': 'live',
+        'generation': 3,
+        'proxy_pod': 'proxy-1',
+        'worker_pod': 'worker-1',
+        'experiment_id': 'experiment-a',
+        'scenario': 'handover',
+        'run_id': 'run-42',
+        'duration_ms': 12.5,
+        'status': 'received',
+    }
+
+
 def test_observability_metadata_middleware_sets_and_resets_context(monkeypatch):
     monkeypatch.setenv('LIVEEDGECAST_REGION', 'env-region')
+    monkeypatch.setenv('RUN_ID', 'env-run')
     request = SimpleNamespace(
-        headers={'x-liveedgecast-tenant': 'tenant-a'},
-        query_params={'environment': 'stage'},
+        headers={
+            'x-liveedgecast-tenant': 'tenant-a',
+            'x-liveedgecast-experiment-id': 'experiment-a',
+        },
+        query_params={
+            'environment': 'stage',
+            'scenario': 'scenario-a',
+        },
     )
     seen_metadata = None
+    seen_log_context = None
 
     async def call_next(_request):
-        nonlocal seen_metadata
+        nonlocal seen_metadata, seen_log_context
         seen_metadata = main.current_request_metadata.get()
+        seen_log_context = main.current_log_context.get()
         return {'status': 'ok'}
 
     result = asyncio.run(main.observability_metadata_middleware(request, call_next))
@@ -306,10 +389,20 @@ def test_observability_metadata_middleware_sets_and_resets_context(monkeypatch):
         'environment': 'stage',
         'region': 'env-region',
     }
+    assert seen_log_context.values == {
+        'experiment_id': 'experiment-a',
+        'scenario': 'scenario-a',
+        'run_id': 'env-run',
+    }
     assert main.current_request_metadata.get().labels == {
         'tenant': 'unknown',
         'environment': 'unknown',
         'region': 'unknown',
+    }
+    assert main.current_log_context.get().values == {
+        'experiment_id': 'unknown',
+        'scenario': 'unknown',
+        'run_id': 'unknown',
     }
 
 
