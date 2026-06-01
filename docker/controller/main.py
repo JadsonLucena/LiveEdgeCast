@@ -465,6 +465,9 @@ def get_float_env(name: str, default: float, min_value: Optional[float] = None) 
     except ValueError:
         logger.warning(f"Invalid float for {name}='{raw_value}', using default {default}")
         return default
+    if value != value or value in (float("inf"), float("-inf")):
+        logger.warning(f"Invalid float for {name}='{raw_value}', must be finite; using default {default}")
+        return default
     if min_value is not None and value < min_value:
         logger.warning(f"Invalid float for {name}='{raw_value}', minimum is {min_value}; using default {default}")
         return default
