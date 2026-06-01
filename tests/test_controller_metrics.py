@@ -28,6 +28,7 @@ def reset_state():
     main.worker_health_failures.clear()
     main.worker_pod_uid_by_name.clear()
     main.worker_create_started_at.clear()
+    main.proxy_rtmp_stats_observed_pods.clear()
     main.reset_controlled_metric_metadata_cache()
 
 
@@ -42,6 +43,15 @@ def sample_value(metric, name, labels=None):
             if sample.name == name and all(sample.labels.get(k) == v for k, v in labels.items()):
                 return sample.value
     return 0
+
+
+def sample_exists(metric, name, labels=None):
+    labels = labels or {}
+    for family in metric.collect():
+        for sample in family.samples:
+            if sample.name == name and all(sample.labels.get(k) == v for k, v in labels.items()):
+                return True
+    return False
 
 
 class JsonCaptureHandler(logging.Handler):
@@ -168,6 +178,24 @@ def test_unlabeled_counter_direct_inc_uses_controlled_metadata(monkeypatch):
     assert sample_value(counter, 'test_direct_inc_counter_total', labels) == before + 1
 
 
+def test_env_parsing_helpers_fall_back_for_invalid_values(monkeypatch):
+    monkeypatch.setenv("TEST_INT_ENV", "invalid")
+    monkeypatch.setenv("TEST_FLOAT_ENV", "0")
+
+    assert main.get_int_env("TEST_INT_ENV", 10, min_value=1) == 10
+    assert main.get_float_env("TEST_FLOAT_ENV", 2.0, min_value=0.1) == 2.0
+
+
+def test_metric_remove_accepts_keyword_labels_without_private_labelnames():
+    metric = main.controller_gauge('test_remove_keyword_gauge', 'Test keyword remove gauge', ('proxy_pod',))
+    metric.labels(proxy_pod='proxy-remove').set(1)
+    assert sample_exists(metric, 'test_remove_keyword_gauge', {'proxy_pod': 'proxy-remove'})
+
+    metric.remove(proxy_pod='proxy-remove')
+
+    assert not sample_exists(metric, 'test_remove_keyword_gauge', {'proxy_pod': 'proxy-remove'})
+
+
 def test_app_lifespan_starts_and_cancels_background_tasks():
     tasks = []
 
@@ -195,7 +223,7 @@ def test_app_lifespan_starts_and_cancels_background_tasks():
 
     async def run_lifespan():
         async with main.app_lifespan(SimpleNamespace()):
-            assert len(tasks) == 4
+            assert len(tasks) == 5
             assert all(not task.cancelled for task in tasks)
 
     with patch.object(main.asyncio, 'sleep', new_callable=AsyncMock), \
@@ -204,8 +232,222 @@ def test_app_lifespan_starts_and_cancels_background_tasks():
         asyncio.run(run_lifespan())
 
     recover_state.assert_called_once_with()
-    assert len(tasks) == 4
+    assert len(tasks) == 5
     assert all(task.cancelled for task in tasks)
+
+
+
+def test_parse_proxy_rtmp_stats_xml_counts_streams_publishers_and_clients():
+    payload = """
+    <rtmp>
+      <server>
+        <application>
+          <name>live</name>
+          <live>
+            <stream>
+              <name>super-secret-stream-key</name>
+              <client><id>1</id><publishing/></client>
+              <client><id>2</id></client>
+            </stream>
+            <stream>
+              <name>another-secret</name>
+              <client publishing="true"><id>3</id></client>
+            </stream>
+          </live>
+        </application>
+      </server>
+    </rtmp>
+    """
+
+    stats = main.parse_proxy_rtmp_stats(payload, "application/xml")
+
+    assert stats.active_streams == 2
+    assert stats.active_publishers == 2
+    assert stats.active_clients == 3
+    assert stats.stream_active == 1
+
+
+
+def test_parse_proxy_rtmp_stats_xml_counts_realistic_nginx_rtmp_stat_payload():
+    payload = """
+    <?xml version="1.0" encoding="utf-8" ?>
+    <?xml-stylesheet type="text/xsl" href="stat.xsl" ?>
+    <rtmp>
+      <nginx_version>1.25.3</nginx_version>
+      <server>
+        <application>
+          <name>live</name>
+          <live>
+            <stream>
+              <name>redacted-stream-key-a</name>
+              <time>12345</time>
+              <bw_in>1024</bw_in>
+              <bw_out>2048</bw_out>
+              <client>
+                <id>10</id>
+                <address>10.244.0.1</address>
+                <publishing/>
+              </client>
+              <client>
+                <id>11</id>
+                <address>10.244.0.2</address>
+              </client>
+            </stream>
+            <stream>
+              <name>redacted-stream-key-b</name>
+              <client>
+                <id>12</id>
+                <address>10.244.0.3</address>
+                <publishing/>
+              </client>
+            </stream>
+            <nclients>3</nclients>
+          </live>
+        </application>
+        <application>
+          <name>vod</name>
+          <live>
+            <nclients>0</nclients>
+          </live>
+        </application>
+      </server>
+    </rtmp>
+    """
+
+    stats = main.parse_proxy_rtmp_stats(payload, "text/xml")
+
+    assert stats.active_streams == 2
+    assert stats.active_publishers == 2
+    assert stats.active_clients == 3
+
+
+def test_parse_proxy_rtmp_stats_json_counts_nginx_rtmp_shape():
+    payload = json.dumps({
+        "rtmp": {
+            "server": {
+                "application": {
+                    "name": "live",
+                    "live": {
+                        "stream": [
+                            {
+                                "name": "secret-stream-key",
+                                "client": [
+                                    {"id": 1, "publishing": {}},
+                                    {"id": 2},
+                                ],
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+    })
+
+    stats = main.parse_proxy_rtmp_stats(payload, "application/json")
+
+    assert stats.active_streams == 1
+    assert stats.active_publishers == 1
+    assert stats.active_clients == 2
+
+
+def test_proxy_rtmp_stats_metrics_use_only_proxy_pod_as_rtmp_label():
+    stats = main.ProxyRtmpStats(active_streams=1, active_publishers=1, active_clients=2)
+
+    main.set_proxy_rtmp_stats_metrics("proxy-a", stats)
+
+    samples = [
+        sample
+        for family in main.proxy_rtmp_active_streams.collect()
+        for sample in family.samples
+        if sample.name == "proxy_rtmp_active_streams" and sample.labels.get("proxy_pod") == "proxy-a"
+    ]
+    assert samples
+    assert samples[-1].value == 1
+    assert "stream" not in samples[-1].labels
+    assert "streamKey" not in samples[-1].labels
+    assert "stream_key" not in samples[-1].labels
+
+
+def test_collect_proxy_rtmp_stats_once_scrapes_proxy_pods_and_counts_errors():
+    reset_state()
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(name="proxy-scrape"),
+        status=SimpleNamespace(pod_ip="10.0.0.10"),
+    )
+    response = SimpleNamespace(
+        text="<rtmp><server><application><live><stream><client><publishing/></client></stream></live></application></server></rtmp>",
+        headers={"Content-Type": "text/xml"},
+        raise_for_status=lambda: None,
+    )
+
+    with patch.object(main.core, "list_namespaced_pod", return_value=SimpleNamespace(items=[pod])), \
+         patch.object(main.requests, "get", return_value=response) as request_get:
+        asyncio.run(main.collect_proxy_rtmp_stats_once())
+
+    request_get.assert_called_once_with("http://10.0.0.10:8080/stats", timeout=main.PROXY_RTMP_STATS_TIMEOUT_SECONDS)
+    assert sample_value(main.proxy_rtmp_active_streams, "proxy_rtmp_active_streams", {"proxy_pod": "proxy-scrape"}) == 1
+    assert sample_value(main.proxy_rtmp_active_publishers, "proxy_rtmp_active_publishers", {"proxy_pod": "proxy-scrape"}) == 1
+    assert sample_value(main.proxy_rtmp_active_clients, "proxy_rtmp_active_clients", {"proxy_pod": "proxy-scrape"}) == 1
+    assert sample_value(main.proxy_rtmp_stream_active, "proxy_rtmp_stream_active", {"proxy_pod": "proxy-scrape"}) == 1
+    assert sample_value(main.proxy_rtmp_stats_up, "proxy_rtmp_stats_up", {"proxy_pod": "proxy-scrape"}) == 1
+
+    before_errors = counter_value(main.proxy_rtmp_stats_scrape_errors_total, proxy_pod="proxy-scrape")
+    with patch.object(main.core, "list_namespaced_pod", return_value=SimpleNamespace(items=[pod])), \
+         patch.object(main.requests, "get", side_effect=main.requests.Timeout("timed out")):
+        asyncio.run(main.collect_proxy_rtmp_stats_once())
+
+    assert counter_value(main.proxy_rtmp_stats_scrape_errors_total, proxy_pod="proxy-scrape") == before_errors + 1
+    assert sample_value(main.proxy_rtmp_active_streams, "proxy_rtmp_active_streams", {"proxy_pod": "proxy-scrape"}) == 1
+    assert sample_value(main.proxy_rtmp_stream_active, "proxy_rtmp_stream_active", {"proxy_pod": "proxy-scrape"}) == 1
+    assert sample_value(main.proxy_rtmp_stats_up, "proxy_rtmp_stats_up", {"proxy_pod": "proxy-scrape"}) == 0
+
+
+def test_collect_proxy_rtmp_stats_once_counts_discovery_errors():
+    reset_state()
+    before_errors = sample_value(
+        main.proxy_rtmp_stats_discovery_errors_total,
+        "proxy_rtmp_stats_discovery_errors_total",
+    )
+
+    with patch.object(main.core, "list_namespaced_pod", side_effect=RuntimeError("api unavailable")):
+        asyncio.run(main.collect_proxy_rtmp_stats_once())
+
+    assert sample_value(
+        main.proxy_rtmp_stats_discovery_errors_total,
+        "proxy_rtmp_stats_discovery_errors_total",
+    ) == before_errors + 1
+
+
+def test_collect_proxy_rtmp_stats_once_removes_stale_proxy_metrics():
+    reset_state()
+    main.set_proxy_rtmp_stats_metrics("proxy-stale", main.ProxyRtmpStats(2, 1, 3))
+    main.proxy_rtmp_stats_scrape_errors_total.labels(proxy_pod="proxy-stale").inc()
+    main.proxy_rtmp_stats_observed_pods.add("proxy-stale")
+    assert sample_exists(
+        main.proxy_rtmp_stats_scrape_errors_total,
+        "proxy_rtmp_stats_scrape_errors_total",
+        {"proxy_pod": "proxy-stale"},
+    )
+
+    with patch.object(main.core, "list_namespaced_pod", return_value=SimpleNamespace(items=[])):
+        asyncio.run(main.collect_proxy_rtmp_stats_once())
+
+    assert not sample_exists(
+        main.proxy_rtmp_active_streams,
+        "proxy_rtmp_active_streams",
+        {"proxy_pod": "proxy-stale"},
+    )
+    assert not sample_exists(
+        main.proxy_rtmp_stats_up,
+        "proxy_rtmp_stats_up",
+        {"proxy_pod": "proxy-stale"},
+    )
+    assert not sample_exists(
+        main.proxy_rtmp_stats_scrape_errors_total,
+        "proxy_rtmp_stats_scrape_errors_total",
+        {"proxy_pod": "proxy-stale"},
+    )
+    assert "proxy-stale" not in main.proxy_rtmp_stats_observed_pods
 
 
 def test_fastapi_middleware_sets_context_for_asgi_request(monkeypatch):

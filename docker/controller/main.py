@@ -12,12 +12,13 @@ import json
 import copy
 import os
 import re
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from fastapi.responses import Response
 
@@ -75,6 +76,17 @@ class LogContext:
     def __post_init__(self) -> None:
         object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
         object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
+
+
+@dataclass(frozen=True)
+class ProxyRtmpStats:
+    active_streams: int
+    active_publishers: int
+    active_clients: int
+
+    @property
+    def stream_active(self) -> int:
+        return 1 if self.active_streams > 0 else 0
 
 
 def sanitize_metadata_value(value: Optional[str]) -> str:
@@ -249,9 +261,11 @@ class ControlledMetadataMetric:
     env/default values to avoid unbounded Prometheus cardinality.
     """
 
-    def __init__(self, metric, base_label_count: int):
+    def __init__(self, metric, base_label_names: Tuple[str, ...]):
         self._metric = metric
-        self._base_label_count = base_label_count
+        self._base_label_names = tuple(base_label_names)
+        self._base_label_count = len(self._base_label_names)
+        self._label_names = metric_label_names(*self._base_label_names)
 
     def labels(self, *labelvalues, **labelkwargs):
         if labelvalues and labelkwargs:
@@ -301,6 +315,33 @@ class ControlledMetadataMetric:
             )
         return self.labels().set(value)
 
+    def remove(self, *labelvalues, **labelkwargs):
+        if labelvalues and labelkwargs:
+            raise ValueError("Cannot mix positional and keyword labels")
+
+        metadata_labels = metric_metadata_labels()
+        if labelkwargs:
+            enriched = dict(labelkwargs)
+            for key, value in metadata_labels.items():
+                enriched[key] = value
+            missing = [name for name in self._label_names if name not in enriched]
+            if missing:
+                raise ValueError(f"Missing label values for: {', '.join(missing)}")
+            return self._metric.remove(*[enriched[name] for name in self._label_names])
+
+        metadata_values = tuple(metadata_labels[name] for name in METADATA_LABEL_NAMES)
+        if len(labelvalues) == self._base_label_count:
+            labelvalues = tuple(labelvalues) + metadata_values
+        elif len(labelvalues) == self._base_label_count + len(METADATA_LABEL_NAMES):
+            labelvalues = tuple(labelvalues[:self._base_label_count]) + metadata_values
+        else:
+            expected_with_metadata = self._base_label_count + len(METADATA_LABEL_NAMES)
+            raise ValueError(
+                f"Incorrect label count: got {len(labelvalues)}, "
+                f"expected {self._base_label_count} base labels or {expected_with_metadata} labels including metadata"
+            )
+        return self._metric.remove(*labelvalues)
+
     def collect(self):
         return self._metric.collect()
 
@@ -308,20 +349,20 @@ class ControlledMetadataMetric:
         return getattr(self._metric, name)
 
 
-def with_metric_metadata(metric, base_label_count: int):
-    return ControlledMetadataMetric(metric, base_label_count)
+def with_metric_metadata(metric, base_label_names: Tuple[str, ...]):
+    return ControlledMetadataMetric(metric, base_label_names)
 
 
 def controller_counter(name: str, description: str, base_labels=()):
-    return with_metric_metadata(Counter(name, description, metric_label_names(*base_labels)), len(base_labels))
+    return with_metric_metadata(Counter(name, description, metric_label_names(*base_labels)), tuple(base_labels))
 
 
 def controller_gauge(name: str, description: str, base_labels=()):
-    return with_metric_metadata(Gauge(name, description, metric_label_names(*base_labels)), len(base_labels))
+    return with_metric_metadata(Gauge(name, description, metric_label_names(*base_labels)), tuple(base_labels))
 
 
 def controller_histogram(name: str, description: str, base_labels=()):
-    return with_metric_metadata(Histogram(name, description, metric_label_names(*base_labels)), len(base_labels))
+    return with_metric_metadata(Histogram(name, description, metric_label_names(*base_labels)), tuple(base_labels))
 
 
 class StructuredMetadataFormatter(logging.Formatter):
@@ -399,21 +440,63 @@ if not logger.handlers:
 for handler in logger.handlers:
     handler.setFormatter(StructuredMetadataFormatter(datefmt='%Y-%m-%d %H:%M:%S'))
 
+
+def get_int_env(name: str, default: int, min_value: Optional[int] = None) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning(f"Invalid integer for {name}='{raw_value}', using default {default}")
+        return default
+    if min_value is not None and value < min_value:
+        logger.warning(f"Invalid integer for {name}='{raw_value}', minimum is {min_value}; using default {default}")
+        return default
+    return value
+
+
+def get_float_env(name: str, default: float, min_value: Optional[float] = None) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError:
+        logger.warning(f"Invalid float for {name}='{raw_value}', using default {default}")
+        return default
+    if min_value is not None and value < min_value:
+        logger.warning(f"Invalid float for {name}='{raw_value}', minimum is {min_value}; using default {default}")
+        return default
+    return value
+
+
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
-    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
+    global registry_health_task
+    global worker_health_task
+    global worker_orphan_sweeper_task
+    global metrics_collection_task
+    global proxy_rtmp_stats_task
     await asyncio.sleep(5)
     recover_state()
     registry_health_task = asyncio.create_task(monitor_stream_registry_health())
     worker_health_task = asyncio.create_task(monitor_worker_health())
     worker_orphan_sweeper_task = asyncio.create_task(sweep_orphan_workers())
     metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
+    proxy_rtmp_stats_task = asyncio.create_task(collect_proxy_rtmp_stats())
     try:
         yield
     finally:
         pending_tasks = [
             task
-            for task in (registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task)
+            for task in (
+                registry_health_task,
+                worker_health_task,
+                worker_orphan_sweeper_task,
+                metrics_collection_task,
+                proxy_rtmp_stats_task,
+            )
             if task and not task.done()
         ]
         for task in pending_tasks:
@@ -474,6 +557,12 @@ STATE_CONFIGMAP_KEY = "state.json"
 STATE_SCHEMA_VERSION = 2
 
 metrics_collection_task: Optional[asyncio.Task] = None
+proxy_rtmp_stats_task: Optional[asyncio.Task] = None
+
+PROXY_RTMP_STATS_INTERVAL_SECONDS = get_int_env("PROXY_RTMP_STATS_INTERVAL_SECONDS", 10, min_value=1)
+PROXY_RTMP_STATS_TIMEOUT_SECONDS = get_float_env("PROXY_RTMP_STATS_TIMEOUT_SECONDS", 2.0, min_value=0.1)
+PROXY_RTMP_STATS_MAX_CONCURRENCY = get_int_env("PROXY_RTMP_STATS_MAX_CONCURRENCY", 20, min_value=1)
+proxy_rtmp_stats_observed_pods: Set[str] = set()
 
 pod_cpu_usage_percent = controller_gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',('pod','namespace'))
 pod_memory_usage_bytes = controller_gauge('pod_memory_usage_bytes','Pod memory usage in bytes',('pod','namespace'))
@@ -482,6 +571,11 @@ pod_network_io_bytes_total = controller_counter('pod_network_io_bytes_total','To
 pod_ready_status = controller_gauge('pod_ready_status','Is pod ready (0 or 1)',('pod','namespace'))
 proxy_active_connections = controller_gauge('proxy_active_connections','Active RTMP connections to proxy',('proxy_pod',))
 proxy_bandwidth_mbps = controller_gauge('proxy_bandwidth_mbps','Current proxy bandwidth in Mbps',('proxy_pod',))
+proxy_rtmp_active_streams = controller_gauge('proxy_rtmp_active_streams', 'Active RTMP streams reported by each proxy /stats endpoint', ('proxy_pod',))
+proxy_rtmp_active_publishers = controller_gauge('proxy_rtmp_active_publishers', 'Active RTMP publishing clients reported by each proxy /stats endpoint', ('proxy_pod',))
+proxy_rtmp_active_clients = controller_gauge('proxy_rtmp_active_clients', 'Active RTMP clients reported by each proxy /stats endpoint', ('proxy_pod',))
+proxy_rtmp_stream_active = controller_gauge('proxy_rtmp_stream_active', 'Whether each proxy has at least one active RTMP stream', ('proxy_pod',))
+proxy_rtmp_stats_up = controller_gauge('proxy_rtmp_stats_up', 'Whether the last proxy RTMP /stats scrape succeeded', ('proxy_pod',))
 worker_pods_available = controller_gauge('worker_pods_available','Available worker pods for allocation',('namespace',))
 stream_proxy_handover_counter = controller_counter('stream_proxy_handover_total','Total proxy handovers accepted by controller')
 handover_attempts_total = controller_counter('handover_attempts_total', 'Total proxy handover attempts')
@@ -509,6 +603,8 @@ stream_release_total = controller_counter('stream_release_total', 'Total stream 
 worker_recovery_total = controller_counter('worker_recovery_total', 'Total worker recovery attempts', ('status', 'reason'))
 proxy_healthcheck_total = controller_counter('proxy_healthcheck_total', 'Total proxy healthcheck evaluations', ('status', 'reason'))
 worker_healthcheck_total = controller_counter('worker_healthcheck_total', 'Total worker healthcheck probes', ('status', 'reason'))
+proxy_rtmp_stats_scrape_errors_total = controller_counter('proxy_rtmp_stats_scrape_errors_total', 'Total proxy RTMP /stats scrape failures', ('proxy_pod',))
+proxy_rtmp_stats_discovery_errors_total = controller_counter('proxy_rtmp_stats_discovery_errors_total', 'Total failures listing proxy pods for RTMP stats scraping')
 worker_create_started_at: Dict[str, float] = {}
 
 try:
@@ -948,6 +1044,196 @@ async def monitor_stream_registry_health():
 
         if proxies:
             await asyncio.gather(*(run_proxy_check(proxy_pod) for proxy_pod in proxies))
+
+def _xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _json_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if isinstance(value, bool):
+            return int(value)
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _collect_json_values(node: Any, target_key: str) -> List[Any]:
+    matches: List[Any] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if str(key).lower() == target_key:
+                matches.extend(_json_list(value))
+            matches.extend(_collect_json_values(value, target_key))
+    elif isinstance(node, list):
+        for item in node:
+            matches.extend(_collect_json_values(item, target_key))
+    return matches
+
+
+def _json_has_truthy_key(node: Any, names: Iterable[str]) -> bool:
+    wanted = {name.lower() for name in names}
+    if not isinstance(node, dict):
+        return False
+    for key, value in node.items():
+        if str(key).lower() in wanted:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                return False
+            if isinstance(value, (dict, list)):
+                return True
+            return str(value).strip().lower() not in ("", "0", "false", "no")
+    return False
+
+
+def parse_proxy_rtmp_stats_xml(payload: str) -> ProxyRtmpStats:
+    root = ET.fromstring(payload)
+    streams = [element for element in root.iter() if _xml_local_name(element.tag) == "stream"]
+    clients = [element for element in root.iter() if _xml_local_name(element.tag) == "client"]
+    publishers = [
+        client_element
+        for client_element in clients
+        if any(_xml_local_name(child.tag) == "publishing" for child in list(client_element))
+        or str(client_element.attrib.get("publishing", "")).strip().lower() in ("1", "true", "yes")
+    ]
+    return ProxyRtmpStats(
+        active_streams=len(streams),
+        active_publishers=len(publishers),
+        active_clients=len(clients),
+    )
+
+
+def parse_proxy_rtmp_stats_json(payload: str) -> ProxyRtmpStats:
+    data = json.loads(payload)
+    if isinstance(data, dict):
+        direct_streams = data.get("active_streams", data.get("activeStreams"))
+        direct_publishers = data.get("active_publishers", data.get("activePublishers"))
+        direct_clients = data.get("active_clients", data.get("activeClients"))
+        if direct_streams is not None or direct_publishers is not None or direct_clients is not None:
+            active_streams = _safe_int(direct_streams)
+            active_publishers = _safe_int(direct_publishers)
+            active_clients = _safe_int(direct_clients)
+            return ProxyRtmpStats(active_streams, active_publishers, active_clients)
+
+    streams = [stream for stream in _collect_json_values(data, "stream") if isinstance(stream, dict)]
+    clients = [client_item for client_item in _collect_json_values(data, "client") if isinstance(client_item, dict)]
+    publishers = [
+        client_item
+        for client_item in clients
+        if _json_has_truthy_key(client_item, ("publishing", "publisher", "is_publisher", "isPublisher"))
+    ]
+    return ProxyRtmpStats(
+        active_streams=len(streams),
+        active_publishers=len(publishers),
+        active_clients=len(clients),
+    )
+
+
+def parse_proxy_rtmp_stats(payload: str, content_type: str = "") -> ProxyRtmpStats:
+    stripped = payload.strip()
+    if not stripped:
+        raise ValueError("empty proxy RTMP stats response")
+    if "json" in content_type.lower() or stripped[0] in "[{":
+        return parse_proxy_rtmp_stats_json(stripped)
+    return parse_proxy_rtmp_stats_xml(stripped)
+
+
+def set_proxy_rtmp_stats_metrics(proxy_pod: str, stats: ProxyRtmpStats) -> None:
+    proxy_rtmp_active_streams.labels(proxy_pod=proxy_pod).set(stats.active_streams)
+    proxy_rtmp_active_publishers.labels(proxy_pod=proxy_pod).set(stats.active_publishers)
+    proxy_rtmp_active_clients.labels(proxy_pod=proxy_pod).set(stats.active_clients)
+    proxy_rtmp_stream_active.labels(proxy_pod=proxy_pod).set(stats.stream_active)
+    proxy_rtmp_stats_up.labels(proxy_pod=proxy_pod).set(1)
+
+
+def remove_proxy_rtmp_stats_metrics(proxy_pod: str) -> None:
+    metrics = (
+        proxy_rtmp_active_streams,
+        proxy_rtmp_active_publishers,
+        proxy_rtmp_active_clients,
+        proxy_rtmp_stream_active,
+        proxy_rtmp_stats_up,
+        proxy_rtmp_stats_scrape_errors_total,
+    )
+    for metric in metrics:
+        try:
+            metric.remove(proxy_pod=proxy_pod)
+        except KeyError:
+            pass
+
+
+def cleanup_stale_proxy_rtmp_stats_metrics(active_proxy_pods: Iterable[str]) -> None:
+    active = set(active_proxy_pods)
+    stale = proxy_rtmp_stats_observed_pods - active
+    for proxy_pod in stale:
+        remove_proxy_rtmp_stats_metrics(proxy_pod)
+    proxy_rtmp_stats_observed_pods.clear()
+    proxy_rtmp_stats_observed_pods.update(active)
+
+
+def list_proxy_pods_for_stats() -> List[Tuple[str, str]]:
+    pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=proxy").items
+    proxy_pods: List[Tuple[str, str]] = []
+    for pod in pods:
+        name = (pod.metadata.name or "").strip() if pod.metadata else ""
+        pod_ip = (pod.status.pod_ip or "").strip() if pod.status else ""
+        if name:
+            proxy_pods.append((name, pod_ip))
+    return proxy_pods
+
+
+def scrape_proxy_rtmp_stats(proxy_pod: str, pod_ip: str) -> ProxyRtmpStats:
+    if not pod_ip:
+        raise RuntimeError(f"proxy pod '{proxy_pod}' has no assigned pod IP")
+    response = requests.get(f"http://{pod_ip}:8080/stats", timeout=PROXY_RTMP_STATS_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    return parse_proxy_rtmp_stats(response.text, response.headers.get("Content-Type", ""))
+
+
+async def collect_proxy_rtmp_stats_once() -> None:
+    try:
+        proxy_pods = await asyncio.to_thread(list_proxy_pods_for_stats)
+    except Exception as e:
+        proxy_rtmp_stats_discovery_errors_total.inc()
+        logger.warning(f"[ProxyRtmpStats] Failed listing proxy pods for /stats scrape: {e}")
+        return
+
+    cleanup_stale_proxy_rtmp_stats_metrics(proxy_pod for proxy_pod, _pod_ip in proxy_pods)
+
+    semaphore = asyncio.Semaphore(PROXY_RTMP_STATS_MAX_CONCURRENCY)
+
+    async def scrape_one(proxy_pod: str, pod_ip: str) -> None:
+        try:
+            async with semaphore:
+                stats = await asyncio.to_thread(scrape_proxy_rtmp_stats, proxy_pod, pod_ip)
+            set_proxy_rtmp_stats_metrics(proxy_pod, stats)
+            logger.debug(
+                "[ProxyRtmpStats] Scraped proxy /stats "
+                f"proxy_pod='{proxy_pod}' active_streams={stats.active_streams} "
+                f"active_publishers={stats.active_publishers} active_clients={stats.active_clients}"
+            )
+        except Exception as e:
+            proxy_rtmp_stats_up.labels(proxy_pod=proxy_pod).set(0)
+            proxy_rtmp_stats_scrape_errors_total.labels(proxy_pod=proxy_pod).inc()
+            logger.warning(f"[ProxyRtmpStats] Failed scraping /stats for proxy '{proxy_pod}': {e}")
+
+    if proxy_pods:
+        await asyncio.gather(*(scrape_one(proxy_pod, pod_ip) for proxy_pod, pod_ip in proxy_pods))
+
+
+async def collect_proxy_rtmp_stats():
+    while True:
+        await collect_proxy_rtmp_stats_once()
+        await asyncio.sleep(PROXY_RTMP_STATS_INTERVAL_SECONDS)
 
 
 def resolve_proxy_address(proxy_pod: str) -> str:
