@@ -15,6 +15,7 @@ import re
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Tuple
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
@@ -28,6 +29,22 @@ METADATA_QUERY_PREFIX = "metadata_"
 METADATA_ENV_PREFIXES: Tuple[str, ...] = ("LIVEEDGECAST", "CONTROLLER_METADATA")
 METADATA_ALLOWED_VALUE = re.compile(r"[^a-zA-Z0-9_.:-]+")
 METADATA_MAX_LENGTH = 64
+LOG_EVENT_FIELDS: Tuple[str, ...] = (
+    "timestamp",
+    "event_type",
+    "stream",
+    "generation",
+    "proxy_pod",
+    "worker_pod",
+    "experiment_id",
+    "scenario",
+    "run_id",
+    "duration_ms",
+    "status",
+)
+LOG_CONTEXT_FIELDS: Tuple[str, ...] = ("experiment_id", "scenario", "run_id")
+LOG_CONTEXT_ENV_PREFIXES: Tuple[str, ...] = ("LIVEEDGECAST", "CONTROLLER", "")
+LOG_CONTEXT_DEFAULT_VALUE = "unknown"
 
 
 @dataclass(frozen=True)
@@ -37,6 +54,16 @@ class RequestMetadata:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", MappingProxyType(dict(self.labels)))
+        object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
+
+
+@dataclass(frozen=True)
+class LogContext:
+    values: Mapping[str, str]
+    sources: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
         object.__setattr__(self, "sources", MappingProxyType(dict(self.sources)))
 
 
@@ -61,9 +88,20 @@ def default_request_metadata() -> RequestMetadata:
     )
 
 
+def default_log_context() -> LogContext:
+    return LogContext(
+        values={name: LOG_CONTEXT_DEFAULT_VALUE for name in LOG_CONTEXT_FIELDS},
+        sources={name: "default" for name in LOG_CONTEXT_FIELDS},
+    )
+
+
 current_request_metadata: ContextVar[RequestMetadata] = ContextVar(
     "current_request_metadata",
     default=default_request_metadata(),
+)
+current_log_context: ContextVar[LogContext] = ContextVar(
+    "current_log_context",
+    default=default_log_context(),
 )
 controlled_metric_metadata_cache: Optional[RequestMetadata] = None
 
@@ -112,6 +150,48 @@ def extract_request_metadata(request: Optional[Request] = None) -> RequestMetada
     return RequestMetadata(labels=labels, sources=sources)
 
 
+def extract_log_context(request: Optional[Request] = None) -> LogContext:
+    """Extracts low-cardinality run context for structured controller event logs."""
+    values: Dict[str, str] = {}
+    sources: Dict[str, str] = {}
+
+    for name in LOG_CONTEXT_FIELDS:
+        raw_value = None
+        source = "default"
+
+        if request is not None:
+            header_candidates = (f"x-liveedgecast-{name.replace('_', '-')}", f"x-{name.replace('_', '-')}")
+            for header_name in header_candidates:
+                candidate = non_blank_metadata_value(request.headers.get(header_name))
+                if candidate is not None:
+                    raw_value = candidate
+                    source = "header"
+                    break
+
+        if raw_value is None and request is not None:
+            for query_name in (name, f"metadata_{name}"):
+                candidate = non_blank_metadata_value(request.query_params.get(query_name))
+                if candidate is not None:
+                    raw_value = candidate
+                    source = "query"
+                    break
+
+        if raw_value is None:
+            env_suffix = name.upper()
+            for prefix in LOG_CONTEXT_ENV_PREFIXES:
+                env_name = f"{prefix}_{env_suffix}" if prefix else env_suffix
+                candidate = non_blank_metadata_value(os.getenv(env_name))
+                if candidate is not None:
+                    raw_value = candidate
+                    source = "env"
+                    break
+
+        values[name] = sanitize_metadata_value(raw_value) if raw_value is not None else LOG_CONTEXT_DEFAULT_VALUE
+        sources[name] = source if raw_value is not None else "default"
+
+    return LogContext(values=values, sources=sources)
+
+
 def metric_label_names(*base_labels: str) -> Tuple[str, ...]:
     return tuple(base_labels) + METADATA_LABEL_NAMES
 
@@ -143,6 +223,13 @@ def get_current_request_metadata() -> RequestMetadata:
     if all(source == "default" for source in metadata.sources.values()):
         return extract_request_metadata(None)
     return metadata
+
+
+def get_current_log_context() -> LogContext:
+    context = current_log_context.get()
+    if all(source == "default" for source in context.sources.values()):
+        return extract_log_context(None)
+    return context
 
 
 class ControlledMetadataMetric:
@@ -229,19 +316,57 @@ def controller_histogram(name: str, description: str, base_labels=()):
 
 class StructuredMetadataFormatter(logging.Formatter):
     def format(self, record):
-        metadata = get_current_request_metadata()
+        context = get_current_log_context()
         payload = {
-            "timestamp": self.formatTime(record, self.datefmt),
+            "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat().replace("+00:00", "Z"),
+            "event_type": getattr(record, "event_type", "log"),
+            "stream": getattr(record, "stream", None),
+            "generation": getattr(record, "generation", None),
+            "proxy_pod": getattr(record, "proxy_pod", None),
+            "worker_pod": getattr(record, "worker_pod", None),
+            "experiment_id": getattr(record, "experiment_id", context.values.get("experiment_id", LOG_CONTEXT_DEFAULT_VALUE)),
+            "scenario": getattr(record, "scenario", context.values.get("scenario", LOG_CONTEXT_DEFAULT_VALUE)),
+            "run_id": getattr(record, "run_id", context.values.get("run_id", LOG_CONTEXT_DEFAULT_VALUE)),
+            "duration_ms": getattr(record, "duration_ms", None),
+            "status": getattr(record, "status", record.levelname.lower()),
             "level": record.levelname,
-            "logger": record.name,
-            "function": record.funcName,
             "message": record.getMessage(),
-            "metadata": dict(metadata.labels),
-            "metadata_sources": dict(metadata.sources),
         }
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload, sort_keys=True)
+        return json.dumps(payload)
+
+
+def log_controller_event(
+    event_type: str,
+    *,
+    stream: Optional[str] = None,
+    generation: Optional[int] = None,
+    proxy_pod: Optional[str] = None,
+    worker_pod: Optional[str] = None,
+    duration_ms: Optional[float] = None,
+    started_at: Optional[float] = None,
+    status: str = "success",
+    level: int = logging.INFO,
+    message: Optional[str] = None,
+) -> None:
+    if duration_ms is None and started_at is not None:
+        duration_ms = round((time.monotonic() - started_at) * 1000, 3)
+    if generation is None and stream:
+        generation = stream_generation.get(stream)
+    logger.log(
+        level,
+        message or event_type,
+        extra={
+            "event_type": event_type,
+            "stream": stream,
+            "generation": generation,
+            "proxy_pod": proxy_pod,
+            "worker_pod": worker_pod,
+            "duration_ms": duration_ms,
+            "status": status,
+        },
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -280,11 +405,13 @@ app = FastAPI(lifespan=app_lifespan)
 
 @app.middleware("http")
 async def observability_metadata_middleware(request: Request, call_next):
-    token = current_request_metadata.set(extract_request_metadata(request))
+    metadata_token = current_request_metadata.set(extract_request_metadata(request))
+    log_context_token = current_log_context.set(extract_log_context(request))
     try:
         return await call_next(request)
     finally:
-        current_request_metadata.reset(token)
+        current_log_context.reset(log_context_token)
+        current_request_metadata.reset(metadata_token)
 
 NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
@@ -334,10 +461,10 @@ pod_ready_status = controller_gauge('pod_ready_status','Is pod ready (0 or 1)',(
 proxy_active_connections = controller_gauge('proxy_active_connections','Active RTMP connections to proxy',('proxy_pod',))
 proxy_bandwidth_mbps = controller_gauge('proxy_bandwidth_mbps','Current proxy bandwidth in Mbps',('proxy_pod',))
 worker_pods_available = controller_gauge('worker_pods_available','Available worker pods for allocation',('namespace',))
-stream_proxy_handover_counter = controller_counter('stream_proxy_handover_total','Total proxy handovers accepted by controller',('stream',))
-handover_attempts_total = controller_counter('handover_attempts_total', 'Total proxy handover attempts', ('stream',))
-handover_success_total = controller_counter('handover_success_total', 'Total successful proxy handovers', ('stream',))
-handover_conflict_total = controller_counter('handover_conflict_total', 'Total conflicting proxy handovers denied', ('stream',))
+stream_proxy_handover_counter = controller_counter('stream_proxy_handover_total','Total proxy handovers accepted by controller')
+handover_attempts_total = controller_counter('handover_attempts_total', 'Total proxy handover attempts')
+handover_success_total = controller_counter('handover_success_total', 'Total successful proxy handovers')
+handover_conflict_total = controller_counter('handover_conflict_total', 'Total conflicting proxy handovers denied')
 stream_started_events_total = controller_counter('stream_started_events_total', 'Total /streams/started events', ('status', 'reason'))
 stream_ended_events_total = controller_counter('stream_ended_events_total', 'Total /streams/ended events', ('status', 'reason'))
 stale_ended_events_ignored_total = controller_counter('stale_ended_events_ignored_total', 'Total stale /streams/ended events ignored without cleanup', ('status', 'reason'))
@@ -446,7 +573,7 @@ def random_suffix():
 
 
 
-def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
+def create_worker_pod_for_stream(stream: str, proxy_dns: str, proxy_pod_name: Optional[str] = None) -> str:
     """
     Cria Pod por stream reaproveitando o template do worker Deployment.
     Apenas STREAM_KEY e PROXY_DNS são injetados dinamicamente.
@@ -476,7 +603,7 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
             c.env = env
 
         labels = dict(pod_metadata.labels or {})
-        labels.update({"app": "worker", "stream": stream})
+        labels.update({"app": "worker"})
 
         logger.debug(
             f"[Worker Pod Create] pod_name='{pod_name}' stream='{stream}' proxy_dns='{proxy_dns}'"
@@ -487,11 +614,26 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
             spec=pod_spec,
         )
 
+        log_controller_event(
+            "worker_create_requested",
+            stream=stream,
+            proxy_pod=proxy_pod_name,
+            worker_pod=pod_name,
+            status="requested",
+        )
         core.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
         with allocation_lock:
             worker_create_started_at[pod_name] = started_at
         metric_status = "success"
         metric_reason = "created"
+        log_controller_event(
+            "worker_created",
+            stream=stream,
+            proxy_pod=proxy_pod_name,
+            worker_pod=pod_name,
+            started_at=started_at,
+            status="created",
+        )
         return pod_name
     except Exception as e:
         if metric_reason == "exception":
@@ -502,13 +644,13 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
         worker_create_total.labels(status=metric_status, reason=metric_reason).inc()
 
 
-def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optional[str]:
+def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str, proxy_pod_name: Optional[str] = None) -> Optional[str]:
     """Recria o worker da stream para aplicar novo PROXY_DNS (env imutável em Pod existente)."""
     old_worker = stream_to_worker.get(stream)
     if not old_worker:
         return None
 
-    new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
+    new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns, proxy_pod_name=proxy_pod_name)
     stream_to_worker[stream] = new_worker
     worker_to_stream.pop(old_worker, None)
     worker_to_stream[new_worker] = stream
@@ -520,6 +662,13 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
 
     try:
         core.delete_namespaced_pod(name=old_worker, namespace=NAMESPACE, grace_period_seconds=0)
+        log_controller_event(
+            "worker_deleted",
+            stream=stream,
+            proxy_pod=proxy_pod_name,
+            worker_pod=old_worker,
+            status="deleted",
+        )
     except ApiException as e:
         logger.warning(f"[Handover] Failed deleting old worker pod {old_worker}: {e}")
 
@@ -550,11 +699,11 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
     - handover allowed if previous owner is ineligible by any criterion:
       proxy unhealthy/dead
     """
-    handover_attempts_total.labels(stream=stream).inc()
+    handover_attempts_total.inc()
     current = stream_registry.get(stream)
     if not current:
         register_or_refresh_stream(stream, candidate_proxy_pod)
-        handover_success_total.labels(stream=stream).inc()
+        handover_success_total.inc()
         return True
 
     current_owner = current.get("proxy_pod")
@@ -573,20 +722,34 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
         )
         stream_generation[stream] = stream_generation.get(stream, 1) + 1
         register_or_refresh_stream(stream, candidate_proxy_pod)
+        log_controller_event(
+            "handover_accepted",
+            stream=stream,
+            proxy_pod=candidate_proxy_pod,
+            status="accepted",
+        )
 
         # PROXY_DNS é env de Pod; para atualizar em reconexão/handover, recria o worker.
         proxy_dns = resolve_proxy_address(candidate_proxy_pod)
         if stream in stream_to_worker:
-            replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
+            replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns, proxy_pod_name=candidate_proxy_pod)
 
-        handover_success_total.labels(stream=stream).inc()
-        stream_proxy_handover_counter.labels(stream=stream).inc()
+        handover_success_total.inc()
+        stream_proxy_handover_counter.inc()
         return True
 
-    handover_conflict_total.labels(stream=stream).inc()
+    handover_conflict_total.inc()
     logger.warning(
         f"[Handover] Denied ownership change for stream '{stream}' from '{current_owner}' "
         f"to '{candidate_proxy_pod}' (owner_unhealthy={owner_unhealthy})"
+    )
+    log_controller_event(
+        "handover_denied",
+        stream=stream,
+        generation=stream_generation.get(stream),
+        proxy_pod=candidate_proxy_pod,
+        status="denied",
+        level=logging.WARNING,
     )
     return False
 
@@ -644,6 +807,13 @@ async def monitor_stream_registry_health():
                                 worker_health_failures.pop(old_uid, None)
                             try:
                                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
+                                log_controller_event(
+                                    "worker_deleted",
+                                    stream=stream,
+                                    proxy_pod=proxy_pod,
+                                    worker_pod=worker_name,
+                                    status="deleted",
+                                )
                             except Exception as e:
                                 logger.warning(f"[ProxyHealth] Failed deleting worker {worker_name}: {e}")
 
@@ -738,7 +908,12 @@ def get_proxy_health_status(proxy_pod: str) -> str:
         proxy_healthcheck_total.labels(status=metric_status, reason=metric_reason).inc()
 
 
-def check_worker_health(pod_name: str, pod_ip: Optional[str] = None) -> bool:
+def check_worker_health(
+    pod_name: str,
+    pod_ip: Optional[str] = None,
+    stream: Optional[str] = None,
+    proxy_pod: Optional[str] = None,
+) -> bool:
     started_at = time.monotonic()
     metric_status = "unhealthy"
     metric_reason = "exception"
@@ -758,8 +933,18 @@ def check_worker_health(pod_name: str, pod_ip: Optional[str] = None) -> bool:
         metric_reason = type(e).__name__
         return False
     finally:
-        worker_healthcheck_duration_seconds.observe(time.monotonic() - started_at)
+        duration_seconds = time.monotonic() - started_at
+        worker_healthcheck_duration_seconds.observe(duration_seconds)
         worker_healthcheck_total.labels(status=metric_status, reason=metric_reason).inc()
+        log_controller_event(
+            "ffmpeg_health_observed",
+            stream=stream,
+            proxy_pod=proxy_pod,
+            worker_pod=pod_name,
+            duration_ms=round(duration_seconds * 1000, 3),
+            status=metric_status,
+            level=logging.INFO if metric_status == "healthy" else logging.WARNING,
+        )
 
 
 def recover_state(
@@ -895,10 +1080,21 @@ async def monitor_worker_health():
                             worker_health_failures[current_uid] = 0
                 if first_ready_at is None:
                     if create_started_at is not None:
-                        worker_ready_duration_seconds.observe(time.monotonic() - create_started_at)
+                        ready_duration_seconds = time.monotonic() - create_started_at
+                        worker_ready_duration_seconds.observe(ready_duration_seconds)
                         worker_ready_total.labels(status="ready", reason="pod_ready").inc()
+                        ready_duration_ms = round(ready_duration_seconds * 1000, 3)
                     else:
                         worker_ready_total.labels(status="ready", reason="start_time_unknown").inc()
+                        ready_duration_ms = None
+                    log_controller_event(
+                        "worker_ready_observed",
+                        stream=stream,
+                        proxy_pod=owner_proxy,
+                        worker_pod=worker_pod,
+                        duration_ms=ready_duration_ms,
+                        status="ready",
+                    )
                     logger.debug(f"[WorkerHealth] Worker '{worker_pod}' became Ready. Starting worker delay timer ({WORKER_READY_HEALTH_DELAY_SECONDS}s) before /health probe.")
                     continue
 
@@ -929,7 +1125,7 @@ async def monitor_worker_health():
                             worker_health_failures.pop(current_uid, None)
                     continue
 
-                healthy = check_worker_health(worker_pod, pod.status.pod_ip)
+                healthy = check_worker_health(worker_pod, pod.status.pod_ip, stream=stream, proxy_pod=owner_proxy)
             except Exception:
                 healthy = False
 
@@ -984,7 +1180,7 @@ async def monitor_worker_health():
                 recovery_reason = "exception"
                 try:
                     proxy_dns = resolve_proxy_address(owner_proxy)
-                    new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
+                    new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns, proxy_pod_name=owner_proxy)
                 except Exception as e:
                     recovery_reason = type(e).__name__
                     worker_recovery_duration_seconds.observe(time.monotonic() - recovery_started_at)
@@ -1025,6 +1221,13 @@ async def monitor_worker_health():
                     )
                     try:
                         core.delete_namespaced_pod(name=new_worker, namespace=NAMESPACE, grace_period_seconds=0)
+                        log_controller_event(
+                            "worker_deleted",
+                            stream=stream,
+                            proxy_pod=owner_proxy,
+                            worker_pod=new_worker,
+                            status="deleted",
+                        )
                     except Exception as e:
                         logger.warning(f"[WorkerHealth] Failed to delete stale replacement pod {new_worker}: {e}")
                     continue
@@ -1032,6 +1235,13 @@ async def monitor_worker_health():
                 if old_worker_to_delete:
                     try:
                         core.delete_namespaced_pod(name=old_worker_to_delete, namespace=NAMESPACE, grace_period_seconds=0)
+                        log_controller_event(
+                            "worker_deleted",
+                            stream=stream,
+                            proxy_pod=owner_proxy,
+                            worker_pod=old_worker_to_delete,
+                            status="deleted",
+                        )
                     except Exception as e:
                         logger.warning(f"[WorkerHealth] Failed to delete pod {old_worker_to_delete}: {e}")
 
@@ -1078,6 +1288,7 @@ async def sweep_orphan_workers():
             logger.warning(f"[OrphanSweeper] Deleting orphan worker pod '{pod_name}'")
             try:
                 core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+                log_controller_event("worker_deleted", worker_pod=pod_name, status="deleted")
             except Exception as e:
                 logger.warning(f"[OrphanSweeper] Failed deleting orphan worker pod '{pod_name}': {e}")
 
@@ -1142,7 +1353,7 @@ def allocate_worker(
                 "status": "idempotent_replay"
             }
 
-        pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
+        pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address, proxy_pod_name=owner_proxy)
 
         with allocation_lock:
             current_worker = stream_to_worker.get(stream)
@@ -1157,6 +1368,13 @@ def allocate_worker(
                 worker_create_started_at.pop(pod_name, None)
                 try:
                     core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+                    log_controller_event(
+                        "worker_deleted",
+                        stream=stream,
+                        proxy_pod=owner_proxy,
+                        worker_pod=pod_name,
+                        status="deleted",
+                    )
                 except ApiException as e:
                     logger.warning(f"[Allocate] Failed deleting extra worker pod {pod_name}: {e}")
                 metric_status = "success"
@@ -1176,8 +1394,23 @@ def allocate_worker(
                 worker_create_started_at.pop(pod_name, None)
                 try:
                     core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+                    log_controller_event(
+                        "worker_deleted",
+                        stream=stream,
+                        proxy_pod=owner_proxy,
+                        worker_pod=pod_name,
+                        status="deleted",
+                    )
                 except ApiException as e:
                     logger.warning(f"[Allocate] Failed deleting stale worker pod {pod_name}: {e}")
+                log_controller_event(
+                    "stale_event_ignored",
+                    stream=stream,
+                    proxy_pod=current_owner,
+                    worker_pod=pod_name,
+                    status="ignored",
+                    level=logging.WARNING,
+                )
                 metric_reason = "ownership_changed"
                 raise HTTPException(status_code=409, detail=f"stream '{stream}' ownership changed during allocation")
 
@@ -1241,11 +1474,25 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
             try:
                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
                 metric_reason = "released"
+                log_controller_event(
+                    "worker_deleted",
+                    stream=stream,
+                    worker_pod=worker_name,
+                    started_at=started_at,
+                    status="deleted",
+                )
             except ApiException as e:
                 if e.status == 404:
                     metric_status = "success"
                     metric_reason = "pod_already_deleted"
                     logger.info(f"[Release] Worker pod {worker_name} was already deleted")
+                    log_controller_event(
+                        "worker_deleted",
+                        stream=stream,
+                        worker_pod=worker_name,
+                        started_at=started_at,
+                        status="already_deleted",
+                    )
                 else:
                     metric_status = "warning"
                     metric_reason = "delete_failed"
@@ -1306,6 +1553,14 @@ def register_stream(
                 metric_status = "success"
                 metric_reason = "registered"
 
+            log_controller_event(
+                "stream_registered",
+                stream=stream,
+                proxy_pod=proxy_pod,
+                started_at=started_at,
+                status=status,
+            )
+
             return {
                 "status": status,
                 "stream": stream,
@@ -1333,6 +1588,13 @@ def stream_started(
     started_at = time.monotonic()
     metric_status = "error"
     metric_reason = "exception"
+    log_controller_event(
+        "publish_received",
+        stream=stream,
+        proxy_pod=proxy_pod,
+        duration_ms=0,
+        status="received",
+    )
     try:
         registration = register_stream(stream=stream, proxy_pod=proxy_pod)
         allocation = allocate_worker(stream=stream, proxy_pod=proxy_pod, ownership_already_verified=True)
@@ -1372,6 +1634,13 @@ async def stream_ended(
     started_at = time.monotonic()
     metric_status = "error"
     metric_reason = "exception"
+    log_controller_event(
+        "stream_ended_received",
+        stream=stream,
+        proxy_pod=proxy_pod,
+        duration_ms=0,
+        status="received",
+    )
     try:
         with allocation_lock:
             if proxy_pod:
@@ -1387,6 +1656,14 @@ async def stream_ended(
                     logger.info(
                         f"[StreamsEnded] Ignored stale ended event for stream '{stream}' "
                         f"from proxy='{proxy_pod}' current_owner='{current_owner}'"
+                    )
+                    log_controller_event(
+                        "stale_event_ignored",
+                        stream=stream,
+                        proxy_pod=proxy_pod,
+                        started_at=started_at,
+                        status="ignored",
+                        level=logging.WARNING,
                     )
                     metric_status = "success"
                     metric_reason = "stale_ended_ignored"
