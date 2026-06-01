@@ -45,6 +45,16 @@ LOG_EVENT_FIELDS: Tuple[str, ...] = (
 LOG_CONTEXT_FIELDS: Tuple[str, ...] = ("experiment_id", "scenario", "run_id")
 LOG_CONTEXT_ENV_PREFIXES: Tuple[str, ...] = ("LIVEEDGECAST", "CONTROLLER")
 LOG_CONTEXT_DEFAULT_VALUE = "unknown"
+LOG_STATUS_REQUESTED = "requested"
+LOG_STATUS_CREATED = "created"
+LOG_STATUS_DELETED = "deleted"
+LOG_STATUS_DELETE_FAILED = "delete_failed"
+LOG_STATUS_ALREADY_DELETED = "already_deleted"
+LOG_STATUS_ACCEPTED = "accepted"
+LOG_STATUS_DENIED = "denied"
+LOG_STATUS_READY = "ready"
+LOG_STATUS_IGNORED = "ignored"
+LOG_STATUS_RECEIVED = "received"
 
 
 @dataclass(frozen=True)
@@ -631,7 +641,7 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
             stream=stream,
             proxy_pod=get_stream_proxy_pod(stream),
             worker_pod=pod_name,
-            status="requested",
+            status=LOG_STATUS_REQUESTED,
         )
         core.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
         with allocation_lock:
@@ -644,7 +654,7 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
             proxy_pod=get_stream_proxy_pod(stream),
             worker_pod=pod_name,
             started_at=started_at,
-            status="created",
+            status=LOG_STATUS_CREATED,
         )
         return pod_name
     except Exception as e:
@@ -679,7 +689,7 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
             stream=stream,
             proxy_pod=get_stream_proxy_pod(stream),
             worker_pod=old_worker,
-            status="deleted",
+            status=LOG_STATUS_DELETED,
         )
     except ApiException as e:
         log_controller_event(
@@ -687,7 +697,7 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
             stream=stream,
             proxy_pod=get_stream_proxy_pod(stream),
             worker_pod=old_worker,
-            status="delete_failed",
+            status=LOG_STATUS_DELETE_FAILED,
             level=logging.WARNING,
         )
         logger.warning(f"[Handover] Failed deleting old worker pod {old_worker}: {e}")
@@ -713,6 +723,12 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
 
 
 def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
+    """Evaluates stream ownership handover under allocation_lock."""
+    with allocation_lock:
+        return _try_handover_stream_owner_locked(stream, candidate_proxy_pod)
+
+
+def _try_handover_stream_owner_locked(stream: str, candidate_proxy_pod: str) -> bool:
     """
     Ownership rule with safe handover. Must be called while holding allocation_lock.
     - idempotent: if already owned by candidate_proxy_pod, just refresh
@@ -764,11 +780,15 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
             if stream in stream_to_worker:
                 replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
         except Exception:
-            created_worker_to_delete = None
+            created_workers_to_delete = []
             current_worker = stream_to_worker.get(stream)
             previous_worker = worker_state_snapshot["stream_to_worker"].get(stream)
             if current_worker and current_worker != previous_worker:
-                created_worker_to_delete = current_worker
+                created_workers_to_delete.append(current_worker)
+            for worker_name in worker_create_started_at:
+                if worker_name not in worker_state_snapshot["worker_create_started_at"]:
+                    created_workers_to_delete.append(worker_name)
+            created_workers_to_delete = list(dict.fromkeys(created_workers_to_delete))
 
             if previous_generation_present:
                 stream_generation[stream] = previous_generation
@@ -795,7 +815,7 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
             worker_pod_uid_by_name.update(worker_state_snapshot["worker_pod_uid_by_name"])
             worker_health_failures.clear()
             worker_health_failures.update(worker_state_snapshot["worker_health_failures"])
-            if created_worker_to_delete:
+            for created_worker_to_delete in created_workers_to_delete:
                 try:
                     core.delete_namespaced_pod(name=created_worker_to_delete, namespace=NAMESPACE, grace_period_seconds=0)
                     log_controller_event(
@@ -803,7 +823,7 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
                         stream=stream,
                         proxy_pod=candidate_proxy_pod,
                         worker_pod=created_worker_to_delete,
-                        status="deleted",
+                        status=LOG_STATUS_DELETED,
                     )
                 except Exception as cleanup_error:
                     log_controller_event(
@@ -811,7 +831,7 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
                         stream=stream,
                         proxy_pod=candidate_proxy_pod,
                         worker_pod=created_worker_to_delete,
-                        status="delete_failed",
+                        status=LOG_STATUS_DELETE_FAILED,
                         level=logging.WARNING,
                     )
                     logger.warning(
@@ -823,7 +843,7 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
             "handover_accepted",
             stream=stream,
             proxy_pod=candidate_proxy_pod,
-            status="accepted",
+            status=LOG_STATUS_ACCEPTED,
         )
         handover_success_total.inc()
         stream_proxy_handover_counter.inc()
@@ -839,7 +859,7 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
         stream=stream,
         generation=stream_generation.get(stream),
         proxy_pod=candidate_proxy_pod,
-        status="denied",
+        status=LOG_STATUS_DENIED,
         level=logging.WARNING,
     )
     return False
@@ -903,7 +923,7 @@ async def monitor_stream_registry_health():
                                     stream=stream,
                                     proxy_pod=proxy_pod,
                                     worker_pod=worker_name,
-                                    status="deleted",
+                                    status=LOG_STATUS_DELETED,
                                 )
                             except Exception as e:
                                 log_controller_event(
@@ -911,7 +931,7 @@ async def monitor_stream_registry_health():
                                     stream=stream,
                                     proxy_pod=proxy_pod,
                                     worker_pod=worker_name,
-                                    status="delete_failed",
+                                    status=LOG_STATUS_DELETE_FAILED,
                                     level=logging.WARNING,
                                 )
                                 logger.warning(f"[ProxyHealth] Failed deleting worker {worker_name}: {e}")
@@ -1181,10 +1201,10 @@ async def monitor_worker_health():
                     if create_started_at is not None:
                         ready_duration_seconds = time.monotonic() - create_started_at
                         worker_ready_duration_seconds.observe(ready_duration_seconds)
-                        worker_ready_total.labels(status="ready", reason="pod_ready").inc()
+                        worker_ready_total.labels(status=LOG_STATUS_READY, reason="pod_ready").inc()
                         ready_duration_ms = round(ready_duration_seconds * 1000, 3)
                     else:
-                        worker_ready_total.labels(status="ready", reason="start_time_unknown").inc()
+                        worker_ready_total.labels(status=LOG_STATUS_READY, reason="start_time_unknown").inc()
                         ready_duration_ms = None
                     log_controller_event(
                         "worker_ready_observed",
@@ -1192,7 +1212,7 @@ async def monitor_worker_health():
                         proxy_pod=owner_proxy,
                         worker_pod=worker_pod,
                         duration_ms=ready_duration_ms,
-                        status="ready",
+                        status=LOG_STATUS_READY,
                     )
                     logger.debug(f"[WorkerHealth] Worker '{worker_pod}' became Ready. Starting worker delay timer ({WORKER_READY_HEALTH_DELAY_SECONDS}s) before /health probe.")
                     continue
@@ -1325,7 +1345,7 @@ async def monitor_worker_health():
                             stream=stream,
                             proxy_pod=owner_proxy,
                             worker_pod=new_worker,
-                            status="deleted",
+                            status=LOG_STATUS_DELETED,
                         )
                     except Exception as e:
                         log_controller_event(
@@ -1333,7 +1353,7 @@ async def monitor_worker_health():
                             stream=stream,
                             proxy_pod=owner_proxy,
                             worker_pod=new_worker,
-                            status="delete_failed",
+                            status=LOG_STATUS_DELETE_FAILED,
                             level=logging.WARNING,
                         )
                         logger.warning(f"[WorkerHealth] Failed to delete stale replacement pod {new_worker}: {e}")
@@ -1347,7 +1367,7 @@ async def monitor_worker_health():
                             stream=stream,
                             proxy_pod=owner_proxy,
                             worker_pod=old_worker_to_delete,
-                            status="deleted",
+                            status=LOG_STATUS_DELETED,
                         )
                     except Exception as e:
                         log_controller_event(
@@ -1355,7 +1375,7 @@ async def monitor_worker_health():
                             stream=stream,
                             proxy_pod=owner_proxy,
                             worker_pod=old_worker_to_delete,
-                            status="delete_failed",
+                            status=LOG_STATUS_DELETE_FAILED,
                             level=logging.WARNING,
                         )
                         logger.warning(f"[WorkerHealth] Failed to delete pod {old_worker_to_delete}: {e}")
@@ -1404,12 +1424,12 @@ async def sweep_orphan_workers():
             # Orphan workers have no stream/proxy mapping; required event keys remain present with null context.
             try:
                 core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
-                log_controller_event("worker_deleted", worker_pod=pod_name, status="deleted")
+                log_controller_event("worker_deleted", worker_pod=pod_name, status=LOG_STATUS_DELETED)
             except Exception as e:
                 log_controller_event(
                     "worker_deleted",
                     worker_pod=pod_name,
-                    status="delete_failed",
+                    status=LOG_STATUS_DELETE_FAILED,
                     level=logging.WARNING,
                 )
                 logger.warning(f"[OrphanSweeper] Failed deleting orphan worker pod '{pod_name}': {e}")
@@ -1495,7 +1515,7 @@ def allocate_worker(
                         stream=stream,
                         proxy_pod=owner_proxy,
                         worker_pod=pod_name,
-                        status="deleted",
+                        status=LOG_STATUS_DELETED,
                     )
                 except ApiException as e:
                     log_controller_event(
@@ -1503,7 +1523,7 @@ def allocate_worker(
                         stream=stream,
                         proxy_pod=owner_proxy,
                         worker_pod=pod_name,
-                        status="delete_failed",
+                        status=LOG_STATUS_DELETE_FAILED,
                         level=logging.WARNING,
                     )
                     logger.warning(f"[Allocate] Failed deleting extra worker pod {pod_name}: {e}")
@@ -1529,7 +1549,7 @@ def allocate_worker(
                         stream=stream,
                         proxy_pod=owner_proxy,
                         worker_pod=pod_name,
-                        status="deleted",
+                        status=LOG_STATUS_DELETED,
                     )
                 except ApiException as e:
                     log_controller_event(
@@ -1537,7 +1557,7 @@ def allocate_worker(
                         stream=stream,
                         proxy_pod=owner_proxy,
                         worker_pod=pod_name,
-                        status="delete_failed",
+                        status=LOG_STATUS_DELETE_FAILED,
                         level=logging.WARNING,
                     )
                     logger.warning(f"[Allocate] Failed deleting stale worker pod {pod_name}: {e}")
@@ -1546,7 +1566,7 @@ def allocate_worker(
                     stream=stream,
                     proxy_pod=current_owner,
                     worker_pod=pod_name,
-                    status="ignored",
+                    status=LOG_STATUS_IGNORED,
                     level=logging.WARNING,
                 )
                 metric_reason = "ownership_changed"
@@ -1620,7 +1640,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                     proxy_pod=owner_proxy,
                     worker_pod=worker_name,
                     started_at=started_at,
-                    status="deleted",
+                    status=LOG_STATUS_DELETED,
                 )
             except ApiException as e:
                 if e.status == 404:
@@ -1633,7 +1653,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                         proxy_pod=owner_proxy,
                         worker_pod=worker_name,
                         started_at=started_at,
-                        status="already_deleted",
+                        status=LOG_STATUS_ALREADY_DELETED,
                     )
                 else:
                     metric_status = "warning"
@@ -1644,7 +1664,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                         proxy_pod=owner_proxy,
                         worker_pod=worker_name,
                         started_at=started_at,
-                        status="delete_failed",
+                        status=LOG_STATUS_DELETE_FAILED,
                         level=logging.WARNING,
                     )
                     logger.warning(f"[Release] Failed deleting worker pod {worker_name}: {e}")
@@ -1744,7 +1764,7 @@ def stream_started(
         stream=stream,
         proxy_pod=proxy_pod,
         duration_ms=0,
-        status="received",
+        status=LOG_STATUS_RECEIVED,
     )
     try:
         registration = register_stream(stream=stream, proxy_pod=proxy_pod)
@@ -1790,7 +1810,7 @@ async def stream_ended(
         stream=stream,
         proxy_pod=proxy_pod,
         duration_ms=0,
-        status="received",
+        status=LOG_STATUS_RECEIVED,
     )
     try:
         with allocation_lock:
@@ -1802,8 +1822,8 @@ async def stream_ended(
                     persist_state_locked()
                 elif current and current.get("proxy_pod") != proxy_pod:
                     current_owner = current.get("proxy_pod")
-                    stale_ended_events_ignored_total.labels(status="ignored", reason="proxy_owner_mismatch").inc()
-                    stream_ended_events_total.labels(status="ignored", reason="stale_owner_mismatch").inc()
+                    stale_ended_events_ignored_total.labels(status=LOG_STATUS_IGNORED, reason="proxy_owner_mismatch").inc()
+                    stream_ended_events_total.labels(status=LOG_STATUS_IGNORED, reason="stale_owner_mismatch").inc()
                     logger.info(
                         f"[StreamsEnded] Ignored stale ended event for stream '{stream}' "
                         f"from proxy='{proxy_pod}' current_owner='{current_owner}'"
@@ -1813,7 +1833,7 @@ async def stream_ended(
                         stream=stream,
                         proxy_pod=proxy_pod,
                         started_at=started_at,
-                        status="ignored",
+                        status=LOG_STATUS_IGNORED,
                         level=logging.WARNING,
                     )
                     metric_status = "success"

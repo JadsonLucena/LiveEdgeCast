@@ -782,6 +782,41 @@ def test_handover_rollback_deletes_new_worker_after_partial_replacement_failure(
     assert cleanup_event['status'] == 'deleted'
 
 
+def test_handover_rollback_deletes_worker_from_create_timestamp_delta():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
+    main.stream_to_proxy['live'] = 'proxy-old'
+    main.stream_generation['live'] = 1
+    main.stream_to_worker['live'] = 'worker-old'
+    main.worker_to_stream['worker-old'] = 'live'
+    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
+
+    def create_then_fail(stream, proxy_dns):
+        main.worker_create_started_at['worker-new'] = 123.0
+        raise RuntimeError('post create failed')
+
+    handler = JsonCaptureHandler()
+    main.logger.addHandler(handler)
+    try:
+        with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
+             patch.object(main, 'create_worker_pod_for_stream', side_effect=create_then_fail), \
+             patch.object(main.core, 'delete_namespaced_pod') as delete_pod:
+            with pytest.raises(RuntimeError, match='post create failed'):
+                main.try_handover_stream_owner('live', 'proxy-new')
+    finally:
+        main.logger.removeHandler(handler)
+
+    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-old'}
+    assert main.stream_to_proxy['live'] == 'proxy-old'
+    assert main.stream_generation['live'] == 1
+    assert main.stream_to_worker['live'] == 'worker-old'
+    assert 'worker-new' not in main.worker_create_started_at
+    delete_pod.assert_called_once_with(name='worker-new', namespace=main.NAMESPACE, grace_period_seconds=0)
+    cleanup_event = next(event for event in handler.events if event['event_type'] == 'worker_deleted')
+    assert cleanup_event['worker_pod'] == 'worker-new'
+    assert cleanup_event['status'] == 'deleted'
+
+
 def test_handover_accepted_with_real_worker_replacement_updates_worker_state():
     reset_state()
     main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
