@@ -2,6 +2,8 @@ import asyncio
 import importlib.util
 import json
 import logging
+import os
+import subprocess
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -1212,6 +1214,8 @@ def test_handover_worker_replacement_clears_old_per_pod_tracking():
 def test_worker_pod_event_records_kubernetes_lifecycle_timestamps():
     reset_state()
     main.stream_generation['live'] = 7
+    main.stream_to_worker['live'] = 'worker-live'
+    main.worker_to_stream['worker-live'] = 'live'
     pod = SimpleNamespace(
         metadata=SimpleNamespace(
             name='worker-live',
@@ -1250,6 +1254,34 @@ def test_worker_pod_event_records_kubernetes_lifecycle_timestamps():
 
 def test_stale_worker_pod_event_does_not_recreate_lifecycle_state_after_cleanup():
     reset_state()
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(
+            name='worker-old',
+            creation_timestamp='2026-06-01T00:00:01Z',
+            annotations={
+                'liveedgecast.io/stream': 'live',
+                'liveedgecast.io/generation': '1',
+                'liveedgecast.io/proxy-pod': 'proxy-1',
+            },
+        ),
+        status=SimpleNamespace(
+            conditions=[
+                SimpleNamespace(type='PodScheduled', status='True', last_transition_time='2026-06-01T00:00:02Z'),
+            ],
+            container_statuses=[],
+        ),
+    )
+
+    main.process_worker_pod_event({'type': 'MODIFIED', 'object': pod})
+
+    assert 'live' not in main.stream_lifecycle_timestamps
+
+
+def test_stale_same_generation_worker_pod_event_is_ignored_when_worker_is_not_current():
+    reset_state()
+    main.stream_generation['live'] = 1
+    main.stream_to_worker['live'] = 'worker-current'
+    main.worker_to_stream['worker-current'] = 'live'
     pod = SimpleNamespace(
         metadata=SimpleNamespace(
             name='worker-old',
@@ -1312,6 +1344,31 @@ def test_approximate_timestamps_do_not_emit_canonical_phase_histograms_until_exa
         'stream_lifecycle_phase_seconds_count',
         labels,
     ) == before + 1
+
+
+def test_worker_pod_lifecycle_watch_records_processing_errors():
+    reset_state()
+
+    class FakeWatch:
+        def stream(self, *_args, **_kwargs):
+            yield {'type': 'MODIFIED', 'object': object()}
+
+    before = counter_value(
+        main.worker_pod_lifecycle_watch_errors_total,
+        status='event_processing_error',
+        reason='RuntimeError',
+    )
+
+    with patch.object(main.watch, 'Watch', return_value=FakeWatch()), \
+         patch.object(main, 'process_worker_pod_event', side_effect=RuntimeError('bad event')):
+        main.collect_worker_pod_lifecycle_events_once(timeout_seconds=1)
+
+    assert counter_value(
+        main.worker_pod_lifecycle_watch_errors_total,
+        status='event_processing_error',
+        reason='RuntimeError',
+    ) == before + 1
+    assert sample_value(main.worker_pod_lifecycle_watch_up, 'worker_pod_lifecycle_watch_up') == 1
 
 
 def test_worker_progress_records_first_ffmpeg_progress_once():
@@ -1377,6 +1434,61 @@ def test_worker_and_proxy_scripts_url_encode_controller_callbacks():
     assert 'CONTROLLER_API="${CONTROLLER_API:-http://controller.media.svc.cluster.local:8000}"' in proxy_script
     assert '--connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}"' in proxy_script
     assert '--data-urlencode "proxy_pod=${PROXY_POD}"' in proxy_script
+
+
+def test_worker_runner_reports_first_progress_once_with_stubbed_ffmpeg_and_curl(tmp_path):
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    curl_log = tmp_path / 'curl.log'
+    ffmpeg_log = tmp_path / 'ffmpeg.log'
+    curl_stub = bin_dir / 'curl'
+    curl_stub.write_text(
+        '#!/bin/sh\n'
+        'printf "%s\\n" "$*" >> "$CURL_LOG"\n'
+        'exit 0\n'
+    )
+    ffmpeg_stub = bin_dir / 'ffmpeg'
+    ffmpeg_stub.write_text(
+        '#!/bin/sh\n'
+        'progress=""\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  if [ "$1" = "-progress" ]; then shift; progress="$1"; fi\n'
+        '  shift || true\n'
+        'done\n'
+        'printf "%s\\n" "frame=1" "progress=continue" > "$progress"\n'
+        'printf "ffmpeg-stub-ran\\n" >> "$FFMPEG_LOG"\n'
+        'exit 0\n'
+    )
+    curl_stub.chmod(0o755)
+    ffmpeg_stub.chmod(0o755)
+    env = {
+        **os.environ,
+        'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+        'STREAM_KEY': 'live&special',
+        'PROXY_DNS': 'proxy.local',
+        'RTMP_PUSH_BASE_URL': 'rtmp://target/live',
+        'CONTROLLER_API': 'http://controller.test',
+        'HOSTNAME': 'worker-test',
+        'CURL_LOG': str(curl_log),
+        'FFMPEG_LOG': str(ffmpeg_log),
+    }
+
+    result = subprocess.run(
+        ['bash', 'docker/worker/worker_stream_runner.sh'],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    curl_calls = curl_log.read_text().splitlines()
+    progress_calls = [call for call in curl_calls if '/workers/progress' in call]
+    started_calls = [call for call in curl_calls if '/workers/ffmpeg/started' in call]
+    assert len(started_calls) == 1
+    assert len(progress_calls) == 1
+    assert ffmpeg_log.read_text().strip() == 'ffmpeg-stub-ran'
 
 
 def test_worker_progress_ignores_stale_or_unmapped_workers():

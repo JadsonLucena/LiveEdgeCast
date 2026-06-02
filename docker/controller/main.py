@@ -629,6 +629,15 @@ stream_lifecycle_phase_observations_total = controller_counter(
     'Total derived stream lifecycle phase observations',
     ('phase', 'status', 'reason'),
 )
+worker_pod_lifecycle_watch_errors_total = controller_counter(
+    'worker_pod_lifecycle_watch_errors_total',
+    'Total worker Pod lifecycle watch failures',
+    ('status', 'reason'),
+)
+worker_pod_lifecycle_watch_up = controller_gauge(
+    'worker_pod_lifecycle_watch_up',
+    'Whether the worker Pod lifecycle watch is currently healthy',
+)
 worker_create_started_at: Dict[str, float] = {}
 STREAM_LIFECYCLE_TIMESTAMP_FIELDS: Tuple[str, ...] = (
     't_publish_start_proxy',
@@ -845,7 +854,11 @@ def stream_generation_from_worker_pod(pod: Any) -> Optional[Tuple[str, int]]:
         else:
             with allocation_lock:
                 indexed = worker_lifecycle_index.get(pod_name) if pod_name else None
-                if stream_generation.get(stream) == generation or indexed == (stream, generation):
+                current_worker = stream_to_worker.get(stream)
+                current_generation = stream_generation.get(stream)
+                if indexed == (stream, generation) or (
+                    pod_name == current_worker and current_generation == generation
+                ):
                     return stream, generation
             logger.debug(
                 f"[WorkerPodEvents] Ignoring stale pod event for pod '{pod_name}' "
@@ -919,6 +932,7 @@ def process_worker_pod_event(event: Mapping[str, Any]) -> None:
 
 def collect_worker_pod_lifecycle_events_once(timeout_seconds: int = 30) -> None:
     watcher = watch.Watch()
+    worker_pod_lifecycle_watch_up.set(1)
     for event in watcher.stream(
         core.list_namespaced_pod,
         namespace=NAMESPACE,
@@ -928,6 +942,10 @@ def collect_worker_pod_lifecycle_events_once(timeout_seconds: int = 30) -> None:
         try:
             process_worker_pod_event(event)
         except Exception as e:
+            worker_pod_lifecycle_watch_errors_total.labels(
+                status='event_processing_error',
+                reason=type(e).__name__,
+            ).inc()
             logger.warning(f"[WorkerPodEvents] Failed processing worker pod event: {e}")
 
 
@@ -936,6 +954,11 @@ async def collect_worker_pod_lifecycle_events() -> None:
         try:
             await asyncio.to_thread(collect_worker_pod_lifecycle_events_once)
         except Exception as e:
+            worker_pod_lifecycle_watch_up.set(0)
+            worker_pod_lifecycle_watch_errors_total.labels(
+                status='watch_error',
+                reason=type(e).__name__,
+            ).inc()
             logger.warning(f"[WorkerPodEvents] Watch failed; retrying: {e}")
             await asyncio.sleep(5)
 
