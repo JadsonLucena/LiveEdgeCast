@@ -92,3 +92,63 @@ values instead of converting an unknown scrape result into zero active streams.
 When a proxy pod disappears from Kubernetes discovery, the controller removes
 that pod's RTMP metric series to avoid stale values after rollouts or
 reschedules.
+
+## Stream startup lifecycle timestamps
+
+The controller models startup milestones per `(stream, generation)` in memory and
+observes derived histograms only when both endpoints of a phase are available.
+The timestamp fields are:
+
+| Timestamp | Source | Notes |
+| --- | --- | --- |
+| `t_publish_start_proxy` | Proxy `on_publish_start` hook query parameter. | If the proxy timestamp is missing, the controller records `t_controller_received_event` time as a documented approximation. |
+| `t_controller_received_event` | Controller `/streams/started` handler. | Wall-clock epoch seconds when the controller receives the publish-start event. |
+| `t_worker_create_requested` | Controller before Kubernetes Pod create API call. | Records the controller-side create request boundary. |
+| `t_worker_pod_created` | Kubernetes Pod metadata/create response. | Uses `metadata.creationTimestamp` when observable; records controller create-response time as an approximation only until exact metadata is observed. |
+| `t_worker_scheduled` | Kubernetes Pod `status.conditions`. | Uses the `PodScheduled=True` `lastTransitionTime`. |
+| `t_worker_container_started` | Kubernetes Pod `status.containerStatuses`. | Uses the first container `state.running.startedAt` observed for the worker Pod. |
+| `t_worker_ready` | Kubernetes Pod `status.conditions`. | Uses the `Ready=True` `lastTransitionTime`. |
+| `t_ffmpeg_started` | Worker HTTP notification immediately before launching FFmpeg. | Approximation of process start; the exact `execve` timestamp is not exposed by Kubernetes. |
+| `t_ffmpeg_first_progress` | Worker one-shot callback after reading the first FFmpeg `-progress` line locally. | The worker runs FFmpeg with a local progress FIFO and notifies the controller once; duplicate callbacks are ignored for the milestone. |
+
+The controller watches worker Pod events with `label_selector=app=worker` and
+extracts scheduling/start/readiness milestones from Pod status. Worker Pods are
+annotated with `liveedgecast.io/stream`, `liveedgecast.io/generation`, and
+`liveedgecast.io/proxy-pod` so Kubernetes events can be correlated without using
+stream names as Prometheus labels. The watch uses a short bounded timeout
+(`WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS`, default `5`) so controller
+shutdown is not delayed for a long-running blocking Kubernetes watch thread.
+
+Derived Prometheus metrics:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `stream_lifecycle_timestamp_observed_total` | `timestamp`, `source` plus controlled metadata | Count of lifecycle timestamp observations accepted by the controller. |
+| `stream_lifecycle_phase_seconds` | `phase`, `start_timestamp`, `end_timestamp` plus controlled metadata | Histogram of derived phase durations once both timestamps are present and neither endpoint is approximate. |
+| `stream_lifecycle_phase_observations_total` | `phase`, `status`, `reason` plus controlled metadata | Count of derived phase observations, including pending phases with approximate endpoints and ignored negative durations caused by clock skew. |
+| `worker_pod_lifecycle_watch_errors_total` | `status`, `reason` plus controlled metadata | Count of worker Pod lifecycle watch failures or per-event processing failures. |
+| `worker_pod_lifecycle_watch_up` | Controlled metadata only | `1` when the worker Pod lifecycle watch loop is active, `0` after a watch failure until the next successful watch starts. |
+
+Derived phases are intentionally low-cardinality and do **not** expose `stream`,
+`generation`, `proxy_pod`, or `worker_pod` as metric labels. Those identifiers
+remain in structured logs and in the controller's in-memory timestamp model for
+correlation. The in-memory model is live-state only and is cleaned up when the
+stream is released or expired; Prometheus metrics and structured logs are the
+durable observability outputs. Canonical phase histograms skip approximate
+endpoints so later exact Kubernetes timestamps do not leave uncorrectable
+approximate observations in Prometheus histograms; skipped approximate phases are
+counted once with `status="pending"` and `reason="approximate_endpoint"`.
+
+Current approximations and observability limits:
+
+- Proxy hook time and controller time may be on different clocks; negative
+  derived durations are ignored and counted with `reason="negative_duration"`.
+- `t_ffmpeg_started` is the worker script notification immediately before the
+  `ffmpeg` command is launched, not a kernel-level process start timestamp.
+- `t_ffmpeg_first_progress` is observed when the worker reads the first line from
+  FFmpeg `-progress` and sends a one-shot callback to the controller; it is later
+  than first input byte processing and depends on FFmpeg's progress emission
+  cadence and worker/controller HTTP delivery.
+- Kubernetes does not expose an exact image pull completion or user-process start
+  timestamp in this controller, so `t_worker_container_started` is the container
+  runtime `startedAt` value from `containerStatuses`.
