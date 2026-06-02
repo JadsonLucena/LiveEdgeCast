@@ -1385,6 +1385,23 @@ def test_worker_pod_lifecycle_watch_records_processing_errors():
     assert sample_value(main.worker_pod_lifecycle_watch_up, 'worker_pod_lifecycle_watch_up') == 1
 
 
+
+def test_worker_pod_lifecycle_watch_default_timeout_is_short_for_shutdown():
+    reset_state()
+    seen_kwargs = {}
+
+    class FakeWatch:
+        def stream(self, *_args, **kwargs):
+            seen_kwargs.update(kwargs)
+            return iter(())
+
+    with patch.object(main.watch, 'Watch', return_value=FakeWatch()):
+        main.collect_worker_pod_lifecycle_events_once()
+
+    assert seen_kwargs['timeout_seconds'] == main.WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS
+    assert seen_kwargs['timeout_seconds'] <= 5
+
+
 def test_worker_progress_records_first_ffmpeg_progress_once():
     reset_state()
     main.stream_generation['live'] = 3

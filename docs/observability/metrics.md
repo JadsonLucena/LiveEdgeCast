@@ -115,7 +115,9 @@ The controller watches worker Pod events with `label_selector=app=worker` and
 extracts scheduling/start/readiness milestones from Pod status. Worker Pods are
 annotated with `liveedgecast.io/stream`, `liveedgecast.io/generation`, and
 `liveedgecast.io/proxy-pod` so Kubernetes events can be correlated without using
-stream names as Prometheus labels.
+stream names as Prometheus labels. The watch uses a short bounded timeout
+(`WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS`, default `5`) so controller
+shutdown is not delayed for a long-running blocking Kubernetes watch thread.
 
 Derived Prometheus metrics:
 

@@ -552,6 +552,7 @@ WORKER_HEALTHCHECK_MAX_FAILURES = 3
 WORKER_HEALTHCHECK_JITTER_SECONDS = 1.5
 WORKER_READY_HEALTH_DELAY_SECONDS = 3  # Wait after worker Ready before worker /health probes.
 WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS = 60
+WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS = get_int_env("WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS", 5, min_value=1)
 PROXY_READY_HEALTH_DELAY_SECONDS = 3  # Wait after proxy Ready before proxy /health probes.
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
@@ -941,7 +942,9 @@ def process_worker_pod_event(event: Mapping[str, Any]) -> None:
         )
 
 
-def collect_worker_pod_lifecycle_events_once(timeout_seconds: int = 30) -> None:
+def collect_worker_pod_lifecycle_events_once(timeout_seconds: Optional[int] = None) -> None:
+    if timeout_seconds is None:
+        timeout_seconds = WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS
     watcher = watch.Watch()
     worker_pod_lifecycle_watch_up.set(1)
     for event in watcher.stream(
