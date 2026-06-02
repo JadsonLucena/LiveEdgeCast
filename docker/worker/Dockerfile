@@ -45,7 +45,8 @@ RUN apk add --no-cache \
     pcre2 \
     zlib \
     ffmpeg \
-    bash
+    bash \
+    curl
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
 COPY --from=builder /tmp/build/nginx-${NGINX_VERSION}/conf/mime.types /etc/nginx/mime.types
