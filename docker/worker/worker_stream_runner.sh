@@ -24,7 +24,9 @@ cleanup() {
     kill -TERM "$PROGRESS_READER_PID" 2>/dev/null || true
     wait "$PROGRESS_READER_PID" 2>/dev/null || true
   fi
-  rm -f "$PROGRESS_FIFO" "$PID_FILE"
+  if [ -n "${STREAM_KEY:-}" ]; then
+    rm -f "$PROGRESS_FIFO" "$PID_FILE"
+  fi
 }
 trap cleanup EXIT
 
