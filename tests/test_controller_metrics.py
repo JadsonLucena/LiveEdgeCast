@@ -1561,6 +1561,43 @@ def test_worker_runner_continues_when_controller_callbacks_fail(tmp_path):
     assert '/workers/progress' in curl_log.read_text()
     assert ffmpeg_log.read_text().strip() == 'ffmpeg-stub-ran'
 
+def test_worker_progress_records_under_allocation_lock_to_prevent_stale_race():
+    reset_state()
+    main.stream_generation['live'] = 5
+    main.worker_to_stream['worker-live'] = 'live'
+    main.stream_to_worker['live'] = 'worker-live'
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    seen_allocated_workers = []
+
+    class MutatingRLock:
+        def __init__(self):
+            self.depth = 0
+
+        def __enter__(self):
+            self.depth += 1
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.depth -= 1
+            if self.depth == 0:
+                main.stream_to_worker['live'] = 'worker-new'
+            return False
+
+    original_record_timestamp = main.record_stream_lifecycle_timestamp
+
+    def record_with_allocation_snapshot(*args, **kwargs):
+        seen_allocated_workers.append(main.stream_to_worker.get('live'))
+        return original_record_timestamp(*args, **kwargs)
+
+    with patch.object(main, 'allocation_lock', MutatingRLock()), \
+         patch.object(main, 'record_stream_lifecycle_timestamp', side_effect=record_with_allocation_snapshot):
+        result = main.record_worker_progress_event('live', 'worker-live', 't_ffmpeg_started', 'worker_hook')
+
+    assert result['status'] == 'observed'
+    assert seen_allocated_workers == ['worker-live']
+    assert main.stream_to_worker['live'] == 'worker-new'
+
+
 def test_worker_progress_ignores_stale_or_unmapped_workers():
     reset_state()
     main.stream_generation['live'] = 4

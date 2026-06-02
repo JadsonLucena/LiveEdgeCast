@@ -995,14 +995,15 @@ def record_worker_progress_event(stream: str, worker_pod: str, field: str, sourc
                 'timestamp': field,
             }
         generation = key[1]
-    observed = record_stream_lifecycle_timestamp(
-        stream,
-        generation,
-        field,
-        source=source,
-        worker_pod=worker_pod,
-        proxy_pod=get_stream_proxy_pod(stream),
-    )
+        proxy_pod = stream_registry.get(stream, {}).get("proxy_pod")
+        observed = record_stream_lifecycle_timestamp(
+            stream,
+            generation,
+            field,
+            source=source,
+            worker_pod=worker_pod,
+            proxy_pod=proxy_pod,
+        )
     return {
         'status': 'observed' if observed else 'duplicate',
         'reason': 'recorded' if observed else 'already_observed',
