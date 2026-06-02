@@ -32,6 +32,7 @@ def reset_state():
     main.worker_create_started_at.clear()
     main.stream_lifecycle_timestamps.clear()
     main.stream_lifecycle_observed_phases.clear()
+    main.stream_lifecycle_pending_approximate_phases.clear()
     main.worker_lifecycle_index.clear()
     main.proxy_rtmp_stats_observed_pods.clear()
     main.reset_controlled_metric_metadata_cache()
@@ -1318,6 +1319,12 @@ def test_approximate_timestamps_do_not_emit_canonical_phase_histograms_until_exa
         'stream_lifecycle_phase_seconds_count',
         labels,
     )
+    pending_labels = {
+        'phase': 'worker_create_request_to_pod_created',
+        'status': 'pending',
+        'reason': 'approximate_endpoint',
+    }
+    pending_before = counter_value(main.stream_lifecycle_phase_observations_total, **pending_labels)
 
     main.record_stream_lifecycle_timestamp(
         'live', 1, 't_worker_create_requested',
@@ -1333,6 +1340,13 @@ def test_approximate_timestamps_do_not_emit_canonical_phase_histograms_until_exa
         'stream_lifecycle_phase_seconds_count',
         labels,
     ) == before
+    assert counter_value(main.stream_lifecycle_phase_observations_total, **pending_labels) == pending_before + 1
+    # Duplicate approximate observations should not repeatedly count pending phases.
+    main.record_stream_lifecycle_timestamp(
+        'live', 1, 't_worker_pod_created',
+        timestamp='2026-06-01T00:00:02Z', source='kubernetes_create_response', approximate=True,
+    )
+    assert counter_value(main.stream_lifecycle_phase_observations_total, **pending_labels) == pending_before + 1
 
     main.record_stream_lifecycle_timestamp(
         'live', 1, 't_worker_pod_created',
@@ -1490,6 +1504,60 @@ def test_worker_runner_reports_first_progress_once_with_stubbed_ffmpeg_and_curl(
     assert len(progress_calls) == 1
     assert ffmpeg_log.read_text().strip() == 'ffmpeg-stub-ran'
 
+
+
+def test_worker_runner_continues_when_controller_callbacks_fail(tmp_path):
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    curl_log = tmp_path / 'curl.log'
+    ffmpeg_log = tmp_path / 'ffmpeg.log'
+    curl_stub = bin_dir / 'curl'
+    curl_stub.write_text(
+        '#!/bin/sh\n'
+        'printf "%s\\n" "$*" >> "$CURL_LOG"\n'
+        'exit 22\n'
+    )
+    ffmpeg_stub = bin_dir / 'ffmpeg'
+    ffmpeg_stub.write_text(
+        '#!/bin/sh\n'
+        'progress=""\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  if [ "$1" = "-progress" ]; then shift; progress="$1"; fi\n'
+        '  shift || true\n'
+        'done\n'
+        'printf "%s\\n" "frame=1" > "$progress"\n'
+        'printf "ffmpeg-stub-ran\\n" >> "$FFMPEG_LOG"\n'
+        'exit 0\n'
+    )
+    curl_stub.chmod(0o755)
+    ffmpeg_stub.chmod(0o755)
+    env = {
+        **os.environ,
+        'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+        'STREAM_KEY': 'live',
+        'PROXY_DNS': 'proxy.local',
+        'RTMP_PUSH_BASE_URL': 'rtmp://target/live',
+        'CONTROLLER_API': 'http://controller.test',
+        'HOSTNAME': 'worker-test',
+        'CURL_LOG': str(curl_log),
+        'FFMPEG_LOG': str(ffmpeg_log),
+        'CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS': '1',
+        'CONTROLLER_CALLBACK_MAX_TIME_SECONDS': '1',
+    }
+
+    result = subprocess.run(
+        ['bash', 'docker/worker/worker_stream_runner.sh'],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert '/workers/ffmpeg/started' in curl_log.read_text()
+    assert '/workers/progress' in curl_log.read_text()
+    assert ffmpeg_log.read_text().strip() == 'ffmpeg-stub-ran'
 
 def test_worker_progress_ignores_stale_or_unmapped_workers():
     reset_state()

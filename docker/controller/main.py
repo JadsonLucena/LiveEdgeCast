@@ -664,6 +664,7 @@ STREAM_LIFECYCLE_DERIVED_PHASES: Tuple[Tuple[str, str, str], ...] = (
 )
 stream_lifecycle_timestamps: Dict[str, Dict[int, Dict[str, Any]]] = {}
 stream_lifecycle_observed_phases: Set[Tuple[str, int, str]] = set()
+stream_lifecycle_pending_approximate_phases: Set[Tuple[str, int, str]] = set()
 worker_lifecycle_index: Dict[str, Tuple[str, int]] = {}
 
 try:
@@ -723,6 +724,9 @@ def cleanup_stream_lifecycle_tracking_locked(stream: Optional[str]) -> None:
     stale_phase_keys = [key for key in stream_lifecycle_observed_phases if key[0] == stream]
     for key in stale_phase_keys:
         stream_lifecycle_observed_phases.discard(key)
+    stale_pending_phase_keys = [key for key in stream_lifecycle_pending_approximate_phases if key[0] == stream]
+    for key in stale_pending_phase_keys:
+        stream_lifecycle_pending_approximate_phases.discard(key)
     stale_worker_keys = [
         worker_pod
         for worker_pod, (tracked_stream, _generation) in worker_lifecycle_index.items()
@@ -762,6 +766,13 @@ def observe_ready_lifecycle_phases_locked(stream: str, generation: int, entry: M
         if start_ts is None or end_ts is None:
             continue
         if isinstance(approximations, Mapping) and (approximations.get(start_field) or approximations.get(end_field)):
+            if observed_key not in stream_lifecycle_pending_approximate_phases:
+                stream_lifecycle_phase_observations_total.labels(
+                    phase=phase,
+                    status='pending',
+                    reason='approximate_endpoint',
+                ).inc()
+                stream_lifecycle_pending_approximate_phases.add(observed_key)
             continue
         duration = end_ts - start_ts
         if duration < 0:

@@ -123,7 +123,7 @@ Derived Prometheus metrics:
 | --- | --- | --- |
 | `stream_lifecycle_timestamp_observed_total` | `timestamp`, `source` plus controlled metadata | Count of lifecycle timestamp observations accepted by the controller. |
 | `stream_lifecycle_phase_seconds` | `phase`, `start_timestamp`, `end_timestamp` plus controlled metadata | Histogram of derived phase durations once both timestamps are present and neither endpoint is approximate. |
-| `stream_lifecycle_phase_observations_total` | `phase`, `status`, `reason` plus controlled metadata | Count of derived phase observations, including ignored negative durations caused by clock skew. |
+| `stream_lifecycle_phase_observations_total` | `phase`, `status`, `reason` plus controlled metadata | Count of derived phase observations, including pending phases with approximate endpoints and ignored negative durations caused by clock skew. |
 | `worker_pod_lifecycle_watch_errors_total` | `status`, `reason` plus controlled metadata | Count of worker Pod lifecycle watch failures or per-event processing failures. |
 | `worker_pod_lifecycle_watch_up` | Controlled metadata only | `1` when the worker Pod lifecycle watch loop is active, `0` after a watch failure until the next successful watch starts. |
 
@@ -134,7 +134,8 @@ correlation. The in-memory model is live-state only and is cleaned up when the
 stream is released or expired; Prometheus metrics and structured logs are the
 durable observability outputs. Canonical phase histograms skip approximate
 endpoints so later exact Kubernetes timestamps do not leave uncorrectable
-approximate observations in Prometheus histograms.
+approximate observations in Prometheus histograms; skipped approximate phases are
+counted once with `status="pending"` and `reason="approximate_endpoint"`.
 
 Current approximations and observability limits:
 
