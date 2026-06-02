@@ -16,7 +16,7 @@ notify_stream_started() {
 
 echo "[$(date)] [on_publish_start] Stream '$STREAM_NAME' started on proxy '$PROXY_POD'"
 
-PUBLISH_START_TS="$(date +%s.%N)"
+PUBLISH_START_TS="$(date +%s)"
 notify_stream_started || \
   echo "[$(date)] [on_publish_start] WARNING: Failed to notify controller stream start"
 
