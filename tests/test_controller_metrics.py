@@ -28,6 +28,9 @@ def reset_state():
     main.worker_health_failures.clear()
     main.worker_pod_uid_by_name.clear()
     main.worker_create_started_at.clear()
+    main.stream_lifecycle_timestamps.clear()
+    main.stream_lifecycle_observed_phases.clear()
+    main.worker_lifecycle_index.clear()
     main.proxy_rtmp_stats_observed_pods.clear()
     main.reset_controlled_metric_metadata_cache()
 
@@ -223,7 +226,7 @@ def test_app_lifespan_starts_and_cancels_background_tasks():
 
     async def run_lifespan():
         async with main.app_lifespan(SimpleNamespace()):
-            assert len(tasks) == 5
+            assert len(tasks) == 6
             assert all(not task.cancelled for task in tasks)
 
     with patch.object(main.asyncio, 'sleep', new_callable=AsyncMock), \
@@ -232,7 +235,7 @@ def test_app_lifespan_starts_and_cancels_background_tasks():
         asyncio.run(run_lifespan())
 
     recover_state.assert_called_once_with()
-    assert len(tasks) == 5
+    assert len(tasks) == 6
     assert all(task.cancelled for task in tasks)
 
 
@@ -1204,3 +1207,237 @@ def test_handover_worker_replacement_clears_old_per_pod_tracking():
     assert 'uid-old' not in main.worker_health_failures
     assert main.worker_create_started_at['worker-new'] == 456.0
     delete_pod.assert_called_once_with(name='worker-old', namespace=main.NAMESPACE, grace_period_seconds=0)
+
+
+def test_worker_pod_event_records_kubernetes_lifecycle_timestamps():
+    reset_state()
+    main.stream_generation['live'] = 7
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(
+            name='worker-live',
+            creation_timestamp='2026-06-01T00:00:01Z',
+            annotations={
+                'liveedgecast.io/stream': 'live',
+                'liveedgecast.io/generation': '7',
+                'liveedgecast.io/proxy-pod': 'proxy-1',
+            },
+        ),
+        status=SimpleNamespace(
+            conditions=[
+                SimpleNamespace(type='PodScheduled', status='True', last_transition_time='2026-06-01T00:00:02Z'),
+                SimpleNamespace(type='Ready', status='True', last_transition_time='2026-06-01T00:00:04Z'),
+            ],
+            container_statuses=[
+                SimpleNamespace(
+                    state=SimpleNamespace(
+                        running=SimpleNamespace(started_at='2026-06-01T00:00:03Z')
+                    )
+                )
+            ],
+        ),
+    )
+
+    main.process_worker_pod_event({'type': 'MODIFIED', 'object': pod})
+
+    entry = main.stream_lifecycle_timestamps['live'][7]
+    assert entry['worker_pod'] == 'worker-live'
+    assert entry['proxy_pod'] == 'proxy-1'
+    assert entry['t_worker_pod_created'] == main.timestamp_to_epoch_seconds('2026-06-01T00:00:01Z')
+    assert entry['t_worker_scheduled'] == main.timestamp_to_epoch_seconds('2026-06-01T00:00:02Z')
+    assert entry['t_worker_container_started'] == main.timestamp_to_epoch_seconds('2026-06-01T00:00:03Z')
+    assert entry['t_worker_ready'] == main.timestamp_to_epoch_seconds('2026-06-01T00:00:04Z')
+
+
+def test_stale_worker_pod_event_does_not_recreate_lifecycle_state_after_cleanup():
+    reset_state()
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(
+            name='worker-old',
+            creation_timestamp='2026-06-01T00:00:01Z',
+            annotations={
+                'liveedgecast.io/stream': 'live',
+                'liveedgecast.io/generation': '1',
+                'liveedgecast.io/proxy-pod': 'proxy-1',
+            },
+        ),
+        status=SimpleNamespace(
+            conditions=[
+                SimpleNamespace(type='PodScheduled', status='True', last_transition_time='2026-06-01T00:00:02Z'),
+            ],
+            container_statuses=[],
+        ),
+    )
+
+    main.process_worker_pod_event({'type': 'MODIFIED', 'object': pod})
+
+    assert 'live' not in main.stream_lifecycle_timestamps
+
+
+def test_approximate_timestamps_do_not_emit_canonical_phase_histograms_until_exact():
+    reset_state()
+    main.stream_generation['live'] = 1
+    labels = {
+        'phase': 'worker_create_request_to_pod_created',
+        'start_timestamp': 't_worker_create_requested',
+        'end_timestamp': 't_worker_pod_created',
+    }
+    before = sample_value(
+        main.stream_lifecycle_phase_seconds,
+        'stream_lifecycle_phase_seconds_count',
+        labels,
+    )
+
+    main.record_stream_lifecycle_timestamp(
+        'live', 1, 't_worker_create_requested',
+        timestamp='2026-06-01T00:00:01Z', source='controller',
+    )
+    main.record_stream_lifecycle_timestamp(
+        'live', 1, 't_worker_pod_created',
+        timestamp='2026-06-01T00:00:02Z', source='kubernetes_create_response', approximate=True,
+    )
+
+    assert sample_value(
+        main.stream_lifecycle_phase_seconds,
+        'stream_lifecycle_phase_seconds_count',
+        labels,
+    ) == before
+
+    main.record_stream_lifecycle_timestamp(
+        'live', 1, 't_worker_pod_created',
+        timestamp='2026-06-01T00:00:02Z', source='kubernetes_pod_metadata',
+    )
+
+    assert sample_value(
+        main.stream_lifecycle_phase_seconds,
+        'stream_lifecycle_phase_seconds_count',
+        labels,
+    ) == before + 1
+
+
+def test_worker_progress_records_first_ffmpeg_progress_once():
+    reset_state()
+    main.stream_generation['live'] = 3
+    main.worker_to_stream['worker-live'] = 'live'
+    main.stream_to_worker['live'] = 'worker-live'
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+
+    first = main.record_worker_progress_event('live', 'worker-live', 't_ffmpeg_first_progress', 'ffmpeg_progress')
+    second = main.record_worker_progress_event('live', 'worker-live', 't_ffmpeg_first_progress', 'ffmpeg_progress')
+
+    assert first['status'] == 'observed'
+    assert second['status'] == 'duplicate'
+    assert second['reason'] == 'already_observed'
+    entry = main.stream_lifecycle_timestamps['live'][3]
+    assert 't_ffmpeg_first_progress' in entry
+    assert entry['worker_pod'] == 'worker-live'
+    assert entry['sources']['t_ffmpeg_first_progress'] == 'ffmpeg_progress'
+
+
+def test_failed_worker_create_does_not_remove_existing_create_timestamp():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_to_proxy['live'] = 'proxy-1'
+    main.stream_generation['live'] = 1
+    main.stream_lifecycle_timestamps['live'] = {
+        1: {
+            't_worker_create_requested': 100.0,
+            'sources': {'t_worker_create_requested': 'controller'},
+            'approximations': {'t_worker_create_requested': False},
+            'worker_pod': 'worker-existing',
+        }
+    }
+    container = SimpleNamespace(env=[])
+    template = SimpleNamespace(
+        spec=SimpleNamespace(containers=[container]),
+        metadata=SimpleNamespace(labels={'app': 'worker'}),
+    )
+    deployment = SimpleNamespace(spec=SimpleNamespace(template=template))
+
+    with patch.object(main, 'random_suffix', return_value='abcde'), \
+         patch.object(main.apps, 'read_namespaced_deployment', return_value=deployment), \
+         patch.object(main.core, 'create_namespaced_pod', side_effect=RuntimeError('create failed')):
+        with pytest.raises(RuntimeError, match='create failed'):
+            main.create_worker_pod_for_stream(stream='live', proxy_dns='10.0.0.1')
+
+    entry = main.stream_lifecycle_timestamps['live'][1]
+    assert entry['t_worker_create_requested'] == 100.0
+    assert entry['worker_pod'] == 'worker-existing'
+    assert 'worker-live-abcde' not in main.worker_lifecycle_index
+
+
+def test_worker_and_proxy_scripts_url_encode_controller_callbacks():
+    worker_script = Path('docker/worker/worker_stream_runner.sh').read_text()
+    proxy_script = Path('docker/proxy/on_publish_start.sh').read_text()
+
+    assert '--data-urlencode "stream=${STREAM_KEY}"' in worker_script
+    assert '--connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}"' in worker_script
+    assert '--data-urlencode "worker_pod=${WORKER_POD}"' in worker_script
+    assert '-progress "$PROGRESS_FIFO"' in worker_script
+    assert '--data-urlencode "stream=${STREAM_NAME}"' in proxy_script
+    assert 'CONTROLLER_API="${CONTROLLER_API:-http://controller.media.svc.cluster.local:8000}"' in proxy_script
+    assert '--connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}"' in proxy_script
+    assert '--data-urlencode "proxy_pod=${PROXY_POD}"' in proxy_script
+
+
+def test_worker_progress_ignores_stale_or_unmapped_workers():
+    reset_state()
+    main.stream_generation['live'] = 4
+    main.worker_to_stream['worker-current'] = 'live'
+    main.stream_to_worker['live'] = 'worker-current'
+    main.worker_lifecycle_index['worker-old'] = ('live', 3)
+
+    stale = main.record_worker_progress_event('live', 'worker-old', 't_ffmpeg_first_progress', 'ffmpeg_progress')
+    unknown = main.record_worker_progress_event('live', 'worker-unknown', 't_ffmpeg_first_progress', 'ffmpeg_progress')
+
+    assert stale == {
+        'status': 'ignored',
+        'reason': 'stale_worker',
+        'stream': 'live',
+        'worker_pod': 'worker-old',
+        'timestamp': 't_ffmpeg_first_progress',
+    }
+    assert unknown == {
+        'status': 'ignored',
+        'reason': 'unmapped_worker',
+        'stream': 'live',
+        'worker_pod': 'worker-unknown',
+        'timestamp': 't_ffmpeg_first_progress',
+    }
+    assert 'live' not in main.stream_lifecycle_timestamps
+
+
+def test_release_worker_cleans_lifecycle_state():
+    reset_state()
+    main.stream_to_worker['live'] = 'worker-a'
+    main.worker_to_stream['worker-a'] = 'live'
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_to_proxy['live'] = 'proxy-1'
+    main.stream_generation['live'] = 1
+    main.worker_lifecycle_index['worker-a'] = ('live', 1)
+    main.stream_lifecycle_timestamps['live'] = {1: {'t_ffmpeg_first_progress': 1.0}}
+    main.stream_lifecycle_observed_phases.add(('live', 1, 'controller_to_first_progress'))
+
+    with patch.object(main, 'persist_state_locked', return_value=None), \
+         patch.object(main.core, 'delete_namespaced_pod'):
+        result = asyncio.run(main.release_worker(stream='live'))
+
+    assert result['status'] == 'released'
+    assert 'live' not in main.stream_lifecycle_timestamps
+    assert ('live', 1, 'controller_to_first_progress') not in main.stream_lifecycle_observed_phases
+    assert 'worker-a' not in main.worker_lifecycle_index
+
+
+def test_stream_started_records_proxy_and_controller_lifecycle_timestamps():
+    reset_state()
+    publish_ts = main.timestamp_to_epoch_seconds('2026-06-01T00:00:00Z')
+
+    with patch.object(main, 'persist_state_locked', return_value=None), \
+         patch.object(main, 'resolve_proxy_address', return_value='10.0.0.1'), \
+         patch.object(main, 'create_worker_pod_for_stream', return_value='worker-a'):
+        result = main.stream_started(stream='live', proxy_pod='proxy-1', t_publish_start_proxy=publish_ts)
+
+    assert result['status'] == 'started_event_processed'
+    entry = main.stream_lifecycle_timestamps['live'][1]
+    assert entry['t_publish_start_proxy'] == publish_ts
+    assert entry['sources']['t_publish_start_proxy'] == 'proxy_hook'
+    assert 't_controller_received_event' in entry

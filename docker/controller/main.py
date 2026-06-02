@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Query, HTTPException, Request
-from kubernetes import client, config
+from kubernetes import client, config, watch
 from kubernetes.client.exceptions import ApiException
 import random
 import string
@@ -56,6 +56,7 @@ LOG_STATUS_DENIED = "denied"
 LOG_STATUS_READY = "ready"
 LOG_STATUS_IGNORED = "ignored"
 LOG_STATUS_RECEIVED = "received"
+LOG_STATUS_OBSERVED = "observed"
 
 
 @dataclass(frozen=True)
@@ -481,6 +482,7 @@ async def app_lifespan(_app: FastAPI):
     global worker_orphan_sweeper_task
     global metrics_collection_task
     global proxy_rtmp_stats_task
+    global worker_pod_events_task
     await asyncio.sleep(5)
     recover_state()
     registry_health_task = asyncio.create_task(monitor_stream_registry_health())
@@ -488,6 +490,7 @@ async def app_lifespan(_app: FastAPI):
     worker_orphan_sweeper_task = asyncio.create_task(sweep_orphan_workers())
     metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
     proxy_rtmp_stats_task = asyncio.create_task(collect_proxy_rtmp_stats())
+    worker_pod_events_task = asyncio.create_task(collect_worker_pod_lifecycle_events())
     try:
         yield
     finally:
@@ -499,6 +502,7 @@ async def app_lifespan(_app: FastAPI):
                 worker_orphan_sweeper_task,
                 metrics_collection_task,
                 proxy_rtmp_stats_task,
+                worker_pod_events_task,
             )
             if task and not task.done()
         ]
@@ -561,10 +565,12 @@ STATE_SCHEMA_VERSION = 2
 
 metrics_collection_task: Optional[asyncio.Task] = None
 proxy_rtmp_stats_task: Optional[asyncio.Task] = None
+worker_pod_events_task: Optional[asyncio.Task] = None
 
 PROXY_RTMP_STATS_INTERVAL_SECONDS = get_int_env("PROXY_RTMP_STATS_INTERVAL_SECONDS", 10, min_value=1)
 PROXY_RTMP_STATS_TIMEOUT_SECONDS = get_float_env("PROXY_RTMP_STATS_TIMEOUT_SECONDS", 2.0, min_value=0.1)
 PROXY_RTMP_STATS_MAX_CONCURRENCY = get_int_env("PROXY_RTMP_STATS_MAX_CONCURRENCY", 20, min_value=1)
+WORKER_CONTROLLER_API = os.getenv("WORKER_CONTROLLER_API", "http://controller.media.svc.cluster.local:8000")
 proxy_rtmp_stats_observed_pods: Set[str] = set()
 
 pod_cpu_usage_percent = controller_gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',('pod','namespace'))
@@ -608,7 +614,48 @@ proxy_healthcheck_total = controller_counter('proxy_healthcheck_total', 'Total p
 worker_healthcheck_total = controller_counter('worker_healthcheck_total', 'Total worker healthcheck probes', ('status', 'reason'))
 proxy_rtmp_stats_scrape_errors_total = controller_counter('proxy_rtmp_stats_scrape_errors_total', 'Total proxy RTMP /stats scrape failures', ('proxy_pod',))
 proxy_rtmp_stats_discovery_errors_total = controller_counter('proxy_rtmp_stats_discovery_errors_total', 'Total failures listing proxy pods for RTMP stats scraping')
+stream_lifecycle_timestamp_observed_total = controller_counter(
+    'stream_lifecycle_timestamp_observed_total',
+    'Total stream lifecycle timestamps observed by the controller',
+    ('timestamp', 'source'),
+)
+stream_lifecycle_phase_seconds = controller_histogram(
+    'stream_lifecycle_phase_seconds',
+    'Derived stream startup phase durations from lifecycle timestamps in seconds',
+    ('phase', 'start_timestamp', 'end_timestamp'),
+)
+stream_lifecycle_phase_observations_total = controller_counter(
+    'stream_lifecycle_phase_observations_total',
+    'Total derived stream lifecycle phase observations',
+    ('phase', 'status', 'reason'),
+)
 worker_create_started_at: Dict[str, float] = {}
+STREAM_LIFECYCLE_TIMESTAMP_FIELDS: Tuple[str, ...] = (
+    't_publish_start_proxy',
+    't_controller_received_event',
+    't_worker_create_requested',
+    't_worker_pod_created',
+    't_worker_scheduled',
+    't_worker_container_started',
+    't_worker_ready',
+    't_ffmpeg_started',
+    't_ffmpeg_first_progress',
+)
+STREAM_LIFECYCLE_DERIVED_PHASES: Tuple[Tuple[str, str, str], ...] = (
+    ('proxy_to_controller', 't_publish_start_proxy', 't_controller_received_event'),
+    ('controller_to_worker_create_request', 't_controller_received_event', 't_worker_create_requested'),
+    ('worker_create_request_to_pod_created', 't_worker_create_requested', 't_worker_pod_created'),
+    ('pod_created_to_scheduled', 't_worker_pod_created', 't_worker_scheduled'),
+    ('scheduled_to_container_started', 't_worker_scheduled', 't_worker_container_started'),
+    ('container_started_to_worker_ready', 't_worker_container_started', 't_worker_ready'),
+    ('worker_ready_to_ffmpeg_started', 't_worker_ready', 't_ffmpeg_started'),
+    ('ffmpeg_started_to_first_progress', 't_ffmpeg_started', 't_ffmpeg_first_progress'),
+    ('proxy_to_first_progress', 't_publish_start_proxy', 't_ffmpeg_first_progress'),
+    ('controller_to_first_progress', 't_controller_received_event', 't_ffmpeg_first_progress'),
+)
+stream_lifecycle_timestamps: Dict[str, Dict[int, Dict[str, Any]]] = {}
+stream_lifecycle_observed_phases: Set[Tuple[str, int, str]] = set()
+worker_lifecycle_index: Dict[str, Tuple[str, int]] = {}
 
 try:
     config.load_incluster_config()
@@ -619,6 +666,316 @@ except:
 
 apps = client.AppsV1Api()
 core = client.CoreV1Api()
+
+
+def timestamp_to_epoch_seconds(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.timestamp()
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    return None
+
+
+def lifecycle_key_for_worker_locked(worker_pod: str) -> Optional[Tuple[str, int]]:
+    indexed = worker_lifecycle_index.get(worker_pod)
+    if indexed:
+        return indexed
+    stream = worker_to_stream.get(worker_pod)
+    if not stream:
+        return None
+    generation = stream_generation.get(stream)
+    if generation is None:
+        return None
+    worker_lifecycle_index[worker_pod] = (stream, generation)
+    return stream, generation
+
+
+def cleanup_worker_lifecycle_tracking_locked(worker_pod: Optional[str]) -> None:
+    if worker_pod:
+        worker_lifecycle_index.pop(worker_pod, None)
+
+
+def cleanup_stream_lifecycle_tracking_locked(stream: Optional[str]) -> None:
+    if not stream:
+        return
+    stream_lifecycle_timestamps.pop(stream, None)
+    stale_phase_keys = [key for key in stream_lifecycle_observed_phases if key[0] == stream]
+    for key in stale_phase_keys:
+        stream_lifecycle_observed_phases.discard(key)
+    stale_worker_keys = [
+        worker_pod
+        for worker_pod, (tracked_stream, _generation) in worker_lifecycle_index.items()
+        if tracked_stream == stream
+    ]
+    for worker_pod in stale_worker_keys:
+        worker_lifecycle_index.pop(worker_pod, None)
+
+
+def remove_lifecycle_timestamp_locked(stream: str, generation: Optional[int], field: str) -> None:
+    if generation is None:
+        return
+    entry = stream_lifecycle_timestamps.get(stream, {}).get(generation)
+    if not entry:
+        return
+    entry.pop(field, None)
+    for metadata_key in ("sources", "approximations"):
+        metadata = entry.get(metadata_key)
+        if isinstance(metadata, dict):
+            metadata.pop(field, None)
+
+
+def get_lifecycle_entry_locked(stream: str, generation: int) -> Dict[str, Any]:
+    generations = stream_lifecycle_timestamps.setdefault(stream, {})
+    entry = generations.setdefault(generation, {'stream': stream, 'generation': generation})
+    return entry
+
+
+def observe_ready_lifecycle_phases_locked(stream: str, generation: int, entry: Mapping[str, Any]) -> None:
+    approximations = entry.get('approximations', {})
+    for phase, start_field, end_field in STREAM_LIFECYCLE_DERIVED_PHASES:
+        observed_key = (stream, generation, phase)
+        if observed_key in stream_lifecycle_observed_phases:
+            continue
+        start_ts = timestamp_to_epoch_seconds(entry.get(start_field))
+        end_ts = timestamp_to_epoch_seconds(entry.get(end_field))
+        if start_ts is None or end_ts is None:
+            continue
+        if isinstance(approximations, Mapping) and (approximations.get(start_field) or approximations.get(end_field)):
+            continue
+        duration = end_ts - start_ts
+        if duration < 0:
+            stream_lifecycle_phase_observations_total.labels(
+                phase=phase,
+                status='ignored',
+                reason='negative_duration',
+            ).inc()
+            stream_lifecycle_observed_phases.add(observed_key)
+            continue
+        stream_lifecycle_phase_seconds.labels(
+            phase=phase,
+            start_timestamp=start_field,
+            end_timestamp=end_field,
+        ).observe(duration)
+        stream_lifecycle_phase_observations_total.labels(
+            phase=phase,
+            status='observed',
+            reason='complete',
+        ).inc()
+        stream_lifecycle_observed_phases.add(observed_key)
+
+
+def record_stream_lifecycle_timestamp(
+    stream: str,
+    generation: Optional[int],
+    field: str,
+    *,
+    timestamp: Optional[Any] = None,
+    source: str,
+    worker_pod: Optional[str] = None,
+    proxy_pod: Optional[str] = None,
+    overwrite: bool = False,
+    approximate: bool = False,
+) -> bool:
+    if field not in STREAM_LIFECYCLE_TIMESTAMP_FIELDS:
+        raise ValueError(f'unknown lifecycle timestamp field: {field}')
+    resolved_generation = generation if generation is not None else stream_generation.get(stream)
+    if resolved_generation is None:
+        return False
+    resolved_timestamp = timestamp_to_epoch_seconds(timestamp)
+    if resolved_timestamp is None:
+        resolved_timestamp = time.time()
+    with allocation_lock:
+        entry = get_lifecycle_entry_locked(stream, resolved_generation)
+        sources = entry.setdefault('sources', {})
+        approximations = entry.setdefault('approximations', {})
+        existing_is_approximate = bool(approximations.get(field))
+        if field in entry and not overwrite and not (existing_is_approximate and not approximate):
+            return False
+        entry[field] = resolved_timestamp
+        sources[field] = source
+        approximations[field] = bool(approximate)
+        if worker_pod:
+            entry['worker_pod'] = worker_pod
+            worker_lifecycle_index[worker_pod] = (stream, resolved_generation)
+        if proxy_pod:
+            entry['proxy_pod'] = proxy_pod
+        observe_ready_lifecycle_phases_locked(stream, resolved_generation, entry)
+    stream_lifecycle_timestamp_observed_total.labels(timestamp=field, source=source).inc()
+    log_controller_event(
+        'stream_lifecycle_timestamp_observed',
+        stream=stream,
+        generation=resolved_generation,
+        proxy_pod=proxy_pod,
+        worker_pod=worker_pod,
+        status=LOG_STATUS_OBSERVED,
+        message=f'{field} observed from {source}',
+    )
+    return True
+
+
+def get_pod_annotation(pod: Any, key: str) -> Optional[str]:
+    metadata = getattr(pod, 'metadata', None)
+    annotations = getattr(metadata, 'annotations', None) or {}
+    value = annotations.get(key)
+    return str(value) if value is not None else None
+
+
+def stream_generation_from_worker_pod(pod: Any) -> Optional[Tuple[str, int]]:
+    metadata = getattr(pod, 'metadata', None)
+    pod_name = getattr(metadata, 'name', None) if metadata else None
+    stream = get_pod_annotation(pod, 'liveedgecast.io/stream')
+    raw_generation = get_pod_annotation(pod, 'liveedgecast.io/generation')
+    if stream and raw_generation:
+        try:
+            generation = int(raw_generation)
+        except ValueError:
+            logger.warning(f"[WorkerPodEvents] Invalid generation annotation on pod '{pod_name}': {raw_generation}")
+        else:
+            with allocation_lock:
+                indexed = worker_lifecycle_index.get(pod_name) if pod_name else None
+                if stream_generation.get(stream) == generation or indexed == (stream, generation):
+                    return stream, generation
+            logger.debug(
+                f"[WorkerPodEvents] Ignoring stale pod event for pod '{pod_name}' "
+                f"stream='{stream}' generation='{generation}'"
+            )
+            return None
+    if pod_name:
+        with allocation_lock:
+            return lifecycle_key_for_worker_locked(pod_name)
+    return None
+
+
+def condition_transition_time(pod: Any, condition_type: str, status: str = 'True') -> Optional[float]:
+    pod_status = getattr(pod, 'status', None)
+    for condition in getattr(pod_status, 'conditions', None) or []:
+        if getattr(condition, 'type', None) == condition_type and getattr(condition, 'status', None) == status:
+            return timestamp_to_epoch_seconds(getattr(condition, 'last_transition_time', None))
+    return None
+
+
+def first_container_started_time(pod: Any) -> Optional[float]:
+    pod_status = getattr(pod, 'status', None)
+    started_times: List[float] = []
+    for container_status in getattr(pod_status, 'container_statuses', None) or []:
+        state = getattr(container_status, 'state', None)
+        running = getattr(state, 'running', None) if state else None
+        started_at = timestamp_to_epoch_seconds(getattr(running, 'started_at', None) if running else None)
+        if started_at is not None:
+            started_times.append(started_at)
+    return min(started_times) if started_times else None
+
+
+def process_worker_pod_event(event: Mapping[str, Any]) -> None:
+    pod = event.get('object')
+    if not pod:
+        return
+    metadata = getattr(pod, 'metadata', None)
+    pod_name = getattr(metadata, 'name', None) if metadata else None
+    if not pod_name:
+        return
+    key = stream_generation_from_worker_pod(pod)
+    if not key:
+        return
+    stream, generation = key
+    proxy_pod = get_pod_annotation(pod, 'liveedgecast.io/proxy-pod') or get_stream_proxy_pod(stream)
+    created_at = timestamp_to_epoch_seconds(getattr(metadata, 'creation_timestamp', None))
+    if created_at is not None:
+        record_stream_lifecycle_timestamp(
+            stream, generation, 't_worker_pod_created', timestamp=created_at,
+            source='kubernetes_pod_metadata', worker_pod=pod_name, proxy_pod=proxy_pod,
+        )
+    scheduled_at = condition_transition_time(pod, 'PodScheduled')
+    if scheduled_at is not None:
+        record_stream_lifecycle_timestamp(
+            stream, generation, 't_worker_scheduled', timestamp=scheduled_at,
+            source='kubernetes_pod_condition', worker_pod=pod_name, proxy_pod=proxy_pod,
+        )
+    container_started_at = first_container_started_time(pod)
+    if container_started_at is not None:
+        record_stream_lifecycle_timestamp(
+            stream, generation, 't_worker_container_started', timestamp=container_started_at,
+            source='kubernetes_container_status', worker_pod=pod_name, proxy_pod=proxy_pod,
+        )
+    ready_at = condition_transition_time(pod, 'Ready')
+    if ready_at is not None:
+        record_stream_lifecycle_timestamp(
+            stream, generation, 't_worker_ready', timestamp=ready_at,
+            source='kubernetes_pod_condition', worker_pod=pod_name, proxy_pod=proxy_pod,
+        )
+
+
+def collect_worker_pod_lifecycle_events_once(timeout_seconds: int = 30) -> None:
+    watcher = watch.Watch()
+    for event in watcher.stream(
+        core.list_namespaced_pod,
+        namespace=NAMESPACE,
+        label_selector='app=worker',
+        timeout_seconds=timeout_seconds,
+    ):
+        try:
+            process_worker_pod_event(event)
+        except Exception as e:
+            logger.warning(f"[WorkerPodEvents] Failed processing worker pod event: {e}")
+
+
+async def collect_worker_pod_lifecycle_events() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(collect_worker_pod_lifecycle_events_once)
+        except Exception as e:
+            logger.warning(f"[WorkerPodEvents] Watch failed; retrying: {e}")
+            await asyncio.sleep(5)
+
+
+def record_worker_progress_event(stream: str, worker_pod: str, field: str, source: str) -> Dict[str, Any]:
+    with allocation_lock:
+        key = lifecycle_key_for_worker_locked(worker_pod)
+        allocated_worker = stream_to_worker.get(stream)
+        if key is None or key[0] != stream:
+            return {
+                'status': 'ignored',
+                'reason': 'unmapped_worker',
+                'stream': stream,
+                'worker_pod': worker_pod,
+                'timestamp': field,
+            }
+        if allocated_worker and allocated_worker != worker_pod:
+            return {
+                'status': 'ignored',
+                'reason': 'stale_worker',
+                'stream': stream,
+                'worker_pod': worker_pod,
+                'timestamp': field,
+            }
+        generation = key[1]
+    observed = record_stream_lifecycle_timestamp(
+        stream,
+        generation,
+        field,
+        source=source,
+        worker_pod=worker_pod,
+        proxy_pod=get_stream_proxy_pod(stream),
+    )
+    return {
+        'status': 'observed' if observed else 'duplicate',
+        'reason': 'recorded' if observed else 'already_observed',
+        'stream': stream,
+        'worker_pod': worker_pod,
+        'timestamp': field,
+    }
 
 
 def persist_state_locked() -> None:
@@ -718,45 +1075,78 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
 
         for c in pod_spec.containers:
             env = list(c.env or [])
-            env = [e for e in env if e.name not in ("STREAM_KEY", "PROXY_DNS")]
+            env = [e for e in env if e.name not in ("STREAM_KEY", "PROXY_DNS", "STREAM_GENERATION", "CONTROLLER_API")]
+            generation_value = str(stream_generation.get(stream, 1))
             env.append(client.V1EnvVar(name="STREAM_KEY", value=stream))
             env.append(client.V1EnvVar(name="PROXY_DNS", value=proxy_dns))
+            env.append(client.V1EnvVar(name="STREAM_GENERATION", value=generation_value))
+            env.append(client.V1EnvVar(name="CONTROLLER_API", value=WORKER_CONTROLLER_API))
             c.env = env
 
         labels = dict(pod_metadata.labels or {})
         labels.update({"app": "worker"})
+        annotations = dict(getattr(pod_metadata, "annotations", None) or {})
+        annotations.update({
+            "liveedgecast.io/stream": stream,
+            "liveedgecast.io/generation": str(stream_generation.get(stream, 1)),
+            "liveedgecast.io/proxy-pod": get_stream_proxy_pod(stream) or "",
+        })
 
         logger.debug(
             f"[Worker Pod Create] pod_name='{pod_name}' stream='{stream}' proxy_dns='{proxy_dns}'"
         )
 
         pod_manifest = client.V1Pod(
-            metadata=client.V1ObjectMeta(name=pod_name, namespace=NAMESPACE, labels=labels),
+            metadata=client.V1ObjectMeta(name=pod_name, namespace=NAMESPACE, labels=labels, annotations=annotations),
             spec=pod_spec,
         )
 
+        generation = stream_generation.get(stream)
+        proxy_pod = get_stream_proxy_pod(stream)
+        create_request_recorded = record_stream_lifecycle_timestamp(
+            stream, generation, "t_worker_create_requested",
+            timestamp=time.time(), source="controller", worker_pod=pod_name, proxy_pod=proxy_pod,
+        )
         log_controller_event(
             "worker_create_requested",
             stream=stream,
-            proxy_pod=get_stream_proxy_pod(stream),
+            generation=generation,
+            proxy_pod=proxy_pod,
             worker_pod=pod_name,
             status=LOG_STATUS_REQUESTED,
         )
-        core.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
+        created_pod = core.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
         with allocation_lock:
             worker_create_started_at[pod_name] = started_at
+            if generation is not None:
+                worker_lifecycle_index[pod_name] = (stream, generation)
+        created_timestamp = getattr(getattr(created_pod, "metadata", None), "creation_timestamp", None)
+        record_stream_lifecycle_timestamp(
+            stream, generation, "t_worker_pod_created",
+            timestamp=created_timestamp or time.time(), source="kubernetes_create_response",
+            worker_pod=pod_name, proxy_pod=proxy_pod, approximate=created_timestamp is None,
+        )
         metric_status = "success"
         metric_reason = "created"
         log_controller_event(
             "worker_created",
             stream=stream,
-            proxy_pod=get_stream_proxy_pod(stream),
+            proxy_pod=proxy_pod,
             worker_pod=pod_name,
             started_at=started_at,
             status=LOG_STATUS_CREATED,
         )
         return pod_name
     except Exception as e:
+        with allocation_lock:
+            failed_pod_name = locals().get("pod_name")
+            failed_generation = locals().get("generation")
+            cleanup_worker_lifecycle_tracking_locked(failed_pod_name)
+            if locals().get("create_request_recorded"):
+                remove_lifecycle_timestamp_locked(stream, failed_generation, "t_worker_create_requested")
+                failed_entry = stream_lifecycle_timestamps.get(stream, {}).get(failed_generation)
+                if failed_entry and failed_entry.get("worker_pod") == failed_pod_name:
+                    failed_entry.pop("worker_pod", None)
         if metric_reason == "exception":
             metric_reason = type(e).__name__
         raise
@@ -774,6 +1164,7 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
     new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
     stream_to_worker[stream] = new_worker
     worker_to_stream.pop(old_worker, None)
+    cleanup_worker_lifecycle_tracking_locked(old_worker)
     worker_to_stream[new_worker] = stream
     worker_ready_since.pop(old_worker, None)
     worker_create_started_at.pop(old_worker, None)
@@ -812,7 +1203,8 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
     Creates or refreshes canonical stream ownership on proxy.
     """
     if stream not in stream_generation:
-        stream_generation[stream] = 1
+        previous_generations = stream_lifecycle_timestamps.get(stream, {})
+        stream_generation[stream] = (max(previous_generations) + 1) if previous_generations else 1
     stream_registry[stream] = {
         "proxy_pod": proxy_pod,
     }
@@ -1004,6 +1396,8 @@ async def monitor_stream_registry_health():
                     for stream in impacted_streams:
                         stream_registry.pop(stream, None)
                         stream_to_proxy.pop(stream, None)
+                        stream_generation.pop(stream, None)
+                        cleanup_stream_lifecycle_tracking_locked(stream)
                         logger.info(
                             f"[Registry] Stream '{stream}' expired after "
                             f"{PROXY_HEALTHCHECK_MAX_FAILURES} failed proxy healthchecks"
@@ -1011,6 +1405,7 @@ async def monitor_stream_registry_health():
                         worker_name = stream_to_worker.pop(stream, None)
                         if worker_name:
                             worker_to_stream.pop(worker_name, None)
+                            cleanup_worker_lifecycle_tracking_locked(worker_name)
                             worker_ready_since.pop(worker_name, None)
                             old_uid = worker_pod_uid_by_name.pop(worker_name, None)
                             if old_uid:
@@ -1183,7 +1578,6 @@ def cleanup_stale_proxy_rtmp_stats_metrics(active_proxy_pods: Iterable[str]) -> 
     proxy_rtmp_stats_observed_pods.update(active)
 
 
-def list_proxy_pods_for_stats() -> List[Tuple[str, str]]:
 def list_proxy_pods_for_stats() -> List[Tuple[str, str]]:
     pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=proxy").items
     proxy_pods: List[Tuple[str, str]] = []
@@ -1467,6 +1861,7 @@ async def monitor_worker_health():
                         worker_health_failures[current_uid] = 0
                         worker_ready_since.pop(worker_pod, None)
                         worker_create_started_at.pop(worker_pod, None)
+                        cleanup_worker_lifecycle_tracking_locked(worker_pod)
                     if current_uid:
                         worker_pod_uid_by_name[worker_pod] = current_uid
 
@@ -1606,10 +2001,12 @@ async def monitor_worker_health():
                     current_owner = stream_registry.get(stream, {}).get("proxy_pod")
                     if allocated != worker_pod or current_owner != owner_proxy:
                         worker_create_started_at.pop(new_worker, None)
+                        cleanup_worker_lifecycle_tracking_locked(new_worker)
                         discard_new_worker = True
                     else:
                         stream_to_worker[stream] = new_worker
                         worker_to_stream.pop(worker_pod, None)
+                        cleanup_worker_lifecycle_tracking_locked(worker_pod)
                         worker_to_stream[new_worker] = stream
                         worker_ready_since.pop(worker_pod, None)
                         worker_create_started_at.pop(worker_pod, None)
@@ -1711,6 +2108,8 @@ async def sweep_orphan_workers():
                 continue
 
             logger.warning(f"[OrphanSweeper] Deleting orphan worker pod '{pod_name}'")
+            with allocation_lock:
+                cleanup_worker_lifecycle_tracking_locked(pod_name)
             # Orphan workers have no stream/proxy mapping; required event keys remain present with null context.
             try:
                 core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
@@ -1727,6 +2126,24 @@ async def sweep_orphan_workers():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/workers/ffmpeg/started")
+def worker_ffmpeg_started(
+    stream: str = Query(..., description="Stream name"),
+    worker_pod: str = Query(..., description="Worker pod reporting FFmpeg start"),
+):
+    return record_worker_progress_event(stream, worker_pod, "t_ffmpeg_started", "worker_hook")
+
+
+@app.api_route("/workers/progress", methods=["POST", "PUT"])
+def worker_ffmpeg_progress(
+    stream: str = Query(..., description="Stream name"),
+    worker_pod: str = Query(..., description="Worker pod reporting FFmpeg -progress"),
+):
+    # The worker posts once after reading the first FFmpeg -progress line locally;
+    # do not wait for or parse a long-lived FFmpeg progress request body here.
+    return record_worker_progress_event(stream, worker_pod, "t_ffmpeg_first_progress", "ffmpeg_progress")
 
 
 def allocate_worker(
@@ -1798,6 +2215,7 @@ def allocate_worker(
                     f"Discarding newly created worker '{pod_name}' and keeping '{current_worker}'."
                 )
                 worker_create_started_at.pop(pod_name, None)
+                cleanup_worker_lifecycle_tracking_locked(pod_name)
                 try:
                     core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
                     log_controller_event(
@@ -1832,6 +2250,7 @@ def allocate_worker(
                     f"expected_owner='{owner_proxy}' current_owner='{current_owner}'. Deleting '{pod_name}'."
                 )
                 worker_create_started_at.pop(pod_name, None)
+                cleanup_worker_lifecycle_tracking_locked(pod_name)
                 try:
                     core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
                     log_controller_event(
@@ -1903,6 +2322,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 changed = True
                 response_status = "released"
                 worker_to_stream.pop(worker_name, None)
+                cleanup_worker_lifecycle_tracking_locked(worker_name)
                 worker_ready_since.pop(worker_name, None)
                 worker_create_started_at.pop(worker_name, None)
                 old_uid = worker_pod_uid_by_name.pop(worker_name, None)
@@ -1915,8 +2335,8 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 changed = True
             if stream_generation.pop(stream, None) is not None:
                 changed = True
-
             if changed:
+                cleanup_stream_lifecycle_tracking_locked(stream)
                 persist_state_locked()
 
         if worker_name:
@@ -2041,12 +2461,14 @@ def register_stream(
 @app.post("/streams/started")
 def stream_started(
     stream: str = Query(..., description="Stream name"),
-    proxy_pod: str = Query(..., description="Proxy pod that received publish")
+    proxy_pod: str = Query(..., description="Proxy pod that received publish"),
+    t_publish_start_proxy: Optional[float] = Query(None, description="Proxy-side publish-start epoch seconds")
 ):
     """Single controller entrypoint when proxy publish starts.
     Controller performs register/allocation/start orchestration.
     """
     started_at = time.monotonic()
+    received_at = time.time()
     metric_status = "error"
     metric_reason = "exception"
     log_controller_event(
@@ -2058,6 +2480,21 @@ def stream_started(
     )
     try:
         registration = register_stream(stream=stream, proxy_pod=proxy_pod)
+        generation = stream_generation.get(stream)
+        if t_publish_start_proxy is not None:
+            record_stream_lifecycle_timestamp(
+                stream, generation, "t_publish_start_proxy",
+                timestamp=t_publish_start_proxy, source="proxy_hook", proxy_pod=proxy_pod,
+            )
+        else:
+            record_stream_lifecycle_timestamp(
+                stream, generation, "t_publish_start_proxy",
+                timestamp=received_at, source="controller_receive_approximation", proxy_pod=proxy_pod, approximate=True,
+            )
+        record_stream_lifecycle_timestamp(
+            stream, generation, "t_controller_received_event",
+            timestamp=received_at, source="controller", proxy_pod=proxy_pod,
+        )
         allocation = allocate_worker(stream=stream, proxy_pod=proxy_pod, ownership_already_verified=True)
 
         replay = registration.get("status") == "idempotent_replay" and allocation.get("status") == "idempotent_replay"
@@ -2109,6 +2546,7 @@ async def stream_ended(
                 if current and current.get("proxy_pod") == proxy_pod:
                     stream_registry.pop(stream, None)
                     stream_to_proxy.pop(stream, None)
+                    cleanup_stream_lifecycle_tracking_locked(stream)
                     persist_state_locked()
                 elif current and current.get("proxy_pod") != proxy_pod:
                     current_owner = current.get("proxy_pod")
