@@ -93,6 +93,35 @@ When a proxy pod disappears from Kubernetes discovery, the controller removes
 that pod's RTMP metric series to avoid stale values after rollouts or
 reschedules.
 
+## Worker FFmpeg progress metrics
+
+Each worker starts a lightweight standard-library exporter on port `9113` and
+exposes `/metrics` for the worker ServiceMonitor. The exporter follows the local
+FFmpeg `-progress` regular file, preserving the last coherent complete progress
+record while a newer record is still being written. A first partial record may be
+reported as best-effort until FFmpeg emits its first `progress=` delimiter; after
+that, gauges remain anchored to the last complete record until the next complete
+record arrives. This avoids false zero values during partial writes while keeping
+`worker_ffmpeg_last_progress_timestamp_seconds` fresh whenever new complete
+progress lines are observed.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `worker_ffmpeg_running` | Gauge | none | `1` when the PID file points to a currently running FFmpeg process, otherwise `0`. |
+| `worker_ffmpeg_health_state` | Gauge | none | `1` when FFmpeg is running and progress has been observed within `FFMPEG_PROGRESS_STALE_SECONDS` (default `15`), otherwise `0`. |
+| `worker_ffmpeg_last_progress_timestamp_seconds` | Gauge | none | Unix timestamp from the exporter clock when the latest complete progress line was observed. |
+| `worker_ffmpeg_progress_age_seconds` | Gauge | none | Seconds elapsed since `worker_ffmpeg_last_progress_timestamp_seconds`; `0` until any progress is observed. |
+| `worker_ffmpeg_out_time_seconds` | Gauge | none | Latest `out_time`/`out_time_us`/`out_time_ms` converted to seconds from the best available progress record. |
+| `worker_ffmpeg_total_size_bytes` | Gauge | none | Latest FFmpeg `total_size` value in bytes from the best available progress record. |
+| `worker_ffmpeg_speed` | Gauge | none | Latest FFmpeg `speed` multiplier with the trailing `x` removed. |
+| `worker_ffmpeg_exit_total` | Counter | `exit_code` | Unique FFmpeg exits observed from the worker-local exit event file. |
+
+The worker runner appends a unique run id and exit code to the exit file after
+FFmpeg exits. The exporter persists seen run ids in a small state file beside the
+exit file so exporter restarts do not double-count already observed exits. Like
+other process-local Prometheus counters, the exported counter can still reset if
+the whole pod and its local filesystem are replaced.
+
 ## Stream startup lifecycle timestamps
 
 The controller models startup milestones per `(stream, generation)` in memory and
@@ -109,7 +138,7 @@ The timestamp fields are:
 | `t_worker_container_started` | Kubernetes Pod `status.containerStatuses`. | Uses the first container `state.running.startedAt` observed for the worker Pod. |
 | `t_worker_ready` | Kubernetes Pod `status.conditions`. | Uses the `Ready=True` `lastTransitionTime`. |
 | `t_ffmpeg_started` | Worker HTTP notification immediately before launching FFmpeg. | Approximation of process start; the exact `execve` timestamp is not exposed by Kubernetes. |
-| `t_ffmpeg_first_progress` | Worker one-shot callback after reading the first FFmpeg `-progress` line locally. | The worker runs FFmpeg with a local progress FIFO and notifies the controller once; duplicate callbacks are ignored for the milestone. |
+| `t_ffmpeg_first_progress` | Worker one-shot callback after reading the first FFmpeg `-progress` line locally. | The worker runs FFmpeg with a local regular progress file and notifies the controller after the first complete `key=value` progress line is delivered; duplicate callbacks are ignored for the milestone. |
 
 The controller watches worker Pod events with `label_selector=app=worker` and
 extracts scheduling/start/readiness milestones from Pod status. Worker Pods are
@@ -145,10 +174,13 @@ Current approximations and observability limits:
   derived durations are ignored and counted with `reason="negative_duration"`.
 - `t_ffmpeg_started` is the worker script notification immediately before the
   `ffmpeg` command is launched, not a kernel-level process start timestamp.
-- `t_ffmpeg_first_progress` is observed when the worker reads the first line from
-  FFmpeg `-progress` and sends a one-shot callback to the controller; it is later
-  than first input byte processing and depends on FFmpeg's progress emission
-  cadence and worker/controller HTTP delivery.
+- `t_ffmpeg_first_progress` is observed when the worker sees the first complete
+  `key=value` line in the FFmpeg `-progress` regular file and successfully sends
+  a one-shot callback to the controller; it is later than first input byte
+  processing and depends on FFmpeg's progress emission cadence plus
+  worker/controller HTTP delivery. Transient callback failures are retried by the
+  worker until the first-progress notification succeeds or the FFmpeg process
+  exits.
 - Kubernetes does not expose an exact image pull completion or user-process start
   timestamp in this controller, so `t_worker_container_started` is the container
   runtime `startedAt` value from `containerStatuses`.

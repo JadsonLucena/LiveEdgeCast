@@ -215,8 +215,12 @@ class ProgressFollower:
                 self.latest_record = dict(self._current_record)
                 self._current_record = {}
 
-        if self._current_record:
-            self.latest_record = {**self.latest_record, **self._current_record}
+        if self._current_record and not self.latest_record:
+            # Before FFmpeg has emitted a progress delimiter, expose the complete
+            # key/value lines already observed.  After a complete record exists,
+            # keep gauges anchored to that coherent record until the next record
+            # reaches its own progress delimiter.
+            self.latest_record = dict(self._current_record)
 
         if observed_complete_line:
             self.latest_timestamp = now
@@ -308,14 +312,20 @@ class ExitCounterStore:
             self.counts[exit_code] = self.counts.get(exit_code, 0) + 1
             changed = True
         if changed:
-            self._save_state()
+            try:
+                self._save_state()
+            except OSError:
+                # Keep serving metrics from memory if the state file cannot be
+                # persisted (for example, transient filesystem or permission
+                # issues).  Future scrapes can retry persistence.
+                pass
         return dict(self.counts)
 
     def _read_exit_events(self) -> Iterable[Tuple[str, str]]:
         try:
             with open(self.exit_file, "r", encoding="utf-8") as handle:
                 lines = handle.readlines()
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             return []
 
         events = []
@@ -343,7 +353,7 @@ class ExitCounterStore:
                         parsed = _int_or_none(value)
                         if code and parsed is not None:
                             self.counts[code] = parsed
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             return
 
     def _save_state(self) -> None:
@@ -459,11 +469,17 @@ def main() -> None:
     server = ThreadingHTTPServer((listen_addr, listen_port), MetricsHandler)
 
     def shutdown(_signum: int, _frame: object) -> None:
-        server.shutdown()
+        # BaseServer.shutdown() must be called from a different thread than the
+        # serve_forever() loop. Signal handlers run on the main thread here, so
+        # delegate shutdown to avoid hanging container termination.
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
