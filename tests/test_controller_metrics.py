@@ -1510,6 +1510,7 @@ def test_worker_runner_reports_first_progress_once_with_stubbed_ffmpeg_and_curl(
         'HOSTNAME': 'worker-test',
         'CURL_LOG': str(curl_log),
         'FFMPEG_LOG': str(ffmpeg_log),
+        'PROGRESS_NOTIFY_POLL_SECONDS': '0.05',
     }
 
     result = subprocess.run(
@@ -1615,7 +1616,7 @@ def test_worker_runner_retries_first_progress_callback_after_transient_failure(t
         '  shift || true\n'
         'done\n'
         'printf "%s\\n" "frame=1" "progress=continue" > "$progress"\n'
-        'sleep 1.2\n'
+        'sleep 0.25\n'
         'printf "ffmpeg-stub-ran\\n" >> "$FFMPEG_LOG"\n'
         'exit 0\n'
     )
@@ -1632,6 +1633,7 @@ def test_worker_runner_retries_first_progress_callback_after_transient_failure(t
         'CURL_LOG': str(curl_log),
         'PROGRESS_ATTEMPTS': str(progress_attempts),
         'FFMPEG_LOG': str(ffmpeg_log),
+        'PROGRESS_NOTIFY_POLL_SECONDS': '0.05',
     }
 
     result = subprocess.run(

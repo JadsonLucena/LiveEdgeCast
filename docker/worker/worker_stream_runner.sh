@@ -93,7 +93,7 @@ rm -rf "$PROGRESS_NOTIFY_LOCK"
       progress_notified=1
       break
     fi
-    sleep 0.2
+    sleep "${PROGRESS_NOTIFY_POLL_SECONDS:-0.2}"
   done
 ) &
 PROGRESS_READER_PID=$!

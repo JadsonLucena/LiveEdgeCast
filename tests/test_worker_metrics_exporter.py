@@ -126,6 +126,31 @@ def test_metrics_collector_preserves_previous_gauges_during_partial_record(tmp_p
     assert metric_value(partial_payload, "worker_ffmpeg_last_progress_timestamp_seconds") == 101.0
 
 
+def test_exit_counter_store_retries_dirty_state_after_save_failure(tmp_path, monkeypatch):
+    exit_file = tmp_path / "ffmpeg.exit"
+    state_file = tmp_path / "ffmpeg.exit.metrics_state"
+    exit_file.write_text("run-a 1\n")
+    store = exporter.ExitCounterStore(str(exit_file), str(state_file))
+    original_save_state = store._save_state
+    attempts = {"count": 0}
+
+    def flaky_save_state():
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("transient state write failure")
+        original_save_state()
+
+    monkeypatch.setattr(store, "_save_state", flaky_save_state)
+
+    assert store.poll() == {"1": 1}
+    assert attempts["count"] == 1
+    assert not state_file.exists()
+
+    assert store.poll() == {"1": 1}
+    assert attempts["count"] == 2
+    assert "seen run-a" in state_file.read_text()
+
+
 def test_metrics_collector_exports_expected_ffmpeg_gauges_and_dedupes_exit_events(tmp_path, monkeypatch):
     progress = tmp_path / "ffmpeg.progress"
     pid_file = tmp_path / "ffmpeg.pid"

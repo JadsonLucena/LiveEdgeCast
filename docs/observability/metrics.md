@@ -180,7 +180,8 @@ Current approximations and observability limits:
   processing and depends on FFmpeg's progress emission cadence plus
   worker/controller HTTP delivery. Transient callback failures are retried by the
   worker until the first-progress notification succeeds or the FFmpeg process
-  exits.
+  exits; the retry poll interval is controlled by `PROGRESS_NOTIFY_POLL_SECONDS`
+  (default `0.2`).
 - Kubernetes does not expose an exact image pull completion or user-process start
   timestamp in this controller, so `t_worker_container_started` is the container
   runtime `startedAt` value from `containerStatuses`.

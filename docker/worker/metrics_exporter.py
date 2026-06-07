@@ -299,6 +299,7 @@ class ExitCounterStore:
     state_file: str
     counts: Dict[str, int] = field(default_factory=dict)
     seen_events: set[str] = field(default_factory=set)
+    _dirty: bool = False
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -312,13 +313,18 @@ class ExitCounterStore:
             self.counts[exit_code] = self.counts.get(exit_code, 0) + 1
             changed = True
         if changed:
+            self._dirty = True
+        if self._dirty:
             try:
                 self._save_state()
             except OSError:
                 # Keep serving metrics from memory if the state file cannot be
                 # persisted (for example, transient filesystem or permission
-                # issues).  Future scrapes can retry persistence.
+                # issues).  Future scrapes retry persistence because _dirty
+                # remains set until a save succeeds.
                 pass
+            else:
+                self._dirty = False
         return dict(self.counts)
 
     def _read_exit_events(self) -> Iterable[Tuple[str, str]]:
