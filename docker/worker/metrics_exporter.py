@@ -125,12 +125,16 @@ class ProgressFollower:
     _current_record: Dict[str, str] = field(default_factory=dict)
     latest_record: Dict[str, str] = field(default_factory=dict)
     latest_timestamp: Optional[float] = None
+    error_counts: Dict[str, int] = field(default_factory=dict)
 
     def poll(self, now: Optional[float] = None) -> Dict[str, str]:
         now = time.time() if now is None else now
         try:
             stat = os.stat(self.path)
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError:
+            return self.latest_record
+        except OSError:
+            self._record_error("progress_read")
             return self.latest_record
 
         identity = (stat.st_dev, stat.st_ino)
@@ -166,9 +170,13 @@ class ProgressFollower:
             # good record and the current file cursor so a later scrape does not
             # reprocess old progress lines as fresh progress. Rotation and
             # truncation are handled by the stat/window checks on the next poll.
+            self._record_error("progress_read")
             return self.latest_record
 
         return self.latest_record
+
+    def _record_error(self, stage: str) -> None:
+        self.error_counts[stage] = self.error_counts.get(stage, 0) + 1
 
     def _file_window_matches(self) -> bool:
         if not self._prefix and not self._tail:
@@ -182,7 +190,9 @@ class ProgressFollower:
                     progress_file.seek(tail_offset)
                     if progress_file.read(len(self._tail)) != self._tail:
                         return False
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError:
+            return True
+        except OSError:
             return True
         return True
 
@@ -296,6 +306,7 @@ class ExitCounterStore:
     state_file: str
     counts: Dict[str, int] = field(default_factory=dict)
     seen_events: set[str] = field(default_factory=set)
+    error_counts: Dict[str, int] = field(default_factory=dict)
     _dirty: bool = False
 
     def __post_init__(self) -> None:
@@ -319,7 +330,7 @@ class ExitCounterStore:
                 # persisted (for example, transient filesystem or permission
                 # issues).  Future scrapes retry persistence because _dirty
                 # remains set until a save succeeds.
-                pass
+                self._record_error("exit_state")
             else:
                 self._dirty = False
         return dict(self.counts)
@@ -328,7 +339,10 @@ class ExitCounterStore:
         try:
             with open(self.exit_file, "r", encoding="utf-8") as handle:
                 lines = handle.readlines()
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError:
+            return []
+        except OSError:
+            self._record_error("exit_state")
             return []
 
         events = []
@@ -356,7 +370,10 @@ class ExitCounterStore:
                         parsed = _int_or_none(value)
                         if code and parsed is not None:
                             self.counts[code] = parsed
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError:
+            return
+        except OSError:
+            self._record_error("exit_state")
             return
 
     def _save_state(self) -> None:
@@ -368,6 +385,9 @@ class ExitCounterStore:
             for event_id in sorted(self.seen_events):
                 handle.write(f"seen {event_id}\n")
         os.replace(tmp_path, self.state_file)
+
+    def _record_error(self, stage: str) -> None:
+        self.error_counts[stage] = self.error_counts.get(stage, 0) + 1
 
 
 @dataclass
@@ -423,6 +443,16 @@ class MetricsCollector:
         ]
         for exit_code, count in sorted(self.exit_store.poll().items()):
             lines.append(f'worker_ffmpeg_exit_total{{exit_code="{exit_code}"}} {count}')
+
+        lines.extend([
+            "# HELP worker_ffmpeg_exporter_errors_total Total worker FFmpeg exporter errors by stage.",
+            "# TYPE worker_ffmpeg_exporter_errors_total counter",
+        ])
+        error_counts = {**self.follower.error_counts}
+        for stage, count in self.exit_store.error_counts.items():
+            error_counts[stage] = error_counts.get(stage, 0) + count
+        for stage, count in sorted(error_counts.items()):
+            lines.append(f'worker_ffmpeg_exporter_errors_total{{stage="{stage}"}} {count}')
         return "\n".join(lines) + "\n"
 
     def _running_value(self) -> int:

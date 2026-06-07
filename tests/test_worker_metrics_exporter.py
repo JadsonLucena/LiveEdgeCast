@@ -142,6 +142,7 @@ def test_progress_follower_keeps_last_record_when_progress_file_io_fails(tmp_pat
 
     assert follower.poll(now=41.0)["total_size"] == "4096"
     assert follower.latest_timestamp == 40.0
+    assert follower.error_counts == {"progress_read": 1}
 
 
 def test_progress_follower_keeps_last_record_when_progress_file_open_fails(tmp_path, monkeypatch):
@@ -160,6 +161,7 @@ def test_progress_follower_keeps_last_record_when_progress_file_open_fails(tmp_p
 
     assert follower.poll(now=51.0)["total_size"] == "4096"
     assert follower.latest_timestamp == 50.0
+    assert follower.error_counts == {"progress_read": 1}
 
 
 def test_progress_follower_does_not_refresh_timestamp_after_transient_open_failure(tmp_path, monkeypatch):
@@ -178,10 +180,28 @@ def test_progress_follower_does_not_refresh_timestamp_after_transient_open_failu
     monkeypatch.setattr(exporter, "open", raise_permission_error, raising=False)
     assert follower.poll(now=70.0)["total_size"] == "4096"
     assert follower.latest_timestamp == 60.0
+    assert follower.error_counts == {"progress_read": 1}
 
     monkeypatch.delattr(exporter, "open", raising=False)
     assert follower.poll(now=80.0)["total_size"] == "4096"
     assert follower.latest_timestamp == 60.0
+    assert follower.error_counts == {"progress_read": 1}
+
+
+def test_exit_counter_store_records_state_load_failures(tmp_path, monkeypatch):
+    exit_file = tmp_path / "ffmpeg.exit"
+    state_file = tmp_path / "ffmpeg.exit.metrics_state"
+
+    def flaky_open(path, *args, **kwargs):
+        if str(path) == str(state_file):
+            raise PermissionError("state file temporarily unreadable")
+        return open(path, *args, **kwargs)
+
+    monkeypatch.setattr(exporter, "open", flaky_open, raising=False)
+
+    store = exporter.ExitCounterStore(str(exit_file), str(state_file))
+
+    assert store.error_counts == {"exit_state": 1}
 
 
 def test_exit_counter_store_retries_dirty_state_after_save_failure(tmp_path, monkeypatch):
@@ -202,11 +222,42 @@ def test_exit_counter_store_retries_dirty_state_after_save_failure(tmp_path, mon
 
     assert store.poll() == {"1": 1}
     assert attempts["count"] == 1
+    assert store.error_counts == {"exit_state": 1}
     assert not state_file.exists()
 
     assert store.poll() == {"1": 1}
     assert attempts["count"] == 2
+    assert store.error_counts == {"exit_state": 1}
     assert "seen run-a" in state_file.read_text()
+
+
+def test_metrics_collector_exports_exporter_error_counters(tmp_path, monkeypatch):
+    progress = tmp_path / "ffmpeg.progress"
+    pid_file = tmp_path / "ffmpeg.pid"
+    exit_file = tmp_path / "ffmpeg.exit"
+    state_file = tmp_path / "ffmpeg.exit.metrics_state"
+    progress.write_text(
+        "frame=1\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
+    )
+    pid_file.write_text("1234")
+    follower = exporter.ProgressFollower(str(progress))
+    assert follower.poll(now=100.0)["total_size"] == "4096"
+    follower.error_counts["progress_read"] = 2
+    exit_store = exporter.ExitCounterStore(str(exit_file), str(state_file))
+    exit_store.error_counts["exit_state"] = 1
+    monkeypatch.setattr(exporter, "process_is_running", lambda pid: pid == 1234)
+    collector = exporter.MetricsCollector(
+        follower=follower,
+        pid_file=str(pid_file),
+        exit_store=exit_store,
+        stale_seconds=15.0,
+        clock=lambda: 101.0,
+    )
+
+    payload = collector.collect()
+
+    assert metric_value(payload, "worker_ffmpeg_exporter_errors_total", '{stage="progress_read"}') == 2
+    assert metric_value(payload, "worker_ffmpeg_exporter_errors_total", '{stage="exit_state"}') == 1
 
 
 def test_metrics_collector_exports_expected_ffmpeg_gauges_and_dedupes_exit_events(tmp_path, monkeypatch):

@@ -115,12 +115,15 @@ progress lines are observed.
 | `worker_ffmpeg_total_size_bytes` | Gauge | none | Latest FFmpeg `total_size` value in bytes from the best available progress record. |
 | `worker_ffmpeg_speed` | Gauge | none | Latest FFmpeg `speed` multiplier with the trailing `x` removed. |
 | `worker_ffmpeg_exit_total` | Counter | `exit_code` | Unique FFmpeg exits observed from the worker-local exit event file. |
+| `worker_ffmpeg_exporter_errors_total` | Counter | `stage` | Exporter read/persistence errors; current stages are `progress_read` and `exit_state`. |
 
 The worker runner appends a unique run id and exit code to the exit file after
 FFmpeg exits. The exporter persists seen run ids in a small state file beside the
 exit file so exporter restarts do not double-count already observed exits. Like
 other process-local Prometheus counters, the exported counter can still reset if
-the whole pod and its local filesystem are replaced.
+the whole pod and its local filesystem are replaced. Exporter errors are counted
+with low-cardinality `stage` labels so operators can distinguish FFmpeg progress
+staleness from exporter file I/O or state persistence issues.
 
 ## Stream startup lifecycle timestamps
 
