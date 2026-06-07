@@ -1462,8 +1462,11 @@ def test_worker_and_proxy_scripts_url_encode_controller_callbacks():
     assert '--data-urlencode "stream=${STREAM_KEY}"' in worker_script
     assert '--connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}"' in worker_script
     assert '--data-urlencode "worker_pod=${WORKER_POD}"' in worker_script
-    assert '-progress "$PROGRESS_FIFO"' in worker_script
+    assert '-progress "$PROGRESS_FILE"' in worker_script
     assert '--data-urlencode "stream=${STREAM_NAME}"' in proxy_script
+    worker_deployment = Path('k8s/worker-deployment.yaml').read_text()
+    assert 'containerPort: 9113' in worker_deployment
+    assert 'name: metrics' in worker_deployment
     assert 'CONTROLLER_API="${CONTROLLER_API:-http://controller.media.svc.cluster.local:8000}"' in proxy_script
     assert '--connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}"' in proxy_script
     assert '--data-urlencode "proxy_pod=${PROXY_POD}"' in proxy_script
@@ -1488,7 +1491,10 @@ def test_worker_runner_reports_first_progress_once_with_stubbed_ffmpeg_and_curl(
         '  if [ "$1" = "-progress" ]; then shift; progress="$1"; fi\n'
         '  shift || true\n'
         'done\n'
-        'printf "%s\\n" "frame=1" "progress=continue" > "$progress"\n'
+        'printf "frame=1" > "$progress"\n'
+        'sleep 0.3\n'
+        'if grep -q "/workers/progress" "$CURL_LOG" 2>/dev/null; then exit 77; fi\n'
+        'printf "\\nprogress=continue\\n" >> "$progress"\n'
         'printf "ffmpeg-stub-ran\\n" >> "$FFMPEG_LOG"\n'
         'exit 0\n'
     )
@@ -1577,6 +1583,72 @@ def test_worker_runner_continues_when_controller_callbacks_fail(tmp_path):
     assert '/workers/ffmpeg/started' in curl_log.read_text()
     assert '/workers/progress' in curl_log.read_text()
     assert ffmpeg_log.read_text().strip() == 'ffmpeg-stub-ran'
+
+
+def test_worker_runner_retries_first_progress_callback_after_transient_failure(tmp_path):
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    curl_log = tmp_path / 'curl.log'
+    progress_attempts = tmp_path / 'progress_attempts'
+    ffmpeg_log = tmp_path / 'ffmpeg.log'
+    curl_stub = bin_dir / 'curl'
+    curl_stub.write_text(
+        '#!/bin/sh\n'
+        'printf "%s\\n" "$*" >> "$CURL_LOG"\n'
+        'case "$*" in\n'
+        '  */workers/progress*)\n'
+        '    attempts=0\n'
+        '    if [ -f "$PROGRESS_ATTEMPTS" ]; then attempts=$(cat "$PROGRESS_ATTEMPTS"); fi\n'
+        '    attempts=$((attempts + 1))\n'
+        '    printf "%s" "$attempts" > "$PROGRESS_ATTEMPTS"\n'
+        '    if [ "$attempts" -eq 1 ]; then exit 22; fi\n'
+        '    ;;\n'
+        'esac\n'
+        'exit 0\n'
+    )
+    ffmpeg_stub = bin_dir / 'ffmpeg'
+    ffmpeg_stub.write_text(
+        '#!/bin/sh\n'
+        'progress=""\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  if [ "$1" = "-progress" ]; then shift; progress="$1"; fi\n'
+        '  shift || true\n'
+        'done\n'
+        'printf "%s\\n" "frame=1" "progress=continue" > "$progress"\n'
+        'sleep 1.2\n'
+        'printf "ffmpeg-stub-ran\\n" >> "$FFMPEG_LOG"\n'
+        'exit 0\n'
+    )
+    curl_stub.chmod(0o755)
+    ffmpeg_stub.chmod(0o755)
+    env = {
+        **os.environ,
+        'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+        'STREAM_KEY': 'retry-progress',
+        'PROXY_DNS': 'proxy.local',
+        'RTMP_PUSH_BASE_URL': 'rtmp://target/live',
+        'CONTROLLER_API': 'http://controller.test',
+        'HOSTNAME': 'worker-test',
+        'CURL_LOG': str(curl_log),
+        'PROGRESS_ATTEMPTS': str(progress_attempts),
+        'FFMPEG_LOG': str(ffmpeg_log),
+    }
+
+    result = subprocess.run(
+        ['bash', 'docker/worker/worker_stream_runner.sh'],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    progress_calls = [call for call in curl_log.read_text().splitlines() if '/workers/progress' in call]
+    assert len(progress_calls) == 2
+    assert progress_attempts.read_text() == '2'
+    assert ffmpeg_log.read_text().strip() == 'ffmpeg-stub-ran'
+
 
 def test_worker_progress_records_under_allocation_lock_to_prevent_stale_race():
     reset_state()
