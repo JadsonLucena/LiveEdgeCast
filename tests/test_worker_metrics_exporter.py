@@ -126,6 +126,42 @@ def test_metrics_collector_preserves_previous_gauges_during_partial_record(tmp_p
     assert metric_value(partial_payload, "worker_ffmpeg_last_progress_timestamp_seconds") == 101.0
 
 
+def test_progress_follower_keeps_last_record_when_progress_file_io_fails(tmp_path, monkeypatch):
+    progress = tmp_path / "ffmpeg.progress"
+    progress.write_text(
+        "frame=1\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
+    )
+    follower = exporter.ProgressFollower(str(progress))
+
+    assert follower.poll(now=40.0)["total_size"] == "4096"
+
+    def raise_permission_error(_path):
+        raise PermissionError("progress file temporarily unreadable")
+
+    monkeypatch.setattr(exporter.os, "stat", raise_permission_error)
+
+    assert follower.poll(now=41.0)["total_size"] == "4096"
+    assert follower.latest_timestamp == 40.0
+
+
+def test_progress_follower_keeps_last_record_when_progress_file_open_fails(tmp_path, monkeypatch):
+    progress = tmp_path / "ffmpeg.progress"
+    progress.write_text(
+        "frame=1\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
+    )
+    follower = exporter.ProgressFollower(str(progress))
+
+    assert follower.poll(now=50.0)["total_size"] == "4096"
+
+    def raise_permission_error(*args, **kwargs):
+        raise PermissionError("progress file temporarily unreadable")
+
+    monkeypatch.setattr(exporter, "open", raise_permission_error, raising=False)
+
+    assert follower.poll(now=51.0)["total_size"] == "4096"
+    assert follower.latest_timestamp == 50.0
+
+
 def test_exit_counter_store_retries_dirty_state_after_save_failure(tmp_path, monkeypatch):
     exit_file = tmp_path / "ffmpeg.exit"
     state_file = tmp_path / "ffmpeg.exit.metrics_state"

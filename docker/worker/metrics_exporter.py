@@ -130,7 +130,7 @@ class ProgressFollower:
         now = time.time() if now is None else now
         try:
             stat = os.stat(self.path)
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             return self.latest_record
 
         identity = (stat.st_dev, stat.st_ino)
@@ -161,9 +161,10 @@ class ProgressFollower:
                         self._remember_prefix(data)
                     self._remember_tail(data)
                     self._process_data(data, now)
-        except FileNotFoundError:
-            # The file may be rotated between stat() and open(). Keep the last
-            # known good record and retry from the new file on the next scrape.
+        except OSError:
+            # The file may be rotated between stat() and open(), or temporarily
+            # unreadable. Keep the last known good record and retry from the
+            # current file on the next scrape.
             self._identity = None
             self._offset = 0
             self._buffer = ""
@@ -185,7 +186,7 @@ class ProgressFollower:
                     progress_file.seek(tail_offset)
                     if progress_file.read(len(self._tail)) != self._tail:
                         return False
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             return True
         return True
 
@@ -406,10 +407,10 @@ class MetricsCollector:
             "# HELP worker_ffmpeg_health_state 1 when FFmpeg is running and recent progress was observed, otherwise 0.",
             "# TYPE worker_ffmpeg_health_state gauge",
             f"worker_ffmpeg_health_state {healthy}",
-            "# HELP worker_ffmpeg_last_progress_timestamp_seconds Unix timestamp of the last complete FFmpeg progress update observed by this exporter.",
+            "# HELP worker_ffmpeg_last_progress_timestamp_seconds Unix timestamp of the last complete FFmpeg progress line observed by this exporter.",
             "# TYPE worker_ffmpeg_last_progress_timestamp_seconds gauge",
             f"worker_ffmpeg_last_progress_timestamp_seconds {last_timestamp or 0.0}",
-            "# HELP worker_ffmpeg_progress_age_seconds Seconds since the last complete FFmpeg progress update observed by this exporter.",
+            "# HELP worker_ffmpeg_progress_age_seconds Seconds since the last complete FFmpeg progress line observed by this exporter.",
             "# TYPE worker_ffmpeg_progress_age_seconds gauge",
             f"worker_ffmpeg_progress_age_seconds {progress_age}",
             "# HELP worker_ffmpeg_out_time_seconds Last FFmpeg out_time value converted to seconds.",
