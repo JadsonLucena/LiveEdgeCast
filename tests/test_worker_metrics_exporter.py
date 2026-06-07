@@ -213,20 +213,28 @@ def test_progress_follower_does_not_refresh_timestamp_after_transient_open_failu
     assert follower.error_counts == {"progress_read": 1}
 
 
-def test_exit_counter_store_records_state_load_failures(tmp_path, monkeypatch):
+def test_exit_counter_store_defers_exit_reads_until_state_load_recovers(tmp_path, monkeypatch):
     exit_file = tmp_path / "ffmpeg.exit"
     state_file = tmp_path / "ffmpeg.exit.metrics_state"
+    exit_file.write_text("run-a 1\n")
+    state_file.write_text("count 1 1\nseen run-a\n")
 
-    def flaky_open(path, *args, **kwargs):
+    def raise_permission_error(path, *args, **kwargs):
         if str(path) == str(state_file):
             raise PermissionError("state file temporarily unreadable")
         return open(path, *args, **kwargs)
 
-    monkeypatch.setattr(exporter, "open", flaky_open, raising=False)
+    monkeypatch.setattr(exporter, "open", raise_permission_error, raising=False)
 
     store = exporter.ExitCounterStore(str(exit_file), str(state_file))
-
     assert store.error_counts == {"exit_state": 1}
+    assert store.poll() == {}
+    assert store.error_counts == {"exit_state": 2}
+
+    monkeypatch.delattr(exporter, "open", raising=False)
+
+    assert store.poll() == {"1": 1}
+    assert store.error_counts == {"exit_state": 2}
 
 
 def test_exit_counter_store_retries_dirty_state_after_save_failure(tmp_path, monkeypatch):

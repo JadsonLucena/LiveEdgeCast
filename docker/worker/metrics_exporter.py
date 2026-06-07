@@ -308,11 +308,17 @@ class ExitCounterStore:
     seen_events: set[str] = field(default_factory=set)
     error_counts: Dict[str, int] = field(default_factory=dict)
     _dirty: bool = False
+    _state_loaded: bool = False
 
     def __post_init__(self) -> None:
-        self._load_state()
+        self._state_loaded = self._load_state()
 
     def poll(self) -> Dict[str, int]:
+        if not self._state_loaded:
+            self._state_loaded = self._load_state()
+            if not self._state_loaded:
+                return dict(self.counts)
+
         changed = False
         for event_id, exit_code in self._read_exit_events():
             if event_id in self.seen_events:
@@ -357,24 +363,30 @@ class ExitCounterStore:
             events.append((event_id, exit_code))
         return events
 
-    def _load_state(self) -> None:
+    def _load_state(self) -> bool:
+        loaded_counts: Dict[str, int] = {}
+        loaded_seen_events: set[str] = set()
         try:
             with open(self.state_file, "r", encoding="utf-8") as handle:
                 for line in handle:
                     kind, _, rest = line.partition(" ")
                     rest = rest.strip()
                     if kind == "seen" and rest:
-                        self.seen_events.add(rest)
+                        loaded_seen_events.add(rest)
                     elif kind == "count" and rest:
                         code, _, value = rest.partition(" ")
                         parsed = _int_or_none(value)
                         if code and parsed is not None:
-                            self.counts[code] = parsed
+                            loaded_counts[code] = parsed
         except FileNotFoundError:
-            return
+            return True
         except OSError:
             self._record_error("exit_state")
-            return
+            return False
+
+        self.counts = loaded_counts
+        self.seen_events = loaded_seen_events
+        return True
 
     def _save_state(self) -> None:
         tmp_path = f"{self.state_file}.tmp"
