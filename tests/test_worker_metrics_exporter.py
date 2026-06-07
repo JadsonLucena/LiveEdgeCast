@@ -162,6 +162,28 @@ def test_progress_follower_keeps_last_record_when_progress_file_open_fails(tmp_p
     assert follower.latest_timestamp == 50.0
 
 
+def test_progress_follower_does_not_refresh_timestamp_after_transient_open_failure(tmp_path, monkeypatch):
+    progress = tmp_path / "ffmpeg.progress"
+    progress.write_text(
+        "frame=1\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
+    )
+    follower = exporter.ProgressFollower(str(progress))
+
+    assert follower.poll(now=60.0)["total_size"] == "4096"
+    assert follower.latest_timestamp == 60.0
+
+    def raise_permission_error(*args, **kwargs):
+        raise PermissionError("progress file temporarily unreadable")
+
+    monkeypatch.setattr(exporter, "open", raise_permission_error, raising=False)
+    assert follower.poll(now=70.0)["total_size"] == "4096"
+    assert follower.latest_timestamp == 60.0
+
+    monkeypatch.delattr(exporter, "open", raising=False)
+    assert follower.poll(now=80.0)["total_size"] == "4096"
+    assert follower.latest_timestamp == 60.0
+
+
 def test_exit_counter_store_retries_dirty_state_after_save_failure(tmp_path, monkeypatch):
     exit_file = tmp_path / "ffmpeg.exit"
     state_file = tmp_path / "ffmpeg.exit.metrics_state"

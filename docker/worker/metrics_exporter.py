@@ -162,15 +162,11 @@ class ProgressFollower:
                     self._remember_tail(data)
                     self._process_data(data, now)
         except OSError:
-            # The file may be rotated between stat() and open(), or temporarily
-            # unreadable. Keep the last known good record and retry from the
-            # current file on the next scrape.
-            self._identity = None
-            self._offset = 0
-            self._buffer = ""
-            self._prefix = ""
-            self._tail = ""
-            self._current_record = {}
+            # The file may be temporarily unreadable. Keep both the last known
+            # good record and the current file cursor so a later scrape does not
+            # reprocess old progress lines as fresh progress. Rotation and
+            # truncation are handled by the stat/window checks on the next poll.
+            return self.latest_record
 
         return self.latest_record
 
