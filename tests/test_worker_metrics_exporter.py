@@ -126,6 +126,31 @@ def test_metrics_collector_preserves_previous_gauges_during_partial_record(tmp_p
     assert metric_value(partial_payload, "worker_ffmpeg_last_progress_timestamp_seconds") == 101.0
 
 
+def test_discover_progress_path_skips_unreadable_glob_candidates(monkeypatch):
+    monkeypatch.delenv("FFMPEG_PROGRESS_FILE", raising=False)
+    monkeypatch.delenv("STREAM_KEY", raising=False)
+    monkeypatch.setattr(exporter.glob, "glob", lambda pattern: ["/tmp/ffmpeg_unreadable.progress"])
+
+    def raise_permission_error(_path):
+        raise PermissionError("progress candidate temporarily unreadable")
+
+    monkeypatch.setattr(exporter.os, "stat", raise_permission_error)
+
+    assert exporter.discover_progress_path() == "/tmp/ffmpeg.progress"
+
+
+def test_read_pid_returns_none_when_pid_file_is_unreadable(tmp_path, monkeypatch):
+    pid_file = tmp_path / "ffmpeg.pid"
+    pid_file.write_text("1234")
+
+    def raise_permission_error(*args, **kwargs):
+        raise PermissionError("pid file temporarily unreadable")
+
+    monkeypatch.setattr(exporter, "open", raise_permission_error, raising=False)
+
+    assert exporter.read_pid(str(pid_file)) is None
+
+
 def test_progress_follower_keeps_last_record_when_progress_file_io_fails(tmp_path, monkeypatch):
     progress = tmp_path / "ffmpeg.progress"
     progress.write_text(

@@ -1459,6 +1459,7 @@ def test_worker_and_proxy_scripts_url_encode_controller_callbacks():
     worker_dockerfile = Path('docker/worker/Dockerfile').read_text()
 
     assert 'curl' in worker_dockerfile
+    assert 'chmod +x /scripts/*.sh /scripts/metrics_exporter.py' in worker_dockerfile
     assert '--data-urlencode "stream=${STREAM_KEY}"' in worker_script
     assert '--connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}"' in worker_script
     assert '--data-urlencode "worker_pod=${WORKER_POD}"' in worker_script

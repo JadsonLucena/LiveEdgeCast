@@ -253,7 +253,7 @@ def discover_progress_path() -> str:
     for path in glob.glob("/tmp/ffmpeg_*.progress"):
         try:
             candidates.append((os.stat(path).st_mtime, path))
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             continue
     if candidates:
         return max(candidates)[1]
@@ -274,7 +274,7 @@ def read_pid(pid_file: str) -> Optional[int]:
     try:
         with open(pid_file, "r", encoding="utf-8") as handle:
             return int(handle.read().strip())
-    except (FileNotFoundError, ValueError):
+    except (FileNotFoundError, OSError, ValueError):
         return None
 
 
