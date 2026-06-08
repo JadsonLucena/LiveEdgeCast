@@ -17,6 +17,7 @@ from common import (  # noqa: E402
     config_from_args,
     ffmpeg_command,
     prepare_run,
+    process_wait_timeout_seconds,
     sleep_with_log,
     start_ffmpeg_streams,
     start_process,
@@ -85,9 +86,21 @@ def main() -> int:
         )
         running_processes.append(duplicate)
 
-        duplicate_results = wait_for_processes([duplicate], logger)
+        duplicate_results = wait_for_processes(
+            [duplicate],
+            logger,
+            timeout_seconds=process_wait_timeout_seconds(
+                config, max(1, config.duration_seconds // 2)
+            ),
+            stop_grace_seconds=config.stop_grace_seconds,
+        )
         running_processes.remove(duplicate)
-        primary_result = wait_for_processes([primary], logger)
+        primary_result = wait_for_processes(
+            [primary],
+            logger,
+            timeout_seconds=process_wait_timeout_seconds(config, primary_duration),
+            stop_grace_seconds=config.stop_grace_seconds,
+        )
         running_processes.remove(primary)
 
         reconnect_results = []
@@ -106,11 +119,27 @@ def main() -> int:
                 logger,
             )
             running_processes.append(reconnect)
-            reconnect_results.extend(wait_for_processes([reconnect], logger))
+            reconnect_results.extend(
+                wait_for_processes(
+                    [reconnect],
+                    logger,
+                    timeout_seconds=process_wait_timeout_seconds(
+                        config, max(1, config.duration_seconds // 2)
+                    ),
+                    stop_grace_seconds=config.stop_grace_seconds,
+                )
+            )
             running_processes.remove(reconnect)
 
         background_results = (
-            wait_for_processes(background, logger) if background else []
+            wait_for_processes(
+                background,
+                logger,
+                timeout_seconds=process_wait_timeout_seconds(config),
+                stop_grace_seconds=config.stop_grace_seconds,
+            )
+            if background
+            else []
         )
         for proc in background:
             if proc in running_processes:

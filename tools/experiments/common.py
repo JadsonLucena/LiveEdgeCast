@@ -257,14 +257,6 @@ def validate_duplicate_timing(
         )
 
 
-def validate_pilot_config(
-    parser: argparse.ArgumentParser, config: "ExperimentConfig"
-) -> None:
-    # Reserved for incremental-pilot validations that depend on multiple parsed
-    # arguments. Type/range validations are enforced by argparse converters.
-    return None
-
-
 def build_incremental_levels(config: "ExperimentConfig") -> list[int]:
     levels = list(range(config.step_size, config.concurrency + 1, config.step_size))
     if not levels:
@@ -491,27 +483,74 @@ def start_ffmpeg_streams(
     duration_seconds: int | None = None,
 ) -> list[ManagedProcess]:
     processes: list[ManagedProcess] = []
-    for index, key in enumerate(keys):
-        proc = start_process(
-            ffmpeg_command(config, key, duration_seconds),
-            f"ffmpeg-{key}",
-            config.artifact_dir,
-            logger,
-        )
-        processes.append(proc)
-        if index < len(keys) - 1 and config.startup_interval_seconds:
-            time.sleep(config.startup_interval_seconds)
-    return processes
+    try:
+        for index, key in enumerate(keys):
+            proc = start_process(
+                ffmpeg_command(config, key, duration_seconds),
+                f"ffmpeg-{key}",
+                config.artifact_dir,
+                logger,
+            )
+            processes.append(proc)
+            if index < len(keys) - 1 and config.startup_interval_seconds:
+                time.sleep(config.startup_interval_seconds)
+        return processes
+    except Exception:
+        if processes:
+            logger.exception(
+                "failed starting all FFmpeg publishers; stopping %s already-started process(es)",
+                len(processes),
+            )
+            stop_processes(processes, config, logger)
+        raise
+
+
+def process_wait_timeout_seconds(
+    config: ExperimentConfig, duration_seconds: int | None = None
+) -> float:
+    duration = (
+        duration_seconds if duration_seconds is not None else config.duration_seconds
+    )
+    startup_budget = max(0.0, config.startup_interval_seconds) * max(
+        0, config.concurrency - 1
+    )
+    return duration + startup_budget + config.stop_grace_seconds + 10
 
 
 def wait_for_processes(
-    processes: Iterable[ManagedProcess], logger: logging.Logger
+    processes: Iterable[ManagedProcess],
+    logger: logging.Logger,
+    timeout_seconds: float | None = None,
+    stop_grace_seconds: float = 5.0,
 ) -> list[dict[str, Any]]:
     results = []
     for proc in processes:
-        returncode = proc.process.wait()
-        logger.info("process completed name=%s returncode=%s", proc.name, returncode)
-        results.append(proc.result())
+        timed_out = False
+        try:
+            if timeout_seconds is None:
+                returncode = proc.process.wait()
+            else:
+                remaining = proc.started_at + timeout_seconds - time.time()
+                returncode = proc.process.wait(timeout=max(0.0, remaining))
+            logger.info(
+                "process completed name=%s returncode=%s", proc.name, returncode
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            logger.warning(
+                "process timed out name=%s timeout_seconds=%s; stopping",
+                proc.name,
+                timeout_seconds,
+            )
+            returncode = proc.stop(stop_grace_seconds)
+            logger.info(
+                "process stopped after timeout name=%s returncode=%s",
+                proc.name,
+                returncode,
+            )
+        result = proc.result()
+        result["timed_out"] = timed_out
+        results.append(result)
     return results
 
 
@@ -672,6 +711,7 @@ def delete_pod(
     )
     return {
         "pod": pod_name,
+        "status": "deleted" if completed.returncode == 0 else "delete_failed",
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,

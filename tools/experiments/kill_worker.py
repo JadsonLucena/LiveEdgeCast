@@ -18,6 +18,7 @@ from common import (  # noqa: E402
     config_from_args,
     delete_pod,
     prepare_run,
+    process_wait_timeout_seconds,
     select_pod,
     start_ffmpeg_streams,
     stop_processes,
@@ -64,11 +65,16 @@ def main() -> int:
         kill_result = {"pod": None, "status": "not_found", "returncode": 1}
         if pod_name:
             kill_result = delete_pod(config, pod_name, logger)
-            kill_result["status"] = (
-                "deleted" if kill_result.get("returncode") == 0 else "delete_failed"
-            )
 
-        results = wait_for_processes(processes, logger)
+        summary["killed_worker"] = kill_result
+        write_json(config.artifact_dir / "summary.json", summary)
+
+        results = wait_for_processes(
+            processes,
+            logger,
+            timeout_seconds=process_wait_timeout_seconds(config),
+            stop_grace_seconds=config.stop_grace_seconds,
+        )
         processes = []
         summary.update({"killed_worker": kill_result, "processes": results})
         exit_code = 0 if kill_result.get("returncode") == 0 else 2

@@ -17,10 +17,10 @@ from common import (  # noqa: E402
     collect_controller_artifacts,
     config_from_args,
     prepare_run,
+    process_wait_timeout_seconds,
     start_ffmpeg_streams,
     stop_processes,
     stream_key,
-    validate_pilot_config,
     validate_runtime_tools,
     wait_for_processes,
     write_json,
@@ -37,7 +37,6 @@ def main() -> int:
     add_saturation_options(parser)
     args = parser.parse_args()
     config = config_from_args(args)
-    validate_pilot_config(parser, config)
     logger = prepare_run(config)
 
     current_processes = []
@@ -59,7 +58,12 @@ def main() -> int:
                 for index in range(1, level + 1)
             ]
             current_processes = start_ffmpeg_streams(config, keys, logger)
-            results = wait_for_processes(current_processes, logger)
+            results = wait_for_processes(
+                current_processes,
+                logger,
+                timeout_seconds=process_wait_timeout_seconds(config),
+                stop_grace_seconds=config.stop_grace_seconds,
+            )
             current_processes = []
             failures = [result for result in results if result["returncode"] != 0]
             error_rate = len(failures) / len(results) if results else 1.0

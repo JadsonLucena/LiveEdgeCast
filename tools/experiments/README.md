@@ -17,7 +17,7 @@ tools/experiments/artifacts/<experiment_id>/<scenario>/<run_id>/
 
 Common artifacts include `config.json`, `run.log`, per-process FFmpeg stdout/stderr logs, and `summary.json`. RTMP and controller URLs are redacted in structured artifacts and agent-managed logs to avoid leaking credentials. FFmpeg's own stderr can still include protocol-level details, so treat raw per-process logs as sensitive when using production endpoints.
 
-Before starting publishers, scripts validate required executables and run a TCP preflight against the RTMP host/port. The `kill_worker` and `kill_proxy` scenarios require `kubectl`; they also collect Kubernetes pod and event snapshots at the end of the run. Controller `/health` and `/metrics` artifacts are collected only when `--controller-url` is provided.
+Before starting publishers, scripts validate required executables and run a TCP preflight against the RTMP host/port. Publisher waits are bounded by the configured duration plus startup/grace budget; timed-out publishers are stopped and marked with `timed_out` in `summary.json`. The `kill_worker` and `kill_proxy` scenarios require `kubectl`; they also collect Kubernetes pod and event snapshots at the end of the run. Controller `/health` and `/metrics` artifacts are collected only when `--controller-url` is provided.
 
 ## Scenarios
 
