@@ -38,3 +38,10 @@ temp/
 # Build artifacts
 dist/
 build/
+
+# Experiment artifacts
+tools/experiments/artifacts/
+
+# Python cache
+__pycache__/
+*.py[cod]
