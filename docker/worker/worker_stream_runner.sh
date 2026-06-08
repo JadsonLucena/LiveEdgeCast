@@ -26,6 +26,7 @@ log "Launching FFmpeg (pull=$PROXY_RTMP push=$TARGET_RTMP)"
 ffmpeg \
   -loglevel warning \
   -rw_timeout 5000000 \
+  -progress "/tmp/ffmpeg_${STREAM_KEY}.progress" \
   -i "$PROXY_RTMP" \
   -c:v copy \
   -c:a copy \
@@ -40,6 +41,7 @@ if wait "$FFMPEG_PID"; then
 else
   EXIT_CODE=$?
 fi
+echo "$EXIT_CODE" > "/tmp/ffmpeg_${STREAM_KEY}.exit"
 
 rm -f "$PID_FILE"
 

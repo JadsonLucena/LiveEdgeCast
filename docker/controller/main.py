@@ -23,6 +23,22 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+
+def get_experiment_tags(experiment_id: str = None, scenario: str = None, run_id: str = None):
+    return {
+        'experiment_id': experiment_id or 'default',
+        'scenario': scenario or 'default',
+        'run_id': run_id or 'default',
+    }
+
+def log_event(event_type: str, stream: str, status: str, tags: dict, generation=None, proxy_pod=None, worker_pod=None, duration_ms=None):
+    payload = {
+        'timestamp': time.time(), 'event_type': event_type, 'stream': stream, 'generation': generation,
+        'proxy_pod': proxy_pod, 'worker_pod': worker_pod, 'experiment_id': tags['experiment_id'],
+        'scenario': tags['scenario'], 'run_id': tags['run_id'], 'duration_ms': duration_ms, 'status': status
+    }
+    logger.info(json.dumps(payload))
+
 NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
 WORKER_SERVICE = "worker"
@@ -435,55 +451,11 @@ def recover_state(
         logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
 
 
-def get_pod_metrics(pod_name: str, namespace: str) -> dict:
-    try:
-        pod = core.read_namespaced_pod(name=pod_name, namespace=namespace)
-        memory_limit = 0
-        for container in pod.spec.containers or []:
-            limits = container.resources.limits if container.resources else None
-            if limits and limits.get('memory'):
-                mem = str(limits.get('memory'))
-                if mem.endswith('Mi'):
-                    memory_limit += int(mem[:-2]) * 1024 * 1024
-        ready = any(c.type == 'Ready' and c.status == 'True' for c in (pod.status.conditions or []))
-        return {'memory_limit': memory_limit, 'ready': ready}
-    except Exception as e:
-        logger.warning(f'Failed to get metrics for {pod_name}: {e}')
-        return {}
-
-def collect_pod_metrics():
-    try:
-        pods = core.list_namespaced_pod(namespace=NAMESPACE,label_selector='app in (proxy, worker)').items
-        for pod in pods:
-            name = pod.metadata.name
-            m = get_pod_metrics(name, NAMESPACE)
-            pod_ready_status.labels(pod=name, namespace=NAMESPACE).set(1 if m.get('ready') else 0)
-            memory_limit = m.get('memory_limit', 0)
-            if memory_limit > 0:
-                pod_memory_usage_bytes.labels(pod=name, namespace=NAMESPACE).set(memory_limit * 0.5)
-                pod_memory_usage_percent.labels(pod=name, namespace=NAMESPACE).set(50)
-    except Exception as e:
-        logger.warning(f'Failed to collect pod metrics: {e}')
-
-def collect_allocation_metrics():
-    with allocation_lock:
-        try:
-            pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker").items
-            ready = 0
-            for pod in pods:
-                conditions = {c.type: c.status for c in (pod.status.conditions or [])}
-                if conditions.get("Ready") == "True":
-                    ready += 1
-            worker_pods_available.labels(namespace=NAMESPACE).set(ready)
-        except Exception:
-            pass
-
 async def collect_infrastructure_metrics():
     while True:
         await asyncio.sleep(30)
-        collect_pod_metrics()
-        collect_allocation_metrics()
-
+        # real CPU/memory/network metrics must be scraped from cAdvisor/kubelet metrics
+        pass
 
 
 
