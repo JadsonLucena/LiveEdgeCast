@@ -157,7 +157,7 @@ port-forward:
 kubectl -n media get deploy/worker svc/worker -o wide
 kubectl -n media get pods -l app=worker -o wide
 kubectl -n monitoring get servicemonitor worker-metrics -o yaml
-kubectl -n monitoring port-forward svc/prometheus-kube-prometheus-prometheus 9090:9090
+kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 9090:9090
 ```
 
 Then open `http://localhost:9090/targets`. If at least one `app=worker` Pod
