@@ -140,21 +140,22 @@ def main() -> int:
             summary["reconnect_attempts"] = reconnect_results
             write_json(config.artifact_dir / "summary.json", summary)
 
-        background_results = (
-            wait_for_processes(
-                background,
-                logger,
-                timeout_seconds=process_wait_timeout_seconds(
-                    config, process_count=len(background)
-                ),
-                stop_grace_seconds=config.stop_grace_seconds,
-            )
-            if background
-            else []
-        )
+        background_results = []
         for proc in background:
+            background_results.extend(
+                wait_for_processes(
+                    [proc],
+                    logger,
+                    timeout_seconds=process_wait_timeout_seconds(
+                        config, process_count=1
+                    ),
+                    stop_grace_seconds=config.stop_grace_seconds,
+                )
+            )
             if proc in running_processes:
                 running_processes.remove(proc)
+            summary["background_processes"] = background_results
+            write_json(config.artifact_dir / "summary.json", summary)
         summary.update(
             {
                 "primary": primary_result,

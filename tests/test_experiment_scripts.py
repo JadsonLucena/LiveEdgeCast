@@ -1,3 +1,5 @@
+import importlib
+import json
 import logging
 import subprocess
 import time
@@ -88,6 +90,57 @@ def test_incremental_step_size_above_concurrency_runs_target_once():
     assert build_incremental_levels(config) == [2]
 
 
+def test_incremental_pilot_entrypoint_handles_oversized_step_size(
+    monkeypatch, tmp_path
+):
+    incremental_pilot = importlib.import_module("incremental_pilot")
+
+    monkeypatch.setattr(
+        incremental_pilot, "validate_runtime_tools", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        incremental_pilot, "collect_controller_artifacts", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        incremental_pilot, "start_ffmpeg_streams", lambda *args, **kwargs: [object()]
+    )
+    monkeypatch.setattr(
+        incremental_pilot,
+        "wait_for_processes",
+        lambda *args, **kwargs: [{"name": "fake", "returncode": 0}],
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "incremental_pilot.py",
+            "--experiment-id",
+            "exp",
+            "--scenario",
+            "incremental_pilot",
+            "--run-id",
+            "run",
+            "--concurrency",
+            "2",
+            "--duration-seconds",
+            "10",
+            "--bitrate",
+            "800k",
+            "--step-size",
+            "3",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert incremental_pilot.main() == 0
+
+    summary = json.loads(
+        (tmp_path / "exp" / "incremental_pilot" / "run" / "summary.json").read_text()
+    )
+    assert [level["concurrency"] for level in summary["levels"]] == [2]
+
+
 def test_process_wait_timeout_uses_actual_process_count():
     parser = scenario_parser("incremental_pilot")
     add_saturation_options(parser)
@@ -146,6 +199,45 @@ def test_wait_for_processes_stops_timed_out_process(tmp_path):
     assert results[0]["timed_out"] is True
     assert results[0]["returncode"] is not None
     assert results[0]["ended_at"] is not None
+
+
+def test_wait_for_processes_records_stop_error_on_timeout():
+    class FailingStopProcess:
+        name = "failing-stop"
+        command = []
+        started_at = time.time() - 1
+        ended_at = None
+        stdout_path = Path("stdout.log")
+        stderr_path = Path("stderr.log")
+
+        class Process:
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired("fake", timeout)
+
+            def poll(self):
+                return None
+
+        process = Process()
+
+        def stop(self, grace_seconds):
+            raise RuntimeError("cannot stop")
+
+        def result(self):
+            return {
+                "name": self.name,
+                "ended_at": self.ended_at,
+                "returncode": self.process.poll(),
+            }
+
+    results = wait_for_processes(
+        [FailingStopProcess()],
+        logging.getLogger("test_wait_stop_error"),
+        timeout_seconds=0.1,
+        stop_grace_seconds=0.1,
+    )
+
+    assert results[0]["timed_out"] is True
+    assert results[0]["stop_error"]["type"] == "RuntimeError"
 
 
 def test_start_ffmpeg_streams_stops_already_started_processes_on_failure(

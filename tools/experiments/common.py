@@ -258,6 +258,7 @@ def validate_duplicate_timing(
 
 
 def build_incremental_levels(config: "ExperimentConfig") -> list[int]:
+    """Return pilot concurrency levels, falling back to the target once for oversized steps."""
     levels = list(range(config.step_size, config.concurrency + 1, config.step_size))
     if not levels:
         return [config.concurrency]
@@ -515,6 +516,7 @@ def process_wait_timeout_seconds(
     duration_seconds: int | None = None,
     process_count: int | None = None,
 ) -> float:
+    """Bound publisher waits using the actual batch size when available."""
     duration = (
         duration_seconds if duration_seconds is not None else config.duration_seconds
     )
@@ -544,19 +546,26 @@ def wait_for_processes(
             )
         except subprocess.TimeoutExpired:
             timed_out = True
+            stop_error = None
             logger.warning(
                 "process timed out name=%s timeout_seconds=%s; stopping",
                 proc.name,
                 timeout_seconds,
             )
-            returncode = proc.stop(stop_grace_seconds)
-            logger.info(
-                "process stopped after timeout name=%s returncode=%s",
-                proc.name,
-                returncode,
-            )
+            try:
+                returncode = proc.stop(stop_grace_seconds)
+                logger.info(
+                    "process stopped after timeout name=%s returncode=%s",
+                    proc.name,
+                    returncode,
+                )
+            except Exception as exc:
+                stop_error = {"type": type(exc).__name__, "message": str(exc)}
+                logger.exception("failed stopping timed-out process name=%s", proc.name)
         result = proc.result()
         result["timed_out"] = timed_out
+        if timed_out and stop_error is not None:
+            result["stop_error"] = stop_error
         results.append(result)
     return results
 
