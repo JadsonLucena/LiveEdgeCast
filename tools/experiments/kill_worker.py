@@ -19,7 +19,7 @@ from common import (  # noqa: E402
     delete_pod,
     prepare_run,
     process_wait_timeout_seconds,
-    select_pod,
+    select_pod_candidates,
     start_ffmpeg_streams,
     stop_processes,
     stream_key,
@@ -52,19 +52,67 @@ def main() -> int:
         time.sleep(config.kill_after_seconds)
 
         target_stream = keys[0]
-        pod_name = select_pod(
-            config, config.worker_selector, logger, annotation_stream=target_stream
-        )
-        if pod_name is None:
-            logger.warning(
-                "no worker pod found for stream=%s; falling back to first worker",
-                target_stream,
+        selection = {
+            "source": (
+                "target_worker_pod"
+                if config.target_worker_pod
+                else "stream_annotation"
+            ),
+            "selector": config.worker_selector,
+            "target_worker_pod": config.target_worker_pod,
+            "target_stream": target_stream,
+            "candidate_pods": [],
+        }
+        pod_name = config.target_worker_pod
+        if pod_name:
+            selection["status"] = "selected"
+            selection["pod"] = pod_name
+        else:
+            annotated_candidates = select_pod_candidates(
+                config, config.worker_selector, logger, annotation_stream=target_stream
             )
-            pod_name = select_pod(config, config.worker_selector, logger)
+            selection["candidate_pods"] = annotated_candidates
+            if len(annotated_candidates) == 1:
+                pod_name = annotated_candidates[0]
+                selection["status"] = "selected"
+                selection["pod"] = pod_name
+            elif len(annotated_candidates) > 1:
+                selection["status"] = "ambiguous"
+                logger.warning(
+                    "worker selector=%s matched multiple workers for stream=%s; refusing ambiguous kill candidates=%s",
+                    config.worker_selector,
+                    target_stream,
+                    ",".join(annotated_candidates),
+                )
+            else:
+                fallback_candidates = select_pod_candidates(
+                    config, config.worker_selector, logger
+                )
+                selection["source"] = "selector"
+                selection["candidate_pods"] = fallback_candidates
+                if len(fallback_candidates) == 1:
+                    pod_name = fallback_candidates[0]
+                    selection["status"] = "selected"
+                    selection["pod"] = pod_name
+                elif fallback_candidates:
+                    selection["status"] = "ambiguous"
+                    logger.warning(
+                        "worker selector=%s matched multiple candidate pods without stream annotation; refusing ambiguous kill candidates=%s",
+                        config.worker_selector,
+                        ",".join(fallback_candidates),
+                    )
+                else:
+                    selection["status"] = "not_found"
 
-        kill_result = {"pod": None, "status": "not_found", "returncode": 1}
+        kill_result = {
+            "pod": None,
+            "status": selection["status"],
+            "returncode": 1,
+            "selection": selection,
+        }
         if pod_name:
             kill_result = delete_pod(config, pod_name, logger)
+            kill_result["selection"] = selection
 
         summary["killed_worker"] = kill_result
         write_json(config.artifact_dir / "summary.json", summary)

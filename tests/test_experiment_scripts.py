@@ -26,6 +26,7 @@ from common import (  # noqa: E402
     process_wait_timeout_seconds,
     run_command,
     select_pod,
+    select_pod_candidates,
     start_process,
     start_ffmpeg_streams,
     stop_processes,
@@ -334,6 +335,53 @@ def test_target_proxy_pod_is_parsed_from_cli():
     config = parsed_config(parser, "--target-proxy-pod", "proxy-1")
 
     assert config.target_proxy_pod == "proxy-1"
+
+
+def test_target_worker_pod_is_parsed_from_cli():
+    parser = scenario_parser("kill_worker")
+    add_kill_options(parser)
+    config = parsed_config(parser, "--target-worker-pod", "worker-1")
+
+    assert config.target_worker_pod == "worker-1"
+
+
+def test_select_pod_candidates_filters_by_stream_annotation(monkeypatch):
+    parser = scenario_parser("kill_worker")
+    add_kill_options(parser)
+    config = parsed_config(parser)
+
+    payload = {
+        "items": [
+            {
+                "metadata": {
+                    "name": "worker-1",
+                    "annotations": {"liveedgecast.io/stream": "target-stream"},
+                },
+                "status": {"phase": "Running"},
+            },
+            {
+                "metadata": {
+                    "name": "worker-2",
+                    "annotations": {"liveedgecast.io/stream": "other-stream"},
+                },
+                "status": {"phase": "Running"},
+            },
+        ]
+    }
+
+    def fake_kubectl(config, args, logger, timeout=30):
+        return subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(common, "kubectl", fake_kubectl)
+
+    assert select_pod_candidates(
+        config,
+        "app=worker",
+        logging.getLogger("test"),
+        annotation_stream="target-stream",
+    ) == ["worker-1"]
 
 
 def test_stop_processes_records_cleanup_stop_error():

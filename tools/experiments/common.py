@@ -42,6 +42,7 @@ class ExperimentConfig:
     proxy_selector: str
     worker_selector: str
     target_proxy_pod: str | None
+    target_worker_pod: str | None
     controller_url: str | None
     ffmpeg_path: str
     kubectl_path: str
@@ -169,16 +170,6 @@ def build_parser(
         default=os.getenv("WORKER_SELECTOR", "app=worker"),
     )
     parser.add_argument(
-        "--target-proxy-pod",
-        "--target_proxy_pod",
-        default=os.getenv("TARGET_PROXY_POD"),
-        type=lambda v: validate_safe_id(v, "target_proxy_pod"),
-        help=(
-            "Exact proxy pod to delete for kill_proxy. When omitted, the proxy "
-            "selector must match exactly one Running/Pending pod."
-        ),
-    )
-    parser.add_argument(
         "--ffmpeg-path", "--ffmpeg_path", default=os.getenv("FFMPEG", "ffmpeg")
     )
     parser.add_argument(
@@ -206,6 +197,27 @@ def add_kill_options(parser: argparse.ArgumentParser) -> None:
         type=non_negative_int,
         default=10,
         help="Seconds to wait before deleting the target pod; must be less than duration_seconds.",
+    )
+    parser.add_argument(
+        "--target-proxy-pod",
+        "--target_proxy_pod",
+        default=os.getenv("TARGET_PROXY_POD"),
+        type=lambda v: validate_safe_id(v, "target_proxy_pod"),
+        help=(
+            "Exact proxy pod to delete for kill_proxy. When omitted, the proxy "
+            "selector must match exactly one Running/Pending pod."
+        ),
+    )
+    parser.add_argument(
+        "--target-worker-pod",
+        "--target_worker_pod",
+        default=os.getenv("TARGET_WORKER_POD"),
+        type=lambda v: validate_safe_id(v, "target_worker_pod"),
+        help=(
+            "Exact worker pod to delete for kill_worker. When omitted and the "
+            "stream annotation cannot identify a worker, the worker selector must "
+            "match exactly one Running/Pending pod."
+        ),
     )
 
 
@@ -291,7 +303,8 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         namespace=args.namespace,
         proxy_selector=args.proxy_selector,
         worker_selector=args.worker_selector,
-        target_proxy_pod=args.target_proxy_pod,
+        target_proxy_pod=getattr(args, "target_proxy_pod", None),
+        target_worker_pod=getattr(args, "target_worker_pod", None),
         controller_url=args.controller_url.rstrip("/") if args.controller_url else None,
         ffmpeg_path=args.ffmpeg_path,
         kubectl_path=args.kubectl_path,
@@ -701,24 +714,23 @@ def kubectl(
     return run_command([config.kubectl_path, *args], logger, timeout=timeout)
 
 
-def select_pod(
+def select_pod_candidates(
     config: ExperimentConfig,
     selector: str,
     logger: logging.Logger,
     annotation_stream: str | None = None,
-    require_single: bool = False,
-) -> str | None:
+) -> list[str]:
     args = ["get", "pods", "-n", config.namespace, "-l", selector, "-o", "json"]
     completed = kubectl(config, args, logger)
     if completed.returncode != 0:
-        return None
+        return []
     try:
         data = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError as exc:
         logger.warning(
             "failed parsing kubectl pod JSON selector=%s error=%s", selector, exc
         )
-        return None
+        return []
 
     candidates: list[str] = []
     for item in data.get("items", []):
@@ -734,7 +746,17 @@ def select_pod(
             continue
         if name and phase in {"Running", "Pending"}:
             candidates.append(name)
+    return candidates
 
+
+def select_pod(
+    config: ExperimentConfig,
+    selector: str,
+    logger: logging.Logger,
+    annotation_stream: str | None = None,
+    require_single: bool = False,
+) -> str | None:
+    candidates = select_pod_candidates(config, selector, logger, annotation_stream)
     if not candidates:
         return None
     if require_single and len(candidates) != 1:

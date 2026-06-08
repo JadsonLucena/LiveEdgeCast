@@ -19,7 +19,7 @@ from common import (  # noqa: E402
     delete_pod,
     prepare_run,
     process_wait_timeout_seconds,
-    select_pod,
+    select_pod_candidates,
     start_ffmpeg_streams,
     stop_processes,
     stream_key,
@@ -51,24 +51,42 @@ def main() -> int:
         processes = start_ffmpeg_streams(config, keys, logger)
         time.sleep(config.kill_after_seconds)
 
-        pod_name = config.target_proxy_pod or select_pod(
-            config, config.proxy_selector, logger, require_single=True
-        )
-        kill_result = {
-            "pod": None,
-            "status": (
-                "not_found"
-                if config.target_proxy_pod
-                else "ambiguous_or_not_found"
-            ),
-            "returncode": 1,
+        selection = {
+            "source": "target_proxy_pod" if config.target_proxy_pod else "selector",
             "selector": config.proxy_selector,
             "target_proxy_pod": config.target_proxy_pod,
+            "candidate_pods": [],
+        }
+        pod_name = config.target_proxy_pod
+        if pod_name:
+            selection["status"] = "selected"
+            selection["pod"] = pod_name
+        else:
+            candidates = select_pod_candidates(config, config.proxy_selector, logger)
+            selection["candidate_pods"] = candidates
+            if len(candidates) == 1:
+                pod_name = candidates[0]
+                selection["status"] = "selected"
+                selection["pod"] = pod_name
+            elif candidates:
+                selection["status"] = "ambiguous"
+                logger.warning(
+                    "proxy selector=%s matched multiple candidate pods; refusing ambiguous kill candidates=%s",
+                    config.proxy_selector,
+                    ",".join(candidates),
+                )
+            else:
+                selection["status"] = "not_found"
+
+        kill_result = {
+            "pod": None,
+            "status": selection["status"],
+            "returncode": 1,
+            "selection": selection,
         }
         if pod_name:
             kill_result = delete_pod(config, pod_name, logger)
-            kill_result["selector"] = config.proxy_selector
-            kill_result["target_proxy_pod"] = config.target_proxy_pod
+            kill_result["selection"] = selection
 
         summary["killed_proxy"] = kill_result
         write_json(config.artifact_dir / "summary.json", summary)

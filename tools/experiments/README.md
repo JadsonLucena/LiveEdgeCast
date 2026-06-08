@@ -42,7 +42,7 @@ Useful optional parameters:
 
 ### Kill worker
 
-Starts the requested streams, waits `--kill-after-seconds`, deletes the worker pod for the first stream when it can identify it by `liveedgecast.io/stream`, and records whether publishers survive. `--kill-after-seconds` must be less than `--duration-seconds` so the worker is killed during the active run.
+Starts the requested streams, waits `--kill-after-seconds`, deletes the explicit `--target-worker-pod` when provided, otherwise deletes the worker pod for the first stream when it can identify it by `liveedgecast.io/stream`, or falls back only when `--worker-selector` matches exactly one Running/Pending pod. Ambiguous worker selections are refused so the run does not accidentally delete a worker unrelated to the experiment traffic. `--kill-after-seconds` must be less than `--duration-seconds` so the worker is killed during the active run.
 
 ```sh
 ./tools/experiments/kill_worker.py \
@@ -95,6 +95,7 @@ Useful optional parameters:
 - `--namespace`: Kubernetes namespace. Defaults to `media` or `NAMESPACE`.
 - `--proxy-selector` / `--proxy_selector`: proxy pod selector. Defaults to `app=proxy` or `PROXY_SELECTOR`. In `kill_proxy`, this selector must match exactly one Running/Pending pod unless `--target-proxy-pod` is set.
 - `--target-proxy-pod` / `--target_proxy_pod`: exact proxy pod to delete in `kill_proxy`. Defaults to `TARGET_PROXY_POD` when set.
-- `--worker-selector` / `--worker_selector`: worker pod selector. Defaults to `app=worker` or `WORKER_SELECTOR`.
+- `--worker-selector` / `--worker_selector`: worker pod selector. Defaults to `app=worker` or `WORKER_SELECTOR`. In `kill_worker`, this selector is first filtered by `liveedgecast.io/stream`; fallback selector matching must be unambiguous unless `--target-worker-pod` is set.
+- `--target-worker-pod` / `--target_worker_pod`: exact worker pod to delete in `kill_worker`. Defaults to `TARGET_WORKER_POD` when set.
 - `--ffmpeg-path` / `--ffmpeg_path`: FFmpeg executable. Defaults to `ffmpeg` or `FFMPEG`.
 - `--kubectl-path` / `--kubectl_path`: kubectl executable. Defaults to `kubectl` or `KUBECTL`.
