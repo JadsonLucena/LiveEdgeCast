@@ -125,6 +125,55 @@ the whole pod and its local filesystem are replaced. Exporter errors are counted
 with low-cardinality `stage` labels so operators can distinguish FFmpeg progress
 staleness from exporter file I/O or state persistence issues.
 
+## Worker metrics ServiceMonitor checks
+
+Worker metrics are exposed by the worker container on the named container port
+`metrics` (`9113`) and scraped through the headless `worker` Service in the
+`media` namespace. Because the Service is headless, Prometheus target addresses
+correspond to selected worker Pod endpoints rather than a single Service
+ClusterIP. Keep these Kubernetes objects aligned when changing worker
+observability:
+
+- `k8s/worker-deployment.yaml`: Pod template labels must include `app: worker`
+  and the worker container must expose `containerPort: 9113` with `name: metrics`.
+- `k8s/worker-service.yaml`: Service metadata must stay in namespace `media`,
+  its selector must be `app: worker`, and its `metrics` Service port must route
+  to `targetPort: metrics` so it follows the named container port.
+- `k8s/worker-service-monitor.yaml`: The ServiceMonitor can live in namespace
+  `monitoring`, but its `namespaceSelector.matchNames` must include `media`, its
+  selector must match `app: worker`, and its endpoint must scrape port `metrics`
+  at path `/metrics`.
+
+After applying the manifests, confirm whether worker Pods exist before
+investigating application-level metrics. The worker Deployment intentionally
+starts with `replicas: 0`; in an idle stack, no worker endpoint or `UP`
+`worker-metrics` target is expected until a stream causes the controller to
+create a worker Pod.
+
+Use these commands to inspect the Kubernetes objects and establish a Prometheus
+port-forward:
+
+```sh
+kubectl -n media get deploy/worker svc/worker -o wide
+kubectl -n media get pods -l app=worker -o wide
+kubectl -n monitoring get servicemonitor worker-metrics -o yaml
+kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 9090:9090
+```
+
+If the Prometheus Service name differs in your cluster, discover the installed
+Service with
+`kubectl -n monitoring get svc -o wide | grep -E 'prometheus|9090'` and
+port-forward the Prometheus server Service that exposes port `9090` instead, or run
+`PROMETHEUS_SERVICE=<service-name> ./tools/port-forward.sh`.
+
+Then open `http://localhost:9090/targets`. If at least one `app=worker` Pod
+exists, verify the `worker-metrics` target is `UP`, points at a `media` namespace
+worker endpoint, and shows the `metrics` port. If the target is missing while
+worker Pods exist, first check the Service labels and ServiceMonitor
+selector/namespace selector; if it is present but down, check the worker Pod
+readiness and scrape `http://<worker-pod-ip>:9113/metrics` from inside the
+cluster.
+
 ## Stream startup lifecycle timestamps
 
 The controller models startup milestones per `(stream, generation)` in memory and
