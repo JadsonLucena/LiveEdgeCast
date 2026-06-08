@@ -115,6 +115,8 @@ MOCK_KNOWN_SERVICES="kube-prometheus-stack-prometheus"
 MOCK_PORTS_kube_prometheus_stack_prometheus=$'9090\tweb\tweb\n'
 run_resolve
 assert_equals "kube-prometheus-stack-prometheus" "$(cat "${TMP_DIR}/resolve.out")" "prefers valid default Prometheus service"
+assert_equals "kube-prometheus-stack-prometheus" "$PROMETHEUS_SERVICE" "default resolution preserves service for caller"
+assert_equals "9090" "$PROMETHEUS_REMOTE_PORT" "default resolution preserves remote port for caller"
 
 reset_mock_state
 PROMETHEUS_SERVICE="custom-prometheus"
@@ -151,6 +153,7 @@ MOCK_KNOWN_SERVICES="custom-web-prometheus"
 MOCK_SERVICE_LIST=$'custom-web-prometheus\tprometheus\t80:web:9090,\n'
 run_resolve
 assert_equals "custom-web-prometheus" "$(cat "${TMP_DIR}/resolve.out")" "discovers Prometheus server candidate with web service port"
+assert_equals "custom-web-prometheus" "$PROMETHEUS_SERVICE" "discovery preserves selected service for caller"
 assert_equals "80" "$PROMETHEUS_REMOTE_PORT" "discovered web service port uses actual service port"
 
 reset_mock_state

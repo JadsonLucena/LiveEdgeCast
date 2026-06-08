@@ -223,8 +223,9 @@ resolve_prometheus_service() {
     if kubectl -n monitoring get "svc/${DEFAULT_PROMETHEUS_SERVICE}" >/dev/null 2>&1; then
         service_port="$(prometheus_service_port "$DEFAULT_PROMETHEUS_SERVICE" || true)"
         if [[ -n "$service_port" ]]; then
+            PROMETHEUS_SERVICE="$DEFAULT_PROMETHEUS_SERVICE"
             PROMETHEUS_REMOTE_PORT="$service_port"
-            echo "$DEFAULT_PROMETHEUS_SERVICE"
+            echo "$PROMETHEUS_SERVICE"
             return
         fi
         print_warning "Default service svc/${DEFAULT_PROMETHEUS_SERVICE} exists but does not expose port 9090/web; trying discovery." >&2
@@ -268,7 +269,7 @@ main() {
 
     print_step "Validating required Services..."
     kubectl -n media get svc/proxy >/dev/null
-    PROMETHEUS_SERVICE="$(resolve_prometheus_service)"
+    resolve_prometheus_service >/dev/null
 
     trap cleanup_started_port_forwards ERR
     trap 'cleanup_started_port_forwards; exit 130' INT
