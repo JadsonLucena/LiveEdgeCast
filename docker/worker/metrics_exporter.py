@@ -344,24 +344,20 @@ class ExitCounterStore:
     def _read_exit_events(self) -> Iterable[Tuple[str, str]]:
         try:
             with open(self.exit_file, "r", encoding="utf-8") as handle:
-                lines = handle.readlines()
+                for index, line in enumerate(handle):
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    exit_code = parts[-1]
+                    if not re.fullmatch(r"-?\d+", exit_code):
+                        continue
+                    event_id = " ".join(parts[:-1]) or f"{self.exit_file}:{index}:{exit_code}"
+                    yield event_id, exit_code
         except FileNotFoundError:
-            return []
+            return
         except OSError:
             self._record_error("exit_state")
-            return []
-
-        events = []
-        for index, line in enumerate(lines):
-            parts = line.strip().split()
-            if not parts:
-                continue
-            exit_code = parts[-1]
-            if not re.fullmatch(r"-?\d+", exit_code):
-                continue
-            event_id = " ".join(parts[:-1]) or f"{self.exit_file}:{index}:{exit_code}"
-            events.append((event_id, exit_code))
-        return events
+            return
 
     def _load_state(self) -> bool:
         loaded_counts: Dict[str, int] = {}

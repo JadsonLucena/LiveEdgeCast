@@ -237,6 +237,35 @@ def test_exit_counter_store_defers_exit_reads_until_state_load_recovers(tmp_path
     assert store.error_counts == {"exit_state": 2}
 
 
+def test_exit_counter_store_streams_exit_file_without_readlines(tmp_path, monkeypatch):
+    exit_file = tmp_path / "ffmpeg.exit"
+    state_file = tmp_path / "ffmpeg.exit.metrics_state"
+
+    class StreamingExitFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            return iter(["run-a 1\n", "run-b 0\n", "run-a 1\n"])
+
+        def readlines(self):
+            raise AssertionError("exit file should be streamed, not read into memory")
+
+    def streaming_open(path, *args, **kwargs):
+        if str(path) == str(exit_file):
+            return StreamingExitFile()
+        return open(path, *args, **kwargs)
+
+    monkeypatch.setattr(exporter, "open", streaming_open, raising=False)
+
+    store = exporter.ExitCounterStore(str(exit_file), str(state_file))
+
+    assert store.poll() == {"0": 1, "1": 1}
+
+
 def test_exit_counter_store_retries_dirty_state_after_save_failure(tmp_path, monkeypatch):
     exit_file = tmp_path / "ffmpeg.exit"
     state_file = tmp_path / "ffmpeg.exit.metrics_state"
