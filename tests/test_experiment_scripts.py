@@ -19,13 +19,16 @@ from common import (  # noqa: E402
     add_saturation_options,
     build_incremental_levels,
     build_parser,
+    collect_controller_artifacts,
     delete_pod,
     config_from_args,
     redact_url,
     process_wait_timeout_seconds,
     run_command,
+    select_pod,
     start_process,
     start_ffmpeg_streams,
+    stop_processes,
     sanitize_command,
     validate_duplicate_timing,
     validate_kill_timing,
@@ -292,3 +295,101 @@ def test_delete_pod_sets_status_from_returncode(monkeypatch):
 
     assert result["status"] == "delete_failed"
     assert result["returncode"] == 1
+
+
+def test_select_pod_requires_single_candidate(monkeypatch):
+    parser = scenario_parser("kill_proxy")
+    add_kill_options(parser)
+    config = parsed_config(parser)
+
+    payload = {
+        "items": [
+            {"metadata": {"name": "proxy-1"}, "status": {"phase": "Running"}},
+            {"metadata": {"name": "proxy-2"}, "status": {"phase": "Running"}},
+        ]
+    }
+
+    def fake_kubectl(config, args, logger, timeout=30):
+        return subprocess.CompletedProcess(
+            args, 0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(common, "kubectl", fake_kubectl)
+
+    assert select_pod(config, "app=proxy", logging.getLogger("test")) == "proxy-1"
+    assert (
+        select_pod(
+            config,
+            "app=proxy",
+            logging.getLogger("test"),
+            require_single=True,
+        )
+        is None
+    )
+
+
+def test_target_proxy_pod_is_parsed_from_cli():
+    parser = scenario_parser("kill_proxy")
+    add_kill_options(parser)
+    config = parsed_config(parser, "--target-proxy-pod", "proxy-1")
+
+    assert config.target_proxy_pod == "proxy-1"
+
+
+def test_stop_processes_records_cleanup_stop_error():
+    parser = scenario_parser("kill_proxy")
+    add_kill_options(parser)
+    config = parsed_config(parser)
+
+    class FailingCleanupProcess:
+        name = "failing-cleanup"
+        command = []
+        started_at = time.time()
+        ended_at = None
+        stdout_path = Path("stdout.log")
+        stderr_path = Path("stderr.log")
+
+        class Process:
+            def poll(self):
+                return None
+
+        process = Process()
+
+        def stop(self, grace_seconds):
+            raise RuntimeError("cleanup failed")
+
+        def result(self):
+            return {"name": self.name, "returncode": self.process.poll()}
+
+    results = stop_processes(
+        [FailingCleanupProcess()], config, logging.getLogger("test_cleanup_stop")
+    )
+
+    assert results[0]["stopped_by"] == "cleanup"
+    assert results[0]["stop_error"]["type"] == "RuntimeError"
+
+
+def test_collect_controller_artifacts_records_failure_metadata(monkeypatch, tmp_path):
+    parser = scenario_parser("incremental_pilot")
+    add_saturation_options(parser)
+    config = parsed_config(
+        parser,
+        "--controller-url",
+        "http://controller.example.test",
+        "--output-dir",
+        str(tmp_path),
+    )
+    config.artifact_dir.mkdir(parents=True)
+
+    def failing_urlopen(request, timeout=10):
+        raise OSError("unreachable")
+
+    monkeypatch.setattr(common, "urlopen", failing_urlopen)
+
+    artifacts = collect_controller_artifacts(
+        config, logging.getLogger("test_controller")
+    )
+
+    assert artifacts["controller_health.json"]["status"] == "collection_failed"
+    assert artifacts["controller_health.json"]["error"]["type"] == "OSError"
+    assert Path(artifacts["controller_health.json"]["path"]).exists()

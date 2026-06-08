@@ -41,6 +41,7 @@ class ExperimentConfig:
     namespace: str
     proxy_selector: str
     worker_selector: str
+    target_proxy_pod: str | None
     controller_url: str | None
     ffmpeg_path: str
     kubectl_path: str
@@ -168,6 +169,16 @@ def build_parser(
         default=os.getenv("WORKER_SELECTOR", "app=worker"),
     )
     parser.add_argument(
+        "--target-proxy-pod",
+        "--target_proxy_pod",
+        default=os.getenv("TARGET_PROXY_POD"),
+        type=lambda v: validate_safe_id(v, "target_proxy_pod"),
+        help=(
+            "Exact proxy pod to delete for kill_proxy. When omitted, the proxy "
+            "selector must match exactly one Running/Pending pod."
+        ),
+    )
+    parser.add_argument(
         "--ffmpeg-path", "--ffmpeg_path", default=os.getenv("FFMPEG", "ffmpeg")
     )
     parser.add_argument(
@@ -280,6 +291,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         namespace=args.namespace,
         proxy_selector=args.proxy_selector,
         worker_selector=args.worker_selector,
+        target_proxy_pod=args.target_proxy_pod,
         controller_url=args.controller_url.rstrip("/") if args.controller_url else None,
         ffmpeg_path=args.ffmpeg_path,
         kubectl_path=args.kubectl_path,
@@ -577,9 +589,14 @@ def stop_processes(
 ) -> list[dict[str, Any]]:
     results = []
     for proc in processes:
-        returncode = proc.stop(config.stop_grace_seconds)
-        logger.info("process stopped name=%s returncode=%s", proc.name, returncode)
-        result = proc.result()
+        try:
+            returncode = proc.stop(config.stop_grace_seconds)
+            logger.info("process stopped name=%s returncode=%s", proc.name, returncode)
+            result = proc.result()
+        except Exception as exc:
+            logger.exception("failed stopping process during cleanup name=%s", proc.name)
+            result = proc.result()
+            result["stop_error"] = {"type": type(exc).__name__, "message": str(exc)}
         result["stopped_by"] = "cleanup"
         results.append(result)
     return results
@@ -689,6 +706,7 @@ def select_pod(
     selector: str,
     logger: logging.Logger,
     annotation_stream: str | None = None,
+    require_single: bool = False,
 ) -> str | None:
     args = ["get", "pods", "-n", config.namespace, "-l", selector, "-o", "json"]
     completed = kubectl(config, args, logger)
@@ -701,19 +719,33 @@ def select_pod(
             "failed parsing kubectl pod JSON selector=%s error=%s", selector, exc
         )
         return None
+
+    candidates: list[str] = []
     for item in data.get("items", []):
         metadata = item.get("metadata", {})
         annotations = metadata.get("annotations", {}) or {}
         status = item.get("status", {})
         phase = status.get("phase")
+        name = metadata.get("name")
         if (
             annotation_stream
             and annotations.get("liveedgecast.io/stream") != annotation_stream
         ):
             continue
-        if phase in {"Running", "Pending"}:
-            return metadata.get("name")
-    return None
+        if name and phase in {"Running", "Pending"}:
+            candidates.append(name)
+
+    if not candidates:
+        return None
+    if require_single and len(candidates) != 1:
+        logger.warning(
+            "selector=%s matched %s candidate pods; refusing ambiguous selection candidates=%s",
+            selector,
+            len(candidates),
+            ",".join(candidates),
+        )
+        return None
+    return candidates[0]
 
 
 def delete_pod(
@@ -773,17 +805,19 @@ def collect_kubernetes_artifacts(
 
 def collect_controller_artifacts(
     config: ExperimentConfig, logger: logging.Logger
-) -> dict[str, str]:
+) -> dict[str, dict[str, Any]]:
     if not config.controller_url:
         return {}
 
-    artifacts: dict[str, str] = {}
+    artifacts: dict[str, dict[str, Any]] = {}
     for name, endpoint in {
         "controller_health.json": "/health",
         "controller_metrics.txt": "/metrics",
     }.items():
         path = config.artifact_dir / name
         url = f"{config.controller_url}{endpoint}"
+        status = "collected"
+        error = None
         try:
             logger.info("fetching controller artifact url=%s", redact_url(url))
             request = Request(url, headers={"User-Agent": "liveedgecast-experiment/1"})
@@ -792,6 +826,8 @@ def collect_controller_artifacts(
             path.write_text(body, encoding="utf-8")
         except Exception as exc:
             # Best-effort artifact collection should not fail a run.
+            status = "collection_failed"
+            error = {"type": type(exc).__name__, "message": str(exc)}
             logger.warning(
                 "failed fetching controller artifact url=%s error=%s",
                 redact_url(url),
@@ -800,7 +836,10 @@ def collect_controller_artifacts(
             path.write_text(
                 f"failed fetching {redact_url(url)}: {exc}\n", encoding="utf-8"
             )
-        artifacts[name] = str(path)
+        artifact = {"path": str(path), "status": status}
+        if error is not None:
+            artifact["error"] = error
+        artifacts[name] = artifact
     return artifacts
 
 

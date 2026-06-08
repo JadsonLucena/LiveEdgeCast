@@ -17,7 +17,7 @@ tools/experiments/artifacts/<experiment_id>/<scenario>/<run_id>/
 
 Common artifacts include `config.json`, `run.log`, per-process FFmpeg stdout/stderr logs, and `summary.json`. RTMP and controller URLs are redacted in structured artifacts and agent-managed logs to avoid leaking credentials. FFmpeg's own stderr can still include protocol-level details, so treat raw per-process logs as sensitive when using production endpoints.
 
-Before starting publishers, scripts validate required executables and run a TCP preflight against the RTMP host/port. Publisher waits are bounded by the configured duration plus startup/grace budget; timed-out publishers are stopped and marked with `timed_out` in `summary.json`. The `kill_worker` and `kill_proxy` scenarios require `kubectl`; they also collect Kubernetes pod and event snapshots with collection status metadata at the end of the run. Controller `/health` and `/metrics` artifacts are collected only when `--controller-url` is provided.
+Before starting publishers, scripts validate required executables and run a TCP preflight against the RTMP host/port. Publisher waits are bounded by the configured duration plus startup/grace budget; timed-out publishers are stopped and marked with `timed_out` in `summary.json`. The `kill_worker` and `kill_proxy` scenarios require `kubectl`; they also collect Kubernetes pod and event snapshots with collection status metadata at the end of the run. Controller `/health` and `/metrics` artifacts are collected only when `--controller-url` is provided and are reported with collection status metadata.
 
 ## Scenarios
 
@@ -56,7 +56,7 @@ Starts the requested streams, waits `--kill-after-seconds`, deletes the worker p
 
 ### Kill proxy
 
-Starts the requested streams, waits `--kill-after-seconds`, deletes one proxy pod selected by `--proxy-selector`, and records publisher outcomes. `--kill-after-seconds` must be less than `--duration-seconds` so the proxy is killed during the active run.
+Starts the requested streams, waits `--kill-after-seconds`, deletes the explicit `--target-proxy-pod` when provided, or otherwise deletes a proxy only when `--proxy-selector` matches exactly one Running/Pending pod. Ambiguous selectors are refused so the run does not accidentally delete a proxy that is unrelated to the experiment traffic. `--kill-after-seconds` must be less than `--duration-seconds` so the proxy is killed during the active run.
 
 ```sh
 ./tools/experiments/kill_proxy.py \
@@ -93,7 +93,8 @@ Useful optional parameters:
 - `--rtmp-url` / `--rtmp_url`: RTMP application URL. Defaults to `rtmp://127.0.0.1:1935/live` or `LIVEEDGECAST_RTMP_URL`.
 - `--controller-url` / `--controller_url`: optional controller HTTP URL used to collect `/health` and `/metrics` artifacts.
 - `--namespace`: Kubernetes namespace. Defaults to `media` or `NAMESPACE`.
-- `--proxy-selector` / `--proxy_selector`: proxy pod selector. Defaults to `app=proxy` or `PROXY_SELECTOR`.
+- `--proxy-selector` / `--proxy_selector`: proxy pod selector. Defaults to `app=proxy` or `PROXY_SELECTOR`. In `kill_proxy`, this selector must match exactly one Running/Pending pod unless `--target-proxy-pod` is set.
+- `--target-proxy-pod` / `--target_proxy_pod`: exact proxy pod to delete in `kill_proxy`. Defaults to `TARGET_PROXY_POD` when set.
 - `--worker-selector` / `--worker_selector`: worker pod selector. Defaults to `app=worker` or `WORKER_SELECTOR`.
 - `--ffmpeg-path` / `--ffmpeg_path`: FFmpeg executable. Defaults to `ffmpeg` or `FFMPEG`.
 - `--kubectl-path` / `--kubectl_path`: kubectl executable. Defaults to `kubectl` or `KUBECTL`.

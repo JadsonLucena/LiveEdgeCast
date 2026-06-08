@@ -51,10 +51,24 @@ def main() -> int:
         processes = start_ffmpeg_streams(config, keys, logger)
         time.sleep(config.kill_after_seconds)
 
-        pod_name = select_pod(config, config.proxy_selector, logger)
-        kill_result = {"pod": None, "status": "not_found", "returncode": 1}
+        pod_name = config.target_proxy_pod or select_pod(
+            config, config.proxy_selector, logger, require_single=True
+        )
+        kill_result = {
+            "pod": None,
+            "status": (
+                "not_found"
+                if config.target_proxy_pod
+                else "ambiguous_or_not_found"
+            ),
+            "returncode": 1,
+            "selector": config.proxy_selector,
+            "target_proxy_pod": config.target_proxy_pod,
+        }
         if pod_name:
             kill_result = delete_pod(config, pod_name, logger)
+            kill_result["selector"] = config.proxy_selector
+            kill_result["target_proxy_pod"] = config.target_proxy_pod
 
         summary["killed_proxy"] = kill_result
         write_json(config.artifact_dir / "summary.json", summary)
