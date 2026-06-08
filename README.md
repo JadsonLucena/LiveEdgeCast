@@ -49,3 +49,13 @@ docker-compose down
 - **Docker Compose**: For running the project directly with Docker.
 # Environment Variables
 - **RTMP_PUSH_URL**: The RTMP URL to which the stream will be pushed. It should be in the format `rtmp://upstream.example.com/live/yourStreamKey`.
+
+# Observability checks
+
+Worker metrics are exposed through the `worker` Service in namespace `media` on
+the named port `metrics` (`9113`) and discovered by the `worker-metrics`
+ServiceMonitor in namespace `monitoring`. After starting the stack and the
+Prometheus port-forward, open `http://localhost:9090/targets` and confirm the
+`worker-metrics` target is `UP`, belongs to the `media` namespace, and uses the
+`metrics` port. Detailed alignment notes for the worker Deployment, Service, and
+ServiceMonitor are documented in `docs/observability/metrics.md`.

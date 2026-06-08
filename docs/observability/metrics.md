@@ -125,6 +125,39 @@ the whole pod and its local filesystem are replaced. Exporter errors are counted
 with low-cardinality `stage` labels so operators can distinguish FFmpeg progress
 staleness from exporter file I/O or state persistence issues.
 
+## Worker metrics ServiceMonitor checks
+
+Worker metrics are exposed by the worker container on the named container port
+`metrics` (`9113`) and scraped through the headless `worker` Service in the
+`media` namespace. Keep these Kubernetes objects aligned when changing worker
+observability:
+
+- `k8s/worker-deployment.yaml`: Pod template labels must include `app: worker`
+  and the worker container must expose `containerPort: 9113` with `name: metrics`.
+- `k8s/worker-service.yaml`: Service metadata must stay in namespace `media`,
+  its selector must be `app: worker`, and its `metrics` Service port must route
+  to `targetPort: metrics` so it follows the named container port.
+- `k8s/worker-service-monitor.yaml`: The ServiceMonitor can live in namespace
+  `monitoring`, but its `namespaceSelector.matchNames` must include `media`, its
+  selector must match `app: worker`, and its endpoint must scrape port `metrics`
+  at path `/metrics`.
+
+After applying the manifests, confirm the Prometheus discovery target before
+investigating application-level metrics:
+
+```sh
+kubectl -n media get deploy/worker svc/worker -o wide
+kubectl -n monitoring get servicemonitor worker-metrics -o yaml
+kubectl -n monitoring port-forward svc/prometheus-kube-prometheus-prometheus 9090:9090
+```
+
+Then open `http://localhost:9090/targets` and verify the `worker-metrics` target
+is `UP`, points at a `media` namespace worker endpoint, and shows the `metrics`
+port. If the target is missing, first check the Service labels and
+ServiceMonitor selector/namespace selector; if it is present but down, check the
+worker Pod readiness and scrape `http://<worker-pod-ip>:9113/metrics` from inside
+the cluster.
+
 ## Stream startup lifecycle timestamps
 
 The controller models startup milestones per `(stream, generation)` in memory and
