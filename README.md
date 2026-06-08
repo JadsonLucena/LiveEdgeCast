@@ -54,8 +54,11 @@ docker-compose down
 
 Worker metrics are exposed through the `worker` Service in namespace `media` on
 the named port `metrics` (`9113`) and discovered by the `worker-metrics`
-ServiceMonitor in namespace `monitoring`. After starting the stack and the
-Prometheus port-forward, open `http://localhost:9090/targets` and confirm the
-`worker-metrics` target is `UP`, belongs to the `media` namespace, and uses the
-`metrics` port. Detailed alignment notes for the worker Deployment, Service, and
-ServiceMonitor are documented in `docs/observability/metrics.md`.
+ServiceMonitor in namespace `monitoring`. Because the worker Deployment starts
+with zero replicas, start a stream or otherwise ensure at least one `app=worker`
+Pod exists before expecting a `worker-metrics` target to be `UP`. After the
+worker Pod exists and the Prometheus port-forward is active, open
+`http://localhost:9090/targets` and confirm the `worker-metrics` target belongs
+to the `media` namespace and uses the `metrics` port. Detailed alignment notes
+for the worker Deployment, Service, and ServiceMonitor are documented in
+`docs/observability/metrics.md`.

@@ -129,7 +129,9 @@ staleness from exporter file I/O or state persistence issues.
 
 Worker metrics are exposed by the worker container on the named container port
 `metrics` (`9113`) and scraped through the headless `worker` Service in the
-`media` namespace. Keep these Kubernetes objects aligned when changing worker
+`media` namespace. Because the Service is headless, Prometheus target addresses
+correspond to selected worker Pod endpoints rather than a single Service
+ClusterIP. Keep these Kubernetes objects aligned when changing worker
 observability:
 
 - `k8s/worker-deployment.yaml`: Pod template labels must include `app: worker`
@@ -142,21 +144,29 @@ observability:
   selector must match `app: worker`, and its endpoint must scrape port `metrics`
   at path `/metrics`.
 
-After applying the manifests, confirm the Prometheus discovery target before
-investigating application-level metrics:
+After applying the manifests, confirm whether worker Pods exist before
+investigating application-level metrics. The worker Deployment intentionally
+starts with `replicas: 0`; in an idle stack, no worker endpoint or `UP`
+`worker-metrics` target is expected until a stream causes the controller to
+create a worker Pod.
+
+Use these commands to inspect the Kubernetes objects and establish a Prometheus
+port-forward:
 
 ```sh
 kubectl -n media get deploy/worker svc/worker -o wide
+kubectl -n media get pods -l app=worker -o wide
 kubectl -n monitoring get servicemonitor worker-metrics -o yaml
 kubectl -n monitoring port-forward svc/prometheus-kube-prometheus-prometheus 9090:9090
 ```
 
-Then open `http://localhost:9090/targets` and verify the `worker-metrics` target
-is `UP`, points at a `media` namespace worker endpoint, and shows the `metrics`
-port. If the target is missing, first check the Service labels and
-ServiceMonitor selector/namespace selector; if it is present but down, check the
-worker Pod readiness and scrape `http://<worker-pod-ip>:9113/metrics` from inside
-the cluster.
+Then open `http://localhost:9090/targets`. If at least one `app=worker` Pod
+exists, verify the `worker-metrics` target is `UP`, points at a `media` namespace
+worker endpoint, and shows the `metrics` port. If the target is missing while
+worker Pods exist, first check the Service labels and ServiceMonitor
+selector/namespace selector; if it is present but down, check the worker Pod
+readiness and scrape `http://<worker-pod-ip>:9113/metrics` from inside the
+cluster.
 
 ## Stream startup lifecycle timestamps
 
