@@ -260,8 +260,18 @@ def validate_duplicate_timing(
 def validate_pilot_config(
     parser: argparse.ArgumentParser, config: "ExperimentConfig"
 ) -> None:
-    if config.step_size > config.concurrency:
-        parser.error("--step-size must be less than or equal to --concurrency")
+    # Reserved for incremental-pilot validations that depend on multiple parsed
+    # arguments. Type/range validations are enforced by argparse converters.
+    return None
+
+
+def build_incremental_levels(config: "ExperimentConfig") -> list[int]:
+    levels = list(range(config.step_size, config.concurrency + 1, config.step_size))
+    if not levels:
+        return [config.concurrency]
+    if levels[-1] != config.concurrency:
+        levels.append(config.concurrency)
+    return levels
 
 
 def config_from_args(args: argparse.Namespace) -> ExperimentConfig:

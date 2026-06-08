@@ -37,7 +37,7 @@ Runs increasing concurrency levels until `--concurrency` is reached or the obser
 
 Useful optional parameters:
 
-- `--step-size`: increment between concurrency levels; must be less than or equal to `--concurrency`.
+- `--step-size`: increment between concurrency levels; values above `--concurrency` run the target concurrency once.
 - `--saturation-error-rate`: publisher failure-rate threshold from `0` to `1`.
 
 ### Kill worker

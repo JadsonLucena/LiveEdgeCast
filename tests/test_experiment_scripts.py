@@ -13,6 +13,7 @@ from common import (  # noqa: E402
     add_duplicate_reconnect_options,
     add_kill_options,
     add_saturation_options,
+    build_incremental_levels,
     build_parser,
     config_from_args,
     redact_url,
@@ -73,20 +74,25 @@ def test_duplicate_attempt_must_overlap_primary_publisher():
     assert exc.value.code == 2
 
 
-def test_incremental_step_size_cannot_exceed_max_concurrency():
+def test_incremental_step_size_above_concurrency_runs_target_once():
     parser = scenario_parser("incremental_pilot")
     add_saturation_options(parser)
     config = parsed_config(parser, "--step-size", "3")
 
-    with pytest.raises(SystemExit) as exc:
-        validate_pilot_config(parser, config)
+    validate_pilot_config(parser, config)
 
-    assert exc.value.code == 2
+    assert build_incremental_levels(config) == [2]
 
 
 def test_urls_are_redacted_in_logged_commands():
-    assert redact_url("rtmp://user:secret@example.com:1935/live/token") == "rtmp://***:***@example.com:1935/..."
-    assert sanitize_command(["ffmpeg", "rtmp://example.com/live/key"])[1] == "rtmp://example.com/..."
+    assert (
+        redact_url("rtmp://user:secret@example.com:1935/live/token")
+        == "rtmp://***:***@example.com:1935/..."
+    )
+    assert (
+        sanitize_command(["ffmpeg", "rtmp://example.com/live/key"])[1]
+        == "rtmp://example.com/..."
+    )
 
 
 def test_run_command_timeout_is_best_effort():

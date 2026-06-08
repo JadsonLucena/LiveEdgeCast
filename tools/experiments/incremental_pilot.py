@@ -12,6 +12,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from common import (  # noqa: E402
     add_saturation_options,
+    build_incremental_levels,
     build_parser,
     collect_controller_artifacts,
     config_from_args,
@@ -51,11 +52,7 @@ def main() -> int:
 
     try:
         validate_runtime_tools(config, need_kubectl=False, logger=logger)
-        levels = list(range(config.step_size, config.concurrency + 1, config.step_size))
-        if levels[-1] != config.concurrency:
-            levels.append(config.concurrency)
-
-        for level in levels:
+        for level in build_incremental_levels(config):
             logger.info("starting incremental level concurrency=%s", level)
             keys = [
                 stream_key(config, index, suffix=f"c{level}")
