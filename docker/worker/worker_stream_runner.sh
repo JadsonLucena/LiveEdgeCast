@@ -56,20 +56,6 @@ notify_first_progress_once() {
   return 1
 }
 
-generate_ffmpeg_run_id() {
-  local uuid=""
-  if [ -r /proc/sys/kernel/random/uuid ]; then
-    IFS= read -r uuid < /proc/sys/kernel/random/uuid || uuid=""
-  fi
-  if [ -n "$uuid" ]; then
-    printf '%s-%s\n' "$uuid" "$FFMPEG_PID"
-    return 0
-  fi
-
-  printf '%s-%s-%s-%s-%s\n' \
-    "${HOSTNAME:-unknown-worker}" "$$" "$FFMPEG_PID" "$(date +%s)" "${RANDOM}${RANDOM}"
-}
-
 cleanup() {
   if [ -n "${PROGRESS_READER_PID:-}" ]; then
     kill -TERM "$PROGRESS_READER_PID" 2>/dev/null || true
@@ -129,7 +115,7 @@ ffmpeg \
 
 FFMPEG_PID=$!
 echo "$FFMPEG_PID" > "$PID_FILE"
-FFMPEG_RUN_ID="$(generate_ffmpeg_run_id)"
+FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-${FFMPEG_PID}-${RANDOM}"
 
 if wait "$FFMPEG_PID"; then
   EXIT_CODE=0

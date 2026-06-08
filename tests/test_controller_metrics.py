@@ -1465,8 +1465,7 @@ def test_worker_and_proxy_scripts_url_encode_controller_callbacks():
     assert '--data-urlencode "worker_pod=${WORKER_POD}"' in worker_script
     assert '-progress "$PROGRESS_FILE"' in worker_script
     assert 'date +%s%N' not in worker_script
-    assert '/proc/sys/kernel/random/uuid' in worker_script
-    assert 'generate_ffmpeg_run_id' in worker_script
+    assert 'FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-${FFMPEG_PID}-${RANDOM}"' in worker_script
     assert '--data-urlencode "stream=${STREAM_NAME}"' in proxy_script
     worker_deployment = Path('k8s/worker-deployment.yaml').read_text()
     assert 'containerPort: 9113' in worker_deployment
