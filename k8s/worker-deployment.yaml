@@ -25,6 +25,9 @@ spec:
             - containerPort: 8080
               name: http
               protocol: TCP
+            - containerPort: 9113
+              name: metrics
+              protocol: TCP
           resources:
             requests:
               memory: "256Mi"

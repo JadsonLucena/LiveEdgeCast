@@ -46,7 +46,8 @@ RUN apk add --no-cache \
     zlib \
     ffmpeg \
     bash \
-    curl
+    curl \
+    python3
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
 COPY --from=builder /tmp/build/nginx-${NGINX_VERSION}/conf/mime.types /etc/nginx/mime.types
@@ -55,10 +56,11 @@ RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
     && chmod 755 /scripts
 
 COPY worker_stream_runner.sh /scripts/worker_stream_runner.sh
+COPY metrics_exporter.py /scripts/metrics_exporter.py
 COPY entrypoint.sh /scripts/entrypoint.sh
-RUN chmod +x /scripts/*.sh
+RUN chmod +x /scripts/*.sh /scripts/metrics_exporter.py
 COPY nginx.conf /etc/nginx/nginx.conf
 
-EXPOSE 1935 8080
+EXPOSE 1935 8080 9113
 STOPSIGNAL SIGQUIT
 ENTRYPOINT ["/scripts/entrypoint.sh"]
