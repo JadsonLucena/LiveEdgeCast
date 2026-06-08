@@ -20,6 +20,7 @@ from common import (  # noqa: E402
     delete_pod,
     config_from_args,
     redact_url,
+    process_wait_timeout_seconds,
     run_command,
     start_process,
     start_ffmpeg_streams,
@@ -87,6 +88,22 @@ def test_incremental_step_size_above_concurrency_runs_target_once():
     assert build_incremental_levels(config) == [2]
 
 
+def test_process_wait_timeout_uses_actual_process_count():
+    parser = scenario_parser("incremental_pilot")
+    add_saturation_options(parser)
+    config = parsed_config(
+        parser,
+        "--concurrency",
+        "100",
+        "--startup-interval-seconds",
+        "2",
+    )
+
+    assert process_wait_timeout_seconds(config, process_count=1) == (
+        config.duration_seconds + config.stop_grace_seconds + 10
+    )
+
+
 def test_urls_are_redacted_in_logged_commands():
     assert (
         redact_url("rtmp://user:secret@example.com:1935/live/token")
@@ -128,6 +145,7 @@ def test_wait_for_processes_stops_timed_out_process(tmp_path):
     assert time.time() - started < 5
     assert results[0]["timed_out"] is True
     assert results[0]["returncode"] is not None
+    assert results[0]["ended_at"] is not None
 
 
 def test_start_ffmpeg_streams_stops_already_started_processes_on_failure(

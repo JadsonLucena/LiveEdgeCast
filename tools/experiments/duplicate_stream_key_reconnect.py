@@ -90,18 +90,25 @@ def main() -> int:
             [duplicate],
             logger,
             timeout_seconds=process_wait_timeout_seconds(
-                config, max(1, config.duration_seconds // 2)
+                config, max(1, config.duration_seconds // 2), process_count=1
             ),
             stop_grace_seconds=config.stop_grace_seconds,
         )
         running_processes.remove(duplicate)
+        summary["duplicate_attempts"] = duplicate_results
+        write_json(config.artifact_dir / "summary.json", summary)
+
         primary_result = wait_for_processes(
             [primary],
             logger,
-            timeout_seconds=process_wait_timeout_seconds(config, primary_duration),
+            timeout_seconds=process_wait_timeout_seconds(
+                config, primary_duration, process_count=1
+            ),
             stop_grace_seconds=config.stop_grace_seconds,
         )
         running_processes.remove(primary)
+        summary["primary"] = primary_result
+        write_json(config.artifact_dir / "summary.json", summary)
 
         reconnect_results = []
         for attempt in range(1, config.reconnect_attempts + 1):
@@ -124,18 +131,22 @@ def main() -> int:
                     [reconnect],
                     logger,
                     timeout_seconds=process_wait_timeout_seconds(
-                        config, max(1, config.duration_seconds // 2)
+                        config, max(1, config.duration_seconds // 2), process_count=1
                     ),
                     stop_grace_seconds=config.stop_grace_seconds,
                 )
             )
             running_processes.remove(reconnect)
+            summary["reconnect_attempts"] = reconnect_results
+            write_json(config.artifact_dir / "summary.json", summary)
 
         background_results = (
             wait_for_processes(
                 background,
                 logger,
-                timeout_seconds=process_wait_timeout_seconds(config),
+                timeout_seconds=process_wait_timeout_seconds(
+                    config, process_count=len(background)
+                ),
                 stop_grace_seconds=config.stop_grace_seconds,
             )
             if background
@@ -152,6 +163,7 @@ def main() -> int:
                 "background_processes": background_results,
             }
         )
+        write_json(config.artifact_dir / "summary.json", summary)
     except Exception as exc:
         exit_code = 1
         logger.exception("duplicate streamKey reconnect experiment failed: %s", exc)

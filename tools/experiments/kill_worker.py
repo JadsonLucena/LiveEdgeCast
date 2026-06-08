@@ -72,7 +72,9 @@ def main() -> int:
         results = wait_for_processes(
             processes,
             logger,
-            timeout_seconds=process_wait_timeout_seconds(config),
+            timeout_seconds=process_wait_timeout_seconds(
+                config, process_count=len(processes)
+            ),
             stop_grace_seconds=config.stop_grace_seconds,
         )
         processes = []

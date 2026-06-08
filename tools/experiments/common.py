@@ -415,6 +415,7 @@ class ManagedProcess:
     process: subprocess.Popen[Any]
     stdout_path: Path
     stderr_path: Path
+    ended_at: float | None = None
 
     def poll(self) -> int | None:
         return self.process.poll()
@@ -428,7 +429,7 @@ class ManagedProcess:
             except OSError:
                 self.process.send_signal(signal.SIGTERM)
             try:
-                return self.process.wait(timeout=grace_seconds)
+                returncode = self.process.wait(timeout=grace_seconds)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(self.process.pid, signal.SIGKILL)
@@ -436,7 +437,11 @@ class ManagedProcess:
                     pass
                 except OSError:
                     self.process.kill()
-                return self.process.wait(timeout=10)
+                returncode = self.process.wait(timeout=10)
+            self.ended_at = time.time()
+            return returncode
+        if self.ended_at is None:
+            self.ended_at = time.time()
         return self.process.returncode
 
     def result(self) -> dict[str, Any]:
@@ -444,7 +449,7 @@ class ManagedProcess:
             "name": self.name,
             "command": sanitize_command(self.command),
             "started_at": self.started_at,
-            "ended_at": time.time() if self.process.poll() is not None else None,
+            "ended_at": self.ended_at,
             "returncode": self.process.poll(),
             "stdout": str(self.stdout_path),
             "stderr": str(self.stderr_path),
@@ -506,14 +511,15 @@ def start_ffmpeg_streams(
 
 
 def process_wait_timeout_seconds(
-    config: ExperimentConfig, duration_seconds: int | None = None
+    config: ExperimentConfig,
+    duration_seconds: int | None = None,
+    process_count: int | None = None,
 ) -> float:
     duration = (
         duration_seconds if duration_seconds is not None else config.duration_seconds
     )
-    startup_budget = max(0.0, config.startup_interval_seconds) * max(
-        0, config.concurrency - 1
-    )
+    count = process_count if process_count is not None else config.concurrency
+    startup_budget = max(0.0, config.startup_interval_seconds) * max(0, count - 1)
     return duration + startup_budget + config.stop_grace_seconds + 10
 
 
@@ -532,6 +538,7 @@ def wait_for_processes(
             else:
                 remaining = proc.started_at + timeout_seconds - time.time()
                 returncode = proc.process.wait(timeout=max(0.0, remaining))
+            proc.ended_at = time.time()
             logger.info(
                 "process completed name=%s returncode=%s", proc.name, returncode
             )
@@ -563,7 +570,9 @@ def stop_processes(
     for proc in processes:
         returncode = proc.stop(config.stop_grace_seconds)
         logger.info("process stopped name=%s returncode=%s", proc.name, returncode)
-        results.append(proc.result())
+        result = proc.result()
+        result["stopped_by"] = "cleanup"
+        results.append(result)
     return results
 
 
@@ -613,6 +622,12 @@ def preflight_rtmp_endpoint(config: ExperimentConfig, logger: logging.Logger) ->
         ) from exc
 
 
+def truncate_for_log(value: str, limit: int = 2000) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated {len(value) - limit} chars>"
+
+
 def run_command(
     command: Sequence[str], logger: logging.Logger, timeout: int = 30
 ) -> subprocess.CompletedProcess[str]:
@@ -645,8 +660,8 @@ def run_command(
     logger.info(
         "command returncode=%s stdout=%s stderr=%s",
         completed.returncode,
-        completed.stdout.strip(),
-        completed.stderr.strip(),
+        truncate_for_log(completed.stdout.strip()),
+        truncate_for_log(completed.stderr.strip()),
     )
     return completed
 
@@ -720,8 +735,8 @@ def delete_pod(
 
 def collect_kubernetes_artifacts(
     config: ExperimentConfig, logger: logging.Logger
-) -> dict[str, str]:
-    artifacts: dict[str, str] = {}
+) -> dict[str, dict[str, Any]]:
+    artifacts: dict[str, dict[str, Any]] = {}
     for name, args in {
         "pods.txt": ["get", "pods", "-n", config.namespace, "-o", "wide"],
         "events.txt": [
@@ -739,7 +754,11 @@ def collect_kubernetes_artifacts(
             + ("\n# STDERR\n" + completed.stderr if completed.stderr else ""),
             encoding="utf-8",
         )
-        artifacts[name] = str(path)
+        artifacts[name] = {
+            "path": str(path),
+            "returncode": completed.returncode,
+            "status": "collected" if completed.returncode == 0 else "collection_failed",
+        }
     return artifacts
 
 
