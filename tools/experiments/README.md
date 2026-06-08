@@ -2,11 +2,11 @@
 
 This directory contains runnable experiment drivers for load and failure scenarios. Existing scripts can remain alongside these files; all new drivers share the same required CLI parameters so each run is traceable and comparable:
 
-- `--experiment-id`
+- `--experiment-id` / `--experiment_id`
 - `--scenario`
-- `--run-id`
+- `--run-id` / `--run_id`
 - `--concurrency`
-- `--duration-seconds`
+- `--duration-seconds` / `--duration_seconds`
 - `--bitrate`
 
 Every script validates arguments before starting, writes execution logs, and creates per-run artifacts under:
@@ -15,13 +15,15 @@ Every script validates arguments before starting, writes execution logs, and cre
 tools/experiments/artifacts/<experiment_id>/<scenario>/<run_id>/
 ```
 
-Common artifacts include `config.json`, `run.log`, per-process FFmpeg stdout/stderr logs, and `summary.json`. Failure-injection scripts also collect Kubernetes pod and event snapshots when `kubectl` is available.
+Common artifacts include `config.json`, `run.log`, per-process FFmpeg stdout/stderr logs, and `summary.json`. RTMP and controller URLs are redacted in structured artifacts and agent-managed logs to avoid leaking credentials. FFmpeg's own stderr can still include protocol-level details, so treat raw per-process logs as sensitive when using production endpoints.
+
+Before starting publishers, scripts validate required executables and run a TCP preflight against the RTMP host/port. The `kill_worker` and `kill_proxy` scenarios require `kubectl`; they also collect Kubernetes pod and event snapshots at the end of the run. Controller `/health` and `/metrics` artifacts are collected only when `--controller-url` is provided.
 
 ## Scenarios
 
-### Incremental pilot until saturation
+### Incremental pilot until publisher failure-rate saturation
 
-Runs increasing concurrency levels until `--concurrency` is reached or the observed FFmpeg failure rate reaches `--saturation-error-rate`.
+Runs increasing concurrency levels until `--concurrency` is reached or the observed FFmpeg publisher failure rate reaches `--saturation-error-rate`. The saturation signal is intentionally named `publisher_failure_rate`; use controller, proxy, or Prometheus metrics alongside these artifacts if you need a broader system-saturation definition.
 
 ```sh
 ./tools/experiments/incremental_pilot.py \
@@ -35,12 +37,12 @@ Runs increasing concurrency levels until `--concurrency` is reached or the obser
 
 Useful optional parameters:
 
-- `--step-size`: increment between concurrency levels.
-- `--saturation-error-rate`: failure-rate threshold from `0` to `1`.
+- `--step-size`: increment between concurrency levels; must be less than or equal to `--concurrency`.
+- `--saturation-error-rate`: publisher failure-rate threshold from `0` to `1`.
 
 ### Kill worker
 
-Starts the requested streams, waits `--kill-after-seconds`, deletes the worker pod for the first stream when it can identify it by `liveedgecast.io/stream`, and records whether publishers survive.
+Starts the requested streams, waits `--kill-after-seconds`, deletes the worker pod for the first stream when it can identify it by `liveedgecast.io/stream`, and records whether publishers survive. `--kill-after-seconds` must be less than `--duration-seconds` so the worker is killed during the active run.
 
 ```sh
 ./tools/experiments/kill_worker.py \
@@ -54,7 +56,7 @@ Starts the requested streams, waits `--kill-after-seconds`, deletes the worker p
 
 ### Kill proxy
 
-Starts the requested streams, waits `--kill-after-seconds`, deletes one proxy pod selected by `--proxy-selector`, and records publisher outcomes.
+Starts the requested streams, waits `--kill-after-seconds`, deletes one proxy pod selected by `--proxy-selector`, and records publisher outcomes. `--kill-after-seconds` must be less than `--duration-seconds` so the proxy is killed during the active run.
 
 ```sh
 ./tools/experiments/kill_proxy.py \
@@ -68,7 +70,7 @@ Starts the requested streams, waits `--kill-after-seconds`, deletes one proxy po
 
 ### Reconnect and duplicate `streamKey`
 
-Starts a primary publisher, launches a second publisher with the same `streamKey`, waits for it, then performs reconnect attempts using the same key. Extra concurrent background streams are started when `--concurrency` is greater than `1`.
+Starts a primary publisher, launches a second publisher with the same `streamKey` while the primary is still active, waits for it, then performs reconnect attempts using the same key. Extra concurrent background streams are started when `--concurrency` is greater than `1`. `--duplicate-attempt-delay-seconds` must be less than `--duration-seconds` so the duplicate attempt overlaps the primary publisher.
 
 ```sh
 ./tools/experiments/duplicate_stream_key_reconnect.py \
@@ -88,9 +90,10 @@ Useful optional parameters:
 
 ## Shared runtime options
 
-- `--rtmp-url`: RTMP application URL. Defaults to `rtmp://127.0.0.1:1935/live` or `LIVEEDGECAST_RTMP_URL`.
+- `--rtmp-url` / `--rtmp_url`: RTMP application URL. Defaults to `rtmp://127.0.0.1:1935/live` or `LIVEEDGECAST_RTMP_URL`.
+- `--controller-url` / `--controller_url`: optional controller HTTP URL used to collect `/health` and `/metrics` artifacts.
 - `--namespace`: Kubernetes namespace. Defaults to `media` or `NAMESPACE`.
-- `--proxy-selector`: proxy pod selector. Defaults to `app=proxy` or `PROXY_SELECTOR`.
-- `--worker-selector`: worker pod selector. Defaults to `app=worker` or `WORKER_SELECTOR`.
-- `--ffmpeg-path`: FFmpeg executable. Defaults to `ffmpeg` or `FFMPEG`.
-- `--kubectl-path`: kubectl executable. Defaults to `kubectl` or `KUBECTL`.
+- `--proxy-selector` / `--proxy_selector`: proxy pod selector. Defaults to `app=proxy` or `PROXY_SELECTOR`.
+- `--worker-selector` / `--worker_selector`: worker pod selector. Defaults to `app=worker` or `WORKER_SELECTOR`.
+- `--ffmpeg-path` / `--ffmpeg_path`: FFmpeg executable. Defaults to `ffmpeg` or `FFMPEG`.
+- `--kubectl-path` / `--kubectl_path`: kubectl executable. Defaults to `kubectl` or `KUBECTL`.

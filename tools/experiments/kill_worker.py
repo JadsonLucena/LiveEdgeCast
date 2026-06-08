@@ -11,6 +11,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from common import (  # noqa: E402
+    add_kill_options,
     build_parser,
     collect_controller_artifacts,
     collect_kubernetes_artifacts,
@@ -19,7 +20,9 @@ from common import (  # noqa: E402
     prepare_run,
     select_pod,
     start_ffmpeg_streams,
+    stop_processes,
     stream_key,
+    validate_kill_timing,
     validate_runtime_tools,
     wait_for_processes,
     write_json,
@@ -30,45 +33,56 @@ SCENARIO = "kill_worker"
 
 def main() -> int:
     parser = build_parser("Run a LiveEdgeCast worker-failure experiment.", [SCENARIO])
+    add_kill_options(parser)
     args = parser.parse_args()
     config = config_from_args(args)
+    validate_kill_timing(parser, config)
     logger = prepare_run(config)
-    validate_runtime_tools(config, need_kubectl=True, logger=logger)
 
+    run_started_at = time.time()
     keys = [stream_key(config, index) for index in range(1, config.concurrency + 1)]
-    processes = start_ffmpeg_streams(config, keys, logger)
-    time.sleep(min(config.kill_after_seconds, config.duration_seconds))
+    processes = []
+    summary = {"started_at": run_started_at, "scenario": SCENARIO, "stream_keys": keys}
+    exit_code = 1
 
-    target_stream = keys[0]
-    pod_name = select_pod(
-        config, config.worker_selector, logger, annotation_stream=target_stream
-    )
-    if pod_name is None:
-        logger.warning(
-            "no worker pod found for stream=%s; falling back to first worker",
-            target_stream,
+    try:
+        validate_runtime_tools(config, need_kubectl=True, logger=logger)
+        processes = start_ffmpeg_streams(config, keys, logger)
+        time.sleep(config.kill_after_seconds)
+
+        target_stream = keys[0]
+        pod_name = select_pod(
+            config, config.worker_selector, logger, annotation_stream=target_stream
         )
-        pod_name = select_pod(config, config.worker_selector, logger)
+        if pod_name is None:
+            logger.warning(
+                "no worker pod found for stream=%s; falling back to first worker",
+                target_stream,
+            )
+            pod_name = select_pod(config, config.worker_selector, logger)
 
-    kill_result = {"pod": None, "status": "not_found"}
-    if pod_name:
-        kill_result = delete_pod(config, pod_name, logger)
+        kill_result = {"pod": None, "status": "not_found", "returncode": 1}
+        if pod_name:
+            kill_result = delete_pod(config, pod_name, logger)
+            kill_result["status"] = (
+                "deleted" if kill_result.get("returncode") == 0 else "delete_failed"
+            )
 
-    results = wait_for_processes(processes, logger)
-    k8s_artifacts = collect_kubernetes_artifacts(config, logger)
-    controller_artifacts = collect_controller_artifacts(config, logger)
-    summary = {
-        "started_at": min((p.started_at for p in processes), default=time.time()),
-        "ended_at": time.time(),
-        "scenario": SCENARIO,
-        "stream_keys": keys,
-        "killed_worker": kill_result,
-        "processes": results,
-        "kubernetes_artifacts": k8s_artifacts,
-        "controller_artifacts": controller_artifacts,
-    }
-    write_json(config.artifact_dir / "summary.json", summary)
-    return 0 if pod_name else 2
+        results = wait_for_processes(processes, logger)
+        processes = []
+        summary.update({"killed_worker": kill_result, "processes": results})
+        exit_code = 0 if kill_result.get("returncode") == 0 else 2
+    except Exception as exc:
+        logger.exception("kill worker experiment failed: %s", exc)
+        summary["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        if processes:
+            summary["stopped_processes"] = stop_processes(processes, config, logger)
+    finally:
+        summary["ended_at"] = time.time()
+        summary["kubernetes_artifacts"] = collect_kubernetes_artifacts(config, logger)
+        summary["controller_artifacts"] = collect_controller_artifacts(config, logger)
+        write_json(config.artifact_dir / "summary.json", summary)
+    return exit_code
 
 
 if __name__ == "__main__":

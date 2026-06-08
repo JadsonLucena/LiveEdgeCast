@@ -14,13 +14,15 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -183,32 +185,83 @@ def build_parser(
         type=non_negative_float,
         default=5.0,
     )
+    return parser
+
+
+def add_kill_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--kill-after-seconds",
         "--kill_after_seconds",
         type=non_negative_int,
         default=10,
+        help="Seconds to wait before deleting the target pod; must be less than duration_seconds.",
     )
+
+
+def add_duplicate_reconnect_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--duplicate-attempt-delay-seconds",
         "--duplicate_attempt_delay_seconds",
         type=non_negative_int,
         default=5,
+        help="Seconds to wait before starting a simultaneous publisher with the same streamKey; must be less than duration_seconds.",
     )
     parser.add_argument(
         "--reconnect-delay-seconds",
         "--reconnect_delay_seconds",
         type=non_negative_int,
         default=3,
+        help="Seconds to wait between reconnect attempts.",
     )
     parser.add_argument(
-        "--reconnect-attempts", "--reconnect_attempts", type=positive_int, default=1
+        "--reconnect-attempts",
+        "--reconnect_attempts",
+        type=positive_int,
+        default=1,
+        help="Number of reconnect attempts after the primary publisher exits.",
+    )
+
+
+def add_saturation_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--saturation-error-rate",
+        "--saturation_error_rate",
+        type=rate,
+        default=0.20,
+        help="Publisher failure-rate threshold from 0 to 1 used by the incremental pilot.",
     )
     parser.add_argument(
-        "--saturation-error-rate", "--saturation_error_rate", type=rate, default=0.20
+        "--step-size",
+        "--step_size",
+        type=positive_int,
+        default=1,
+        help="Concurrency increment between pilot levels.",
     )
-    parser.add_argument("--step-size", "--step_size", type=positive_int, default=1)
-    return parser
+
+
+def validate_kill_timing(
+    parser: argparse.ArgumentParser, config: "ExperimentConfig"
+) -> None:
+    if config.kill_after_seconds >= config.duration_seconds:
+        parser.error(
+            "--kill-after-seconds must be less than --duration-seconds so the pod is killed during the run"
+        )
+
+
+def validate_duplicate_timing(
+    parser: argparse.ArgumentParser, config: "ExperimentConfig"
+) -> None:
+    if config.duplicate_attempt_delay_seconds >= config.duration_seconds:
+        parser.error(
+            "--duplicate-attempt-delay-seconds must be less than --duration-seconds so the duplicate streamKey attempt overlaps the primary publisher"
+        )
+
+
+def validate_pilot_config(
+    parser: argparse.ArgumentParser, config: "ExperimentConfig"
+) -> None:
+    if config.step_size > config.concurrency:
+        parser.error("--step-size must be less than or equal to --concurrency")
 
 
 def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
@@ -229,12 +282,14 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         kubectl_path=args.kubectl_path,
         startup_interval_seconds=args.startup_interval_seconds,
         stop_grace_seconds=args.stop_grace_seconds,
-        kill_after_seconds=args.kill_after_seconds,
-        duplicate_attempt_delay_seconds=args.duplicate_attempt_delay_seconds,
-        reconnect_delay_seconds=args.reconnect_delay_seconds,
-        reconnect_attempts=args.reconnect_attempts,
-        saturation_error_rate=args.saturation_error_rate,
-        step_size=args.step_size,
+        kill_after_seconds=getattr(args, "kill_after_seconds", 0),
+        duplicate_attempt_delay_seconds=getattr(
+            args, "duplicate_attempt_delay_seconds", 0
+        ),
+        reconnect_delay_seconds=getattr(args, "reconnect_delay_seconds", 0),
+        reconnect_attempts=getattr(args, "reconnect_attempts", 1),
+        saturation_error_rate=getattr(args, "saturation_error_rate", 0.20),
+        step_size=getattr(args, "step_size", 1),
     )
 
 
@@ -246,6 +301,7 @@ def prepare_run(config: ExperimentConfig) -> logging.Logger:
     )
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
+    logger.propagate = False
 
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     file_handler = logging.FileHandler(artifact_dir / "run.log", encoding="utf-8")
@@ -261,10 +317,41 @@ def prepare_run(config: ExperimentConfig) -> logging.Logger:
     return logger
 
 
+def redact_url(value: str | None) -> str | None:
+    if not value:
+        return value
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"rtmp", "rtmps", "http", "https"}:
+        return value
+
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    if parsed.username or parsed.password:
+        host = f"***:***@{host}"
+
+    redacted_path = "/..." if parsed.path else ""
+    redacted_query = "..." if parsed.query else ""
+    return urlunsplit((parsed.scheme, host, redacted_path, redacted_query, ""))
+
+
+def sanitize_command(command: Sequence[str]) -> list[str]:
+    return [
+        (
+            redact_url(part)
+            if part.startswith(("rtmp://", "rtmps://", "http://", "https://"))
+            else part
+        )
+        for part in command
+    ]
+
+
 def serialize_config(config: ExperimentConfig) -> dict[str, Any]:
     data = asdict(config)
     data["output_dir"] = str(config.output_dir)
     data["artifact_dir"] = str(config.artifact_dir)
+    data["rtmp_url"] = redact_url(config.rtmp_url)
+    data["controller_url"] = redact_url(config.controller_url)
     return data
 
 
@@ -332,18 +419,28 @@ class ManagedProcess:
 
     def stop(self, grace_seconds: float) -> int | None:
         if self.process.poll() is None:
-            self.process.send_signal(signal.SIGTERM)
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                self.process.send_signal(signal.SIGTERM)
             try:
                 return self.process.wait(timeout=grace_seconds)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    self.process.kill()
                 return self.process.wait(timeout=10)
         return self.process.returncode
 
     def result(self) -> dict[str, Any]:
         return {
             "name": self.name,
-            "command": self.command,
+            "command": sanitize_command(self.command),
             "started_at": self.started_at,
             "ended_at": time.time() if self.process.poll() is not None else None,
             "returncode": self.process.poll(),
@@ -358,14 +455,15 @@ def start_process(
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
     stdout_path = artifact_dir / f"{safe_name}.stdout.log"
     stderr_path = artifact_dir / f"{safe_name}.stderr.log"
-    logger.info("starting process name=%s command=%s", name, " ".join(command))
-    stdout = stdout_path.open("wb")
-    stderr = stderr_path.open("wb")
-    process = subprocess.Popen(
-        list(command), stdout=stdout, stderr=stderr, start_new_session=True
+    logger.info(
+        "starting process name=%s command=%s", name, " ".join(sanitize_command(command))
     )
-    stdout.close()
-    stderr.close()
+    with ExitStack() as stack:
+        stdout = stack.enter_context(stdout_path.open("wb"))
+        stderr = stack.enter_context(stderr_path.open("wb"))
+        process = subprocess.Popen(
+            list(command), stdout=stdout, stderr=stderr, start_new_session=True
+        )
     return ManagedProcess(
         name=name,
         command=list(command),
@@ -425,7 +523,10 @@ def command_exists(binary: str) -> bool:
 
 
 def validate_runtime_tools(
-    config: ExperimentConfig, need_kubectl: bool, logger: logging.Logger
+    config: ExperimentConfig,
+    need_kubectl: bool,
+    logger: logging.Logger,
+    check_rtmp: bool = True,
 ) -> None:
     missing = []
     if not command_exists(config.ffmpeg_path):
@@ -434,16 +535,64 @@ def validate_runtime_tools(
         missing.append(config.kubectl_path)
     if missing:
         raise RuntimeError(f"missing required executable(s): {', '.join(missing)}")
-    logger.info("runtime tools validated need_kubectl=%s", need_kubectl)
+    if check_rtmp:
+        preflight_rtmp_endpoint(config, logger)
+    logger.info(
+        "runtime tools validated need_kubectl=%s check_rtmp=%s",
+        need_kubectl,
+        check_rtmp,
+    )
+
+
+def preflight_rtmp_endpoint(config: ExperimentConfig, logger: logging.Logger) -> None:
+    parsed = urlsplit(config.rtmp_url)
+    if parsed.scheme not in {"rtmp", "rtmps"} or not parsed.hostname:
+        logger.info(
+            "skipping RTMP preflight for unsupported URL=%s",
+            redact_url(config.rtmp_url),
+        )
+        return
+
+    port = parsed.port or (443 if parsed.scheme == "rtmps" else 1935)
+    logger.info("preflighting RTMP endpoint host=%s port=%s", parsed.hostname, port)
+    try:
+        with socket.create_connection((parsed.hostname, port), timeout=3):
+            return
+    except OSError as exc:
+        raise RuntimeError(
+            f"RTMP endpoint is not reachable: {redact_url(config.rtmp_url)} ({exc})"
+        ) from exc
 
 
 def run_command(
     command: Sequence[str], logger: logging.Logger, timeout: int = 30
 ) -> subprocess.CompletedProcess[str]:
-    logger.info("running command=%s", " ".join(command))
-    completed = subprocess.run(
-        command, text=True, capture_output=True, timeout=timeout, check=False
-    )
+    logger.info("running command=%s", " ".join(sanitize_command(command)))
+    try:
+        completed = subprocess.run(
+            command, text=True, capture_output=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = (
+            exc.stdout
+            if isinstance(exc.stdout, str)
+            else (exc.stdout or b"").decode("utf-8", errors="replace")
+        )
+        stderr = (
+            exc.stderr
+            if isinstance(exc.stderr, str)
+            else (exc.stderr or b"").decode("utf-8", errors="replace")
+        )
+        completed = subprocess.CompletedProcess(
+            command,
+            124,
+            stdout=stdout,
+            stderr=f"{stderr}\nTimeout after {timeout}s".strip(),
+        )
+    except OSError as exc:
+        completed = subprocess.CompletedProcess(
+            command, 127, stdout="", stderr=str(exc)
+        )
     logger.info(
         "command returncode=%s stdout=%s stderr=%s",
         completed.returncode,
@@ -472,7 +621,13 @@ def select_pod(
     completed = kubectl(config, args, logger)
     if completed.returncode != 0:
         return None
-    data = json.loads(completed.stdout or "{}")
+    try:
+        data = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "failed parsing kubectl pod JSON selector=%s error=%s", selector, exc
+        )
+        return None
     for item in data.get("items", []):
         metadata = item.get("metadata", {})
         annotations = metadata.get("annotations", {}) or {}
@@ -552,7 +707,7 @@ def collect_controller_artifacts(
         path = config.artifact_dir / name
         url = f"{config.controller_url}{endpoint}"
         try:
-            logger.info("fetching controller artifact url=%s", url)
+            logger.info("fetching controller artifact url=%s", redact_url(url))
             request = Request(url, headers={"User-Agent": "liveedgecast-experiment/1"})
             with urlopen(request, timeout=10) as response:
                 body = response.read().decode("utf-8", errors="replace")
@@ -560,9 +715,13 @@ def collect_controller_artifacts(
         except Exception as exc:
             # Best-effort artifact collection should not fail a run.
             logger.warning(
-                "failed fetching controller artifact url=%s error=%s", url, exc
+                "failed fetching controller artifact url=%s error=%s",
+                redact_url(url),
+                exc,
             )
-            path.write_text(f"failed fetching {url}: {exc}\n", encoding="utf-8")
+            path.write_text(
+                f"failed fetching {redact_url(url)}: {exc}\n", encoding="utf-8"
+            )
         artifacts[name] = str(path)
     return artifacts
 
