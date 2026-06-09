@@ -537,6 +537,8 @@ def test_kill_proxy_entrypoint_records_ambiguous_selection_without_delete(
             "10",
             "--bitrate",
             "800k",
+            "--kill-after-seconds",
+            "1",
             "--output-dir",
             str(tmp_path),
         ],
@@ -614,6 +616,8 @@ def test_kill_worker_entrypoint_records_fallback_ambiguous_selection_without_del
             "10",
             "--bitrate",
             "800k",
+            "--kill-after-seconds",
+            "1",
             "--output-dir",
             str(tmp_path),
         ],
@@ -629,3 +633,166 @@ def test_kill_worker_entrypoint_records_fallback_ambiguous_selection_without_del
     assert selection["status"] == "ambiguous"
     assert selection["annotation_selection"]["status"] == "not_found"
     assert selection["fallback_selection"]["candidate_pods"] == ["worker-1", "worker-2"]
+
+
+def test_kill_worker_targets_first_active_stream_after_startup_delay(
+    monkeypatch, tmp_path
+):
+    kill_worker = importlib.import_module("kill_worker")
+    selected_streams = []
+    deleted_pods = []
+
+    class FakeProcess:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(
+        kill_worker, "validate_runtime_tools", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(kill_worker.time, "sleep", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        kill_worker,
+        "start_ffmpeg_streams",
+        lambda *args, **kwargs: [FakeProcess(0), FakeProcess(None)],
+    )
+    monkeypatch.setattr(
+        kill_worker,
+        "wait_for_processes",
+        lambda *args, **kwargs: [{"name": "fake", "returncode": 0}],
+    )
+    monkeypatch.setattr(
+        kill_worker, "collect_kubernetes_artifacts", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        kill_worker, "collect_controller_artifacts", lambda *args, **kwargs: {}
+    )
+
+    def fake_select(config, selector, logger, annotation_stream=None, require_single=False):
+        selected_streams.append(annotation_stream)
+        return {
+            "status": "selected",
+            "pod": "worker-for-active-stream",
+            "candidate_pods": ["worker-for-active-stream"],
+            "returncode": 0,
+        }
+
+    monkeypatch.setattr(kill_worker, "select_pod_candidates_with_status", fake_select)
+
+    def fake_delete(config, pod_name, logger):
+        deleted_pods.append(pod_name)
+        return {"pod": pod_name, "returncode": 0, "status": "deleted"}
+
+    monkeypatch.setattr(kill_worker, "delete_pod", fake_delete)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kill_worker.py",
+            "--experiment-id",
+            "exp",
+            "--scenario",
+            "kill_worker",
+            "--run-id",
+            "run",
+            "--concurrency",
+            "2",
+            "--duration-seconds",
+            "10",
+            "--bitrate",
+            "800k",
+            "--kill-after-seconds",
+            "1",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert kill_worker.main() == 0
+    assert selected_streams == ["exp-kill_worker-run-002"]
+    assert deleted_pods == ["worker-for-active-stream"]
+    summary = json.loads(
+        (tmp_path / "exp" / "kill_worker" / "run" / "summary.json").read_text()
+    )
+    selection = summary["killed_worker"]["selection"]
+    assert selection["target_stream"] == "exp-kill_worker-run-002"
+    assert selection["active_stream_keys"] == ["exp-kill_worker-run-002"]
+
+
+def test_kill_worker_refuses_kill_when_no_active_stream_remains(monkeypatch, tmp_path):
+    kill_worker = importlib.import_module("kill_worker")
+    delete_calls = []
+    select_calls = []
+
+    class EndedProcess:
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(
+        kill_worker, "validate_runtime_tools", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(kill_worker.time, "sleep", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        kill_worker,
+        "start_ffmpeg_streams",
+        lambda *args, **kwargs: [EndedProcess(), EndedProcess()],
+    )
+    monkeypatch.setattr(
+        kill_worker,
+        "wait_for_processes",
+        lambda *args, **kwargs: [{"name": "fake", "returncode": 0}],
+    )
+    monkeypatch.setattr(
+        kill_worker, "collect_kubernetes_artifacts", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        kill_worker, "collect_controller_artifacts", lambda *args, **kwargs: {}
+    )
+
+    def fake_select(*args, **kwargs):
+        select_calls.append((args, kwargs))
+        return {"status": "selected", "pod": "worker-1", "candidate_pods": ["worker-1"]}
+
+    monkeypatch.setattr(kill_worker, "select_pod_candidates_with_status", fake_select)
+
+    def fake_delete(*args, **kwargs):
+        delete_calls.append(args)
+        return {"returncode": 0, "status": "deleted"}
+
+    monkeypatch.setattr(kill_worker, "delete_pod", fake_delete)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kill_worker.py",
+            "--experiment-id",
+            "exp",
+            "--scenario",
+            "kill_worker",
+            "--run-id",
+            "run",
+            "--concurrency",
+            "2",
+            "--duration-seconds",
+            "10",
+            "--bitrate",
+            "800k",
+            "--kill-after-seconds",
+            "1",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert kill_worker.main() == 2
+    assert select_calls == []
+    assert delete_calls == []
+    summary = json.loads(
+        (tmp_path / "exp" / "kill_worker" / "run" / "summary.json").read_text()
+    )
+    selection = summary["killed_worker"]["selection"]
+    assert selection["status"] == "no_active_stream"
+    assert selection["target_stream"] is None
+    assert selection["active_stream_keys"] == []

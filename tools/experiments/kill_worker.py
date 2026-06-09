@@ -51,7 +51,12 @@ def main() -> int:
         processes = start_ffmpeg_streams(config, keys, logger)
         time.sleep(config.kill_after_seconds)
 
-        target_stream = keys[0]
+        active_streams = [
+            key
+            for key, proc in zip(keys, processes)
+            if not hasattr(proc, "poll") or proc.poll() is None
+        ]
+        target_stream = active_streams[0] if active_streams else None
         selection = {
             "source": (
                 "target_worker_pod"
@@ -61,12 +66,18 @@ def main() -> int:
             "selector": config.worker_selector,
             "target_worker_pod": config.target_worker_pod,
             "target_stream": target_stream,
+            "active_stream_keys": active_streams,
             "candidate_pods": [],
         }
         pod_name = config.target_worker_pod
         if pod_name:
             selection["status"] = "selected"
             selection["pod"] = pod_name
+        elif target_stream is None:
+            selection["status"] = "no_active_stream"
+            logger.warning(
+                "no active publisher stream remains after startup and kill delay; refusing worker kill"
+            )
         else:
             annotation_selection = select_pod_candidates_with_status(
                 config,
