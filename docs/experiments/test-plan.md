@@ -202,7 +202,9 @@ campanha como exploratória e execute nova campanha confirmatória.
 - Usar gráficos de distribuição ou boxplots por cenário e nível de carga; evitar
   apenas médias para cold start.
 - Reportar denominador de cada taxa e quantidade de amostras excluídas por
-  limitação de observabilidade.
+  limitação de observabilidade; para lifecycle, separar fases observadas/ignoradas
+  de timestamps que nunca chegaram e, portanto, não incrementam o contador de
+  observações de fase.
 - Comparar cenários por diferença relativa ao baseline e diferença absoluta em
   segundos/pontos percentuais.
 - Para P99, exigir volume de amostras compatível; com poucas dezenas de amostras,
@@ -277,6 +279,9 @@ campanha como exploratória e execute nova campanha confirmatória.
   esses identificadores não são labels Prometheus por controle de cardinalidade.
 - Não há métrica Prometheus direta de órfãos; exclusões precisam ser observadas
   por logs ou inferidas por comparação entre Pods e atividade.
+- Fases de lifecycle com endpoint ausente não incrementam
+  `stream_lifecycle_phase_observations_total`; compare timestamps individuais
+  observados com a carga planejada antes de interpretar perdas de cold start.
 
 ## Checklist por repetição
 

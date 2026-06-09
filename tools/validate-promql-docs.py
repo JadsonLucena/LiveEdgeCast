@@ -103,6 +103,37 @@ def check_cadvisor_container_filters(blocks: list[tuple[int, str]]) -> None:
                 f"memory cAdvisor query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
                 "should exclude container=\"POD\""
             )
+        if any(metric in body for metric in (
+            "container_cpu_usage_seconds_total",
+            "container_memory_working_set_bytes",
+            "container_network_receive_bytes_total",
+            "container_network_transmit_bytes_total",
+        )):
+            if "proxy-lb|proxy|worker|controller" not in body:
+                fail(
+                    f"resource rollup near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
+                    "must split proxy-lb from proxy so HAProxy is not counted as RTMP proxy"
+                )
+
+
+def check_non_ready_query_uses_kube_state_metrics(blocks: list[tuple[int, str]]) -> None:
+    for start_line, body in blocks:
+        if "pod_ready_status" in body and ("max_over_time" in body or "min_over_time" in body):
+            fail(
+                f"non-ready-over-time query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
+                "must use kube-state-metrics readiness so deleted Pods go stale"
+            )
+
+
+def check_allocation_replay_filter(blocks: list[tuple[int, str]]) -> None:
+    for start_line, body in blocks:
+        if "stream_allocation_total" not in body or "idempotent_replay" not in body:
+            continue
+        if "concurrent_idempotent_replay" not in body:
+            fail(
+                f"allocation success query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
+                "must exclude both idempotent_replay and concurrent_idempotent_replay"
+            )
 
 
 def check_worker_pods_available_wording() -> None:
@@ -121,6 +152,8 @@ def main() -> int:
     check_worker_ffmpeg_scoped(promql_blocks)
     check_ratio_denominators_are_clamped(promql_blocks)
     check_cadvisor_container_filters(promql_blocks)
+    check_non_ready_query_uses_kube_state_metrics(promql_blocks)
+    check_allocation_replay_filter(promql_blocks)
     check_worker_pods_available_wording()
     print(f"Validated {len(promql_blocks)} PromQL snippets in {PROMQL_DOC.relative_to(ROOT)}")
     return 0

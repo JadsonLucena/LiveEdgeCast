@@ -96,8 +96,12 @@ sum by (phase, reason) (
 )
 ```
 
-Use a segunda consulta para reportar quantas medições não entraram no histograma
-por endpoint aproximado, timestamp ausente ou duração negativa por skew de relógio.
+Use a segunda consulta para reportar medições que chegaram à avaliação de fase,
+mas não entraram no histograma por endpoint aproximado ou duração negativa por
+skew de relógio. Fases cujo start ou end timestamp nunca chega não incrementam
+`stream_lifecycle_phase_observations_total` na implementação atual; trate perdas
+de callbacks/eventos como limitação de observabilidade e compare os contadores de
+timestamps observados com a carga esperada.
 
 ## MTTR de worker
 
@@ -210,9 +214,9 @@ clamp_min(sum(rate(stream_allocation_total[5m])), 1e-9)
 ### Taxa de sucesso excluindo replay idempotente
 
 ```promql
-sum(rate(stream_allocation_total{status="success",reason!="idempotent_replay"}[5m]))
+sum(rate(stream_allocation_total{status="success",reason!~"^(idempotent_replay|concurrent_idempotent_replay)$"}[5m]))
 /
-clamp_min(sum(rate(stream_allocation_total{reason!="idempotent_replay"}[5m])), 1e-9)
+clamp_min(sum(rate(stream_allocation_total{reason!~"^(idempotent_replay|concurrent_idempotent_replay)$"}[5m])), 1e-9)
 ```
 
 ### Latência P95 de alocação
@@ -261,9 +265,14 @@ sum(proxy_rtmp_active_streams)
 
 ### Pods de worker não prontos por mais de 5 minutos
 
+Use kube-state-metrics para este painel, pois as séries `pod_ready_status`
+emitidas pelo controller podem permanecer expostas com o último valor se um Pod
+desaparecer antes de uma nova coleta. A série abaixo fica stale quando o Pod é
+removido do cluster.
+
 ```promql
 sum by (pod) (
-  1 - max_over_time(pod_ready_status{namespace="media",pod=~"worker-.*"}[5m])
+  min_over_time(kube_pod_status_ready{namespace="media",pod=~"worker-.*",condition="false"}[5m])
 )
 ```
 
@@ -330,15 +339,16 @@ sum(proxy_rtmp_stats_up)
 
 As consultas abaixo agregam por componente inferido pelo nome do Pod. Quando
 possível, prefira labels de workload do kube-state-metrics; os exemplos por regex
-funcionam com os manifests atuais (`proxy-*`, `worker-*`, `controller-*`).
+funcionam com os manifests atuais e separam `proxy-lb-*` de `proxy-*` para não
+misturar o HAProxy de entrada com os Pods RTMP.
 
 ### CPU por componente usando cAdvisor
 
 ```promql
 sum by (component) (
   label_replace(
-    rate(container_cpu_usage_seconds_total{namespace="media",container!="",container!="POD",pod=~"(proxy|worker|controller)-.*"}[5m]),
-    "component", "$1", "pod", "^(proxy|worker|controller)-.*"
+    rate(container_cpu_usage_seconds_total{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 )
 ```
@@ -348,8 +358,8 @@ sum by (component) (
 ```promql
 sum by (component) (
   label_replace(
-    container_memory_working_set_bytes{namespace="media",container!="",container!="POD",pod=~"(proxy|worker|controller)-.*"},
-    "component", "$1", "pod", "^(proxy|worker|controller)-.*"
+    container_memory_working_set_bytes{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"},
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 )
 ```
@@ -359,8 +369,8 @@ sum by (component) (
 ```promql
 sum by (component) (
   label_replace(
-    rate(container_network_receive_bytes_total{namespace="media",pod=~"(proxy|worker|controller)-.*"}[5m]),
-    "component", "$1", "pod", "^(proxy|worker|controller)-.*"
+    rate(container_network_receive_bytes_total{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 )
 ```
@@ -370,8 +380,8 @@ sum by (component) (
 ```promql
 sum by (component) (
   label_replace(
-    rate(container_network_transmit_bytes_total{namespace="media",pod=~"(proxy|worker|controller)-.*"}[5m]),
-    "component", "$1", "pod", "^(proxy|worker|controller)-.*"
+    rate(container_network_transmit_bytes_total{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 )
 ```
