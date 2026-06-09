@@ -44,6 +44,8 @@ Useful optional parameters:
 
 Starts the requested streams, waits `--kill-after-seconds`, deletes the explicit `--target-worker-pod` when provided, otherwise deletes the worker pod for the first still-active stream when it can identify it by `liveedgecast.io/stream`, or falls back only when `--worker-selector` matches exactly one Running/Pending pod. If no publisher is still active after startup and kill delay, the worker kill is refused. Ambiguous worker selections are refused so the run does not accidentally delete a worker unrelated to the experiment traffic. `--kill-after-seconds` must be less than `--duration-seconds` so the worker is killed during the active run.
 
+This scenario exercises Kubernetes Pod disruption/orphan behavior. Do not use it as the primary worker MTTR measurement unless the controller is changed to record recovery for deleted Pods; use an FFmpeg or `/health` failure for `worker_recovery_duration_seconds` experiments.
+
 ```sh
 ./tools/experiments/kill_worker.py \
   --experiment-id exp-001 \

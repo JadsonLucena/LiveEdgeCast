@@ -268,11 +268,14 @@ sum(proxy_rtmp_active_streams)
 Use kube-state-metrics para este painel, pois as séries `pod_ready_status`
 emitidas pelo controller podem permanecer expostas com o último valor se um Pod
 desaparecer antes de uma nova coleta. A série abaixo fica stale quando o Pod é
-removido do cluster.
+removido do cluster e exige idade mínima de 5 minutos para não contar workers que
+ainda estão no cold start normal.
 
 ```promql
 sum by (pod) (
   min_over_time(kube_pod_status_ready{namespace="media",pod=~"worker-.*",condition="false"}[5m])
+  * on (namespace, pod) group_left()
+    (time() - kube_pod_created{namespace="media",pod=~"worker-.*"} > bool 300)
 )
 ```
 

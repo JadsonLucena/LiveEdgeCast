@@ -123,6 +123,12 @@ def check_non_ready_query_uses_kube_state_metrics(blocks: list[tuple[int, str]])
                 f"non-ready-over-time query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
                 "must use kube-state-metrics readiness so deleted Pods go stale"
             )
+        if "kube_pod_status_ready" in body and 'condition="false"' in body:
+            if "kube_pod_created" not in body or "> bool 300" not in body:
+                fail(
+                    f"non-ready-over-time query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
+                    "must require Pod age > 300s so normal cold-starting workers are not counted"
+                )
 
 
 def check_allocation_replay_filter(blocks: list[tuple[int, str]]) -> None:

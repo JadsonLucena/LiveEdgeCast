@@ -85,12 +85,16 @@ com o catálogo de métricas e as consultas PromQL de `docs/observability`.
 ### Cenário C: falha de worker e MTTR
 
 1. Iniciar streams até workers ficarem Ready e FFmpeg saudável.
-2. Induzir falha de um worker por repetição, por exemplo deletando o Pod ou
-   interrompendo o processo FFmpeg conforme permitido pelo ambiente.
+2. Induzir uma falha de saúde do worker por repetição, preferencialmente
+   interrompendo/congelando o processo FFmpeg ou fazendo `/health` falhar conforme
+   permitido pelo ambiente. Não use deleção direta do Pod como método primário de
+   MTTR: na implementação atual, a ausência do Pod impede acumular falhas de
+   healthcheck até o threshold que observa `worker_recovery_duration_seconds`.
 3. Medir detecção via `worker_healthcheck_total`, recuperação via
    `worker_recovery_duration_seconds` e retorno de `worker_ffmpeg_health_state`.
 4. Confirmar que a alocação final aponta para o worker substituto e que o antigo
-   foi removido.
+   foi removido. Trate deleção de Pod como cenário separado de disrupção/orfandade
+   até o controller registrar recovery para esse caminho.
 
 ### Cenário D: falha de proxy owner e handover
 
@@ -147,7 +151,10 @@ Para cada repetição, armazenar:
   recursos e número de réplicas.
 - Timestamps de início/fim da repetição em UTC.
 - Export Prometheus ou snapshots das consultas em `promql.md`.
-- Logs estruturados do controller filtrados por `experiment_id` e `run_id`.
+- Logs estruturados do controller correlacionados por `stream`/prefixo do
+  stream key e pelos artefatos do gerador de carga. Use `experiment_id` e `run_id`
+  apenas quando esses campos forem propagados por headers/query parameters ou
+  configurados no ambiente do controller; os hooks RTMP normais não os enviam.
 - Eventos Kubernetes relevantes dos namespaces `media` e `monitoring`.
 - Resultado do gerador de carga: streams iniciados, encerrados, falhas e bitrate.
 
@@ -164,7 +171,10 @@ Uma repetição é válida quando todos os critérios abaixo forem verdadeiros:
 - O número de streams observado em `proxy_rtmp_active_streams` corresponde ao
   plano de carga dentro de tolerância de uma janela de scrape.
 - Não houve mudança não planejada de manifests, escala base ou imagens.
-- Eventos de início/fim foram emitidos com `experiment_id` e `run_id` corretos.
+- Eventos de início/fim são correlacionáveis com a repetição por stream key,
+  artefatos do gerador de carga ou metadados de log explicitamente propagados;
+  não rejeite runs RTMP normais apenas porque `run_id` aparece como `unknown` nos
+  logs do controller.
 
 ### Aceitação funcional
 
