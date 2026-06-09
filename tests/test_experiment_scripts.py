@@ -27,6 +27,7 @@ from common import (  # noqa: E402
     run_command,
     select_pod,
     select_pod_candidates,
+    select_pod_candidates_with_status,
     start_process,
     start_ffmpeg_streams,
     stop_processes,
@@ -384,6 +385,43 @@ def test_select_pod_candidates_filters_by_stream_annotation(monkeypatch):
     ) == ["worker-1"]
 
 
+def test_select_pod_candidates_records_kubectl_failure(monkeypatch):
+    parser = scenario_parser("kill_proxy")
+    add_kill_options(parser)
+    config = parsed_config(parser)
+
+    def fake_kubectl(config, args, logger, timeout=30):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="forbidden")
+
+    monkeypatch.setattr(common, "kubectl", fake_kubectl)
+
+    selection = select_pod_candidates_with_status(
+        config, "app=proxy", logging.getLogger("test")
+    )
+
+    assert selection["status"] == "kubectl_failed"
+    assert selection["returncode"] == 1
+    assert selection["stderr"] == "forbidden"
+
+
+def test_select_pod_candidates_records_parse_failure(monkeypatch):
+    parser = scenario_parser("kill_proxy")
+    add_kill_options(parser)
+    config = parsed_config(parser)
+
+    def fake_kubectl(config, args, logger, timeout=30):
+        return subprocess.CompletedProcess(args, 0, stdout="not-json", stderr="")
+
+    monkeypatch.setattr(common, "kubectl", fake_kubectl)
+
+    selection = select_pod_candidates_with_status(
+        config, "app=proxy", logging.getLogger("test")
+    )
+
+    assert selection["status"] == "parse_failed"
+    assert selection["error"]["type"] == "JSONDecodeError"
+
+
 def test_stop_processes_records_cleanup_stop_error():
     parser = scenario_parser("kill_proxy")
     add_kill_options(parser)
@@ -441,3 +479,153 @@ def test_collect_controller_artifacts_records_failure_metadata(monkeypatch, tmp_
     assert artifacts["controller_health.json"]["status"] == "collection_failed"
     assert artifacts["controller_health.json"]["error"]["type"] == "OSError"
     assert Path(artifacts["controller_health.json"]["path"]).exists()
+
+
+def test_kill_proxy_entrypoint_records_ambiguous_selection_without_delete(
+    monkeypatch, tmp_path
+):
+    kill_proxy = importlib.import_module("kill_proxy")
+    delete_calls = []
+
+    monkeypatch.setattr(
+        kill_proxy, "validate_runtime_tools", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(kill_proxy.time, "sleep", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        kill_proxy, "start_ffmpeg_streams", lambda *args, **kwargs: [object()]
+    )
+    monkeypatch.setattr(
+        kill_proxy,
+        "wait_for_processes",
+        lambda *args, **kwargs: [{"name": "fake", "returncode": 0}],
+    )
+    monkeypatch.setattr(
+        kill_proxy, "collect_kubernetes_artifacts", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        kill_proxy, "collect_controller_artifacts", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        kill_proxy,
+        "select_pod_candidates_with_status",
+        lambda *args, **kwargs: {
+            "status": "ambiguous",
+            "candidate_pods": ["proxy-1", "proxy-2"],
+            "returncode": 0,
+        },
+    )
+
+    def fake_delete(*args, **kwargs):
+        delete_calls.append(args)
+        return {"returncode": 0, "status": "deleted"}
+
+    monkeypatch.setattr(kill_proxy, "delete_pod", fake_delete)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kill_proxy.py",
+            "--experiment-id",
+            "exp",
+            "--scenario",
+            "kill_proxy",
+            "--run-id",
+            "run",
+            "--concurrency",
+            "1",
+            "--duration-seconds",
+            "10",
+            "--bitrate",
+            "800k",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert kill_proxy.main() == 2
+    assert delete_calls == []
+    summary = json.loads(
+        (tmp_path / "exp" / "kill_proxy" / "run" / "summary.json").read_text()
+    )
+    assert summary["killed_proxy"]["selection"]["status"] == "ambiguous"
+    assert summary["killed_proxy"]["selection"]["candidate_pods"] == [
+        "proxy-1",
+        "proxy-2",
+    ]
+
+
+def test_kill_worker_entrypoint_records_fallback_ambiguous_selection_without_delete(
+    monkeypatch, tmp_path
+):
+    kill_worker = importlib.import_module("kill_worker")
+    delete_calls = []
+
+    monkeypatch.setattr(
+        kill_worker, "validate_runtime_tools", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(kill_worker.time, "sleep", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        kill_worker, "start_ffmpeg_streams", lambda *args, **kwargs: [object()]
+    )
+    monkeypatch.setattr(
+        kill_worker,
+        "wait_for_processes",
+        lambda *args, **kwargs: [{"name": "fake", "returncode": 0}],
+    )
+    monkeypatch.setattr(
+        kill_worker, "collect_kubernetes_artifacts", lambda *args, **kwargs: {}
+    )
+    monkeypatch.setattr(
+        kill_worker, "collect_controller_artifacts", lambda *args, **kwargs: {}
+    )
+
+    def fake_select(
+        config, selector, logger, annotation_stream=None, require_single=False
+    ):
+        if annotation_stream:
+            return {"status": "not_found", "candidate_pods": [], "returncode": 0}
+        return {
+            "status": "ambiguous",
+            "candidate_pods": ["worker-1", "worker-2"],
+            "returncode": 0,
+        }
+
+    monkeypatch.setattr(kill_worker, "select_pod_candidates_with_status", fake_select)
+
+    def fake_delete(*args, **kwargs):
+        delete_calls.append(args)
+        return {"returncode": 0, "status": "deleted"}
+
+    monkeypatch.setattr(kill_worker, "delete_pod", fake_delete)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kill_worker.py",
+            "--experiment-id",
+            "exp",
+            "--scenario",
+            "kill_worker",
+            "--run-id",
+            "run",
+            "--concurrency",
+            "1",
+            "--duration-seconds",
+            "10",
+            "--bitrate",
+            "800k",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert kill_worker.main() == 2
+    assert delete_calls == []
+    summary = json.loads(
+        (tmp_path / "exp" / "kill_worker" / "run" / "summary.json").read_text()
+    )
+    selection = summary["killed_worker"]["selection"]
+    assert selection["source"] == "selector"
+    assert selection["status"] == "ambiguous"
+    assert selection["annotation_selection"]["status"] == "not_found"
+    assert selection["fallback_selection"]["candidate_pods"] == ["worker-1", "worker-2"]

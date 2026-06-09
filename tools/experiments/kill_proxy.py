@@ -19,7 +19,7 @@ from common import (  # noqa: E402
     delete_pod,
     prepare_run,
     process_wait_timeout_seconds,
-    select_pod_candidates,
+    select_pod_candidates_with_status,
     start_ffmpeg_streams,
     stop_processes,
     stream_key,
@@ -34,7 +34,7 @@ SCENARIO = "kill_proxy"
 
 def main() -> int:
     parser = build_parser("Run a LiveEdgeCast proxy-failure experiment.", [SCENARIO])
-    add_kill_options(parser)
+    add_kill_options(parser, include_worker_target=False)
     args = parser.parse_args()
     config = config_from_args(args)
     validate_kill_timing(parser, config)
@@ -62,21 +62,13 @@ def main() -> int:
             selection["status"] = "selected"
             selection["pod"] = pod_name
         else:
-            candidates = select_pod_candidates(config, config.proxy_selector, logger)
-            selection["candidate_pods"] = candidates
-            if len(candidates) == 1:
-                pod_name = candidates[0]
-                selection["status"] = "selected"
-                selection["pod"] = pod_name
-            elif candidates:
-                selection["status"] = "ambiguous"
-                logger.warning(
-                    "proxy selector=%s matched multiple candidate pods; refusing ambiguous kill candidates=%s",
-                    config.proxy_selector,
-                    ",".join(candidates),
-                )
-            else:
-                selection["status"] = "not_found"
+            selector_selection = select_pod_candidates_with_status(
+                config, config.proxy_selector, logger, require_single=True
+            )
+            selection.update(selector_selection)
+            selection["source"] = "selector"
+            if selection["status"] == "selected":
+                pod_name = selection["pod"]
 
         kill_result = {
             "pod": None,

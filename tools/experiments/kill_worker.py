@@ -19,7 +19,7 @@ from common import (  # noqa: E402
     delete_pod,
     prepare_run,
     process_wait_timeout_seconds,
-    select_pod_candidates,
+    select_pod_candidates_with_status,
     start_ffmpeg_streams,
     stop_processes,
     stream_key,
@@ -34,7 +34,7 @@ SCENARIO = "kill_worker"
 
 def main() -> int:
     parser = build_parser("Run a LiveEdgeCast worker-failure experiment.", [SCENARIO])
-    add_kill_options(parser)
+    add_kill_options(parser, include_proxy_target=False)
     args = parser.parse_args()
     config = config_from_args(args)
     validate_kill_timing(parser, config)
@@ -68,41 +68,30 @@ def main() -> int:
             selection["status"] = "selected"
             selection["pod"] = pod_name
         else:
-            annotated_candidates = select_pod_candidates(
-                config, config.worker_selector, logger, annotation_stream=target_stream
+            annotation_selection = select_pod_candidates_with_status(
+                config,
+                config.worker_selector,
+                logger,
+                annotation_stream=target_stream,
+                require_single=True,
             )
-            selection["candidate_pods"] = annotated_candidates
-            if len(annotated_candidates) == 1:
-                pod_name = annotated_candidates[0]
-                selection["status"] = "selected"
+            selection["annotation_selection"] = annotation_selection
+            selection["candidate_pods"] = annotation_selection["candidate_pods"]
+            selection["status"] = annotation_selection["status"]
+            if annotation_selection["status"] == "selected":
+                pod_name = annotation_selection["pod"]
                 selection["pod"] = pod_name
-            elif len(annotated_candidates) > 1:
-                selection["status"] = "ambiguous"
-                logger.warning(
-                    "worker selector=%s matched multiple workers for stream=%s; refusing ambiguous kill candidates=%s",
-                    config.worker_selector,
-                    target_stream,
-                    ",".join(annotated_candidates),
-                )
-            else:
-                fallback_candidates = select_pod_candidates(
-                    config, config.worker_selector, logger
+            elif annotation_selection["status"] == "not_found":
+                fallback_selection = select_pod_candidates_with_status(
+                    config, config.worker_selector, logger, require_single=True
                 )
                 selection["source"] = "selector"
-                selection["candidate_pods"] = fallback_candidates
-                if len(fallback_candidates) == 1:
-                    pod_name = fallback_candidates[0]
-                    selection["status"] = "selected"
+                selection["fallback_selection"] = fallback_selection
+                selection["candidate_pods"] = fallback_selection["candidate_pods"]
+                selection["status"] = fallback_selection["status"]
+                if fallback_selection["status"] == "selected":
+                    pod_name = fallback_selection["pod"]
                     selection["pod"] = pod_name
-                elif fallback_candidates:
-                    selection["status"] = "ambiguous"
-                    logger.warning(
-                        "worker selector=%s matched multiple candidate pods without stream annotation; refusing ambiguous kill candidates=%s",
-                        config.worker_selector,
-                        ",".join(fallback_candidates),
-                    )
-                else:
-                    selection["status"] = "not_found"
 
         kill_result = {
             "pod": None,

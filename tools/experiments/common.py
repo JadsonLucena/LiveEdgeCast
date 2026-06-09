@@ -190,7 +190,11 @@ def build_parser(
     return parser
 
 
-def add_kill_options(parser: argparse.ArgumentParser) -> None:
+def add_kill_options(
+    parser: argparse.ArgumentParser,
+    include_proxy_target: bool = True,
+    include_worker_target: bool = True,
+) -> None:
     parser.add_argument(
         "--kill-after-seconds",
         "--kill_after_seconds",
@@ -198,27 +202,29 @@ def add_kill_options(parser: argparse.ArgumentParser) -> None:
         default=10,
         help="Seconds to wait before deleting the target pod; must be less than duration_seconds.",
     )
-    parser.add_argument(
-        "--target-proxy-pod",
-        "--target_proxy_pod",
-        default=os.getenv("TARGET_PROXY_POD"),
-        type=lambda v: validate_safe_id(v, "target_proxy_pod"),
-        help=(
-            "Exact proxy pod to delete for kill_proxy. When omitted, the proxy "
-            "selector must match exactly one Running/Pending pod."
-        ),
-    )
-    parser.add_argument(
-        "--target-worker-pod",
-        "--target_worker_pod",
-        default=os.getenv("TARGET_WORKER_POD"),
-        type=lambda v: validate_safe_id(v, "target_worker_pod"),
-        help=(
-            "Exact worker pod to delete for kill_worker. When omitted and the "
-            "stream annotation cannot identify a worker, the worker selector must "
-            "match exactly one Running/Pending pod."
-        ),
-    )
+    if include_proxy_target:
+        parser.add_argument(
+            "--target-proxy-pod",
+            "--target_proxy_pod",
+            default=os.getenv("TARGET_PROXY_POD"),
+            type=lambda v: validate_safe_id(v, "target_proxy_pod"),
+            help=(
+                "Exact proxy pod to delete for kill_proxy. When omitted, the proxy "
+                "selector must match exactly one Running/Pending pod."
+            ),
+        )
+    if include_worker_target:
+        parser.add_argument(
+            "--target-worker-pod",
+            "--target_worker_pod",
+            default=os.getenv("TARGET_WORKER_POD"),
+            type=lambda v: validate_safe_id(v, "target_worker_pod"),
+            help=(
+                "Exact worker pod to delete for kill_worker. When omitted and the "
+                "stream annotation cannot identify a worker, the worker selector must "
+                "match exactly one Running/Pending pod."
+            ),
+        )
 
 
 def add_duplicate_reconnect_options(parser: argparse.ArgumentParser) -> None:
@@ -714,23 +720,45 @@ def kubectl(
     return run_command([config.kubectl_path, *args], logger, timeout=timeout)
 
 
-def select_pod_candidates(
+def select_pod_candidates_with_status(
     config: ExperimentConfig,
     selector: str,
     logger: logging.Logger,
     annotation_stream: str | None = None,
-) -> list[str]:
+    require_single: bool = False,
+) -> dict[str, Any]:
     args = ["get", "pods", "-n", config.namespace, "-l", selector, "-o", "json"]
     completed = kubectl(config, args, logger)
+    selection: dict[str, Any] = {
+        "selector": selector,
+        "annotation_stream": annotation_stream,
+        "candidate_pods": [],
+        "returncode": completed.returncode,
+    }
     if completed.returncode != 0:
-        return []
+        selection.update(
+            {
+                "status": "kubectl_failed",
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+        )
+        return selection
+
     try:
         data = json.loads(completed.stdout or "{}")
     except json.JSONDecodeError as exc:
         logger.warning(
             "failed parsing kubectl pod JSON selector=%s error=%s", selector, exc
         )
-        return []
+        selection.update(
+            {
+                "status": "parse_failed",
+                "stdout": completed.stdout,
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+            }
+        )
+        return selection
 
     candidates: list[str] = []
     for item in data.get("items", []):
@@ -746,7 +774,34 @@ def select_pod_candidates(
             continue
         if name and phase in {"Running", "Pending"}:
             candidates.append(name)
-    return candidates
+
+    selection["candidate_pods"] = candidates
+    if not candidates:
+        selection["status"] = "not_found"
+    elif require_single and len(candidates) != 1:
+        logger.warning(
+            "selector=%s matched %s candidate pods; refusing ambiguous selection candidates=%s",
+            selector,
+            len(candidates),
+            ",".join(candidates),
+        )
+        selection["status"] = "ambiguous"
+    else:
+        selection["status"] = "selected"
+        selection["pod"] = candidates[0]
+    return selection
+
+
+def select_pod_candidates(
+    config: ExperimentConfig,
+    selector: str,
+    logger: logging.Logger,
+    annotation_stream: str | None = None,
+) -> list[str]:
+    selection = select_pod_candidates_with_status(
+        config, selector, logger, annotation_stream
+    )
+    return list(selection.get("candidate_pods", []))
 
 
 def select_pod(
@@ -756,18 +811,10 @@ def select_pod(
     annotation_stream: str | None = None,
     require_single: bool = False,
 ) -> str | None:
-    candidates = select_pod_candidates(config, selector, logger, annotation_stream)
-    if not candidates:
-        return None
-    if require_single and len(candidates) != 1:
-        logger.warning(
-            "selector=%s matched %s candidate pods; refusing ambiguous selection candidates=%s",
-            selector,
-            len(candidates),
-            ",".join(candidates),
-        )
-        return None
-    return candidates[0]
+    selection = select_pod_candidates_with_status(
+        config, selector, logger, annotation_stream, require_single=require_single
+    )
+    return selection.get("pod") if selection.get("status") == "selected" else None
 
 
 def delete_pod(
