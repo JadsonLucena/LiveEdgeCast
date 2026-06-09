@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Static sanity checks for observability PromQL/LogQL documentation snippets.
+
+This script intentionally uses only the Python standard library. It is not a full
+PromQL parser; it catches repository-specific regressions that previously made
+canonical documentation snippets misleading or syntactically invalid. If
+`promtool` is available in the execution environment, run it against rendered
+rules/dashboards as an additional parser-level validation step.
+"""
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PROMQL_DOC = ROOT / "docs" / "observability" / "promql.md"
+METRICS_DOC = ROOT / "docs" / "observability" / "metrics.md"
+DOCS = (PROMQL_DOC, METRICS_DOC)
+
+FENCE_RE = re.compile(r"```(?P<lang>\w+)?\n(?P<body>.*?)```", re.DOTALL)
+
+
+def fail(message: str) -> None:
+    print(f"ERROR: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def check_fences(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    fence_count = text.count("```")
+    if fence_count % 2:
+        fail(f"{path.relative_to(ROOT)} has unbalanced Markdown fences ({fence_count})")
+
+
+def extract_blocks(path: Path, language: str) -> list[tuple[int, str]]:
+    text = path.read_text(encoding="utf-8")
+    blocks: list[tuple[int, str]] = []
+    for match in FENCE_RE.finditer(text):
+        if (match.group("lang") or "").lower() == language:
+            blocks.append((line_number(text, match.start()), match.group("body")))
+    return blocks
+
+
+def check_no_range_selector_on_parenthesized_expression(blocks: list[tuple[int, str]]) -> None:
+    invalid = re.compile(r"\([^\n]*[-+*/][^\n]*\)\s*\[[0-9]+[smhdwy](?::[^\]]*)?\]")
+    for start_line, body in blocks:
+        match = invalid.search(body)
+        if match:
+            snippet_line = start_line + body[: match.start()].count("\n") + 1
+            fail(
+                "range selector appears to be applied to a parenthesized expression "
+                f"near {PROMQL_DOC.relative_to(ROOT)}:{snippet_line}; use a subquery [range:] "
+                "or put the range on the vector selector"
+            )
+
+
+def check_worker_ffmpeg_scoped(blocks: list[tuple[int, str]]) -> None:
+    unscoped = re.compile(r"worker_ffmpeg_health_state(?!\s*\{)")
+    for start_line, body in blocks:
+        match = unscoped.search(body)
+        if match:
+            snippet_line = start_line + body[: match.start()].count("\n") + 1
+            fail(
+                f"unscoped worker_ffmpeg_health_state near {PROMQL_DOC.relative_to(ROOT)}:{snippet_line}; "
+                "include namespace/job labels to avoid cross-environment aggregation"
+            )
+
+
+def check_ratio_denominators_are_clamped(blocks: list[tuple[int, str]]) -> None:
+    for start_line, body in blocks:
+        if "/" not in body:
+            continue
+        lines = body.splitlines()
+        for idx, line in enumerate(lines):
+            if line.strip() != "/":
+                continue
+            denominator = lines[idx + 1].strip() if idx + 1 < len(lines) else ""
+            if denominator.startswith("clamp_min("):
+                continue
+            # Percent normalization by an intentionally non-zero or separately clamped gauge can be valid,
+            # but the current canonical ratio snippets should clamp direct counter denominators.
+            if denominator.startswith("sum(rate("):
+                fail(
+                    f"unclamped rate denominator near {PROMQL_DOC.relative_to(ROOT)}:{start_line + idx + 1}; "
+                    "wrap it with clamp_min(..., 1e-9) for idle windows"
+                )
+
+
+def check_cadvisor_container_filters(blocks: list[tuple[int, str]]) -> None:
+    for start_line, body in blocks:
+        if "container_cpu_usage_seconds_total" in body and 'container!="POD"' not in body:
+            fail(
+                f"CPU cAdvisor query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
+                "should exclude container=\"POD\""
+            )
+        if "container_memory_working_set_bytes" in body and 'container!="POD"' not in body:
+            fail(
+                f"memory cAdvisor query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
+                "should exclude container=\"POD\""
+            )
+
+
+def check_worker_pods_available_wording() -> None:
+    text = METRICS_DOC.read_text(encoding="utf-8")
+    if "não usar como capacidade livre de alocação" not in text:
+        fail("metrics catalog must state worker_pods_available is not free allocation capacity")
+
+
+def main() -> int:
+    for doc in DOCS:
+        check_fences(doc)
+    promql_blocks = extract_blocks(PROMQL_DOC, "promql")
+    if not promql_blocks:
+        fail(f"no promql blocks found in {PROMQL_DOC.relative_to(ROOT)}")
+    check_no_range_selector_on_parenthesized_expression(promql_blocks)
+    check_worker_ffmpeg_scoped(promql_blocks)
+    check_ratio_denominators_are_clamped(promql_blocks)
+    check_cadvisor_container_filters(promql_blocks)
+    check_worker_pods_available_wording()
+    print(f"Validated {len(promql_blocks)} PromQL snippets in {PROMQL_DOC.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

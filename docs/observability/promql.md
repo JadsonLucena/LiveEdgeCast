@@ -15,6 +15,11 @@ Kubernetes/cAdvisor/kube-state-metrics instaladas pelo stack de monitoramento.
 - Evite agrupar por `pod` em gráficos agregados do artigo; use `component` ou
   `namespace` para reduzir cardinalidade e tornar as séries comparáveis entre
   repetições.
+- Antes de publicar mudanças neste arquivo, execute
+  `python3 tools/validate-promql-docs.py` para checar fences Markdown e armadilhas
+  conhecidas dos snippets. Quando `promtool` estiver disponível, valide também as
+  expressões finais no Prometheus/Grafana alvo, principalmente consultas com
+  placeholders como `$window`.
 
 ## Cold start P50/P95/P99
 
@@ -332,7 +337,7 @@ funcionam com os manifests atuais (`proxy-*`, `worker-*`, `controller-*`).
 ```promql
 sum by (component) (
   label_replace(
-    rate(container_cpu_usage_seconds_total{namespace="media",container!="",pod=~"(proxy|worker|controller)-.*"}[5m]),
+    rate(container_cpu_usage_seconds_total{namespace="media",container!="",container!="POD",pod=~"(proxy|worker|controller)-.*"}[5m]),
     "component", "$1", "pod", "^(proxy|worker|controller)-.*"
   )
 )
@@ -343,7 +348,7 @@ sum by (component) (
 ```promql
 sum by (component) (
   label_replace(
-    container_memory_working_set_bytes{namespace="media",container!="",pod=~"(proxy|worker|controller)-.*"},
+    container_memory_working_set_bytes{namespace="media",container!="",container!="POD",pod=~"(proxy|worker|controller)-.*"},
     "component", "$1", "pod", "^(proxy|worker|controller)-.*"
   )
 )
