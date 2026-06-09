@@ -85,11 +85,15 @@ com o catálogo de métricas e as consultas PromQL de `docs/observability`.
 ### Cenário C: falha de worker e MTTR
 
 1. Iniciar streams até workers ficarem Ready e FFmpeg saudável.
-2. Induzir uma falha de saúde do worker por repetição, preferencialmente
-   interrompendo/congelando o processo FFmpeg ou fazendo `/health` falhar conforme
-   permitido pelo ambiente. Não use deleção direta do Pod como método primário de
-   MTTR: na implementação atual, a ausência do Pod impede acumular falhas de
-   healthcheck até o threshold que observa `worker_recovery_duration_seconds`.
+2. Induzir uma falha de saúde do worker visível ao controller por repetição,
+   preferencialmente derrubando/reiniciando o container do worker ou fazendo o
+   endpoint `/health` servido pelo nginx falhar conforme permitido pelo ambiente.
+   Não use apenas congelamento do FFmpeg como método primário de MTTR: o
+   controller consulta `/health` e não `worker_ffmpeg_health_state`, então um
+   nginx saudável pode mascarar o congelamento do processo FFmpeg. Também não use
+   deleção direta do Pod como método primário de MTTR: na implementação atual, a
+   ausência do Pod impede acumular falhas de healthcheck até o threshold que
+   observa `worker_recovery_duration_seconds`.
 3. Medir detecção via `worker_healthcheck_total`, recuperação via
    `worker_recovery_duration_seconds` e retorno de `worker_ffmpeg_health_state`.
 4. Confirmar que a alocação final aponta para o worker substituto e que o antigo

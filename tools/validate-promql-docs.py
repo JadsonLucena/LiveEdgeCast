@@ -123,12 +123,37 @@ def check_non_ready_query_uses_kube_state_metrics(blocks: list[tuple[int, str]])
                 f"non-ready-over-time query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
                 "must use kube-state-metrics readiness so deleted Pods go stale"
             )
-        if "kube_pod_status_ready" in body and 'condition="false"' in body:
-            if "kube_pod_created" not in body or "> bool 300" not in body:
-                fail(
-                    f"non-ready-over-time query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
-                    "must require Pod age > 300s so normal cold-starting workers are not counted"
-                )
+        if "kube_pod_status_ready" not in body:
+            continue
+        if "kube_pod_created" not in body or "> bool 300" not in body:
+            fail(
+                f"non-ready-over-time query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
+                "must require Pod age > 300s so normal cold-starting workers are not counted"
+            )
+        if 'condition="false"' in body and "unknown" not in body:
+            fail(
+                f"non-ready-over-time query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
+                "must treat Ready=Unknown as non-ready too, not only Ready=False"
+            )
+        if 'condition="true"' in body and "1 - max_over_time" not in body:
+            fail(
+                f"non-ready-over-time query near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
+                "should count absence of Ready=True over the window so false and unknown are both non-ready"
+            )
+
+
+def check_missing_worker_health_coalesces_to_zero(blocks: list[tuple[int, str]]) -> None:
+    for start_line, body in blocks:
+        if (
+            "kube_pod_status_phase" in body
+            and "worker_ffmpeg_health_state" in body
+            and "-" in body
+            and "or on() vector(0)" not in body
+        ):
+            fail(
+                f"worker health subtraction near {PROMQL_DOC.relative_to(ROOT)}:{start_line} "
+                "must coalesce missing worker_ffmpeg_health_state series with or on() vector(0)"
+            )
 
 
 def check_allocation_replay_filter(blocks: list[tuple[int, str]]) -> None:
@@ -159,6 +184,7 @@ def main() -> int:
     check_ratio_denominators_are_clamped(promql_blocks)
     check_cadvisor_container_filters(promql_blocks)
     check_non_ready_query_uses_kube_state_metrics(promql_blocks)
+    check_missing_worker_health_coalesces_to_zero(promql_blocks)
     check_allocation_replay_filter(promql_blocks)
     check_worker_pods_available_wording()
     print(f"Validated {len(promql_blocks)} PromQL snippets in {PROMQL_DOC.relative_to(ROOT)}")

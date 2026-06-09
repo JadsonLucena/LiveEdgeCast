@@ -252,7 +252,10 @@ valor JSON `null` no campo `stream`.
 ```promql
 sum(kube_pod_status_phase{namespace="media",phase="Running",pod=~"worker-.*"})
 -
-sum(worker_ffmpeg_health_state{namespace="media"})
+(
+  sum(worker_ffmpeg_health_state{namespace="media"})
+  or on() vector(0)
+)
 ```
 
 ### Workers em execução menos streams ativos observados no proxy
@@ -268,12 +271,13 @@ sum(proxy_rtmp_active_streams)
 Use kube-state-metrics para este painel, pois as séries `pod_ready_status`
 emitidas pelo controller podem permanecer expostas com o último valor se um Pod
 desaparecer antes de uma nova coleta. A série abaixo fica stale quando o Pod é
-removido do cluster e exige idade mínima de 5 minutos para não contar workers que
-ainda estão no cold start normal.
+removido do cluster, trata `Ready=False` e `Ready=Unknown` como não prontos ao
+testar ausência de `Ready=True`, e exige idade mínima de 5 minutos para não
+contar workers que ainda estão no cold start normal.
 
 ```promql
-sum by (pod) (
-  min_over_time(kube_pod_status_ready{namespace="media",pod=~"worker-.*",condition="false"}[5m])
+sum by (namespace, pod) (
+  (1 - max_over_time(kube_pod_status_ready{namespace="media",pod=~"worker-.*",condition="true"}[5m]))
   * on (namespace, pod) group_left()
     (time() - kube_pod_created{namespace="media",pod=~"worker-.*"} > bool 300)
 )
