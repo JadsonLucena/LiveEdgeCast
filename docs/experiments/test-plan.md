@@ -22,7 +22,7 @@ com o catálogo de métricas e as consultas PromQL de `docs/observability`.
 | H1: o sistema inicia streams dentro do orçamento definido. | P50/P95/P99 de `stream_lifecycle_phase_seconds{phase="proxy_to_first_progress"}`. | `histogram_quantile()` sobre buckets do histograma. |
 | H2: a alocação é confiável sob carga. | `stream_allocation_total{status="success"} / stream_allocation_total`. | Taxa de sucesso de alocação. |
 | H3: handover preserva ownership sem limpar stream ativo de outro proxy. | `stream_proxy_handover_total`, `handover_conflict_total`, `stale_ended_events_ignored_total`. | Taxa de handover e conflitos. |
-| H4: recuperação de worker tem MTTR aceitável. | P95 e média de `worker_recovery_duration_seconds{status="success",reason="replaced"}`. | MTTR por histograma. |
+| H4: recuperação de worker tem MTTR aceitável. | P95 e média de `worker_recovery_duration_seconds` para tentativas de recovery, acompanhados de `worker_recovery_total{status="success",reason="replaced"}`. | MTTR por histograma e taxa de sucesso por contador. |
 | H5: uso de recursos cresce de forma proporcional à carga. | CPU, memória e rede por componente via cAdvisor/kubelet. | Agregações por `component`. |
 
 ## Variáveis experimentais
@@ -113,8 +113,11 @@ com o catálogo de métricas e as consultas PromQL de `docs/observability`.
 ## Repetições e randomização
 
 - Executar no mínimo **30 repetições válidas** por combinação principal de
-  cenário e nível de carga quando o objetivo for estimar P95/P99. Para smoke
-  tests ou regressões rápidas, usar no mínimo 5 repetições e não reportar P99.
+  cenário e nível de carga para estimar mediana e P95 inicial. Para P99, exigir
+  volume substancialmente maior de amostras de stream por combinação (centenas ou
+  milhares, conforme a precisão desejada) ou reportar P99 apenas como exploratório
+  junto com máximo observado e intervalo de confiança amplo. Para smoke tests ou
+  regressões rápidas, usar no mínimo 5 repetições e não reportar P99.
 - Randomizar a ordem dos níveis de carga dentro de cada bloco diário para reduzir
   viés de aquecimento do cluster e ruído externo.
 - Separar cenários de falha: não misturar falha de worker e proxy na mesma
@@ -202,8 +205,10 @@ campanha como exploratória e execute nova campanha confirmatória.
   limitação de observabilidade.
 - Comparar cenários por diferença relativa ao baseline e diferença absoluta em
   segundos/pontos percentuais.
-- Para P99, exigir volume de amostras compatível; se houver poucas amostras,
-  reportar P95 e máximo observado, deixando P99 como exploratório.
+- Para P99, exigir volume de amostras compatível; com poucas dezenas de amostras,
+  reportar P95 e máximo observado, deixando P99 como exploratório. Distinguir
+  repetições de amostras de stream e considerar agrupamento por repetição quando
+  múltiplos streams forem gerados no mesmo run.
 
 ## Ameaças à validade
 

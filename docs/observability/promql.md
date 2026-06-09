@@ -98,15 +98,17 @@ por endpoint aproximado, timestamp ausente ou duração negativa por skew de rel
 
 No LiveEdgeCast, MTTR operacional de worker é aproximado pela duração das
 tentativas de recuperação de worker não saudável registradas em
-`worker_recovery_duration_seconds`. A consulta abaixo mede tempo até substituição
-ou descarte da tentativa de recuperação, não tempo percebido pelo usuário final.
+`worker_recovery_duration_seconds`. O histograma não possui labels de `status` ou
+`reason`; portanto ele mede a duração de todas as tentativas observadas. Use
+`worker_recovery_total{status="success",reason="replaced"}` como métrica
+complementar para separar taxa de sucesso e volume de substituições concluídas.
 
 ### MTTR médio
 
 ```promql
-sum(rate(worker_recovery_duration_seconds_sum{status="success",reason="replaced"}[5m]))
+sum(rate(worker_recovery_duration_seconds_sum[5m]))
 /
-sum(rate(worker_recovery_duration_seconds_count{status="success",reason="replaced"}[5m]))
+sum(rate(worker_recovery_duration_seconds_count[5m]))
 ```
 
 ### MTTR P95
@@ -115,7 +117,7 @@ sum(rate(worker_recovery_duration_seconds_count{status="success",reason="replace
 histogram_quantile(
   0.95,
   sum by (le) (
-    rate(worker_recovery_duration_seconds_bucket{status="success",reason="replaced"}[5m])
+    rate(worker_recovery_duration_seconds_bucket[5m])
   )
 )
 ```
@@ -149,12 +151,25 @@ negações por conflito de owner saudável.
 sum(rate(stream_proxy_handover_total[5m]))
 ```
 
-### Taxa de sucesso de handover
+### Taxa de aceite de ownership
+
+`handover_success_total` inclui tanto handovers aceitos quanto o primeiro registro
+de ownership quando ainda não existe owner anterior. Use esta consulta para medir
+aceite geral de ownership; para handover efetivo entre proxies, use
+`stream_proxy_handover_total`.
 
 ```promql
 sum(rate(handover_success_total[5m]))
 /
 sum(rate(handover_attempts_total[5m]))
+```
+
+### Taxa de handover efetivo entre proxies
+
+```promql
+sum(rate(stream_proxy_handover_total[5m]))
+/
+clamp_min(sum(rate(handover_attempts_total[5m])), 1e-9)
 ```
 
 ### Taxa de conflito de handover
@@ -221,7 +236,7 @@ controller, mas a métrica atual não exporta diretamente a cardinalidade de
 órfãos. Para dashboards, use métricas de Kubernetes para detectar workers prontos
 sem atividade de FFmpeg ou compare workers vivos com streams ativos. Para análise
 forense, correlacione com logs estruturados `event_type="worker_deleted"` e
-`stream=null`.
+valor JSON `null` no campo `stream`.
 
 ### Workers vivos sem FFmpeg saudável
 
@@ -249,13 +264,20 @@ sum by (pod) (
 
 ### Exclusões de órfãos por logs
 
-Prometheus não consulta logs. Em Loki, use a consulta equivalente:
+Prometheus não consulta logs. Em Loki, valide a sintaxe exata do parser usado no
+cluster: o controller serializa ausência de stream como JSON `null`, não como
+string vazia. Uma consulta típica é parsear o JSON para obter `status` e aplicar
+um filtro de linha para o campo nulo:
 
 ```logql
 sum by (status) (
-  count_over_time({namespace="media",app="controller"} | json | event_type="worker_deleted" | stream="" [$window])
+  count_over_time({namespace="media",app="controller"} | json | event_type="worker_deleted" |= "\"stream\": null" [$window])
 )
 ```
+
+Se o backend de logs normalizar `null` como campo ausente ou string vazia, ajuste
+o predicado de nulidade e mantenha a validação contra amostras reais antes de
+usar a consulta no artigo.
 
 ## Ativos
 
@@ -347,22 +369,22 @@ sum by (component) (
 
 ### Métricas de recurso emitidas pelo controller
 
-```promql
-avg by (pod, namespace) (pod_cpu_usage_percent{namespace="media"})
-```
+A implementação atual do coletor do controller popula readiness e memória
+aproximada, mas não popula CPU nem rede. Assim, use estas séries apenas como
+smoke test de disponibilidade de Pod e prefira cAdvisor/kubelet para resultados
+do artigo.
 
 ```promql
 avg by (pod, namespace) (pod_memory_usage_percent{namespace="media"})
 ```
 
 ```promql
-sum by (pod, direction) (rate(pod_network_io_bytes_total[5m]))
+avg by (pod, namespace) (pod_ready_status{namespace="media"})
 ```
 
-As métricas de recurso do controller são úteis para smoke tests e dashboards
-simples. Para resultados do artigo, prefira cAdvisor/kubelet para CPU, memória e
-rede, porque `pod_memory_usage_percent` usa uma aproximação quando a coleta
-detalhada não está disponível.
+Não use `pod_cpu_usage_percent` nem `pod_network_io_bytes_total` como fonte de
+resultado enquanto elas permanecerem apenas declaradas ou dependentes de coletor
+não implementado.
 
 ## SLOs e critérios resumidos para dashboards
 

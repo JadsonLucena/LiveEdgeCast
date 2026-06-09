@@ -286,7 +286,7 @@ pelo Prometheus, como `pod`, `namespace`, `job` e `instance`.
 
 | Métrica | Tipo | Labels específicos | Unidade | Cardinalidade esperada | Interpretação | Uso no artigo |
 | --- | --- | --- | --- | --- | --- | --- |
-| `worker_recovery_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Duração de tentativas de recuperar worker não saudável. | MTTR médio e P95 para falhas de worker. |
+| `worker_recovery_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Duração de todas as tentativas de recuperar worker não saudável; o resultado fica no contador separado `worker_recovery_total`. | MTTR médio/P95 operacional de tentativas de recovery, sem segmentação direta por status. |
 | `worker_recovery_total` | Counter | `status`, `reason` | eventos | Baixa. | Resultado de tentativas de recuperação: substituído, erro ou estado obsoleto. | Taxa de recuperação bem-sucedida e causas de falha. |
 | `proxy_healthcheck_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Tempo para avaliar healthcheck de proxies. | Contexto para cenários de failover/handover. |
 | `proxy_healthcheck_total` | Counter | `status`, `reason` | eventos | Baixa. | Avaliações de saúde de proxy por resultado. | Evidenciar quando handover foi motivado por proxy não saudável. |
@@ -333,10 +333,15 @@ limpeza de estado.
 
 | Métrica | Tipo | Labels específicos | Unidade | Cardinalidade esperada | Interpretação | Uso no artigo |
 | --- | --- | --- | --- | --- | --- | --- |
-| `pod_cpu_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média: proxy/worker por Pod. | Percentual de CPU quando a coleta do controller estiver disponível. | Smoke test; para artigo, preferir cAdvisor `container_cpu_usage_seconds_total`. |
+| `pod_cpu_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média: proxy/worker por Pod. | Declarada pelo controller, mas não populada pelo coletor atual. | Não usar no artigo até haver coleta implementada; preferir cAdvisor `container_cpu_usage_seconds_total`. |
 | `pod_memory_usage_bytes` | Gauge | `pod`, `namespace` | bytes | Média. | Uso de memória estimado/coletado por Pod. | Apenas contexto; a implementação pode aproximar valor por limite. |
-| `pod_memory_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média. | Percentual de memória do limite. | Não usar como métrica primária de consumo sem validar origem. |
-| `pod_network_io_bytes_total` | Counter | `pod`, `direction` | bytes | Média: Pod × direção. | I/O de rede acumulado quando coletado pelo controller. | Indicador auxiliar; para artigo, preferir cAdvisor por componente. |
+| `pod_memory_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média. | Percentual de memória do limite; a implementação atual usa aproximação quando só o limite é conhecido. | Não usar como métrica primária de consumo sem validar origem. |
+| `pod_network_io_bytes_total` | Counter | `pod`, `direction` | bytes | Média: Pod × direção. | Declarada pelo controller, mas não incrementada pelo coletor atual. | Não usar no artigo até haver coleta implementada; preferir cAdvisor por componente. |
+
+As métricas de recurso emitidas pelo controller são auxiliares. Para resultados
+quantitativos do artigo, use cAdvisor/kubelet como fonte primária; `pod_cpu_usage_percent`
+e `pod_network_io_bytes_total` não devem ser consideradas disponíveis enquanto o
+coletor atual não as preencher.
 
 ### Cardinalidade e retenção de labels
 
