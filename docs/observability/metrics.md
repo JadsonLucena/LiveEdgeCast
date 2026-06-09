@@ -292,7 +292,7 @@ pelo Prometheus, como `pod`, `namespace`, `job` e `instance`.
 | `proxy_healthcheck_total` | Counter | `status`, `reason` | eventos | Baixa. | Avaliações de saúde de proxy por resultado. | Evidenciar quando handover foi motivado por proxy não saudável. |
 | `worker_healthcheck_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Duração de probes `/health` nos workers. | Contexto para detecção de falha antes do MTTR. |
 | `worker_healthcheck_total` | Counter | `status`, `reason` | eventos | Baixa. | Probes de saúde de worker por resultado. | Taxa de falha que dispara recuperação. |
-| `worker_pods_available` | Gauge | `namespace` | pods | Muito baixa: um namespace por ambiente. | Número de Pods de worker Ready observados para alocação. | Capacidade disponível antes/durante experimento. |
+| `worker_pods_available` | Gauge | `namespace` | pods | Muito baixa: um namespace por ambiente. | Número de Pods de worker com condição `Ready=True`; a implementação atual não subtrai workers já associados a streams. | Readiness/capacidade bruta observada; não usar como capacidade livre de alocação. |
 | `pod_ready_status` | Gauge | `pod`, `namespace` | booleano `0/1` | Média: um por Pod proxy/worker. | Readiness agregada do Pod conforme status Kubernetes. | Smoke test; para séries do artigo, agregar por componente. |
 
 O controller não expõe uma métrica dedicada de órfãos. Órfãos são observáveis por

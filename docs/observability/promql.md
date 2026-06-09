@@ -108,7 +108,7 @@ complementar para separar taxa de sucesso e volume de substituições concluída
 ```promql
 sum(rate(worker_recovery_duration_seconds_sum[5m]))
 /
-sum(rate(worker_recovery_duration_seconds_count[5m]))
+clamp_min(sum(rate(worker_recovery_duration_seconds_count[5m])), 1e-9)
 ```
 
 ### MTTR P95
@@ -127,7 +127,7 @@ histogram_quantile(
 ```promql
 sum(rate(worker_recovery_total{status="success",reason="replaced"}[5m]))
 /
-sum(rate(worker_recovery_total[5m]))
+clamp_min(sum(rate(worker_recovery_total[5m])), 1e-9)
 ```
 
 ### Recuperações com erro por causa
@@ -161,7 +161,7 @@ aceite geral de ownership; para handover efetivo entre proxies, use
 ```promql
 sum(rate(handover_success_total[5m]))
 /
-sum(rate(handover_attempts_total[5m]))
+clamp_min(sum(rate(handover_attempts_total[5m])), 1e-9)
 ```
 
 ### Taxa de handover efetivo entre proxies
@@ -177,7 +177,7 @@ clamp_min(sum(rate(handover_attempts_total[5m])), 1e-9)
 ```promql
 sum(rate(handover_conflict_total[5m]))
 /
-sum(rate(handover_attempts_total[5m]))
+clamp_min(sum(rate(handover_attempts_total[5m])), 1e-9)
 ```
 
 ### Handovers efetivos por 100 streams ativos
@@ -199,7 +199,7 @@ worker para não inflar a taxa de sucesso primária.
 ```promql
 sum(rate(stream_allocation_total{status="success"}[5m]))
 /
-sum(rate(stream_allocation_total[5m]))
+clamp_min(sum(rate(stream_allocation_total[5m])), 1e-9)
 ```
 
 ### Taxa de sucesso excluindo replay idempotente
@@ -207,7 +207,7 @@ sum(rate(stream_allocation_total[5m]))
 ```promql
 sum(rate(stream_allocation_total{status="success",reason!="idempotent_replay"}[5m]))
 /
-sum(rate(stream_allocation_total{reason!="idempotent_replay"}[5m]))
+clamp_min(sum(rate(stream_allocation_total{reason!="idempotent_replay"}[5m])), 1e-9)
 ```
 
 ### Latência P95 de alocação
@@ -243,7 +243,7 @@ valor JSON `null` no campo `stream`.
 ```promql
 sum(kube_pod_status_phase{namespace="media",phase="Running",pod=~"worker-.*"})
 -
-sum(worker_ffmpeg_health_state)
+sum(worker_ffmpeg_health_state{namespace="media"})
 ```
 
 ### Workers em execução menos streams ativos observados no proxy
@@ -258,7 +258,7 @@ sum(proxy_rtmp_active_streams)
 
 ```promql
 sum by (pod) (
-  max_over_time((1 - pod_ready_status{namespace="media",pod=~"worker-.*"})[5m])
+  1 - max_over_time(pod_ready_status{namespace="media",pod=~"worker-.*"}[5m])
 )
 ```
 
@@ -299,7 +299,11 @@ sum by (proxy_pod) (proxy_rtmp_active_publishers)
 sum by (proxy_pod) (proxy_rtmp_active_clients)
 ```
 
-### Workers disponíveis para alocação
+### Workers Ready observados
+
+`worker_pods_available` conta Pods de worker `Ready=True` observados pelo
+controller. Ela não subtrai workers já associados a streams e, portanto, não deve
+ser interpretada como capacidade livre de alocação.
 
 ```promql
 sum by (namespace) (worker_pods_available)
@@ -308,7 +312,7 @@ sum by (namespace) (worker_pods_available)
 ### Workers com FFmpeg saudável
 
 ```promql
-sum(worker_ffmpeg_health_state)
+sum(worker_ffmpeg_health_state{namespace="media"})
 ```
 
 ### Proxies com scrape RTMP saudável
