@@ -603,6 +603,8 @@ proxy_rtmp_active_clients = controller_gauge('proxy_rtmp_active_clients', 'Activ
 proxy_rtmp_stream_active = controller_gauge('proxy_rtmp_stream_active', 'Whether each proxy has at least one active RTMP stream', ('proxy_pod',))
 proxy_rtmp_stats_up = controller_gauge('proxy_rtmp_stats_up', 'Whether the last proxy RTMP /stats scrape succeeded', ('proxy_pod',))
 worker_pods_available = controller_gauge('worker_pods_available','Available worker pods for allocation',('namespace',))
+controller_active_streams = controller_gauge('controller_active_streams', 'Active streams currently tracked by the controller')
+controller_active_allocations = controller_gauge('controller_active_allocations', 'Active stream-to-worker allocations currently tracked by the controller')
 stream_proxy_handover_counter = controller_counter('stream_proxy_handover_total','Total proxy handovers accepted by controller')
 handover_attempts_total = controller_counter('handover_attempts_total', 'Total proxy handover attempts')
 handover_success_total = controller_counter('handover_success_total', 'Total successful proxy handovers')
@@ -627,6 +629,12 @@ worker_create_total = controller_counter('worker_create_total', 'Total worker po
 worker_ready_total = controller_counter('worker_ready_total', 'Total worker ready observations', ('status', 'reason'))
 stream_release_total = controller_counter('stream_release_total', 'Total stream release attempts', ('status', 'reason'))
 worker_recovery_total = controller_counter('worker_recovery_total', 'Total worker recovery attempts', ('status', 'reason'))
+workers_deleted_total = controller_counter('workers_deleted_total', 'Total worker pod deletion attempts', ('status', 'reason'))
+worker_replacements_total = controller_counter('worker_replacements_total', 'Total worker pod replacement attempts', ('status', 'reason'))
+orphan_workers_deleted_total = controller_counter('orphan_workers_deleted_total', 'Total orphan worker pod deletion attempts', ('status', 'reason'))
+kubernetes_api_errors_total = controller_counter('kubernetes_api_errors_total', 'Total Kubernetes API errors observed by the controller', ('operation', 'resource', 'reason'))
+state_persistence_errors_total = controller_counter('state_persistence_errors_total', 'Total persisted-state read/write errors', ('operation', 'reason'))
+state_recovery_total = controller_counter('state_recovery_total', 'Total controller state recovery outcomes', ('status', 'reason'))
 proxy_healthcheck_total = controller_counter('proxy_healthcheck_total', 'Total proxy healthcheck evaluations', ('status', 'reason'))
 worker_healthcheck_total = controller_counter('worker_healthcheck_total', 'Total worker healthcheck probes', ('status', 'reason'))
 proxy_rtmp_stats_scrape_errors_total = controller_counter('proxy_rtmp_stats_scrape_errors_total', 'Total proxy RTMP /stats scrape failures', ('proxy_pod',))
@@ -693,6 +701,51 @@ except:
 
 apps = client.AppsV1Api()
 core = client.CoreV1Api()
+
+
+def update_controller_state_gauges_locked() -> None:
+    """Updates controller state gauges from in-memory state.
+
+    Must be called while holding allocation_lock when paired with a state mutation.
+    """
+    controller_active_streams.set(len(stream_registry))
+    controller_active_allocations.set(len(stream_to_worker))
+
+
+def kubernetes_api_error_reason(exc: Exception) -> str:
+    """Maps Kubernetes exceptions to low-cardinality metric reasons."""
+    if isinstance(exc, ApiException):
+        status_reason = {
+            400: "bad_request",
+            401: "unauthorized",
+            403: "forbidden",
+            404: "not_found",
+            409: "conflict",
+            429: "rate_limited",
+        }.get(getattr(exc, "status", None))
+        if status_reason:
+            return status_reason
+        status = getattr(exc, "status", None)
+        if status and status >= 500:
+            return "server_error"
+        return "api_exception"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    return "client_exception"
+
+
+def record_kubernetes_api_error(operation: str, resource: str, exc: Exception) -> None:
+    kubernetes_api_errors_total.labels(
+        operation=operation,
+        resource=resource,
+        reason=kubernetes_api_error_reason(exc),
+    ).inc()
+
+
+def record_worker_delete_metric(status: str, reason: str, *, orphan: bool = False) -> None:
+    workers_deleted_total.labels(status=status, reason=reason).inc()
+    if orphan:
+        orphan_workers_deleted_total.labels(status=status, reason=reason).inc()
 
 
 def timestamp_to_epoch_seconds(value: Any) -> Optional[float]:
@@ -983,6 +1036,15 @@ async def collect_worker_pod_lifecycle_events() -> None:
     while True:
         try:
             await asyncio.to_thread(collect_worker_pod_lifecycle_events_once)
+        except ApiException as e:
+            record_kubernetes_api_error("watch", "pod", e)
+            worker_pod_lifecycle_watch_up.set(0)
+            worker_pod_lifecycle_watch_errors_total.labels(
+                status='watch_error',
+                reason=type(e).__name__,
+            ).inc()
+            logger.warning(f"[WorkerPodEvents] Watch failed; retrying: {e}")
+            await asyncio.sleep(5)
         except Exception as e:
             worker_pod_lifecycle_watch_up.set(0)
             worker_pod_lifecycle_watch_errors_total.labels(
@@ -1049,6 +1111,7 @@ def persist_state_locked() -> None:
         metadata=client.V1ObjectMeta(name=STATE_CONFIGMAP_NAME, namespace=NAMESPACE),
         data={STATE_CONFIGMAP_KEY: json.dumps(payload)}
     )
+    update_controller_state_gauges_locked()
     try:
         core.patch_namespaced_config_map(
             name=STATE_CONFIGMAP_NAME,
@@ -1057,8 +1120,15 @@ def persist_state_locked() -> None:
         )
     except ApiException as e:
         if e.status == 404:
-            core.create_namespaced_config_map(namespace=NAMESPACE, body=body)
+            try:
+                core.create_namespaced_config_map(namespace=NAMESPACE, body=body)
+            except ApiException as create_error:
+                record_kubernetes_api_error("create", "configmap", create_error)
+                state_persistence_errors_total.labels(operation="persist", reason="create_failed").inc()
+                raise
         else:
+            record_kubernetes_api_error("patch", "configmap", e)
+            state_persistence_errors_total.labels(operation="persist", reason="patch_failed").inc()
             raise
 
 
@@ -1073,6 +1143,8 @@ def restore_persisted_state_locked() -> bool:
     except ApiException as e:
         if e.status == 404:
             return False
+        record_kubernetes_api_error("read", "configmap", e)
+        state_persistence_errors_total.labels(operation="restore", reason="read_failed").inc()
         logger.warning(f"[State Recovery] Failed to read state ConfigMap: {e}")
         return False
 
@@ -1083,6 +1155,7 @@ def restore_persisted_state_locked() -> bool:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
+        state_persistence_errors_total.labels(operation="restore", reason="invalid_json").inc()
         logger.warning("[State Recovery] Invalid JSON in persisted state, ignoring.")
         return False
 
@@ -1096,6 +1169,7 @@ def restore_persisted_state_locked() -> bool:
     stream_registry.update(data.get("stream_registry", {}))
     stream_generation.clear()
     stream_generation.update(data.get("stream_generation", {}))
+    update_controller_state_gauges_locked()
     return True
 
 
@@ -1116,7 +1190,11 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
     try:
         pod_name = f"worker-{stream.lower().replace('_','-')[:40]}-{random_suffix()}"
 
-        deployment = apps.read_namespaced_deployment(name=WORKER_DEPLOYMENT, namespace=NAMESPACE)
+        try:
+            deployment = apps.read_namespaced_deployment(name=WORKER_DEPLOYMENT, namespace=NAMESPACE)
+        except ApiException as e:
+            record_kubernetes_api_error("read", "deployment", e)
+            raise
         template = deployment.spec.template
         if not template or not template.spec or not template.spec.containers:
             metric_reason = "invalid_template"
@@ -1169,7 +1247,11 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
             worker_pod=pod_name,
             status=LOG_STATUS_REQUESTED,
         )
-        created_pod = core.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
+        try:
+            created_pod = core.create_namespaced_pod(namespace=NAMESPACE, body=pod_manifest)
+        except ApiException as e:
+            record_kubernetes_api_error("create", "pod", e)
+            raise
         with allocation_lock:
             worker_create_started_at[pod_name] = started_at
             if generation is not None:
@@ -1211,11 +1293,18 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
 
 def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optional[str]:
     """Recria o worker da stream para aplicar novo PROXY_DNS (env imutável em Pod existente)."""
+    replacement_status = "error"
+    replacement_reason = "exception"
     old_worker = stream_to_worker.get(stream)
     if not old_worker:
+        worker_replacements_total.labels(status="skipped", reason="worker_not_found").inc()
         return None
 
-    new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
+    try:
+        new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
+    except Exception as e:
+        worker_replacements_total.labels(status="error", reason="create_failed").inc()
+        raise
     stream_to_worker[stream] = new_worker
     worker_to_stream.pop(old_worker, None)
     cleanup_worker_lifecycle_tracking_locked(old_worker)
@@ -1228,6 +1317,7 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
 
     try:
         core.delete_namespaced_pod(name=old_worker, namespace=NAMESPACE, grace_period_seconds=0)
+        record_worker_delete_metric("success", "replaced")
         log_controller_event(
             "worker_deleted",
             stream=stream,
@@ -1236,6 +1326,8 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
             status=LOG_STATUS_DELETED,
         )
     except ApiException as e:
+        record_kubernetes_api_error("delete", "pod", e)
+        record_worker_delete_metric("warning", "delete_failed")
         log_controller_event(
             "worker_deleted",
             stream=stream,
@@ -1245,6 +1337,11 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
             level=logging.WARNING,
         )
         logger.warning(f"[Handover] Failed deleting old worker pod {old_worker}: {e}")
+
+    update_controller_state_gauges_locked()
+    replacement_status = "success"
+    replacement_reason = "replaced"
+    worker_replacements_total.labels(status=replacement_status, reason=replacement_reason).inc()
 
     logger.info(
         f"[Handover] Replaced worker pod for stream '{stream}' due to proxy change: "
@@ -1363,6 +1460,7 @@ def _try_handover_stream_owner_locked(stream: str, candidate_proxy_pod: str) -> 
             for created_worker_to_delete in created_workers_to_delete:
                 try:
                     core.delete_namespaced_pod(name=created_worker_to_delete, namespace=NAMESPACE, grace_period_seconds=0)
+                    record_worker_delete_metric("success", "rollback")
                     log_controller_event(
                         "worker_deleted",
                         stream=stream,
@@ -1370,7 +1468,9 @@ def _try_handover_stream_owner_locked(stream: str, candidate_proxy_pod: str) -> 
                         worker_pod=created_worker_to_delete,
                         status=LOG_STATUS_DELETED,
                     )
-                except Exception as cleanup_error:
+                except ApiException as cleanup_error:
+                    record_kubernetes_api_error("delete", "pod", cleanup_error)
+                    record_worker_delete_metric("warning", "delete_failed")
                     log_controller_event(
                         "worker_deleted",
                         stream=stream,
@@ -1466,6 +1566,7 @@ async def monitor_stream_registry_health():
                                 worker_health_failures.pop(old_uid, None)
                             try:
                                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
+                                record_worker_delete_metric("success", "proxy_unhealthy")
                                 log_controller_event(
                                     "worker_deleted",
                                     stream=stream,
@@ -1473,7 +1574,20 @@ async def monitor_stream_registry_health():
                                     worker_pod=worker_name,
                                     status=LOG_STATUS_DELETED,
                                 )
+                            except ApiException as e:
+                                record_kubernetes_api_error("delete", "pod", e)
+                                record_worker_delete_metric("warning", "delete_failed")
+                                log_controller_event(
+                                    "worker_deleted",
+                                    stream=stream,
+                                    proxy_pod=proxy_pod,
+                                    worker_pod=worker_name,
+                                    status=LOG_STATUS_DELETE_FAILED,
+                                    level=logging.WARNING,
+                                )
+                                logger.warning(f"[ProxyHealth] Failed deleting worker {worker_name}: {e}")
                             except Exception as e:
+                                record_worker_delete_metric("warning", "delete_failed")
                                 log_controller_event(
                                     "worker_deleted",
                                     stream=stream,
@@ -1484,6 +1598,7 @@ async def monitor_stream_registry_health():
                                 )
                                 logger.warning(f"[ProxyHealth] Failed deleting worker {worker_name}: {e}")
 
+                    update_controller_state_gauges_locked()
                     proxy_health_failures.pop(proxy_pod, None)
                     proxy_ready_since.pop(proxy_pod, None)
                     persist_state_locked()
@@ -1654,6 +1769,11 @@ def scrape_proxy_rtmp_stats(proxy_pod: str, pod_ip: str) -> ProxyRtmpStats:
 async def collect_proxy_rtmp_stats_once() -> None:
     try:
         proxy_pods = await asyncio.to_thread(list_proxy_pods_for_stats)
+    except ApiException as e:
+        record_kubernetes_api_error("list", "pod", e)
+        proxy_rtmp_stats_discovery_errors_total.inc()
+        logger.warning(f"[ProxyRtmpStats] Failed listing proxy pods for /stats scrape: {e}")
+        return
     except Exception as e:
         proxy_rtmp_stats_discovery_errors_total.inc()
         logger.warning(f"[ProxyRtmpStats] Failed listing proxy pods for /stats scrape: {e}")
@@ -1693,7 +1813,11 @@ def resolve_proxy_address(proxy_pod: str) -> str:
     if not proxy_pod:
         raise RuntimeError("proxy_pod is required to resolve proxy address")
 
-    pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
+    try:
+        pod = core.read_namespaced_pod(name=proxy_pod, namespace=NAMESPACE)
+    except ApiException as e:
+        record_kubernetes_api_error("read", "pod", e)
+        raise
     pod_ip = (pod.status.pod_ip or "").strip() if pod and pod.status else ""
     if not pod_ip:
         raise RuntimeError(f"proxy pod '{proxy_pod}' has no assigned pod IP")
@@ -1737,7 +1861,9 @@ def get_proxy_health_status(proxy_pod: str) -> str:
             metric_reason = "ready_delay"
             return "warming_up"
 
-        target = resolve_proxy_address(proxy_pod)
+        target = (pod.status.pod_ip or "").strip() if pod and pod.status else ""
+        if not target:
+            raise RuntimeError(f"proxy pod '{proxy_pod}' has no assigned pod IP")
         response = requests.get(f"http://{target}:8080/health", timeout=PROXY_HEALTHCHECK_TIMEOUT_SECONDS)
         if response.status_code == 200:
             metric_status = "healthy"
@@ -1747,6 +1873,7 @@ def get_proxy_health_status(proxy_pod: str) -> str:
         metric_reason = f"http_{response.status_code}"
         return "unhealthy"
     except ApiException as e:
+        record_kubernetes_api_error("read", "pod", e)
         if e.status == 404:
             metric_status = "unhealthy"
             metric_reason = "pod_not_found"
@@ -1812,17 +1939,23 @@ def recover_state(
     """
     logger.info("[State Recovery] Starting state recovery...")
     
-    with allocation_lock:
-        restored = restore_persisted_state_locked()
-        if restored:
-            logger.info(
-                f"[State Recovery] Restored persisted state with {len(stream_to_worker)} active stream allocations."
-            )
-            return
+    try:
+        with allocation_lock:
+            restored = restore_persisted_state_locked()
+            if restored:
+                state_recovery_total.labels(status="success", reason="restored").inc()
+                logger.info(
+                    f"[State Recovery] Restored persisted state with {len(stream_to_worker)} active stream allocations."
+                )
+                return
 
-        # Sem estado persistido: não reaproveitar pods já existentes.
-        # No modelo por-env (STREAM_KEY/PROXY_DNS), reuso pode carregar config obsoleta.
-        logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
+            state_recovery_total.labels(status="skipped", reason="no_persisted_state").inc()
+            # Sem estado persistido: não reaproveitar pods já existentes.
+            # No modelo por-env (STREAM_KEY/PROXY_DNS), reuso pode carregar config obsoleta.
+            logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
+    except Exception as e:
+        state_recovery_total.labels(status="error", reason="exception").inc()
+        raise
 
 
 async def collect_infrastructure_metrics():
@@ -1940,6 +2073,9 @@ async def monitor_worker_health():
                     continue
 
                 healthy = check_worker_health(worker_pod, pod.status.pod_ip, stream=stream, proxy_pod=owner_proxy)
+            except ApiException as e:
+                record_kubernetes_api_error("read", "pod", e)
+                healthy = False
             except Exception:
                 healthy = False
 
@@ -2037,6 +2173,7 @@ async def monitor_worker_health():
                     )
                     try:
                         core.delete_namespaced_pod(name=new_worker, namespace=NAMESPACE, grace_period_seconds=0)
+                        record_worker_delete_metric("success", "stale_replacement")
                         log_controller_event(
                             "worker_deleted",
                             stream=stream,
@@ -2044,7 +2181,20 @@ async def monitor_worker_health():
                             worker_pod=new_worker,
                             status=LOG_STATUS_DELETED,
                         )
+                    except ApiException as e:
+                        record_kubernetes_api_error("delete", "pod", e)
+                        record_worker_delete_metric("warning", "delete_failed")
+                        log_controller_event(
+                            "worker_deleted",
+                            stream=stream,
+                            proxy_pod=owner_proxy,
+                            worker_pod=new_worker,
+                            status=LOG_STATUS_DELETE_FAILED,
+                            level=logging.WARNING,
+                        )
+                        logger.warning(f"[WorkerHealth] Failed to delete stale replacement pod {new_worker}: {e}")
                     except Exception as e:
+                        record_worker_delete_metric("warning", "delete_failed")
                         log_controller_event(
                             "worker_deleted",
                             stream=stream,
@@ -2059,6 +2209,7 @@ async def monitor_worker_health():
                 if old_worker_to_delete:
                     try:
                         core.delete_namespaced_pod(name=old_worker_to_delete, namespace=NAMESPACE, grace_period_seconds=0)
+                        record_worker_delete_metric("success", "replaced")
                         log_controller_event(
                             "worker_deleted",
                             stream=stream,
@@ -2066,7 +2217,20 @@ async def monitor_worker_health():
                             worker_pod=old_worker_to_delete,
                             status=LOG_STATUS_DELETED,
                         )
+                    except ApiException as e:
+                        record_kubernetes_api_error("delete", "pod", e)
+                        record_worker_delete_metric("warning", "delete_failed")
+                        log_controller_event(
+                            "worker_deleted",
+                            stream=stream,
+                            proxy_pod=owner_proxy,
+                            worker_pod=old_worker_to_delete,
+                            status=LOG_STATUS_DELETE_FAILED,
+                            level=logging.WARNING,
+                        )
+                        logger.warning(f"[WorkerHealth] Failed to delete pod {old_worker_to_delete}: {e}")
                     except Exception as e:
+                        record_worker_delete_metric("warning", "delete_failed")
                         log_controller_event(
                             "worker_deleted",
                             stream=stream,
@@ -2081,6 +2245,7 @@ async def monitor_worker_health():
                 recovery_reason = "replaced"
                 worker_recovery_duration_seconds.observe(time.monotonic() - recovery_started_at)
                 worker_recovery_total.labels(status=recovery_status, reason=recovery_reason).inc()
+                worker_replacements_total.labels(status="success", reason="recovered").inc()
                 logger.info(
                     f"[WorkerHealth] Replaced unhealthy worker for stream '{stream}': "
                     f"old='{worker_pod}' new='{new_worker}' proxy='{owner_proxy}'"
@@ -2095,6 +2260,10 @@ async def sweep_orphan_workers():
 
         try:
             pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker").items
+        except ApiException as e:
+            record_kubernetes_api_error("list", "pod", e)
+            logger.warning(f"[OrphanSweeper] Failed to list worker pods: {e}")
+            continue
         except Exception as e:
             logger.warning(f"[OrphanSweeper] Failed to list worker pods: {e}")
             continue
@@ -2123,8 +2292,20 @@ async def sweep_orphan_workers():
             # Orphan workers have no stream/proxy mapping; required event keys remain present with null context.
             try:
                 core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+                record_worker_delete_metric("success", "orphan", orphan=True)
                 log_controller_event("worker_deleted", worker_pod=pod_name, status=LOG_STATUS_DELETED)
+            except ApiException as e:
+                record_kubernetes_api_error("delete", "pod", e)
+                record_worker_delete_metric("warning", "delete_failed", orphan=True)
+                log_controller_event(
+                    "worker_deleted",
+                    worker_pod=pod_name,
+                    status=LOG_STATUS_DELETE_FAILED,
+                    level=logging.WARNING,
+                )
+                logger.warning(f"[OrphanSweeper] Failed deleting orphan worker pod '{pod_name}': {e}")
             except Exception as e:
+                record_worker_delete_metric("warning", "delete_failed", orphan=True)
                 log_controller_event(
                     "worker_deleted",
                     worker_pod=pod_name,
@@ -2228,6 +2409,7 @@ def allocate_worker(
                 cleanup_worker_lifecycle_tracking_locked(pod_name)
                 try:
                     core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+                    record_worker_delete_metric("success", "concurrent_allocation")
                     log_controller_event(
                         "worker_deleted",
                         stream=stream,
@@ -2236,6 +2418,8 @@ def allocate_worker(
                         status=LOG_STATUS_DELETED,
                     )
                 except ApiException as e:
+                    record_kubernetes_api_error("delete", "pod", e)
+                    record_worker_delete_metric("warning", "delete_failed")
                     log_controller_event(
                         "worker_deleted",
                         stream=stream,
@@ -2263,6 +2447,7 @@ def allocate_worker(
                 cleanup_worker_lifecycle_tracking_locked(pod_name)
                 try:
                     core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
+                    record_worker_delete_metric("success", "stale_allocation")
                     log_controller_event(
                         "worker_deleted",
                         stream=stream,
@@ -2271,6 +2456,8 @@ def allocate_worker(
                         status=LOG_STATUS_DELETED,
                     )
                 except ApiException as e:
+                    record_kubernetes_api_error("delete", "pod", e)
+                    record_worker_delete_metric("warning", "delete_failed")
                     log_controller_event(
                         "worker_deleted",
                         stream=stream,
@@ -2347,12 +2534,14 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 changed = True
             if changed:
                 cleanup_stream_lifecycle_tracking_locked(stream)
+                update_controller_state_gauges_locked()
                 persist_state_locked()
 
         if worker_name:
             logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
             try:
                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
+                record_worker_delete_metric("success", "released")
                 metric_reason = "released"
                 log_controller_event(
                     "worker_deleted",
@@ -2366,6 +2555,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 if e.status == 404:
                     metric_status = "success"
                     metric_reason = "pod_already_deleted"
+                    record_worker_delete_metric("success", "pod_already_deleted")
                     logger.info(f"[Release] Worker pod {worker_name} was already deleted")
                     log_controller_event(
                         "worker_deleted",
@@ -2378,6 +2568,8 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 else:
                     metric_status = "warning"
                     metric_reason = "delete_failed"
+                    record_kubernetes_api_error("delete", "pod", e)
+                    record_worker_delete_metric("warning", "delete_failed")
                     log_controller_event(
                         "worker_deleted",
                         stream=stream,
