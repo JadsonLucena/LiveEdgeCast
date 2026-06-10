@@ -90,6 +90,15 @@ class ProxyRtmpStats:
         return 1 if self.active_streams > 0 else 0
 
 
+@dataclass(frozen=True)
+class StateRestoreResult:
+    restored: bool
+    reason: str
+
+    def __bool__(self) -> bool:
+        return self.restored
+
+
 def sanitize_metadata_value(value: Optional[str]) -> str:
     if value is None:
         return METADATA_DEFAULT_VALUE
@@ -1132,32 +1141,32 @@ def persist_state_locked() -> None:
             raise
 
 
-def restore_persisted_state_locked() -> bool:
+def restore_persisted_state_locked() -> StateRestoreResult:
     """
     Restores persisted state from the ConfigMap.
-    Returns True if state was restored.
+    Returns a low-cardinality result reason for recovery metrics.
     Must be called only while holding allocation_lock.
     """
     try:
         cm = core.read_namespaced_config_map(name=STATE_CONFIGMAP_NAME, namespace=NAMESPACE)
     except ApiException as e:
         if e.status == 404:
-            return False
+            return StateRestoreResult(restored=False, reason="not_found")
         record_kubernetes_api_error("read", "configmap", e)
         state_persistence_errors_total.labels(operation="restore", reason="read_failed").inc()
         logger.warning(f"[State Recovery] Failed to read state ConfigMap: {e}")
-        return False
+        return StateRestoreResult(restored=False, reason="read_failed")
 
     raw = (cm.data or {}).get(STATE_CONFIGMAP_KEY)
     if not raw:
-        return False
+        return StateRestoreResult(restored=False, reason="empty")
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         state_persistence_errors_total.labels(operation="restore", reason="invalid_json").inc()
         logger.warning("[State Recovery] Invalid JSON in persisted state, ignoring.")
-        return False
+        return StateRestoreResult(restored=False, reason="invalid_json")
 
     stream_to_worker.clear()
     stream_to_worker.update(data.get("stream_to_worker", {}))
@@ -1170,7 +1179,7 @@ def restore_persisted_state_locked() -> bool:
     stream_generation.clear()
     stream_generation.update(data.get("stream_generation", {}))
     update_controller_state_gauges_locked()
-    return True
+    return StateRestoreResult(restored=True, reason="restored")
 
 
 def random_suffix():
@@ -1941,18 +1950,25 @@ def recover_state(
     
     try:
         with allocation_lock:
-            restored = restore_persisted_state_locked()
-            if restored:
+            restore_result = restore_persisted_state_locked()
+            if restore_result.restored:
                 state_recovery_total.labels(status="success", reason="restored").inc()
                 logger.info(
                     f"[State Recovery] Restored persisted state with {len(stream_to_worker)} active stream allocations."
                 )
                 return
 
-            state_recovery_total.labels(status="skipped", reason="no_persisted_state").inc()
-            # Sem estado persistido: não reaproveitar pods já existentes.
-            # No modelo por-env (STREAM_KEY/PROXY_DNS), reuso pode carregar config obsoleta.
-            logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
+            if restore_result.reason in ("not_found", "empty"):
+                state_recovery_total.labels(status="skipped", reason="no_persisted_state").inc()
+                # Sem estado persistido: não reaproveitar pods já existentes.
+                # No modelo por-env (STREAM_KEY/PROXY_DNS), reuso pode carregar config obsoleta.
+                logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
+                return
+
+            state_recovery_total.labels(status="error", reason=restore_result.reason).inc()
+            logger.warning(
+                f"[State Recovery] Persisted state restore failed with reason '{restore_result.reason}'."
+            )
     except Exception as e:
         state_recovery_total.labels(status="error", reason="exception").inc()
         raise

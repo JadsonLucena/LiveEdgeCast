@@ -220,7 +220,7 @@ def test_restore_persisted_state_sets_gauges_and_records_invalid_json_metric():
 
     with patch.object(main.core, 'read_namespaced_config_map', return_value=bad_config_map):
         with main.allocation_lock:
-            assert main.restore_persisted_state_locked() is False
+            assert main.restore_persisted_state_locked() == main.StateRestoreResult(restored=False, reason='invalid_json')
 
     assert counter_value(main.state_persistence_errors_total, **invalid_labels) == invalid_before + 1
 
@@ -235,7 +235,7 @@ def test_restore_persisted_state_sets_gauges_and_records_invalid_json_metric():
 
     with patch.object(main.core, 'read_namespaced_config_map', return_value=good_config_map):
         with main.allocation_lock:
-            assert main.restore_persisted_state_locked() is True
+            assert main.restore_persisted_state_locked() == main.StateRestoreResult(restored=True, reason='restored')
 
     assert sample_value(main.controller_active_streams, 'controller_active_streams') == 1
     assert sample_value(main.controller_active_allocations, 'controller_active_allocations') == 1
@@ -248,13 +248,37 @@ def test_recover_state_records_restored_and_missing_outcomes():
     restored_before = counter_value(main.state_recovery_total, **restored_labels)
     skipped_before = counter_value(main.state_recovery_total, **skipped_labels)
 
-    with patch.object(main, 'restore_persisted_state_locked', return_value=True):
+    with patch.object(
+        main,
+        'restore_persisted_state_locked',
+        return_value=main.StateRestoreResult(restored=True, reason='restored'),
+    ):
         main.recover_state()
-    with patch.object(main, 'restore_persisted_state_locked', return_value=False):
+    with patch.object(
+        main,
+        'restore_persisted_state_locked',
+        return_value=main.StateRestoreResult(restored=False, reason='not_found'),
+    ):
         main.recover_state()
 
     assert counter_value(main.state_recovery_total, **restored_labels) == restored_before + 1
     assert counter_value(main.state_recovery_total, **skipped_labels) == skipped_before + 1
+
+
+def test_recover_state_records_restore_failures_without_skipped_metric():
+    reset_state()
+    invalid_json_labels = {'status': 'error', 'reason': 'invalid_json'}
+    skipped_labels = {'status': 'skipped', 'reason': 'no_persisted_state'}
+    invalid_before = counter_value(main.state_recovery_total, **invalid_json_labels)
+    skipped_before = counter_value(main.state_recovery_total, **skipped_labels)
+
+    bad_config_map = SimpleNamespace(data={main.STATE_CONFIGMAP_KEY: '{bad json'})
+
+    with patch.object(main.core, 'read_namespaced_config_map', return_value=bad_config_map):
+        main.recover_state()
+
+    assert counter_value(main.state_recovery_total, **invalid_json_labels) == invalid_before + 1
+    assert counter_value(main.state_recovery_total, **skipped_labels) == skipped_before
 
 
 def test_release_worker_records_delete_and_api_error_metrics():
