@@ -106,6 +106,7 @@ ffmpeg \
   -loglevel warning \
   -nostats \
   -rw_timeout 5000000 \
+  -progress "/tmp/ffmpeg_${STREAM_KEY}.progress" \
   -i "$PROXY_RTMP" \
   -c:v copy \
   -c:a copy \
@@ -122,6 +123,7 @@ if wait "$FFMPEG_PID"; then
 else
   EXIT_CODE=$?
 fi
+echo "$EXIT_CODE" > "/tmp/ffmpeg_${STREAM_KEY}.exit"
 
 if progress_file_has_complete_line; then
   notify_first_progress_once || true
