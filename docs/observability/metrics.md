@@ -278,9 +278,9 @@ pelo Prometheus, como `pod`, `namespace`, `job` e `instance`.
 | `stream_release_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Duração do release/cleanup de worker. | Medir custo de teardown e estabilização entre repetições. |
 | `stream_release_total` | Counter | `status`, `reason` | eventos | Baixa. | Tentativas de release e resultado. | Confirmar limpeza após cada cenário. |
 | `stream_proxy_handover_total` | Counter | nenhum específico | handovers | Uma série por metadados controlados. | Handovers efetivos aceitos entre proxies. | Numerador recomendado para handover rate efetivo. |
-| `handover_attempts_total` | Counter | nenhum específico | tentativas | Uma série por metadados controlados. | Avaliações de ownership/handover. | Denominador para taxa de sucesso/conflito. |
+| `handover_attempts_total` | Counter | nenhum específico | avaliações | Uma série por metadados controlados. | Avaliações de ownership/handover, incluindo primeiro registro e refresh do mesmo owner. | Normalizar volume por carga de ownership; não usar como denominador de aceite de handover efetivo. |
 | `handover_success_total` | Counter | nenhum específico | tentativas | Uma série por metadados controlados. | Avaliações aceitas, incluindo primeiro registro sem owner anterior. | Use com cautela; para handover entre proxies prefira `stream_proxy_handover_total`. |
-| `handover_conflict_total` | Counter | nenhum específico | conflitos | Uma série por metadados controlados. | Handovers negados porque o owner atual permanece elegível. | Taxa de conflitos e segurança de ownership. |
+| `handover_conflict_total` | Counter | nenhum específico | conflitos | Uma série por metadados controlados. | Tentativas de troca negadas porque o owner atual permanece elegível. | Denominador, junto com `stream_proxy_handover_total`, para taxas de aceite/conflito em trocas reais. |
 
 ### Métricas de recuperação, saúde e órfãos
 

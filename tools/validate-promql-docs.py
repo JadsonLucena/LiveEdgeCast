@@ -167,6 +167,26 @@ def check_allocation_replay_filter(blocks: list[tuple[int, str]]) -> None:
             )
 
 
+def check_handover_denominator_guidance(blocks: list[tuple[int, str]]) -> None:
+    text = PROMQL_DOC.read_text(encoding="utf-8")
+    if "não é denominador de taxa de aceite de handover" not in text:
+        fail("handover docs must state handover_attempts_total is not the effective handover acceptance denominator")
+    if "stream_proxy_handover_total + handover_conflict_total" not in text:
+        fail("handover docs must define real owner-change denominator as stream_proxy_handover_total + handover_conflict_total")
+    if "não mede taxa de aceite de handover efetivo" not in text:
+        fail("handover docs must label handover_attempts_total ratios as ownership-evaluation normalization only")
+
+    has_owner_change_ratio = any(
+        "stream_proxy_handover_total" in body
+        and "handover_conflict_total" in body
+        and "+" in body
+        and "/" in body
+        for _, body in blocks
+    )
+    if not has_owner_change_ratio:
+        fail("handover docs must include an acceptance ratio over real owner-change events")
+
+
 def check_worker_pods_available_wording() -> None:
     text = METRICS_DOC.read_text(encoding="utf-8")
     if "não usar como capacidade livre de alocação" not in text:
@@ -186,6 +206,7 @@ def main() -> int:
     check_non_ready_query_uses_kube_state_metrics(promql_blocks)
     check_missing_worker_health_coalesces_to_zero(promql_blocks)
     check_allocation_replay_filter(promql_blocks)
+    check_handover_denominator_guidance(promql_blocks)
     check_worker_pods_available_wording()
     print(f"Validated {len(promql_blocks)} PromQL snippets in {PROMQL_DOC.relative_to(ROOT)}")
     return 0

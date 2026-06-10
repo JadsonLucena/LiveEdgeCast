@@ -149,10 +149,13 @@ sum by (reason) (
 
 ## Handover rate
 
-A taxa de handover deve distinguir tentativas, aceitações e conflitos. O contador
-`handover_attempts_total` inclui avaliações de ownership; `stream_proxy_handover_total`
-representa handovers efetivos entre proxies; `handover_conflict_total` representa
-negações por conflito de owner saudável.
+A taxa de handover deve distinguir avaliações de ownership, mudanças reais de
+owner e conflitos. O contador `handover_attempts_total` é incrementado antes de
+saber se a chamada é primeiro registro, refresh do mesmo owner ou tentativa real
+de troca de proxy; portanto ele não é denominador de taxa de aceite de handover
+efetivo. `stream_proxy_handover_total` representa handovers aceitos entre proxies
+e `handover_conflict_total` representa tentativas de troca negadas por owner
+saudável.
 
 ### Handovers efetivos por segundo
 
@@ -173,18 +176,47 @@ sum(rate(handover_success_total[5m]))
 clamp_min(sum(rate(handover_attempts_total[5m])), 1e-9)
 ```
 
-### Taxa de handover efetivo entre proxies
+### Taxa de aceite de troca real entre proxies
+
+Esta razão usa como denominador apenas eventos que indicam tentativa de mudança
+de owner observável (`stream_proxy_handover_total + handover_conflict_total`):
+handover aceito entre proxies ou conflito negado. Ela evita
+diluir o resultado com primeiro registro de stream e refresh idempotente do mesmo
+owner. A implementação atual não exporta um contador separado para tentativas de
+troca que falham por exceção antes de aceitar/negar; se esse detalhe for
+necessário para o artigo, instrumente um contador dedicado de tentativa de troca
+de owner.
 
 ```promql
 sum(rate(stream_proxy_handover_total[5m]))
 /
-clamp_min(sum(rate(handover_attempts_total[5m])), 1e-9)
+clamp_min(
+  sum(rate(stream_proxy_handover_total[5m]))
+  + sum(rate(handover_conflict_total[5m])),
+  1e-9
+)
 ```
 
-### Taxa de conflito de handover
+### Taxa de conflito em tentativas reais de troca
 
 ```promql
 sum(rate(handover_conflict_total[5m]))
+/
+clamp_min(
+  sum(rate(stream_proxy_handover_total[5m]))
+  + sum(rate(handover_conflict_total[5m])),
+  1e-9
+)
+```
+
+### Handovers aceitos normalizados por avaliações de ownership
+
+Use esta consulta apenas como métrica de volume relativo à carga de avaliações de
+ownership. Ela não mede taxa de aceite de handover efetivo, pois o denominador
+inclui registros iniciais e refreshes do mesmo owner.
+
+```promql
+sum(rate(stream_proxy_handover_total[5m]))
 /
 clamp_min(sum(rate(handover_attempts_total[5m])), 1e-9)
 ```

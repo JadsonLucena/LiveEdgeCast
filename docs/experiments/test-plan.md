@@ -21,7 +21,7 @@ com o catálogo de métricas e as consultas PromQL de `docs/observability`.
 | --- | --- | --- |
 | H1: o sistema inicia streams dentro do orçamento definido. | P50/P95/P99 de `stream_lifecycle_phase_seconds{phase="proxy_to_first_progress"}`. | `histogram_quantile()` sobre buckets do histograma. |
 | H2: a alocação é confiável sob carga. | `stream_allocation_total{status="success"} / stream_allocation_total`. | Taxa de sucesso de alocação. |
-| H3: handover preserva ownership sem limpar stream ativo de outro proxy. | `stream_proxy_handover_total`, `handover_conflict_total`, `stale_ended_events_ignored_total`. | Taxa de handover e conflitos. |
+| H3: handover preserva ownership sem limpar stream ativo de outro proxy. | `stream_proxy_handover_total`, `handover_conflict_total`, `stale_ended_events_ignored_total`. | Taxa de aceite/conflito em trocas reais usando `stream_proxy_handover_total + handover_conflict_total` como denominador. |
 | H4: recuperação de worker tem MTTR aceitável. | P95 e média de `worker_recovery_duration_seconds` para tentativas de recovery, acompanhados de `worker_recovery_total{status="success",reason="replaced"}`. | MTTR por histograma e taxa de sucesso por contador. |
 | H5: uso de recursos cresce de forma proporcional à carga. | CPU, memória e rede por componente via cAdvisor/kubelet. | Agregações por `component`. |
 
@@ -106,9 +106,13 @@ com o catálogo de métricas e as consultas PromQL de `docs/observability`.
 2. Tornar o owner inelegível, por exemplo removendo o Pod ou fazendo healthcheck
    falhar.
 3. Reenviar/publicar pelo proxy candidato e observar `stream_proxy_handover_total`.
-4. Verificar que eventos `ended` obsoletos são ignorados e que conflitos são
+4. Calcular aceite/conflito de troca real com denominador
+   `stream_proxy_handover_total + handover_conflict_total`; não usar
+   `handover_attempts_total` como denominador de aceite, pois ele também inclui
+   registros iniciais e refreshes do mesmo owner.
+5. Verificar que eventos `ended` obsoletos são ignorados e que conflitos são
    registrados quando o owner original ainda está saudável.
-5. Coletar tempo até worker recriado/apontado para o novo proxy.
+6. Coletar tempo até worker recriado/apontado para o novo proxy.
 
 ### Cenário E: restart do controller e reconciliação
 
@@ -201,7 +205,7 @@ Modelo recomendado:
 | Cold start P95 `proxy_to_first_progress` | `<= X s` |
 | Cold start P99 `proxy_to_first_progress` | `<= Y s` |
 | MTTR P95 de worker | `<= Z s` |
-| Handover conflict rate em owner saudável | `<= A%` |
+| Handover conflict rate em tentativas reais de troca | `<= A%` |
 | Erro de alocação sem falha induzida | `<= B%` |
 | CPU média por componente no nível nominal | `<= C cores` |
 | Memória P95 por componente no nível nominal | `<= D GiB` |
