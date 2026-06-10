@@ -206,7 +206,7 @@ Derived Prometheus metrics:
 | --- | --- | --- |
 | `stream_lifecycle_timestamp_observed_total` | `timestamp`, `source` plus controlled metadata | Count of lifecycle timestamp observations accepted by the controller. |
 | `stream_lifecycle_phase_seconds` | `phase`, `start_timestamp`, `end_timestamp` plus controlled metadata | Histogram of derived phase durations once both timestamps are present and neither endpoint is approximate. |
-| `stream_lifecycle_phase_observations_total` | `phase`, `status`, `reason` plus controlled metadata | Count of derived phase observations, including pending phases with approximate endpoints and ignored negative durations caused by clock skew. |
+| `stream_lifecycle_phase_observations_total` | `phase`, `status`, `reason` plus controlled metadata | Count of derived phase observations after both endpoints are present, including pending phases with approximate endpoints and ignored negative durations caused by clock skew. Missing lifecycle endpoints do not increment this counter in the current implementation. |
 | `worker_pod_lifecycle_watch_errors_total` | `status`, `reason` plus controlled metadata | Count of worker Pod lifecycle watch failures or per-event processing failures. |
 | `worker_pod_lifecycle_watch_up` | Controlled metadata only | `1` when the worker Pod lifecycle watch loop is active, `0` after a watch failure until the next successful watch starts. |
 
@@ -237,3 +237,121 @@ Current approximations and observability limits:
 - Kubernetes does not expose an exact image pull completion or user-process start
   timestamp in this controller, so `t_worker_container_started` is the container
   runtime `startedAt` value from `containerStatuses`.
+
+## Catálogo detalhado para dashboards e artigo
+
+As tabelas abaixo consolidam tipo, labels, unidade, cardinalidade esperada,
+interpretação operacional e uso recomendado no artigo. Todas as métricas do
+controller recebem também os labels controlados `tenant`, `environment` e
+`region`; eles são omitidos das colunas quando não forem específicos da métrica.
+Métricas do worker são exportadas por Pod e ganham labels de target adicionados
+pelo Prometheus, como `pod`, `namespace`, `job` e `instance`.
+
+### Métricas de lifecycle e cold start
+
+| Métrica | Tipo | Labels específicos | Unidade | Cardinalidade esperada | Interpretação | Uso no artigo |
+| --- | --- | --- | --- | --- | --- | --- |
+| `stream_lifecycle_timestamp_observed_total` | Counter | `timestamp`, `source` | eventos | Baixa: 9 timestamps × poucas fontes × metadados controlados. | Conta timestamps de lifecycle aceitos pelo controller. Crescimento desigual por timestamp indica perda de observabilidade em algum marco. | Relatar completude da instrumentação e volume de amostras por fase. |
+| `stream_lifecycle_phase_seconds` | Histogram | `phase`, `start_timestamp`, `end_timestamp` | segundos | Baixa: fases derivadas fixas × buckets × metadados controlados. | Duração de fases de startup quando ambos endpoints são exatos. A fase `proxy_to_first_progress` é o cold start fim-a-fim. | Base principal para P50/P95/P99 de cold start e decomposição de latência. |
+| `stream_lifecycle_phase_observations_total` | Counter | `phase`, `status`, `reason` | eventos | Baixa: fases fixas × status/razões controladas. | Conta observações derivadas após ambos endpoints estarem presentes, inclusive fases pendentes por endpoint aproximado ou descartadas por duração negativa; timestamps ausentes não incrementam este contador na implementação atual. | Denominador parcial de qualidade dos dados; combine com contadores de timestamps observados para reportar perdas e limitações de medição. |
+| `worker_pod_lifecycle_watch_errors_total` | Counter | `status`, `reason` | eventos | Baixa: razões controladas. | Falhas do watch de eventos/status de Pods de worker. | Evidência de confiabilidade da coleta de timestamps Kubernetes. |
+| `worker_pod_lifecycle_watch_up` | Gauge | nenhum específico | booleano `0/1` | Uma série por combinação de metadados controlados. | `1` quando o loop de watch está ativo; `0` após falha até reinício do watch. | Filtro de validade para experimentos de cold start. |
+
+### Métricas de eventos, alocação e handover
+
+| Métrica | Tipo | Labels específicos | Unidade | Cardinalidade esperada | Interpretação | Uso no artigo |
+| --- | --- | --- | --- | --- | --- | --- |
+| `stream_started_events_total` | Counter | `status`, `reason` | eventos | Baixa: status e razões controladas. | Eventos `/streams/started` aceitos, replays e erros. | Validar carga aplicada e idempotência durante repetições. |
+| `stream_ended_events_total` | Counter | `status`, `reason` | eventos | Baixa. | Eventos `/streams/ended` aceitos, replays e erros. | Validar encerramento de sessões e limpeza de estado. |
+| `stale_ended_events_ignored_total` | Counter | `status`, `reason` | eventos | Baixa. | Eventos de fim obsoletos ignorados para evitar cleanup indevido. | Quantificar efeitos de reordenação de eventos e handover. |
+| `idempotent_replay_total` | Counter | `status`, `reason` | eventos | Baixa. | Replays idempotentes detectados em endpoints críticos. | Separar retries esperados de falhas reais nas taxas do artigo. |
+| `stream_event_to_controller_seconds` | Histogram | `event` | segundos | Baixa: `started`/`ended` × buckets. | Tempo de processamento do controller por evento de stream. | Latência do plano de controle, não cold start completo. |
+| `stream_event_to_controller_total` | Counter | `event`, `status`, `reason` | eventos | Baixa. | Contagem de eventos processados por tipo e resultado. | Denominador para taxas de erro por endpoint. |
+| `stream_registration_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Duração da etapa de registro/refresh de owner. | Decompor overhead do controller antes da alocação. |
+| `stream_registration_total` | Counter | `status`, `reason` | eventos | Baixa. | Tentativas de registro de stream. | Taxa de sucesso de registro. |
+| `stream_allocation_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Duração do fluxo de alocação de worker. | P95 de alocação e contribuição para cold start. |
+| `stream_allocation_total` | Counter | `status`, `reason` | eventos | Baixa. | Tentativas de alocação, incluindo sucesso, replay idempotente e erros. | Métrica principal de allocation success. |
+| `worker_create_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Duração da chamada de criação de Pod de worker. | Separar overhead de API Kubernetes do tempo de scheduling. |
+| `worker_create_total` | Counter | `status`, `reason` | eventos | Baixa. | Tentativas de criação de worker e causas de falha. | Diagnóstico de falhas de alocação. |
+| `worker_ready_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Tempo da criação do worker até primeira observação Ready pelo controller. | Aproximação operacional de readiness para comparar cenários. |
+| `worker_ready_total` | Counter | `status`, `reason` | eventos | Baixa. | Observações de Ready e respectivas razões. | Validar se workers chegaram a Ready em cada repetição. |
+| `stream_release_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Duração do release/cleanup de worker. | Medir custo de teardown e estabilização entre repetições. |
+| `stream_release_total` | Counter | `status`, `reason` | eventos | Baixa. | Tentativas de release e resultado. | Confirmar limpeza após cada cenário. |
+| `stream_proxy_handover_total` | Counter | nenhum específico | handovers | Uma série por metadados controlados. | Handovers efetivos aceitos entre proxies. | Numerador recomendado para handover rate efetivo. |
+| `handover_attempts_total` | Counter | nenhum específico | avaliações | Uma série por metadados controlados. | Avaliações de ownership/handover, incluindo primeiro registro e refresh do mesmo owner. | Normalizar volume por carga de ownership; não usar como denominador de aceite de handover efetivo. |
+| `handover_success_total` | Counter | nenhum específico | tentativas | Uma série por metadados controlados. | Avaliações aceitas, incluindo primeiro registro sem owner anterior. | Use com cautela; para handover entre proxies prefira `stream_proxy_handover_total`. |
+| `handover_conflict_total` | Counter | nenhum específico | conflitos | Uma série por metadados controlados. | Tentativas de troca negadas porque o owner atual permanece elegível. | Denominador, junto com `stream_proxy_handover_total`, para taxas de aceite/conflito em trocas reais. |
+
+### Métricas de recuperação, saúde e órfãos
+
+| Métrica | Tipo | Labels específicos | Unidade | Cardinalidade esperada | Interpretação | Uso no artigo |
+| --- | --- | --- | --- | --- | --- | --- |
+| `worker_recovery_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Duração de todas as tentativas de recuperar worker não saudável; o resultado fica no contador separado `worker_recovery_total`. | MTTR médio/P95 operacional de tentativas de recovery, sem segmentação direta por status. |
+| `worker_recovery_total` | Counter | `status`, `reason` | eventos | Baixa. | Resultado de tentativas de recuperação: substituído, erro ou estado obsoleto. | Taxa de recuperação bem-sucedida e causas de falha. |
+| `proxy_healthcheck_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Tempo para avaliar healthcheck de proxies. | Contexto para cenários de failover/handover. |
+| `proxy_healthcheck_total` | Counter | `status`, `reason` | eventos | Baixa. | Avaliações de saúde de proxy por resultado. | Evidenciar quando handover foi motivado por proxy não saudável. |
+| `worker_healthcheck_duration_seconds` | Histogram | nenhum específico | segundos | Baixa. | Duração de probes `/health` nos workers. | Contexto para detecção de falha antes do MTTR. |
+| `worker_healthcheck_total` | Counter | `status`, `reason` | eventos | Baixa. | Probes de saúde de worker por resultado. | Taxa de falha que dispara recuperação. |
+| `worker_pods_available` | Gauge | `namespace` | pods | Muito baixa: um namespace por ambiente. | Número de Pods de worker com condição `Ready=True`; a implementação atual não subtrai workers já associados a streams. | Readiness/capacidade bruta observada; não usar como capacidade livre de alocação. |
+| `pod_ready_status` | Gauge | `pod`, `namespace` | booleano `0/1` | Média: um por Pod proxy/worker. | Readiness agregada do Pod conforme status Kubernetes. | Smoke test; para séries do artigo, agregar por componente. |
+
+O controller não expõe uma métrica dedicada de órfãos. Órfãos são observáveis por
+logs estruturados de `worker_deleted` sem stream associado e por aproximações em
+PromQL comparando workers vivos, readiness e atividade FFmpeg/RTMP. Essa lacuna
+deve ser reportada como limitação de observabilidade quando o artigo discutir
+limpeza de estado.
+
+### Métricas de proxy RTMP e ativos
+
+| Métrica | Tipo | Labels específicos | Unidade | Cardinalidade esperada | Interpretação | Uso no artigo |
+| --- | --- | --- | --- | --- | --- | --- |
+| `proxy_rtmp_active_streams` | Gauge | `proxy_pod` | streams | Média: uma série por proxy ativo. | Quantidade de streams ativos por proxy conforme `/stats`. | Carga efetiva e denominador para normalizar handover. |
+| `proxy_rtmp_active_publishers` | Gauge | `proxy_pod` | publishers | Média: uma série por proxy ativo. | Clientes publicadores ativos por proxy. | Validar que a carga injetada chegou ao RTMP. |
+| `proxy_rtmp_active_clients` | Gauge | `proxy_pod` | clientes | Média: uma série por proxy ativo. | Clientes RTMP totais por proxy. | Indicador de fan-in/fan-out RTMP. |
+| `proxy_rtmp_stream_active` | Gauge | `proxy_pod` | booleano `0/1` | Média: uma série por proxy ativo. | Indica se o proxy tem ao menos um stream. | Presença de atividade por proxy. |
+| `proxy_rtmp_stats_up` | Gauge | `proxy_pod` | booleano `0/1` | Média: uma série por proxy ativo. | Sucesso do último scrape `/stats` por proxy. | Filtro de validade para métricas RTMP. |
+| `proxy_rtmp_stats_scrape_errors_total` | Counter | `proxy_pod` | erros | Média: uma série por proxy ativo. | Falhas de fetch/parse do `/stats` por proxy. | Qualidade da observabilidade RTMP. |
+| `proxy_rtmp_stats_discovery_errors_total` | Counter | nenhum específico | erros | Uma série por metadados controlados. | Falhas ao listar Pods de proxy antes do scrape. | Limitação de coleta em janelas com falha Kubernetes/API. |
+| `proxy_active_connections` | Gauge | `proxy_pod` | conexões | Média. | Conexões RTMP ativas quando coletadas pelo controller. | Indicador auxiliar; prefira `/stats` para contagem de clientes. |
+| `proxy_bandwidth_mbps` | Gauge | `proxy_pod` | megabits/s | Média. | Banda atual por proxy quando coletada. | Contexto de carga; valide origem antes de usar como métrica primária. |
+
+### Métricas do worker FFmpeg
+
+| Métrica | Tipo | Labels específicos | Unidade | Cardinalidade esperada | Interpretação | Uso no artigo |
+| --- | --- | --- | --- | --- | --- | --- |
+| `worker_ffmpeg_running` | Gauge | nenhum no exporter; target adiciona `pod`/`namespace`. | booleano `0/1` | Média: uma série por worker vivo. | PID file aponta para processo FFmpeg em execução. | Confirmar ativação do worker após alocação. |
+| `worker_ffmpeg_health_state` | Gauge | target labels | booleano `0/1` | Média. | FFmpeg está rodando e progresso recente não está stale. | Indicador de worker ativo/saudável e aproximação para órfãos. |
+| `worker_ffmpeg_last_progress_timestamp_seconds` | Gauge | target labels | Unix timestamp em segundos | Média. | Momento, no relógio do exporter, da última linha completa de progresso. | Diagnóstico de staleness; não usar como timestamp de cold start. |
+| `worker_ffmpeg_progress_age_seconds` | Gauge | target labels | segundos | Média. | Idade do último progresso. | Detectar congelamento de processamento. |
+| `worker_ffmpeg_out_time_seconds` | Gauge | target labels | segundos de mídia | Média. | Último `out_time` do FFmpeg convertido para segundos. | Evidenciar avanço de transcodificação durante o experimento. |
+| `worker_ffmpeg_total_size_bytes` | Gauge | target labels | bytes | Média. | Último `total_size` reportado pelo FFmpeg. | Volume de saída processado. |
+| `worker_ffmpeg_speed` | Gauge | target labels | multiplicador `x` | Média. | Velocidade de processamento relativa ao tempo real. | Métrica de desempenho do worker. |
+| `worker_ffmpeg_exit_total` | Counter | `exit_code` mais target labels | saídas | Média: exit codes controlados por worker. | Saídas únicas de FFmpeg observadas pelo exporter. | Falhas de processamento por repetição. |
+| `worker_ffmpeg_exporter_errors_total` | Counter | `stage` mais target labels | erros | Baixa por worker: estágios controlados. | Erros de leitura/persistência do exporter. | Qualidade da telemetria do worker. |
+
+### Métricas de recursos
+
+| Métrica | Tipo | Labels específicos | Unidade | Cardinalidade esperada | Interpretação | Uso no artigo |
+| --- | --- | --- | --- | --- | --- | --- |
+| `pod_cpu_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média: proxy/worker por Pod. | Declarada pelo controller, mas não populada pelo coletor atual. | Não usar no artigo até haver coleta implementada; preferir cAdvisor `container_cpu_usage_seconds_total`. |
+| `pod_memory_usage_bytes` | Gauge | `pod`, `namespace` | bytes | Média. | Uso de memória estimado/coletado por Pod. | Apenas contexto; a implementação pode aproximar valor por limite. |
+| `pod_memory_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média. | Percentual de memória do limite; a implementação atual usa aproximação quando só o limite é conhecido. | Não usar como métrica primária de consumo sem validar origem. |
+| `pod_network_io_bytes_total` | Counter | `pod`, `direction` | bytes | Média: Pod × direção. | Declarada pelo controller, mas não incrementada pelo coletor atual. | Não usar no artigo até haver coleta implementada; preferir cAdvisor por componente. |
+
+As métricas de recurso emitidas pelo controller são auxiliares. Para resultados
+quantitativos do artigo, use cAdvisor/kubelet como fonte primária; `pod_cpu_usage_percent`
+e `pod_network_io_bytes_total` não devem ser consideradas disponíveis enquanto o
+coletor atual não as preencher.
+
+### Cardinalidade e retenção de labels
+
+- **Baixa cardinalidade**: labels com enumeração fixa (`status`, `reason`,
+  `phase`, `timestamp`, `event`) e metadados controlados. São seguros para
+  alertas e agregações de longo prazo.
+- **Cardinalidade média**: labels por Pod (`pod`, `proxy_pod`) variam com escala e
+  rollouts. Use para troubleshooting e agregue por componente no artigo.
+- **Labels proibidos em métricas**: `stream`, `streamKey`, `generation`,
+  `worker_pod` em histogramas de lifecycle e identificadores de sessão. Eles
+  aparecem em logs estruturados para correlação, mas não em Prometheus.
+- **Unidades**: métricas terminadas em `_seconds` usam segundos; `_bytes` usa
+  bytes; `_total` é contador acumulado; gauges booleanos usam `0` ou `1`.
