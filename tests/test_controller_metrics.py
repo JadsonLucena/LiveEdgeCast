@@ -184,6 +184,188 @@ def test_unlabeled_counter_direct_inc_uses_controlled_metadata(monkeypatch):
     assert sample_value(counter, 'test_direct_inc_counter_total', labels) == before + 1
 
 
+def test_controller_state_gauges_update_from_locked_state():
+    reset_state()
+    main.stream_registry.update({'live-1': {'proxy_pod': 'proxy-1'}, 'live-2': {'proxy_pod': 'proxy-2'}})
+    main.stream_to_worker['live-1'] = 'worker-1'
+
+    with main.allocation_lock:
+        main.update_controller_state_gauges_locked()
+
+    assert sample_value(main.controller_active_streams, 'controller_active_streams') == 2
+    assert sample_value(main.controller_active_allocations, 'controller_active_allocations') == 1
+
+
+def test_persist_state_records_persistence_and_kubernetes_error_metrics():
+    reset_state()
+    labels = {'operation': 'persist', 'reason': 'patch_failed'}
+    kube_labels = {'operation': 'patch', 'resource': 'configmap', 'reason': 'server_error'}
+    before = counter_value(main.state_persistence_errors_total, **labels)
+    kube_before = counter_value(main.kubernetes_api_errors_total, **kube_labels)
+
+    with patch.object(main.core, 'patch_namespaced_config_map', side_effect=ApiException(status=500)):
+        with pytest.raises(ApiException):
+            with main.allocation_lock:
+                main.persist_state_locked()
+
+    assert counter_value(main.state_persistence_errors_total, **labels) == before + 1
+    assert counter_value(main.kubernetes_api_errors_total, **kube_labels) == kube_before + 1
+
+
+def test_restore_persisted_state_sets_gauges_and_records_invalid_json_metric():
+    reset_state()
+    invalid_labels = {'operation': 'restore', 'reason': 'invalid_json'}
+    invalid_before = counter_value(main.state_persistence_errors_total, **invalid_labels)
+    bad_config_map = SimpleNamespace(data={main.STATE_CONFIGMAP_KEY: '{bad json'})
+
+    with patch.object(main.core, 'read_namespaced_config_map', return_value=bad_config_map):
+        with main.allocation_lock:
+            assert main.restore_persisted_state_locked() == main.StateRestoreResult(restored=False, reason='invalid_json')
+
+    assert counter_value(main.state_persistence_errors_total, **invalid_labels) == invalid_before + 1
+
+    restored_payload = {
+        'stream_to_worker': {'live': 'worker-a'},
+        'worker_to_stream': {'worker-a': 'live'},
+        'stream_to_proxy': {'live': 'proxy-1'},
+        'stream_registry': {'live': {'proxy_pod': 'proxy-1'}},
+        'stream_generation': {'live': 3},
+    }
+    good_config_map = SimpleNamespace(data={main.STATE_CONFIGMAP_KEY: json.dumps(restored_payload)})
+
+    with patch.object(main.core, 'read_namespaced_config_map', return_value=good_config_map):
+        with main.allocation_lock:
+            assert main.restore_persisted_state_locked() == main.StateRestoreResult(restored=True, reason='restored')
+
+    assert sample_value(main.controller_active_streams, 'controller_active_streams') == 1
+    assert sample_value(main.controller_active_allocations, 'controller_active_allocations') == 1
+
+
+def test_recover_state_records_restored_and_missing_outcomes():
+    reset_state()
+    restored_labels = {'status': 'success', 'reason': 'restored'}
+    skipped_labels = {'status': 'skipped', 'reason': 'no_persisted_state'}
+    restored_before = counter_value(main.state_recovery_total, **restored_labels)
+    skipped_before = counter_value(main.state_recovery_total, **skipped_labels)
+
+    with patch.object(
+        main,
+        'restore_persisted_state_locked',
+        return_value=main.StateRestoreResult(restored=True, reason='restored'),
+    ):
+        main.recover_state()
+    with patch.object(
+        main,
+        'restore_persisted_state_locked',
+        return_value=main.StateRestoreResult(restored=False, reason='not_found'),
+    ):
+        main.recover_state()
+
+    assert counter_value(main.state_recovery_total, **restored_labels) == restored_before + 1
+    assert counter_value(main.state_recovery_total, **skipped_labels) == skipped_before + 1
+
+
+def test_recover_state_records_restore_failures_without_skipped_metric():
+    reset_state()
+    invalid_json_labels = {'status': 'error', 'reason': 'invalid_json'}
+    skipped_labels = {'status': 'skipped', 'reason': 'no_persisted_state'}
+    invalid_before = counter_value(main.state_recovery_total, **invalid_json_labels)
+    skipped_before = counter_value(main.state_recovery_total, **skipped_labels)
+
+    bad_config_map = SimpleNamespace(data={main.STATE_CONFIGMAP_KEY: '{bad json'})
+
+    with patch.object(main.core, 'read_namespaced_config_map', return_value=bad_config_map):
+        main.recover_state()
+
+    assert counter_value(main.state_recovery_total, **invalid_json_labels) == invalid_before + 1
+    assert counter_value(main.state_recovery_total, **skipped_labels) == skipped_before
+
+
+def test_release_worker_records_delete_and_api_error_metrics():
+    reset_state()
+    main.stream_to_worker['live'] = 'worker-a'
+    main.worker_to_stream['worker-a'] = 'live'
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_generation['live'] = 1
+    delete_labels = {'status': 'warning', 'reason': 'delete_failed'}
+    kube_labels = {'operation': 'delete', 'resource': 'pod', 'reason': 'forbidden'}
+    delete_before = counter_value(main.workers_deleted_total, **delete_labels)
+    kube_before = counter_value(main.kubernetes_api_errors_total, **kube_labels)
+
+    with patch.object(main, 'persist_state_locked', return_value=None), \
+         patch.object(main.core, 'delete_namespaced_pod', side_effect=ApiException(status=403)):
+        result = asyncio.run(main.release_worker(stream='live'))
+
+    assert result['status'] == 'released'
+    assert counter_value(main.workers_deleted_total, **delete_labels) == delete_before + 1
+    assert counter_value(main.kubernetes_api_errors_total, **kube_labels) == kube_before + 1
+    assert sample_value(main.controller_active_streams, 'controller_active_streams') == 0
+    assert sample_value(main.controller_active_allocations, 'controller_active_allocations') == 0
+
+
+def test_create_worker_pod_records_kubernetes_create_error_metric():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_generation['live'] = 1
+    container = SimpleNamespace(env=[])
+    template = SimpleNamespace(spec=SimpleNamespace(containers=[container]), metadata=SimpleNamespace(labels={}))
+    deployment = SimpleNamespace(spec=SimpleNamespace(template=template))
+    labels = {'operation': 'create', 'resource': 'pod', 'reason': 'rate_limited'}
+    before = counter_value(main.kubernetes_api_errors_total, **labels)
+
+    with patch.object(main, 'random_suffix', return_value='abcde'), \
+         patch.object(main.apps, 'read_namespaced_deployment', return_value=deployment), \
+         patch.object(main.core, 'create_namespaced_pod', side_effect=ApiException(status=429)):
+        with pytest.raises(ApiException):
+            main.create_worker_pod_for_stream(stream='live', proxy_dns='10.0.0.1')
+
+    assert counter_value(main.kubernetes_api_errors_total, **labels) == before + 1
+
+
+def test_replace_worker_records_replacement_and_delete_metrics():
+    reset_state()
+    main.stream_to_worker['live'] = 'worker-old'
+    main.worker_to_stream['worker-old'] = 'live'
+    replace_labels = {'status': 'success', 'reason': 'replaced'}
+    delete_labels = {'status': 'success', 'reason': 'replaced'}
+    replace_before = counter_value(main.worker_replacements_total, **replace_labels)
+    delete_before = counter_value(main.workers_deleted_total, **delete_labels)
+
+    with patch.object(main, 'create_worker_pod_for_stream', return_value='worker-new'), \
+         patch.object(main.core, 'delete_namespaced_pod'):
+        assert main.replace_worker_pod_for_stream_locked('live', '10.0.0.1') == 'worker-new'
+
+    assert counter_value(main.worker_replacements_total, **replace_labels) == replace_before + 1
+    assert counter_value(main.workers_deleted_total, **delete_labels) == delete_before + 1
+    assert sample_value(main.controller_active_allocations, 'controller_active_allocations') == 1
+
+
+def test_sweep_orphan_workers_records_orphan_delete_metrics():
+    reset_state()
+    orphan = SimpleNamespace(metadata=SimpleNamespace(name='worker-orphan'))
+    orphan_labels = {'status': 'success', 'reason': 'orphan'}
+    all_delete_labels = {'status': 'success', 'reason': 'orphan'}
+    orphan_before = counter_value(main.orphan_workers_deleted_total, **orphan_labels)
+    all_delete_before = counter_value(main.workers_deleted_total, **all_delete_labels)
+
+    async def sleep_side_effect(*args, **kwargs):
+        if sleep_side_effect.calls == 0:
+            sleep_side_effect.calls += 1
+            return None
+        raise asyncio.CancelledError
+
+    sleep_side_effect.calls = 0
+
+    with patch.object(main.asyncio, 'sleep', side_effect=sleep_side_effect), \
+         patch.object(main.core, 'list_namespaced_pod', return_value=SimpleNamespace(items=[orphan])), \
+         patch.object(main.core, 'delete_namespaced_pod'):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main.sweep_orphan_workers())
+
+    assert counter_value(main.orphan_workers_deleted_total, **orphan_labels) == orphan_before + 1
+    assert counter_value(main.workers_deleted_total, **all_delete_labels) == all_delete_before + 1
+
+
 def test_env_parsing_helpers_fall_back_for_invalid_values(monkeypatch):
     monkeypatch.setenv("TEST_INT_ENV", "invalid")
     monkeypatch.setenv("TEST_FLOAT_ENV", "0")
@@ -1028,6 +1210,43 @@ def test_handover_rollback_deletes_new_worker_after_partial_replacement_failure(
     assert cleanup_event['proxy_pod'] == 'proxy-new'
     assert cleanup_event['worker_pod'] == 'worker-new'
     assert cleanup_event['status'] == 'deleted'
+
+
+def test_handover_rollback_keeps_original_error_after_non_api_delete_failure():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
+    main.stream_to_proxy['live'] = 'proxy-old'
+    main.stream_generation['live'] = 1
+    main.stream_to_worker['live'] = 'worker-old'
+    main.worker_to_stream['worker-old'] = 'live'
+    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
+    delete_labels = {'status': 'warning', 'reason': 'delete_failed'}
+    delete_before = counter_value(main.workers_deleted_total, **delete_labels)
+
+    def partial_replacement(stream, proxy_dns):
+        main.stream_to_worker[stream] = 'worker-new'
+        main.worker_create_started_at['worker-extra'] = 123.0
+        raise RuntimeError('original handover failure')
+
+    handler = JsonCaptureHandler()
+    main.logger.addHandler(handler)
+    try:
+        with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
+             patch.object(main, 'replace_worker_pod_for_stream_locked', side_effect=partial_replacement), \
+             patch.object(main.core, 'delete_namespaced_pod', side_effect=[RuntimeError('transport timeout'), None]) as delete_pod:
+            with pytest.raises(RuntimeError, match='original handover failure'):
+                main.try_handover_stream_owner('live', 'proxy-new')
+    finally:
+        main.logger.removeHandler(handler)
+
+    assert delete_pod.call_count == 2
+    assert [call.kwargs['name'] for call in delete_pod.call_args_list] == ['worker-new', 'worker-extra']
+    assert counter_value(main.workers_deleted_total, **delete_labels) == delete_before + 1
+    cleanup_events = [event for event in handler.events if event['event_type'] == 'worker_deleted']
+    assert [(event['worker_pod'], event['status']) for event in cleanup_events] == [
+        ('worker-new', 'delete_failed'),
+        ('worker-extra', 'deleted'),
+    ]
 
 
 def test_handover_rollback_deletes_worker_from_create_timestamp_delta():
