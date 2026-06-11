@@ -486,6 +486,19 @@ def get_float_env(name: str, default: float, min_value: Optional[float] = None) 
     return value
 
 
+def get_bool_env(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    logger.warning(f"Invalid boolean for {name}='{raw_value}', using default {default}")
+    return default
+
+
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
     global registry_health_task
@@ -580,6 +593,7 @@ WORKER_HEALTHCHECK_JITTER_SECONDS = 1.5
 WORKER_READY_HEALTH_DELAY_SECONDS = 3  # Wait after worker Ready before worker /health probes.
 WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS = 60
 WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS = get_int_env("WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS", 5, min_value=1)
+CONTROLLER_DESTINATION_CALLBACK_ENABLED = get_bool_env("CONTROLLER_DESTINATION_CALLBACK_ENABLED", False)
 PROXY_READY_HEALTH_DELAY_SECONDS = 3  # Wait after proxy Ready before proxy /health probes.
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
@@ -665,6 +679,16 @@ stream_lifecycle_phase_observations_total = controller_counter(
     'Total derived stream lifecycle phase observations',
     ('phase', 'status', 'reason'),
 )
+stream_lifecycle_missing_timestamp_total = controller_counter(
+    'stream_lifecycle_missing_timestamp_total',
+    'Total lifecycle phase endpoints missing when stream lifecycle tracking is cleaned up',
+    ('timestamp', 'phase', 'reason'),
+)
+stream_lifecycle_approximate_timestamp_total = controller_counter(
+    'stream_lifecycle_approximate_timestamp_total',
+    'Total approximate lifecycle timestamps accepted by the controller',
+    ('timestamp', 'source'),
+)
 worker_pod_lifecycle_watch_errors_total = controller_counter(
     'worker_pod_lifecycle_watch_errors_total',
     'Total worker Pod lifecycle watch failures',
@@ -685,6 +709,7 @@ STREAM_LIFECYCLE_TIMESTAMP_FIELDS: Tuple[str, ...] = (
     't_worker_ready',
     't_ffmpeg_started',
     't_ffmpeg_first_progress',
+    't_destination_received',
 )
 STREAM_LIFECYCLE_DERIVED_PHASES: Tuple[Tuple[str, str, str], ...] = (
     ('proxy_to_controller', 't_publish_start_proxy', 't_controller_received_event'),
@@ -695,8 +720,11 @@ STREAM_LIFECYCLE_DERIVED_PHASES: Tuple[Tuple[str, str, str], ...] = (
     ('container_started_to_worker_ready', 't_worker_container_started', 't_worker_ready'),
     ('worker_ready_to_ffmpeg_started', 't_worker_ready', 't_ffmpeg_started'),
     ('ffmpeg_started_to_first_progress', 't_ffmpeg_started', 't_ffmpeg_first_progress'),
+    ('ffmpeg_first_progress_to_destination', 't_ffmpeg_first_progress', 't_destination_received'),
     ('proxy_to_first_progress', 't_publish_start_proxy', 't_ffmpeg_first_progress'),
     ('controller_to_first_progress', 't_controller_received_event', 't_ffmpeg_first_progress'),
+    ('proxy_to_destination', 't_publish_start_proxy', 't_destination_received'),
+    ('controller_to_destination', 't_controller_received_event', 't_destination_received'),
 )
 stream_lifecycle_timestamps: Dict[str, Dict[int, Dict[str, Any]]] = {}
 stream_lifecycle_observed_phases: Set[Tuple[str, int, str]] = set()
@@ -815,10 +843,32 @@ def cleanup_worker_lifecycle_tracking_locked(worker_pod: Optional[str]) -> None:
         worker_lifecycle_index.pop(worker_pod, None)
 
 
+def record_missing_lifecycle_timestamps_locked(stream: str, generations: Mapping[int, Mapping[str, Any]]) -> None:
+    for generation, entry in generations.items():
+        for phase, start_field, end_field in STREAM_LIFECYCLE_DERIVED_PHASES:
+            observed_key = (stream, generation, phase)
+            if observed_key in stream_lifecycle_observed_phases:
+                continue
+            if timestamp_to_epoch_seconds(entry.get(start_field)) is None:
+                stream_lifecycle_missing_timestamp_total.labels(
+                    timestamp=start_field,
+                    phase=phase,
+                    reason='stream_cleanup',
+                ).inc()
+            if timestamp_to_epoch_seconds(entry.get(end_field)) is None:
+                stream_lifecycle_missing_timestamp_total.labels(
+                    timestamp=end_field,
+                    phase=phase,
+                    reason='stream_cleanup',
+                ).inc()
+
+
 def cleanup_stream_lifecycle_tracking_locked(stream: Optional[str]) -> None:
     if not stream:
         return
-    stream_lifecycle_timestamps.pop(stream, None)
+    generations = stream_lifecycle_timestamps.pop(stream, None)
+    if generations:
+        record_missing_lifecycle_timestamps_locked(stream, generations)
     stale_phase_keys = [key for key in stream_lifecycle_observed_phases if key[0] == stream]
     for key in stale_phase_keys:
         stream_lifecycle_observed_phases.discard(key)
@@ -931,6 +981,8 @@ def record_stream_lifecycle_timestamp(
             entry['proxy_pod'] = proxy_pod
         observe_ready_lifecycle_phases_locked(stream, resolved_generation, entry)
     stream_lifecycle_timestamp_observed_total.labels(timestamp=field, source=source).inc()
+    if approximate:
+        stream_lifecycle_approximate_timestamp_total.labels(timestamp=field, source=source).inc()
     log_controller_event(
         'stream_lifecycle_timestamp_observed',
         stream=stream,
@@ -2832,6 +2884,84 @@ def stream_started(
     finally:
         stream_event_to_controller_seconds.labels(event="started").observe(time.monotonic() - started_at)
         stream_event_to_controller_total.labels(event="started", status=metric_status, reason=metric_reason).inc()
+
+
+
+@app.post("/streams/destination-received")
+def stream_destination_received(
+    stream: str = Query(..., description="Stream name"),
+    generation: Optional[int] = Query(None, description="Optional stream generation for stale callback protection"),
+    t_destination_received: Optional[float] = Query(None, description="Experimental receiver destination-arrival epoch seconds"),
+):
+    """Optional experimental receiver callback for external destination arrival.
+
+    The callback is disabled unless CONTROLLER_DESTINATION_CALLBACK_ENABLED is true.
+    """
+    if not CONTROLLER_DESTINATION_CALLBACK_ENABLED:
+        raise HTTPException(status_code=404, detail="destination callback endpoint is disabled")
+
+    received_at = time.time()
+    with allocation_lock:
+        current_generation = stream_generation.get(stream)
+        registry_entry = stream_registry.get(stream, {})
+        proxy_pod = registry_entry.get("proxy_pod")
+        if current_generation is None:
+            log_controller_event(
+                "destination_received_ignored",
+                stream=stream,
+                generation=generation,
+                status=LOG_STATUS_IGNORED,
+                message="destination callback ignored because stream has no active generation",
+            )
+            return {
+                "status": "ignored",
+                "reason": "stream_not_active",
+                "stream": stream,
+                "timestamp": "t_destination_received",
+            }
+        if generation is not None and generation != current_generation:
+            log_controller_event(
+                "destination_received_ignored",
+                stream=stream,
+                generation=generation,
+                proxy_pod=proxy_pod,
+                status=LOG_STATUS_IGNORED,
+                message=f"stale destination generation current={current_generation}",
+            )
+            return {
+                "status": "ignored",
+                "reason": "stale_generation",
+                "stream": stream,
+                "generation": current_generation,
+                "received_generation": generation,
+                "timestamp": "t_destination_received",
+            }
+        resolved_generation = current_generation
+
+    observed = record_stream_lifecycle_timestamp(
+        stream,
+        resolved_generation,
+        "t_destination_received",
+        timestamp=t_destination_received if t_destination_received is not None else received_at,
+        source="experimental_receiver",
+        proxy_pod=proxy_pod,
+        approximate=t_destination_received is None,
+    )
+    log_controller_event(
+        "destination_received",
+        stream=stream,
+        generation=resolved_generation,
+        proxy_pod=proxy_pod,
+        status=LOG_STATUS_OBSERVED if observed else "duplicate",
+        message="t_destination_received observed from experimental receiver" if observed else "duplicate t_destination_received callback",
+    )
+    return {
+        "status": "observed" if observed else "duplicate",
+        "reason": "recorded" if observed else "already_observed",
+        "stream": stream,
+        "generation": resolved_generation,
+        "timestamp": "t_destination_received",
+    }
 
 @app.post("/streams/ended")
 async def stream_ended(

@@ -191,6 +191,7 @@ The timestamp fields are:
 | `t_worker_ready` | Kubernetes Pod `status.conditions`. | Uses the `Ready=True` `lastTransitionTime`. |
 | `t_ffmpeg_started` | Worker HTTP notification immediately before launching FFmpeg. | Approximation of process start; the exact `execve` timestamp is not exposed by Kubernetes. |
 | `t_ffmpeg_first_progress` | Worker one-shot callback after reading the first FFmpeg `-progress` line locally. | The worker runs FFmpeg with a local regular progress file and notifies the controller after the first complete `key=value` progress line is delivered; duplicate callbacks are ignored for the milestone. |
+| `t_destination_received` | Optional `/streams/destination-received` callback from an experimental receiver. | Valid only when an external receiver is explicitly instrumented and `CONTROLLER_DESTINATION_CALLBACK_ENABLED=true`; without that receiver, destination phases are expected to be absent and must not be interpreted as delivery latency. If the callback omits `t_destination_received`, the controller records receive time as an approximation. |
 
 The controller watches worker Pod events with `label_selector=app=worker` and
 extracts scheduling/start/readiness milestones from Pod status. Worker Pods are
@@ -206,7 +207,9 @@ Derived Prometheus metrics:
 | --- | --- | --- |
 | `stream_lifecycle_timestamp_observed_total` | `timestamp`, `source` plus controlled metadata | Count of lifecycle timestamp observations accepted by the controller. |
 | `stream_lifecycle_phase_seconds` | `phase`, `start_timestamp`, `end_timestamp` plus controlled metadata | Histogram of derived phase durations once both timestamps are present and neither endpoint is approximate. |
-| `stream_lifecycle_phase_observations_total` | `phase`, `status`, `reason` plus controlled metadata | Count of derived phase observations after both endpoints are present, including pending phases with approximate endpoints and ignored negative durations caused by clock skew. Missing lifecycle endpoints do not increment this counter in the current implementation. |
+| `stream_lifecycle_phase_observations_total` | `phase`, `status`, `reason` plus controlled metadata | Count of derived phase observations after both endpoints are present, including pending phases with approximate endpoints and ignored negative durations caused by clock skew. |
+| `stream_lifecycle_missing_timestamp_total` | `timestamp`, `phase`, `reason` plus controlled metadata | Count of phase endpoints still missing when in-memory lifecycle tracking is cleaned up. Destination-related misses are expected unless an experimental receiver is instrumented. |
+| `stream_lifecycle_approximate_timestamp_total` | `timestamp`, `source` plus controlled metadata | Count of accepted lifecycle timestamps that used a controller-side approximation because the external timestamp was unavailable. |
 | `worker_pod_lifecycle_watch_errors_total` | `status`, `reason` plus controlled metadata | Count of worker Pod lifecycle watch failures or per-event processing failures. |
 | `worker_pod_lifecycle_watch_up` | Controlled metadata only | `1` when the worker Pod lifecycle watch loop is active, `0` after a watch failure until the next successful watch starts. |
 
@@ -218,7 +221,21 @@ stream is released or expired; Prometheus metrics and structured logs are the
 durable observability outputs. Canonical phase histograms skip approximate
 endpoints so later exact Kubernetes timestamps do not leave uncorrectable
 approximate observations in Prometheus histograms; skipped approximate phases are
-counted once with `status="pending"` and `reason="approximate_endpoint"`.
+counted once with `status="pending"` and `reason="approximate_endpoint"`. Missing
+endpoints that remain absent until cleanup are counted by
+`stream_lifecycle_missing_timestamp_total{reason="stream_cleanup"}`. Accepted
+controller-side approximations are counted by
+`stream_lifecycle_approximate_timestamp_total`.
+
+Destination-derived phases are emitted only when `t_destination_received` is
+observed from an experimental receiver callback. Enable the callback explicitly
+with `CONTROLLER_DESTINATION_CALLBACK_ENABLED=true` and post to
+`/streams/destination-received` with `stream`, optional `generation`, and optional
+`t_destination_received` epoch seconds. The derived destination phases are
+`ffmpeg_first_progress_to_destination`, `proxy_to_destination`, and
+`controller_to_destination`. If no receiver is instrumented, do not use these
+phases for delivery latency; use the existing first-progress phases instead and
+expect destination timestamps to appear as missing at lifecycle cleanup.
 
 Current approximations and observability limits:
 
@@ -237,6 +254,11 @@ Current approximations and observability limits:
 - Kubernetes does not expose an exact image pull completion or user-process start
   timestamp in this controller, so `t_worker_container_started` is the container
   runtime `startedAt` value from `containerStatuses`.
+- `t_destination_received` is meaningful only for experiments with an
+  instrumented receiver that reports external destination arrival. It is not a
+  default LiveEdgeCast datapath timestamp and should not be mixed with
+  first-progress cold-start percentiles unless the experiment explicitly includes
+  that receiver.
 
 ## Catálogo detalhado para dashboards e artigo
 
@@ -251,9 +273,11 @@ pelo Prometheus, como `pod`, `namespace`, `job` e `instance`.
 
 | Métrica | Tipo | Labels específicos | Unidade | Cardinalidade esperada | Interpretação | Uso no artigo |
 | --- | --- | --- | --- | --- | --- | --- |
-| `stream_lifecycle_timestamp_observed_total` | Counter | `timestamp`, `source` | eventos | Baixa: 9 timestamps × poucas fontes × metadados controlados. | Conta timestamps de lifecycle aceitos pelo controller. Crescimento desigual por timestamp indica perda de observabilidade em algum marco. | Relatar completude da instrumentação e volume de amostras por fase. |
-| `stream_lifecycle_phase_seconds` | Histogram | `phase`, `start_timestamp`, `end_timestamp` | segundos | Baixa: fases derivadas fixas × buckets × metadados controlados. | Duração de fases de startup quando ambos endpoints são exatos. A fase `proxy_to_first_progress` é o cold start fim-a-fim. | Base principal para P50/P95/P99 de cold start e decomposição de latência. |
-| `stream_lifecycle_phase_observations_total` | Counter | `phase`, `status`, `reason` | eventos | Baixa: fases fixas × status/razões controladas. | Conta observações derivadas após ambos endpoints estarem presentes, inclusive fases pendentes por endpoint aproximado ou descartadas por duração negativa; timestamps ausentes não incrementam este contador na implementação atual. | Denominador parcial de qualidade dos dados; combine com contadores de timestamps observados para reportar perdas e limitações de medição. |
+| `stream_lifecycle_timestamp_observed_total` | Counter | `timestamp`, `source` | eventos | Baixa: 10 timestamps × poucas fontes × metadados controlados. | Conta timestamps de lifecycle aceitos pelo controller. Crescimento desigual por timestamp indica perda de observabilidade em algum marco. | Relatar completude da instrumentação e volume de amostras por fase. |
+| `stream_lifecycle_phase_seconds` | Histogram | `phase`, `start_timestamp`, `end_timestamp` | segundos | Baixa: fases derivadas fixas × buckets × metadados controlados. | Duração de fases de startup quando ambos endpoints são exatos. A fase `proxy_to_first_progress` é o cold start até primeiro progresso; `proxy_to_destination` é fim-a-fim externo apenas com receptor experimental. | Base principal para P50/P95/P99 de cold start, decomposição de latência e, quando instrumentado, latência até destino externo. |
+| `stream_lifecycle_phase_observations_total` | Counter | `phase`, `status`, `reason` | eventos | Baixa: fases fixas × status/razões controladas. | Conta observações derivadas após ambos endpoints estarem presentes, inclusive fases pendentes por endpoint aproximado ou descartadas por duração negativa. | Denominador parcial de qualidade dos dados; combine com contadores de timestamps ausentes/aproximados para reportar perdas e limitações de medição. |
+| `stream_lifecycle_missing_timestamp_total` | Counter | `timestamp`, `phase`, `reason` | eventos | Baixa: timestamps × fases fixas × razões controladas. | Conta endpoints de fase que continuam ausentes no cleanup do lifecycle. Ausência de `t_destination_received` é normal quando não há receptor experimental instrumentado. | Evidência direta de completude por fase e filtro para experimentos com destino externo. |
+| `stream_lifecycle_approximate_timestamp_total` | Counter | `timestamp`, `source` | eventos | Baixa: timestamps × fontes controladas. | Conta timestamps aceitos como aproximações, como publish-start aproximado pelo recebimento no controller ou destino sem timestamp próprio. | Reportar qualidade temporal e excluir/qualificar percentis afetados por aproximações. |
 | `worker_pod_lifecycle_watch_errors_total` | Counter | `status`, `reason` | eventos | Baixa: razões controladas. | Falhas do watch de eventos/status de Pods de worker. | Evidência de confiabilidade da coleta de timestamps Kubernetes. |
 | `worker_pod_lifecycle_watch_up` | Gauge | nenhum específico | booleano `0/1` | Uma série por combinação de metadados controlados. | `1` quando o loop de watch está ativo; `0` após falha até reinício do watch. | Filtro de validade para experimentos de cold start. |
 
