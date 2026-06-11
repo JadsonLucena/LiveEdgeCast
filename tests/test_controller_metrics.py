@@ -80,6 +80,12 @@ def capture_controller_events(action):
     return result, handler.events
 
 
+def assert_required_log_fields(event):
+    assert list(event)[:len(main.LOG_EVENT_FIELDS)] == list(main.LOG_EVENT_FIELDS)
+    for field in main.LOG_EVENT_FIELDS:
+        assert field in event
+
+
 def test_metadata_extraction_precedence_and_sanitization(monkeypatch):
     monkeypatch.setenv('LIVEEDGECAST_TENANT', 'env-tenant')
     monkeypatch.setenv('LIVEEDGECAST_ENVIRONMENT', 'prod')
@@ -203,11 +209,19 @@ def test_persist_state_records_persistence_and_kubernetes_error_metrics():
     before = counter_value(main.state_persistence_errors_total, **labels)
     kube_before = counter_value(main.kubernetes_api_errors_total, **kube_labels)
 
-    with patch.object(main.core, 'patch_namespaced_config_map', side_effect=ApiException(status=500)):
-        with pytest.raises(ApiException):
-            with main.allocation_lock:
-                main.persist_state_locked()
+    handler = JsonCaptureHandler()
+    main.logger.addHandler(handler)
+    try:
+        with patch.object(main.core, 'patch_namespaced_config_map', side_effect=ApiException(status=500)):
+            with pytest.raises(ApiException):
+                with main.allocation_lock:
+                    main.persist_state_locked()
+    finally:
+        main.logger.removeHandler(handler)
 
+    failure_event = next(event for event in handler.events if event['event_type'] == 'state_persistence_failed')
+    assert_required_log_fields(failure_event)
+    assert failure_event['status'] == 'failed'
     assert counter_value(main.state_persistence_errors_total, **labels) == before + 1
     assert counter_value(main.kubernetes_api_errors_total, **kube_labels) == kube_before + 1
 
@@ -253,14 +267,20 @@ def test_recover_state_records_restored_and_missing_outcomes():
         'restore_persisted_state_locked',
         return_value=main.StateRestoreResult(restored=True, reason='restored'),
     ):
-        main.recover_state()
+        _, restored_events = capture_controller_events(main.recover_state)
     with patch.object(
         main,
         'restore_persisted_state_locked',
         return_value=main.StateRestoreResult(restored=False, reason='not_found'),
     ):
-        main.recover_state()
+        _, skipped_events = capture_controller_events(main.recover_state)
 
+    restored_event = next(event for event in restored_events if event['event_type'] == 'state_recovery_completed')
+    skipped_event = next(event for event in skipped_events if event['event_type'] == 'state_recovery_completed')
+    assert_required_log_fields(restored_event)
+    assert_required_log_fields(skipped_event)
+    assert restored_event['status'] == 'success'
+    assert skipped_event['status'] == 'skipped'
     assert counter_value(main.state_recovery_total, **restored_labels) == restored_before + 1
     assert counter_value(main.state_recovery_total, **skipped_labels) == skipped_before + 1
 
@@ -275,8 +295,11 @@ def test_recover_state_records_restore_failures_without_skipped_metric():
     bad_config_map = SimpleNamespace(data={main.STATE_CONFIGMAP_KEY: '{bad json'})
 
     with patch.object(main.core, 'read_namespaced_config_map', return_value=bad_config_map):
-        main.recover_state()
+        _, events = capture_controller_events(main.recover_state)
 
+    failure_event = next(event for event in events if event['event_type'] == 'state_recovery_failed')
+    assert_required_log_fields(failure_event)
+    assert failure_event['status'] == 'failed'
     assert counter_value(main.state_recovery_total, **invalid_json_labels) == invalid_before + 1
     assert counter_value(main.state_recovery_total, **skipped_labels) == skipped_before
 
@@ -333,8 +356,14 @@ def test_replace_worker_records_replacement_and_delete_metrics():
 
     with patch.object(main, 'create_worker_pod_for_stream', return_value='worker-new'), \
          patch.object(main.core, 'delete_namespaced_pod'):
-        assert main.replace_worker_pod_for_stream_locked('live', '10.0.0.1') == 'worker-new'
+        result, events = capture_controller_events(lambda: main.replace_worker_pod_for_stream_locked('live', '10.0.0.1'))
 
+    assert result == 'worker-new'
+    replaced_event = next(event for event in events if event['event_type'] == 'worker_replaced')
+    assert_required_log_fields(replaced_event)
+    assert replaced_event['stream'] == 'live'
+    assert replaced_event['worker_pod'] == 'worker-new'
+    assert replaced_event['status'] == 'success'
     assert counter_value(main.worker_replacements_total, **replace_labels) == replace_before + 1
     assert counter_value(main.workers_deleted_total, **delete_labels) == delete_before + 1
     assert sample_value(main.controller_active_allocations, 'controller_active_allocations') == 1
@@ -356,12 +385,24 @@ def test_sweep_orphan_workers_records_orphan_delete_metrics():
 
     sleep_side_effect.calls = 0
 
-    with patch.object(main.asyncio, 'sleep', side_effect=sleep_side_effect), \
-         patch.object(main.core, 'list_namespaced_pod', return_value=SimpleNamespace(items=[orphan])), \
-         patch.object(main.core, 'delete_namespaced_pod'):
-        with pytest.raises(asyncio.CancelledError):
-            asyncio.run(main.sweep_orphan_workers())
+    handler = JsonCaptureHandler()
+    main.logger.addHandler(handler)
+    try:
+        with patch.object(main.asyncio, 'sleep', side_effect=sleep_side_effect), \
+             patch.object(main.core, 'list_namespaced_pod', return_value=SimpleNamespace(items=[orphan])), \
+             patch.object(main.core, 'delete_namespaced_pod'):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(main.sweep_orphan_workers())
+    finally:
+        main.logger.removeHandler(handler)
 
+    legacy_event = next(event for event in handler.events if event['event_type'] == 'worker_deleted')
+    orphan_event = next(event for event in handler.events if event['event_type'] == 'orphan_worker_deleted')
+    for event in (legacy_event, orphan_event):
+        assert_required_log_fields(event)
+        assert event['stream'] is None
+        assert event['worker_pod'] == 'worker-orphan'
+        assert event['status'] == 'deleted'
     assert counter_value(main.orphan_workers_deleted_total, **orphan_labels) == orphan_before + 1
     assert counter_value(main.workers_deleted_total, **all_delete_labels) == all_delete_before + 1
 
@@ -1638,6 +1679,82 @@ def test_worker_progress_records_first_ffmpeg_progress_once():
     assert 't_ffmpeg_first_progress' in entry
     assert entry['worker_pod'] == 'worker-live'
     assert entry['sources']['t_ffmpeg_first_progress'] == 'ffmpeg_progress'
+
+
+def test_worker_progress_emits_explicit_ffmpeg_events():
+    reset_state()
+    main.stream_generation['live'] = 3
+    main.worker_to_stream['worker-live'] = 'live'
+    main.stream_to_worker['live'] = 'worker-live'
+    main.worker_lifecycle_index['worker-live'] = ('live', 3)
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+
+    _, started_events = capture_controller_events(
+        lambda: main.record_worker_progress_event('live', 'worker-live', 't_ffmpeg_started', 'worker_hook')
+    )
+    _, progress_events = capture_controller_events(
+        lambda: main.record_worker_progress_event('live', 'worker-live', 't_ffmpeg_first_progress', 'ffmpeg_progress')
+    )
+
+    started_event = next(event for event in started_events if event['event_type'] == 'ffmpeg_started')
+    progress_event = next(event for event in progress_events if event['event_type'] == 'ffmpeg_first_progress')
+    for event in (started_event, progress_event):
+        assert_required_log_fields(event)
+        assert event['stream'] == 'live'
+        assert event['generation'] == 3
+        assert event['proxy_pod'] == 'proxy-1'
+        assert event['worker_pod'] == 'worker-live'
+        assert event['status'] == 'observed'
+
+
+def test_proxy_healthcheck_emits_proxy_failure_detected_event():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-1'}
+    main.stream_to_proxy['live'] = 'proxy-1'
+    main.stream_to_worker['live'] = 'worker-a'
+    main.worker_to_stream['worker-a'] = 'live'
+    main.stream_generation['live'] = 7
+    main.proxy_health_failures['proxy-1'] = main.PROXY_HEALTHCHECK_MAX_FAILURES - 1
+
+    async def sleep_side_effect(*args, **kwargs):
+        if sleep_side_effect.calls == 0:
+            sleep_side_effect.calls += 1
+            return None
+        raise asyncio.CancelledError
+
+    sleep_side_effect.calls = 0
+    handler = JsonCaptureHandler()
+    main.logger.addHandler(handler)
+    try:
+        with patch.object(main, 'PROXY_HEALTHCHECK_JITTER_SECONDS', 0), \
+             patch.object(main.asyncio, 'sleep', side_effect=sleep_side_effect), \
+             patch.object(main, 'get_proxy_health_status', return_value='unhealthy'), \
+             patch.object(main.core, 'delete_namespaced_pod'), \
+             patch.object(main, 'persist_state_locked', return_value=None):
+            with pytest.raises(asyncio.CancelledError):
+                asyncio.run(main.monitor_stream_registry_health())
+    finally:
+        main.logger.removeHandler(handler)
+
+    failure_event = next(event for event in handler.events if event['event_type'] == 'proxy_failure_detected')
+    assert_required_log_fields(failure_event)
+    assert failure_event['stream'] == 'live'
+    assert failure_event['generation'] == 7
+    assert failure_event['proxy_pod'] == 'proxy-1'
+    assert failure_event['status'] == 'unhealthy'
+
+
+def test_controller_metrics_do_not_add_worker_or_generation_cardinality_labels():
+    forbidden_labels = {'streamKey', 'worker_pod', 'generation'}
+    for metric_name in (
+        'worker_replacements_total',
+        'orphan_workers_deleted_total',
+        'state_recovery_total',
+        'state_persistence_errors_total',
+        'proxy_healthcheck_total',
+    ):
+        metric = getattr(main, metric_name)
+        assert forbidden_labels.isdisjoint(metric._base_label_names)
 
 
 def test_failed_worker_create_does_not_remove_existing_create_timestamp():
