@@ -396,10 +396,13 @@ def test_sweep_orphan_workers_records_orphan_delete_metrics():
     finally:
         main.logger.removeHandler(handler)
 
+    legacy_event = next(event for event in handler.events if event['event_type'] == 'worker_deleted')
     orphan_event = next(event for event in handler.events if event['event_type'] == 'orphan_worker_deleted')
-    assert_required_log_fields(orphan_event)
-    assert orphan_event['worker_pod'] == 'worker-orphan'
-    assert orphan_event['status'] == 'deleted'
+    for event in (legacy_event, orphan_event):
+        assert_required_log_fields(event)
+        assert event['stream'] is None
+        assert event['worker_pod'] == 'worker-orphan'
+        assert event['status'] == 'deleted'
     assert counter_value(main.orphan_workers_deleted_total, **orphan_labels) == orphan_before + 1
     assert counter_value(main.workers_deleted_total, **all_delete_labels) == all_delete_before + 1
 

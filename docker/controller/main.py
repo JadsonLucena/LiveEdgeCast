@@ -759,6 +759,23 @@ def record_worker_delete_metric(status: str, reason: str, *, orphan: bool = Fals
         orphan_workers_deleted_total.labels(status=status, reason=reason).inc()
 
 
+def log_orphan_worker_deleted(worker_pod: str, *, status: str, level: int = logging.INFO) -> None:
+    # Preserve the documented orphan-deletion query contract: existing Loki
+    # dashboards filter event_type="worker_deleted" with null stream context.
+    log_controller_event(
+        "worker_deleted",
+        worker_pod=worker_pod,
+        status=status,
+        level=level,
+    )
+    log_controller_event(
+        "orphan_worker_deleted",
+        worker_pod=worker_pod,
+        status=status,
+        level=level,
+    )
+
+
 def timestamp_to_epoch_seconds(value: Any) -> Optional[float]:
     if value is None:
         return None
@@ -2388,22 +2405,20 @@ async def sweep_orphan_workers():
             try:
                 core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
                 record_worker_delete_metric("success", "orphan", orphan=True)
-                log_controller_event("orphan_worker_deleted", worker_pod=pod_name, status=LOG_STATUS_DELETED)
+                log_orphan_worker_deleted(pod_name, status=LOG_STATUS_DELETED)
             except ApiException as e:
                 record_kubernetes_api_error("delete", "pod", e)
                 record_worker_delete_metric("warning", "delete_failed", orphan=True)
-                log_controller_event(
-                    "orphan_worker_deleted",
-                    worker_pod=pod_name,
+                log_orphan_worker_deleted(
+                    pod_name,
                     status=LOG_STATUS_DELETE_FAILED,
                     level=logging.WARNING,
                 )
                 logger.warning(f"[OrphanSweeper] Failed deleting orphan worker pod '{pod_name}': {e}")
             except Exception as e:
                 record_worker_delete_metric("warning", "delete_failed", orphan=True)
-                log_controller_event(
-                    "orphan_worker_deleted",
-                    worker_pod=pod_name,
+                log_orphan_worker_deleted(
+                    pod_name,
                     status=LOG_STATUS_DELETE_FAILED,
                     level=logging.WARNING,
                 )
