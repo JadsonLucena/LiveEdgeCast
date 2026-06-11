@@ -576,17 +576,7 @@ stream_to_worker: Dict[str, str] = {}
 worker_to_stream: Dict[str, str] = {}
 
 stream_to_proxy: Dict[str, str] = {}
-
-
-class StreamGenerationDict(dict):
-    def clear(self) -> None:
-        super().clear()
-        high_water = globals().get("stream_generation_high_water")
-        if isinstance(high_water, dict):
-            high_water.clear()
-
-
-stream_generation: Dict[str, int] = StreamGenerationDict()
+stream_generation: Dict[str, int] = {}
 stream_generation_high_water: Dict[str, int] = {}
 stream_registry: Dict[str, Dict[str, str]] = {}
 
@@ -833,6 +823,13 @@ def timestamp_to_epoch_seconds(value: Any) -> Optional[float]:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.timestamp()
     return None
+
+
+def generation_to_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def lifecycle_key_for_worker_locked(worker_pod: str) -> Optional[Tuple[str, int]]:
@@ -1285,15 +1282,31 @@ def restore_persisted_state_locked() -> StateRestoreResult:
     stream_registry.clear()
     stream_registry.update(data.get("stream_registry", {}))
     stream_generation.clear()
-    stream_generation.update(data.get("stream_generation", {}))
+    restored_generation = data.get("stream_generation", {})
+    if isinstance(restored_generation, dict):
+        for stream, generation in restored_generation.items():
+            normalized_generation = generation_to_int(generation)
+            if normalized_generation is None:
+                state_persistence_errors_total.labels(operation="restore", reason="invalid_generation").inc()
+                logger.warning(f"[State Recovery] Invalid stream generation for '{stream}': {generation}")
+                continue
+            stream_generation[stream] = normalized_generation
+
     stream_generation_high_water.clear()
     restored_high_water = data.get("stream_generation_high_water", {})
     if isinstance(restored_high_water, dict):
-        stream_generation_high_water.update(restored_high_water)
+        for stream, generation in restored_high_water.items():
+            normalized_generation = generation_to_int(generation)
+            if normalized_generation is None:
+                state_persistence_errors_total.labels(operation="restore", reason="invalid_generation_high_water").inc()
+                logger.warning(f"[State Recovery] Invalid stream generation high-water for '{stream}': {generation}")
+                continue
+            stream_generation_high_water[stream] = normalized_generation
+
     for stream, generation in stream_generation.items():
         stream_generation_high_water[stream] = max(
-            int(stream_generation_high_water.get(stream, 0)),
-            int(generation),
+            generation_to_int(stream_generation_high_water.get(stream)) or 0,
+            generation,
         )
     update_controller_state_gauges_locked()
     return StateRestoreResult(restored=True, reason="restored")
@@ -1490,11 +1503,11 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
     if stream not in stream_generation:
         previous_generations = stream_lifecycle_timestamps.get(stream, {})
         previous_lifecycle_generation = max(previous_generations) if previous_generations else 0
-        previous_high_water_generation = int(stream_generation_high_water.get(stream, 0))
+        previous_high_water_generation = generation_to_int(stream_generation_high_water.get(stream)) or 0
         stream_generation[stream] = max(previous_lifecycle_generation, previous_high_water_generation) + 1
     stream_generation_high_water[stream] = max(
-        int(stream_generation_high_water.get(stream, 0)),
-        int(stream_generation[stream]),
+        generation_to_int(stream_generation_high_water.get(stream)) or 0,
+        stream_generation[stream],
     )
     stream_registry[stream] = {
         "proxy_pod": proxy_pod,
@@ -2919,8 +2932,14 @@ def stream_started(
 @app.post("/streams/destination-received")
 def stream_destination_received(
     stream: str = Query(..., description="Stream name"),
-    generation: Optional[int] = Query(None, description="Optional stream generation; echo /streams/started generation to reject stale callbacks"),
-    t_destination_received: Optional[float] = Query(None, description="Experimental receiver destination-arrival epoch seconds"),
+    generation: int = Query(
+        ...,
+        description="Required stream generation; echo /streams/started generation to reject stale callbacks",
+    ),
+    t_destination_received: Optional[float] = Query(
+        None,
+        description="Experimental receiver destination-arrival epoch seconds",
+    ),
 ):
     """Optional experimental receiver callback for external destination arrival.
 
@@ -2950,7 +2969,7 @@ def stream_destination_received(
                 "stream": stream,
                 "timestamp": "t_destination_received",
             }
-        if generation is not None and generation != current_generation:
+        if generation != current_generation:
             log_controller_event(
                 "destination_received_ignored",
                 stream=stream,
