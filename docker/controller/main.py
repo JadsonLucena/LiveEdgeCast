@@ -2973,15 +2973,16 @@ def stream_destination_received(
     timestamp_value = t_destination_received if t_destination_received is not None else received_at
     with allocation_lock:
         current_generation = stream_generation.get(stream)
-        registry_entry = stream_registry.get(stream, {})
-        proxy_pod = registry_entry.get("proxy_pod")
-        if current_generation is None:
+        registry_entry = stream_registry.get(stream)
+        proxy_pod = registry_entry.get("proxy_pod") if registry_entry else None
+        if current_generation is None or not registry_entry:
             log_controller_event(
                 "destination_received_ignored",
                 stream=stream,
                 generation=generation,
+                proxy_pod=proxy_pod,
                 status=LOG_STATUS_IGNORED,
-                message="destination callback ignored because stream has no active generation",
+                message="destination callback ignored because stream has no active owner",
             )
             return {
                 "status": "ignored",

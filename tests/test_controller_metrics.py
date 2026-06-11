@@ -2157,6 +2157,34 @@ def test_destination_received_rejects_non_finite_timestamp(timestamp):
     assert exc_info.value.detail == 't_destination_received must be finite epoch seconds'
 
 
+def test_destination_received_ignores_registryless_generation():
+    reset_state()
+    main.stream_generation['live'] = 3
+    main.stream_generation_high_water['live'] = 3
+    main.stream_lifecycle_timestamps['live'] = {
+        3: {
+            'stream': 'live',
+            'generation': 3,
+            't_publish_start_proxy': 30.0,
+            't_controller_received_event': 31.0,
+            't_ffmpeg_first_progress': 32.0,
+            'sources': {},
+            'approximations': {},
+        }
+    }
+
+    with patch.object(main, 'CONTROLLER_DESTINATION_CALLBACK_ENABLED', True):
+        result = main.stream_destination_received(
+            stream='live',
+            generation=3,
+            t_destination_received=33.0,
+        )
+
+    assert result['status'] == 'ignored'
+    assert result['reason'] == 'stream_not_active'
+    assert 't_destination_received' not in main.stream_lifecycle_timestamps['live'][3]
+
+
 def test_reused_stream_generation_rejects_delayed_destination_callback():
     reset_state()
     with main.allocation_lock:
