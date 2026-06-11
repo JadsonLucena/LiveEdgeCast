@@ -576,7 +576,18 @@ stream_to_worker: Dict[str, str] = {}
 worker_to_stream: Dict[str, str] = {}
 
 stream_to_proxy: Dict[str, str] = {}
-stream_generation: Dict[str, int] = {}
+
+
+class StreamGenerationDict(dict):
+    def clear(self) -> None:
+        super().clear()
+        high_water = globals().get("stream_generation_high_water")
+        if isinstance(high_water, dict):
+            high_water.clear()
+
+
+stream_generation: Dict[str, int] = StreamGenerationDict()
+stream_generation_high_water: Dict[str, int] = {}
 stream_registry: Dict[str, Dict[str, str]] = {}
 
 registry_health_task: Optional[asyncio.Task] = None
@@ -603,7 +614,7 @@ proxy_ready_since: Dict[str, float] = {}
 
 STATE_CONFIGMAP_NAME = "controller-state"
 STATE_CONFIGMAP_KEY = "state.json"
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 
 metrics_collection_task: Optional[asyncio.Task] = None
 proxy_rtmp_stats_task: Optional[asyncio.Task] = None
@@ -1197,6 +1208,7 @@ def persist_state_locked() -> None:
         "stream_to_proxy": stream_to_proxy,
         "stream_registry": stream_registry,
         "stream_generation": stream_generation,
+        "stream_generation_high_water": stream_generation_high_water,
     }
     body = client.V1ConfigMap(
         metadata=client.V1ObjectMeta(name=STATE_CONFIGMAP_NAME, namespace=NAMESPACE),
@@ -1274,6 +1286,15 @@ def restore_persisted_state_locked() -> StateRestoreResult:
     stream_registry.update(data.get("stream_registry", {}))
     stream_generation.clear()
     stream_generation.update(data.get("stream_generation", {}))
+    stream_generation_high_water.clear()
+    restored_high_water = data.get("stream_generation_high_water", {})
+    if isinstance(restored_high_water, dict):
+        stream_generation_high_water.update(restored_high_water)
+    for stream, generation in stream_generation.items():
+        stream_generation_high_water[stream] = max(
+            int(stream_generation_high_water.get(stream, 0)),
+            int(generation),
+        )
     update_controller_state_gauges_locked()
     return StateRestoreResult(restored=True, reason="restored")
 
@@ -1468,7 +1489,13 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
     """
     if stream not in stream_generation:
         previous_generations = stream_lifecycle_timestamps.get(stream, {})
-        stream_generation[stream] = (max(previous_generations) + 1) if previous_generations else 1
+        previous_lifecycle_generation = max(previous_generations) if previous_generations else 0
+        previous_high_water_generation = int(stream_generation_high_water.get(stream, 0))
+        stream_generation[stream] = max(previous_lifecycle_generation, previous_high_water_generation) + 1
+    stream_generation_high_water[stream] = max(
+        int(stream_generation_high_water.get(stream, 0)),
+        int(stream_generation[stream]),
+    )
     stream_registry[stream] = {
         "proxy_pod": proxy_pod,
     }
@@ -2810,6 +2837,7 @@ def register_stream(
                 "status": status,
                 "stream": stream,
                 "proxy_pod": proxy_pod,
+                "generation": stream_generation.get(stream),
                 "healthcheck_interval_seconds": PROXY_HEALTHCHECK_INTERVAL_SECONDS,
                 "max_failed_healthchecks": PROXY_HEALTHCHECK_MAX_FAILURES
             }
@@ -2875,6 +2903,7 @@ def stream_started(
             "status": event_status,
             "registration": registration,
             "stream": stream,
+            "generation": generation,
             "allocation": allocation,
         }
     except Exception as e:
@@ -2890,7 +2919,7 @@ def stream_started(
 @app.post("/streams/destination-received")
 def stream_destination_received(
     stream: str = Query(..., description="Stream name"),
-    generation: Optional[int] = Query(None, description="Optional stream generation for stale callback protection"),
+    generation: Optional[int] = Query(None, description="Optional stream generation; echo /streams/started generation to reject stale callbacks"),
     t_destination_received: Optional[float] = Query(None, description="Experimental receiver destination-arrival epoch seconds"),
 ):
     """Optional experimental receiver callback for external destination arrival.

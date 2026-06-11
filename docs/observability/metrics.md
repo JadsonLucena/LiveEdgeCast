@@ -234,9 +234,13 @@ Destination-derived phases are emitted only when `t_destination_received` is
 observed from an experimental receiver callback. Enable the callback explicitly
 with `CONTROLLER_DESTINATION_CALLBACK_ENABLED=true` and post to
 `/streams/destination-received` with `stream`, optional `generation`, and optional
-`t_destination_received` epoch seconds. Callback responses include whether the
-accepted timestamp was approximate so receiver experiments can detect omitted
-external timestamps immediately. The derived destination phases are
+`t_destination_received` epoch seconds. The controller returns the active
+`generation` from `/streams/started` and keeps a persisted per-stream generation
+high-water mark so reused stream names receive non-reused generations after
+cleanup; receivers should echo that generation to reject delayed callbacks from
+previous runs. Callback responses include whether the accepted timestamp was
+approximate so receiver experiments can detect omitted external timestamps
+immediately. The derived destination phases are
 `ffmpeg_first_progress_to_destination`, `proxy_to_destination`, and
 `controller_to_destination`. If no receiver is instrumented, do not use these
 phases for delivery latency; use the existing first-progress phases instead and
