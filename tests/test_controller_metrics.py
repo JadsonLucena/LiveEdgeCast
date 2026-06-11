@@ -2105,6 +2105,21 @@ def test_destination_received_requires_generation_query_parameter():
     assert generation_parameter['required'] is True
 
 
+@pytest.mark.parametrize('timestamp', [float('nan'), float('inf'), float('-inf')])
+def test_destination_received_rejects_non_finite_timestamp(timestamp):
+    reset_state()
+    with patch.object(main, 'CONTROLLER_DESTINATION_CALLBACK_ENABLED', True):
+        with pytest.raises(main.HTTPException) as exc_info:
+            main.stream_destination_received(
+                stream='live',
+                generation=1,
+                t_destination_received=timestamp,
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == 't_destination_received must be finite epoch seconds'
+
+
 def test_reused_stream_generation_rejects_delayed_destination_callback():
     reset_state()
     with main.allocation_lock:

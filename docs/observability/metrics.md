@@ -234,7 +234,7 @@ Destination-derived phases are emitted only when `t_destination_received` is
 observed from an experimental receiver callback. Enable the callback explicitly
 with `CONTROLLER_DESTINATION_CALLBACK_ENABLED=true` and post to
 `/streams/destination-received` with `stream`, required `generation`, and optional
-`t_destination_received` epoch seconds. The controller returns the active
+finite `t_destination_received` epoch seconds. The controller returns the active
 `generation` from `/streams/started` and keeps a persisted per-stream generation
 high-water mark so reused stream names receive non-reused generations after
 cleanup; receivers must echo that generation so delayed callbacks from previous

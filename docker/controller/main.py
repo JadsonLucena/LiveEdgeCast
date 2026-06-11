@@ -832,6 +832,10 @@ def generation_to_int(value: Any) -> Optional[int]:
         return None
 
 
+def is_finite_number(value: float) -> bool:
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
 def lifecycle_key_for_worker_locked(worker_pod: str) -> Optional[Tuple[str, int]]:
     indexed = worker_lifecycle_index.get(worker_pod)
     if indexed:
@@ -2947,6 +2951,11 @@ def stream_destination_received(
     """
     if not CONTROLLER_DESTINATION_CALLBACK_ENABLED:
         raise HTTPException(status_code=404, detail="destination callback endpoint is disabled")
+    if t_destination_received is not None and not is_finite_number(t_destination_received):
+        raise HTTPException(
+            status_code=400,
+            detail="t_destination_received must be finite epoch seconds",
+        )
 
     received_at = time.time()
     timestamp_is_approximate = t_destination_received is None
