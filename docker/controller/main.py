@@ -1307,11 +1307,17 @@ def restore_persisted_state_locked() -> StateRestoreResult:
                 continue
             stream_generation_high_water[stream] = normalized_generation
 
-    for stream, generation in stream_generation.items():
+    for stream, generation in list(stream_generation.items()):
         stream_generation_high_water[stream] = max(
             generation_to_int(stream_generation_high_water.get(stream)) or 0,
             generation,
         )
+        if stream not in stream_registry:
+            logger.warning(
+                f"[State Recovery] Dropping registry-less generation for stream '{stream}' "
+                f"after preserving high-water generation {stream_generation_high_water[stream]}"
+            )
+            stream_generation.pop(stream, None)
     update_controller_state_gauges_locked()
     return StateRestoreResult(restored=True, reason="restored")
 
@@ -1504,11 +1510,16 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
     """
     Creates or refreshes canonical stream ownership on proxy.
     """
-    if stream not in stream_generation:
+    if stream not in stream_generation or stream not in stream_registry:
         previous_generations = stream_lifecycle_timestamps.get(stream, {})
         previous_lifecycle_generation = max(previous_generations) if previous_generations else 0
         previous_high_water_generation = generation_to_int(stream_generation_high_water.get(stream)) or 0
-        stream_generation[stream] = max(previous_lifecycle_generation, previous_high_water_generation) + 1
+        previous_active_generation = generation_to_int(stream_generation.get(stream)) or 0
+        stream_generation[stream] = max(
+            previous_lifecycle_generation,
+            previous_high_water_generation,
+            previous_active_generation,
+        ) + 1
     stream_generation_high_water[stream] = max(
         generation_to_int(stream_generation_high_water.get(stream)) or 0,
         stream_generation[stream],

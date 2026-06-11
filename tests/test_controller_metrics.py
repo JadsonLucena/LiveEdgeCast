@@ -256,6 +256,43 @@ def test_restore_persisted_state_sets_gauges_and_records_invalid_json_metric():
     assert sample_value(main.controller_active_allocations, 'controller_active_allocations') == 1
 
 
+def test_restore_drops_registryless_generation_but_preserves_high_water():
+    reset_state()
+    payload = {
+        'stream_to_worker': {'live': 'worker-a'},
+        'worker_to_stream': {'worker-a': 'live'},
+        'stream_to_proxy': {},
+        'stream_registry': {},
+        'stream_generation': {'live': 3},
+    }
+    config_map = SimpleNamespace(data={main.STATE_CONFIGMAP_KEY: json.dumps(payload)})
+
+    with patch.object(main.core, 'read_namespaced_config_map', return_value=config_map):
+        with main.allocation_lock:
+            assert main.restore_persisted_state_locked() == main.StateRestoreResult(
+                restored=True,
+                reason='restored',
+            )
+            assert 'live' not in main.stream_generation
+            assert main.stream_generation_high_water['live'] == 3
+
+            main.register_or_refresh_stream('live', 'proxy-2')
+
+    assert main.stream_generation['live'] == 4
+
+
+def test_register_bumps_stale_registryless_generation():
+    reset_state()
+    with main.allocation_lock:
+        main.stream_generation['live'] = 3
+        main.stream_generation_high_water['live'] = 3
+
+        main.register_or_refresh_stream('live', 'proxy-2')
+
+    assert main.stream_generation['live'] == 4
+    assert main.stream_generation_high_water['live'] == 4
+
+
 def test_recover_state_records_restored_and_missing_outcomes():
     reset_state()
     restored_labels = {'status': 'success', 'reason': 'restored'}
