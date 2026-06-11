@@ -1491,6 +1491,19 @@ def _try_handover_stream_owner_locked(stream: str, candidate_proxy_pod: str) -> 
                     logger.warning(
                         f"[Handover] Failed deleting rolled-back worker pod {created_worker_to_delete}: {cleanup_error}"
                     )
+                except Exception as cleanup_error:
+                    record_worker_delete_metric("warning", "delete_failed")
+                    log_controller_event(
+                        "worker_deleted",
+                        stream=stream,
+                        proxy_pod=candidate_proxy_pod,
+                        worker_pod=created_worker_to_delete,
+                        status=LOG_STATUS_DELETE_FAILED,
+                        level=logging.WARNING,
+                    )
+                    logger.warning(
+                        f"[Handover] Failed deleting rolled-back worker pod {created_worker_to_delete}: {cleanup_error}"
+                    )
             raise
 
         log_controller_event(

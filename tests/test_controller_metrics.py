@@ -1212,6 +1212,43 @@ def test_handover_rollback_deletes_new_worker_after_partial_replacement_failure(
     assert cleanup_event['status'] == 'deleted'
 
 
+def test_handover_rollback_keeps_original_error_after_non_api_delete_failure():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
+    main.stream_to_proxy['live'] = 'proxy-old'
+    main.stream_generation['live'] = 1
+    main.stream_to_worker['live'] = 'worker-old'
+    main.worker_to_stream['worker-old'] = 'live'
+    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
+    delete_labels = {'status': 'warning', 'reason': 'delete_failed'}
+    delete_before = counter_value(main.workers_deleted_total, **delete_labels)
+
+    def partial_replacement(stream, proxy_dns):
+        main.stream_to_worker[stream] = 'worker-new'
+        main.worker_create_started_at['worker-extra'] = 123.0
+        raise RuntimeError('original handover failure')
+
+    handler = JsonCaptureHandler()
+    main.logger.addHandler(handler)
+    try:
+        with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
+             patch.object(main, 'replace_worker_pod_for_stream_locked', side_effect=partial_replacement), \
+             patch.object(main.core, 'delete_namespaced_pod', side_effect=[RuntimeError('transport timeout'), None]) as delete_pod:
+            with pytest.raises(RuntimeError, match='original handover failure'):
+                main.try_handover_stream_owner('live', 'proxy-new')
+    finally:
+        main.logger.removeHandler(handler)
+
+    assert delete_pod.call_count == 2
+    assert [call.kwargs['name'] for call in delete_pod.call_args_list] == ['worker-new', 'worker-extra']
+    assert counter_value(main.workers_deleted_total, **delete_labels) == delete_before + 1
+    cleanup_events = [event for event in handler.events if event['event_type'] == 'worker_deleted']
+    assert [(event['worker_pod'], event['status']) for event in cleanup_events] == [
+        ('worker-new', 'delete_failed'),
+        ('worker-extra', 'deleted'),
+    ]
+
+
 def test_handover_rollback_deletes_worker_from_create_timestamp_delta():
     reset_state()
     main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
