@@ -57,6 +57,8 @@ LOG_STATUS_READY = "ready"
 LOG_STATUS_IGNORED = "ignored"
 LOG_STATUS_RECEIVED = "received"
 LOG_STATUS_OBSERVED = "observed"
+LOG_STATUS_FAILED = "failed"
+LOG_STATUS_SUCCESS = "success"
 
 
 @dataclass(frozen=True)
@@ -1094,6 +1096,16 @@ def record_worker_progress_event(stream: str, worker_pod: str, field: str, sourc
             worker_pod=worker_pod,
             proxy_pod=proxy_pod,
         )
+    if observed and field in ("t_ffmpeg_started", "t_ffmpeg_first_progress"):
+        log_controller_event(
+            "ffmpeg_started" if field == "t_ffmpeg_started" else "ffmpeg_first_progress",
+            stream=stream,
+            generation=generation,
+            proxy_pod=proxy_pod,
+            worker_pod=worker_pod,
+            status=LOG_STATUS_OBSERVED,
+            message=f"{field} observed from {source}",
+        )
     return {
         'status': 'observed' if observed else 'duplicate',
         'reason': 'recorded' if observed else 'already_observed',
@@ -1108,6 +1120,7 @@ def persist_state_locked() -> None:
     Persists critical controller state to a ConfigMap to survive pod restart/crash.
     Must be called only while holding allocation_lock.
     """
+    started_at = time.monotonic()
     payload = {
         "schema_version": STATE_SCHEMA_VERSION,
         "stream_to_worker": stream_to_worker,
@@ -1134,10 +1147,24 @@ def persist_state_locked() -> None:
             except ApiException as create_error:
                 record_kubernetes_api_error("create", "configmap", create_error)
                 state_persistence_errors_total.labels(operation="persist", reason="create_failed").inc()
+                log_controller_event(
+                    "state_persistence_failed",
+                    started_at=started_at,
+                    status=LOG_STATUS_FAILED,
+                    level=logging.WARNING,
+                    message="state persistence create failed",
+                )
                 raise
         else:
             record_kubernetes_api_error("patch", "configmap", e)
             state_persistence_errors_total.labels(operation="persist", reason="patch_failed").inc()
+            log_controller_event(
+                "state_persistence_failed",
+                started_at=started_at,
+                status=LOG_STATUS_FAILED,
+                level=logging.WARNING,
+                message="state persistence patch failed",
+            )
             raise
 
 
@@ -1351,6 +1378,14 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
     replacement_status = "success"
     replacement_reason = "replaced"
     worker_replacements_total.labels(status=replacement_status, reason=replacement_reason).inc()
+    log_controller_event(
+        "worker_replaced",
+        stream=stream,
+        proxy_pod=get_stream_proxy_pod(stream),
+        worker_pod=new_worker,
+        status=LOG_STATUS_SUCCESS,
+        message=f"worker replaced old='{old_worker}' new='{new_worker}'",
+    )
 
     logger.info(
         f"[Handover] Replaced worker pod for stream '{stream}' due to proxy change: "
@@ -1570,6 +1605,15 @@ async def monitor_stream_registry_health():
                         if entry.get("proxy_pod") == proxy_pod
                     ]
                     for stream in impacted_streams:
+                        failed_generation = stream_generation.get(stream)
+                        log_controller_event(
+                            "proxy_failure_detected",
+                            stream=stream,
+                            generation=failed_generation,
+                            proxy_pod=proxy_pod,
+                            status="unhealthy",
+                            level=logging.WARNING,
+                        )
                         stream_registry.pop(stream, None)
                         stream_to_proxy.pop(stream, None)
                         stream_generation.pop(stream, None)
@@ -1966,6 +2010,11 @@ def recover_state(
             restore_result = restore_persisted_state_locked()
             if restore_result.restored:
                 state_recovery_total.labels(status="success", reason="restored").inc()
+                log_controller_event(
+                    "state_recovery_completed",
+                    status=LOG_STATUS_SUCCESS,
+                    message="state recovery restored persisted state",
+                )
                 logger.info(
                     f"[State Recovery] Restored persisted state with {len(stream_to_worker)} active stream allocations."
                 )
@@ -1973,17 +2022,34 @@ def recover_state(
 
             if restore_result.reason in ("not_found", "empty"):
                 state_recovery_total.labels(status="skipped", reason="no_persisted_state").inc()
+                log_controller_event(
+                    "state_recovery_completed",
+                    status="skipped",
+                    message="state recovery skipped because no persisted state was found",
+                )
                 # Sem estado persistido: não reaproveitar pods já existentes.
                 # No modelo por-env (STREAM_KEY/PROXY_DNS), reuso pode carregar config obsoleta.
                 logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
                 return
 
             state_recovery_total.labels(status="error", reason=restore_result.reason).inc()
+            log_controller_event(
+                "state_recovery_failed",
+                status=LOG_STATUS_FAILED,
+                level=logging.WARNING,
+                message=f"state recovery failed: {restore_result.reason}",
+            )
             logger.warning(
                 f"[State Recovery] Persisted state restore failed with reason '{restore_result.reason}'."
             )
     except Exception as e:
         state_recovery_total.labels(status="error", reason="exception").inc()
+        log_controller_event(
+            "state_recovery_failed",
+            status=LOG_STATUS_FAILED,
+            level=logging.WARNING,
+            message="state recovery raised an exception",
+        )
         raise
 
 
@@ -2322,12 +2388,12 @@ async def sweep_orphan_workers():
             try:
                 core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
                 record_worker_delete_metric("success", "orphan", orphan=True)
-                log_controller_event("worker_deleted", worker_pod=pod_name, status=LOG_STATUS_DELETED)
+                log_controller_event("orphan_worker_deleted", worker_pod=pod_name, status=LOG_STATUS_DELETED)
             except ApiException as e:
                 record_kubernetes_api_error("delete", "pod", e)
                 record_worker_delete_metric("warning", "delete_failed", orphan=True)
                 log_controller_event(
-                    "worker_deleted",
+                    "orphan_worker_deleted",
                     worker_pod=pod_name,
                     status=LOG_STATUS_DELETE_FAILED,
                     level=logging.WARNING,
@@ -2336,7 +2402,7 @@ async def sweep_orphan_workers():
             except Exception as e:
                 record_worker_delete_metric("warning", "delete_failed", orphan=True)
                 log_controller_event(
-                    "worker_deleted",
+                    "orphan_worker_deleted",
                     worker_pod=pod_name,
                     status=LOG_STATUS_DELETE_FAILED,
                     level=logging.WARNING,
