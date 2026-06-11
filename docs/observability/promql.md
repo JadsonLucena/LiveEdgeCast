@@ -121,12 +121,31 @@ histogram_quantile(
 
 ### Decomposição do cold start por fase
 
+Use esta consulta para decompor apenas o caminho até o primeiro progresso do
+FFmpeg, sem incluir destino externo.
+
 ```promql
 histogram_quantile(
   0.95,
   sum by (le, phase) (
     rate(stream_lifecycle_phase_seconds_bucket{
-      phase=~"proxy_to_controller|controller_to_worker_create_request|worker_create_request_to_pod_created|pod_created_to_scheduled|scheduled_to_container_started|container_started_to_worker_ready|worker_ready_to_ffmpeg_started|ffmpeg_started_to_first_progress|ffmpeg_first_progress_to_destination"
+      phase=~"proxy_to_controller|controller_to_worker_create_request|worker_create_request_to_pod_created|pod_created_to_scheduled|scheduled_to_container_started|container_started_to_worker_ready|worker_ready_to_ffmpeg_started|ffmpeg_started_to_first_progress"
+    }[5m])
+  )
+)
+```
+
+### Extensão experimental com destino externo por fase
+
+Use esta consulta somente quando houver receptor experimental instrumentado; ela
+mostra o trecho adicional após o primeiro progresso e os agregados até destino.
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, phase) (
+    rate(stream_lifecycle_phase_seconds_bucket{
+      phase=~"ffmpeg_first_progress_to_destination|proxy_to_destination|controller_to_destination"
     }[5m])
   )
 )

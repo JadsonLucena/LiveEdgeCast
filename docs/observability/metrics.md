@@ -225,13 +225,18 @@ counted once with `status="pending"` and `reason="approximate_endpoint"`. Missin
 endpoints that remain absent until cleanup are counted by
 `stream_lifecycle_missing_timestamp_total{reason="stream_cleanup"}`. Accepted
 controller-side approximations are counted by
-`stream_lifecycle_approximate_timestamp_total`.
+`stream_lifecycle_approximate_timestamp_total`. Because lifecycle state is
+in-memory, `stream_lifecycle_missing_timestamp_total` only covers streams whose
+tracking entry survives until normal cleanup; controller restarts or crashes can
+still undercount missing lifecycle endpoints.
 
 Destination-derived phases are emitted only when `t_destination_received` is
 observed from an experimental receiver callback. Enable the callback explicitly
 with `CONTROLLER_DESTINATION_CALLBACK_ENABLED=true` and post to
 `/streams/destination-received` with `stream`, optional `generation`, and optional
-`t_destination_received` epoch seconds. The derived destination phases are
+`t_destination_received` epoch seconds. Callback responses include whether the
+accepted timestamp was approximate so receiver experiments can detect omitted
+external timestamps immediately. The derived destination phases are
 `ffmpeg_first_progress_to_destination`, `proxy_to_destination`, and
 `controller_to_destination`. If no receiver is instrumented, do not use these
 phases for delivery latency; use the existing first-progress phases instead and

@@ -2901,6 +2901,8 @@ def stream_destination_received(
         raise HTTPException(status_code=404, detail="destination callback endpoint is disabled")
 
     received_at = time.time()
+    timestamp_is_approximate = t_destination_received is None
+    timestamp_value = t_destination_received if t_destination_received is not None else received_at
     with allocation_lock:
         current_generation = stream_generation.get(stream)
         registry_entry = stream_registry.get(stream, {})
@@ -2937,16 +2939,16 @@ def stream_destination_received(
                 "timestamp": "t_destination_received",
             }
         resolved_generation = current_generation
+        observed = record_stream_lifecycle_timestamp(
+            stream,
+            resolved_generation,
+            "t_destination_received",
+            timestamp=timestamp_value,
+            source="experimental_receiver",
+            proxy_pod=proxy_pod,
+            approximate=timestamp_is_approximate,
+        )
 
-    observed = record_stream_lifecycle_timestamp(
-        stream,
-        resolved_generation,
-        "t_destination_received",
-        timestamp=t_destination_received if t_destination_received is not None else received_at,
-        source="experimental_receiver",
-        proxy_pod=proxy_pod,
-        approximate=t_destination_received is None,
-    )
     log_controller_event(
         "destination_received",
         stream=stream,
@@ -2961,6 +2963,8 @@ def stream_destination_received(
         "stream": stream,
         "generation": resolved_generation,
         "timestamp": "t_destination_received",
+        "source": "experimental_receiver",
+        "approximate": timestamp_is_approximate,
     }
 
 @app.post("/streams/ended")
