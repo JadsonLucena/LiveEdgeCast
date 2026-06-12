@@ -9,6 +9,17 @@ exporter = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = exporter
 spec.loader.exec_module(exporter)
 
+COMPLETE_PROGRESS_WITH_BITRATE = (
+    Path("tests/fixtures/ffmpeg_progress/complete.progress")
+    .read_text()
+    .replace("frame=2\n", "frame=2\nbitrate=1234.5kbits/s\n")
+)
+PARTIAL_PROGRESS_WITH_BITRATE = (
+    Path("tests/fixtures/ffmpeg_progress/partial.progress")
+    .read_text()
+    .replace("total_size=12000\n", "total_size=12000\nbitrate=1.50Mbits/s\n")
+)
+
 
 def metric_value(payload, metric_name, labels=None):
     labels = labels or ""
@@ -20,13 +31,7 @@ def metric_value(payload, metric_name, labels=None):
 
 
 def test_parse_complete_progress_fixture_uses_latest_record():
-    fixture = (
-        Path("tests/fixtures/ffmpeg_progress/complete.progress")
-        .read_text()
-        .replace("frame=2\n", "frame=2\nbitrate=1234.5kbits/s\n")
-    )
-
-    records = list(exporter.parse_progress_records(fixture))
+    records = list(exporter.parse_progress_records(COMPLETE_PROGRESS_WITH_BITRATE))
 
     assert len(records) == 2
     assert exporter.parse_out_time_seconds(records[-1]) == 2.5
@@ -38,18 +43,19 @@ def test_parse_complete_progress_fixture_uses_latest_record():
 
 
 def test_parse_partial_progress_fixture_ignores_unfinished_line_but_keeps_complete_values():
-    fixture = (
-        Path("tests/fixtures/ffmpeg_progress/partial.progress")
-        .read_text()
-        .replace("total_size=12000\n", "total_size=12000\nbitrate=1.50Mbits/s\n")
-    )
-
-    records = list(exporter.parse_progress_records(fixture))
+    records = list(exporter.parse_progress_records(PARTIAL_PROGRESS_WITH_BITRATE))
 
     assert records[-1]["frame"] == "4"
     assert records[-1]["out_time"] == "00:00:04.000000"
     assert exporter.parse_bitrate_bits_per_second(records[0]) == 1_500_000.0
     assert "speed" not in records[-1]
+
+
+def test_parse_bitrate_rejects_invalid_and_negative_values():
+    assert exporter.parse_bitrate_bits_per_second({"bitrate": "42"}) == 42.0
+    assert exporter.parse_bitrate_bits_per_second({"bitrate": "N/A"}) is None
+    assert exporter.parse_bitrate_bits_per_second({"bitrate": "not-a-rate"}) is None
+    assert exporter.parse_bitrate_bits_per_second({"bitrate": "-1kbits/s"}) is None
 
 
 def test_progress_follower_handles_partial_write_completion_truncation_and_rotation(
@@ -70,6 +76,7 @@ def test_progress_follower_handles_partial_write_completion_truncation_and_rotat
         "frame=2\ntotal_size=222\nout_time=00:00:02.000000\nspeed=0.75x\nprogress=continue\n"
     )
     assert follower.poll(now=12.0)["total_size"] == "222"
+    assert follower.first_timestamp == 12.0
 
     rotated = tmp_path / "ffmpeg.progress.rotated"
     progress.rename(rotated)
@@ -77,6 +84,7 @@ def test_progress_follower_handles_partial_write_completion_truncation_and_rotat
         "frame=3\ntotal_size=333\nout_time=00:00:03.000000\nspeed=1.00x\nprogress=continue\n"
     )
     assert follower.poll(now=13.0)["total_size"] == "333"
+    assert follower.first_timestamp == 13.0
 
 
 def test_progress_follower_reads_records_beyond_chunk_boundaries(tmp_path):

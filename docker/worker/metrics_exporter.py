@@ -93,7 +93,7 @@ def parse_bitrate_bits_per_second(record: Dict[str, str]) -> Optional[float]:
         return None
 
     parsed = _float_or_none(match.group("value"))
-    if parsed is None:
+    if parsed is None or parsed < 0:
         return None
 
     unit = (match.group("unit") or "bits/s").lower()
@@ -175,17 +175,9 @@ class ProgressFollower:
         identity = (stat.st_dev, stat.st_ino)
         if self._identity != identity or stat.st_size < self._offset:
             self._identity = identity
-            self._offset = 0
-            self._buffer = ""
-            self._prefix = ""
-            self._tail = ""
-            self._current_record = {}
+            self._reset_file_state()
         elif not self._file_window_matches():
-            self._offset = 0
-            self._buffer = ""
-            self._prefix = ""
-            self._tail = ""
-            self._current_record = {}
+            self._reset_file_state()
 
         try:
             with open(
@@ -214,6 +206,14 @@ class ProgressFollower:
 
     def _record_error(self, stage: str) -> None:
         self.error_counts[stage] = self.error_counts.get(stage, 0) + 1
+
+    def _reset_file_state(self) -> None:
+        self._offset = 0
+        self._buffer = ""
+        self._prefix = ""
+        self._tail = ""
+        self._current_record = {}
+        self.first_timestamp = None
 
     def _file_window_matches(self) -> bool:
         if not self._prefix and not self._tail:

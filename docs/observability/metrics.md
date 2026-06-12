@@ -111,11 +111,11 @@ progress lines are observed.
 | `worker_ffmpeg_health_state` | Gauge | none | `1` when FFmpeg is running and progress has been observed within `FFMPEG_PROGRESS_STALE_SECONDS` (default `15`), otherwise `0`. |
 | `worker_ffmpeg_last_progress_timestamp_seconds` | Gauge | none | Unix timestamp from the exporter clock when the latest complete progress line was observed. |
 | `worker_ffmpeg_progress_age_seconds` | Gauge | none | Seconds elapsed since `worker_ffmpeg_last_progress_timestamp_seconds`; `0` until any progress is observed. |
-| `worker_ffmpeg_first_progress_timestamp_seconds` | Gauge | none | Unix timestamp from the exporter clock when this exporter first observed a complete FFmpeg progress line; `0` until any progress is observed. |
+| `worker_ffmpeg_first_progress_timestamp_seconds` | Gauge | none | Unix timestamp from the exporter clock when this exporter first observed a complete FFmpeg progress line for the current progress file/run; resets to `0` after progress file truncation or rotation until new progress is observed. |
 | `worker_ffmpeg_out_time_seconds` | Gauge | none | Latest `out_time`/`out_time_us`/`out_time_ms` converted to seconds from the best available progress record. |
 | `worker_ffmpeg_total_size_bytes` | Gauge | none | Latest FFmpeg `total_size` value in bytes from the best available progress record. |
 | `worker_ffmpeg_speed` | Gauge | none | Latest FFmpeg `speed` multiplier with the trailing `x` removed. |
-| `worker_ffmpeg_bitrate_bits_per_second` | Gauge | none | Latest FFmpeg `bitrate` value converted to bits per second from `bits/s`, `kbits/s`, `Mbits/s`, or `Gbits/s`; `N/A`, missing, or unparsable values are exported as `0`. |
+| `worker_ffmpeg_bitrate_bits_per_second` | Gauge | none | Latest FFmpeg `bitrate` value converted to bits per second from unitless bits/s, `bits/s`, `kbits/s`, `Mbits/s`, or `Gbits/s`; negative, `N/A`, missing, or unparsable values are exported as `0`. |
 | `worker_ffmpeg_exit_total` | Counter | `exit_code` | Unique FFmpeg exits observed from the worker-local exit event file. |
 | `worker_ffmpeg_exporter_errors_total` | Counter | `stage` | Exporter read/persistence errors; current stages are `progress_read` and `exit_state`. |
 
@@ -366,11 +366,11 @@ limpeza de estado.
 | `worker_ffmpeg_health_state` | Gauge | target labels | booleano `0/1` | Média. | FFmpeg está rodando e progresso recente não está stale. | Indicador de worker ativo/saudável e aproximação para órfãos. |
 | `worker_ffmpeg_last_progress_timestamp_seconds` | Gauge | target labels | Unix timestamp em segundos | Média. | Momento, no relógio do exporter, da última linha completa de progresso. | Diagnóstico de staleness; não usar como timestamp de cold start. |
 | `worker_ffmpeg_progress_age_seconds` | Gauge | target labels | segundos | Média. | Idade do último progresso. | Detectar congelamento de processamento. |
-| `worker_ffmpeg_first_progress_timestamp_seconds` | Gauge | target labels | Unix timestamp em segundos | Média: uma série por worker vivo. | Primeiro momento, no relógio do exporter, em que uma linha completa de progresso foi observada; `0` antes disso. | Aproximação local do primeiro progresso observável pelo exporter. |
+| `worker_ffmpeg_first_progress_timestamp_seconds` | Gauge | target labels | Unix timestamp em segundos | Média: uma série por worker vivo. | Primeiro momento, no relógio do exporter, em que uma linha completa de progresso foi observada para o arquivo/run atual; volta a `0` após truncamento ou rotação até novo progresso. | Aproximação local do primeiro progresso observável pelo exporter. |
 | `worker_ffmpeg_out_time_seconds` | Gauge | target labels | segundos de mídia | Média. | Último `out_time` do FFmpeg convertido para segundos. | Evidenciar avanço de transcodificação durante o experimento. |
 | `worker_ffmpeg_total_size_bytes` | Gauge | target labels | bytes | Média. | Último `total_size` reportado pelo FFmpeg. | Volume de saída processado. |
 | `worker_ffmpeg_speed` | Gauge | target labels | multiplicador `x` | Média. | Velocidade de processamento relativa ao tempo real. | Métrica de desempenho do worker. |
-| `worker_ffmpeg_bitrate_bits_per_second` | Gauge | target labels | bits/s | Média: uma série por worker vivo. | Último `bitrate` do arquivo `-progress` convertido de `bits/s`, `kbits/s`, `Mbits/s` ou `Gbits/s`; valores ausentes, `N/A` ou inválidos viram `0`. | Taxa de bits reportada pelo FFmpeg para contextualizar carga e qualidade de saída. |
+| `worker_ffmpeg_bitrate_bits_per_second` | Gauge | target labels | bits/s | Média: uma série por worker vivo. | Último `bitrate` do arquivo `-progress` convertido de valores sem unidade (bits/s), `bits/s`, `kbits/s`, `Mbits/s` ou `Gbits/s`; valores negativos, ausentes, `N/A` ou inválidos viram `0`. | Taxa de bits reportada pelo FFmpeg para contextualizar carga e qualidade de saída. |
 | `worker_ffmpeg_exit_total` | Counter | `exit_code` mais target labels | saídas | Média: exit codes controlados por worker. | Saídas únicas de FFmpeg observadas pelo exporter. | Falhas de processamento por repetição. |
 | `worker_ffmpeg_exporter_errors_total` | Counter | `stage` mais target labels | erros | Baixa por worker: estágios controlados. | Erros de leitura/persistência do exporter. | Qualidade da telemetria do worker. |
 
