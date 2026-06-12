@@ -20,27 +20,41 @@ def metric_value(payload, metric_name, labels=None):
 
 
 def test_parse_complete_progress_fixture_uses_latest_record():
-    fixture = Path("tests/fixtures/ffmpeg_progress/complete.progress").read_text()
+    fixture = (
+        Path("tests/fixtures/ffmpeg_progress/complete.progress")
+        .read_text()
+        .replace("frame=2\n", "frame=2\nbitrate=1234.5kbits/s\n")
+    )
 
     records = list(exporter.parse_progress_records(fixture))
 
     assert len(records) == 2
     assert exporter.parse_out_time_seconds(records[-1]) == 2.5
     assert records[-1]["total_size"] == "8192"
+    assert records[-1]["bitrate"] == "1234.5kbits/s"
+    assert exporter.parse_bitrate_bits_per_second(records[0]) is None
+    assert exporter.parse_bitrate_bits_per_second(records[-1]) == 1_234_500.0
     assert records[-1]["speed"] == "0.98x"
 
 
 def test_parse_partial_progress_fixture_ignores_unfinished_line_but_keeps_complete_values():
-    fixture = Path("tests/fixtures/ffmpeg_progress/partial.progress").read_text()
+    fixture = (
+        Path("tests/fixtures/ffmpeg_progress/partial.progress")
+        .read_text()
+        .replace("total_size=12000\n", "total_size=12000\nbitrate=1.50Mbits/s\n")
+    )
 
     records = list(exporter.parse_progress_records(fixture))
 
     assert records[-1]["frame"] == "4"
     assert records[-1]["out_time"] == "00:00:04.000000"
+    assert exporter.parse_bitrate_bits_per_second(records[0]) == 1_500_000.0
     assert "speed" not in records[-1]
 
 
-def test_progress_follower_handles_partial_write_completion_truncation_and_rotation(tmp_path):
+def test_progress_follower_handles_partial_write_completion_truncation_and_rotation(
+    tmp_path,
+):
     progress = tmp_path / "ffmpeg.progress"
     progress.write_text("frame=1\nout_time=00:00:01.000000\nspeed=1.")
     follower = exporter.ProgressFollower(str(progress))
@@ -52,12 +66,16 @@ def test_progress_follower_handles_partial_write_completion_truncation_and_rotat
     assert follower.poll(now=11.0)["speed"] == "1.25x"
     assert follower.latest_timestamp == 11.0
 
-    progress.write_text("frame=2\ntotal_size=222\nout_time=00:00:02.000000\nspeed=0.75x\nprogress=continue\n")
+    progress.write_text(
+        "frame=2\ntotal_size=222\nout_time=00:00:02.000000\nspeed=0.75x\nprogress=continue\n"
+    )
     assert follower.poll(now=12.0)["total_size"] == "222"
 
     rotated = tmp_path / "ffmpeg.progress.rotated"
     progress.rename(rotated)
-    progress.write_text("frame=3\ntotal_size=333\nout_time=00:00:03.000000\nspeed=1.00x\nprogress=continue\n")
+    progress.write_text(
+        "frame=3\ntotal_size=333\nout_time=00:00:03.000000\nspeed=1.00x\nprogress=continue\n"
+    )
     assert follower.poll(now=13.0)["total_size"] == "333"
 
 
@@ -93,13 +111,15 @@ def test_progress_follower_refreshes_timestamp_for_identical_new_records(tmp_pat
     assert follower.latest_timestamp == 31.0
 
 
-def test_metrics_collector_preserves_previous_gauges_during_partial_record(tmp_path, monkeypatch):
+def test_metrics_collector_preserves_previous_gauges_during_partial_record(
+    tmp_path, monkeypatch
+):
     progress = tmp_path / "ffmpeg.progress"
     pid_file = tmp_path / "ffmpeg.pid"
     exit_file = tmp_path / "ffmpeg.exit"
     state_file = tmp_path / "ffmpeg.exit.metrics_state"
     progress.write_text(
-        "frame=1\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
+        "frame=1\nbitrate=250.5kbits/s\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
     )
     pid_file.write_text("1234")
     monkeypatch.setattr(exporter, "process_is_running", lambda pid: pid == 1234)
@@ -116,6 +136,14 @@ def test_metrics_collector_preserves_previous_gauges_during_partial_record(tmp_p
     assert metric_value(first_payload, "worker_ffmpeg_out_time_seconds") == 1.5
     assert metric_value(first_payload, "worker_ffmpeg_total_size_bytes") == 4096
     assert metric_value(first_payload, "worker_ffmpeg_speed") == 1.25
+    assert (
+        metric_value(first_payload, "worker_ffmpeg_bitrate_bits_per_second")
+        == 250_500.0
+    )
+    assert (
+        metric_value(first_payload, "worker_ffmpeg_first_progress_timestamp_seconds")
+        == 100.0
+    )
 
     progress.write_text(progress.read_text() + "frame=2\n")
     partial_payload = collector.collect()
@@ -123,13 +151,26 @@ def test_metrics_collector_preserves_previous_gauges_during_partial_record(tmp_p
     assert metric_value(partial_payload, "worker_ffmpeg_out_time_seconds") == 1.5
     assert metric_value(partial_payload, "worker_ffmpeg_total_size_bytes") == 4096
     assert metric_value(partial_payload, "worker_ffmpeg_speed") == 1.25
-    assert metric_value(partial_payload, "worker_ffmpeg_last_progress_timestamp_seconds") == 101.0
+    assert (
+        metric_value(partial_payload, "worker_ffmpeg_bitrate_bits_per_second")
+        == 250_500.0
+    )
+    assert (
+        metric_value(partial_payload, "worker_ffmpeg_last_progress_timestamp_seconds")
+        == 101.0
+    )
+    assert (
+        metric_value(partial_payload, "worker_ffmpeg_first_progress_timestamp_seconds")
+        == 100.0
+    )
 
 
 def test_discover_progress_path_skips_unreadable_glob_candidates(monkeypatch):
     monkeypatch.delenv("FFMPEG_PROGRESS_FILE", raising=False)
     monkeypatch.delenv("STREAM_KEY", raising=False)
-    monkeypatch.setattr(exporter.glob, "glob", lambda pattern: ["/tmp/ffmpeg_unreadable.progress"])
+    monkeypatch.setattr(
+        exporter.glob, "glob", lambda pattern: ["/tmp/ffmpeg_unreadable.progress"]
+    )
 
     def raise_permission_error(_path):
         raise PermissionError("progress candidate temporarily unreadable")
@@ -151,7 +192,9 @@ def test_read_pid_returns_none_when_pid_file_is_unreadable(tmp_path, monkeypatch
     assert exporter.read_pid(str(pid_file)) is None
 
 
-def test_progress_follower_keeps_last_record_when_progress_file_io_fails(tmp_path, monkeypatch):
+def test_progress_follower_keeps_last_record_when_progress_file_io_fails(
+    tmp_path, monkeypatch
+):
     progress = tmp_path / "ffmpeg.progress"
     progress.write_text(
         "frame=1\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
@@ -170,7 +213,9 @@ def test_progress_follower_keeps_last_record_when_progress_file_io_fails(tmp_pat
     assert follower.error_counts == {"progress_read": 1}
 
 
-def test_progress_follower_keeps_last_record_when_progress_file_open_fails(tmp_path, monkeypatch):
+def test_progress_follower_keeps_last_record_when_progress_file_open_fails(
+    tmp_path, monkeypatch
+):
     progress = tmp_path / "ffmpeg.progress"
     progress.write_text(
         "frame=1\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
@@ -189,7 +234,9 @@ def test_progress_follower_keeps_last_record_when_progress_file_open_fails(tmp_p
     assert follower.error_counts == {"progress_read": 1}
 
 
-def test_progress_follower_does_not_refresh_timestamp_after_transient_open_failure(tmp_path, monkeypatch):
+def test_progress_follower_does_not_refresh_timestamp_after_transient_open_failure(
+    tmp_path, monkeypatch
+):
     progress = tmp_path / "ffmpeg.progress"
     progress.write_text(
         "frame=1\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
@@ -213,7 +260,9 @@ def test_progress_follower_does_not_refresh_timestamp_after_transient_open_failu
     assert follower.error_counts == {"progress_read": 1}
 
 
-def test_exit_counter_store_defers_exit_reads_until_state_load_recovers(tmp_path, monkeypatch):
+def test_exit_counter_store_defers_exit_reads_until_state_load_recovers(
+    tmp_path, monkeypatch
+):
     exit_file = tmp_path / "ffmpeg.exit"
     state_file = tmp_path / "ffmpeg.exit.metrics_state"
     exit_file.write_text("run-a 1\n")
@@ -266,7 +315,9 @@ def test_exit_counter_store_streams_exit_file_without_readlines(tmp_path, monkey
     assert store.poll() == {"0": 1, "1": 1}
 
 
-def test_exit_counter_store_retries_dirty_state_after_save_failure(tmp_path, monkeypatch):
+def test_exit_counter_store_retries_dirty_state_after_save_failure(
+    tmp_path, monkeypatch
+):
     exit_file = tmp_path / "ffmpeg.exit"
     state_file = tmp_path / "ffmpeg.exit.metrics_state"
     exit_file.write_text("run-a 1\n")
@@ -318,17 +369,29 @@ def test_metrics_collector_exports_exporter_error_counters(tmp_path, monkeypatch
 
     payload = collector.collect()
 
-    assert metric_value(payload, "worker_ffmpeg_exporter_errors_total", '{stage="progress_read"}') == 2
-    assert metric_value(payload, "worker_ffmpeg_exporter_errors_total", '{stage="exit_state"}') == 1
+    assert (
+        metric_value(
+            payload, "worker_ffmpeg_exporter_errors_total", '{stage="progress_read"}'
+        )
+        == 2
+    )
+    assert (
+        metric_value(
+            payload, "worker_ffmpeg_exporter_errors_total", '{stage="exit_state"}'
+        )
+        == 1
+    )
 
 
-def test_metrics_collector_exports_expected_ffmpeg_gauges_and_dedupes_exit_events(tmp_path, monkeypatch):
+def test_metrics_collector_exports_expected_ffmpeg_gauges_and_dedupes_exit_events(
+    tmp_path, monkeypatch
+):
     progress = tmp_path / "ffmpeg.progress"
     pid_file = tmp_path / "ffmpeg.pid"
     exit_file = tmp_path / "ffmpeg.exit"
     state_file = tmp_path / "ffmpeg.exit.metrics_state"
     progress.write_text(
-        "frame=1\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
+        "frame=1\nbitrate=3.25Mbits/s\ntotal_size=4096\nout_time=00:00:01.500000\nspeed=1.25x\nprogress=continue\n"
     )
     pid_file.write_text("1234")
     exit_file.write_text("run-a 1\nrun-a 1\nrun-b 0\n")
@@ -346,11 +409,17 @@ def test_metrics_collector_exports_expected_ffmpeg_gauges_and_dedupes_exit_event
     payload = collector.collect()
     assert metric_value(payload, "worker_ffmpeg_running") == 1
     assert metric_value(payload, "worker_ffmpeg_health_state") == 1
-    assert metric_value(payload, "worker_ffmpeg_last_progress_timestamp_seconds") == 100.0
+    assert (
+        metric_value(payload, "worker_ffmpeg_last_progress_timestamp_seconds") == 100.0
+    )
     assert metric_value(payload, "worker_ffmpeg_progress_age_seconds") == 0.0
     assert metric_value(payload, "worker_ffmpeg_out_time_seconds") == 1.5
     assert metric_value(payload, "worker_ffmpeg_total_size_bytes") == 4096
     assert metric_value(payload, "worker_ffmpeg_speed") == 1.25
+    assert metric_value(payload, "worker_ffmpeg_bitrate_bits_per_second") == 3_250_000.0
+    assert (
+        metric_value(payload, "worker_ffmpeg_first_progress_timestamp_seconds") == 100.0
+    )
     assert metric_value(payload, "worker_ffmpeg_exit_total", '{exit_code="1"}') == 1
     assert metric_value(payload, "worker_ffmpeg_exit_total", '{exit_code="0"}') == 1
 
@@ -362,5 +431,11 @@ def test_metrics_collector_exports_expected_ffmpeg_gauges_and_dedupes_exit_event
         clock=lambda: 101.0,
     )
     restarted_payload = restarted.collect()
-    assert metric_value(restarted_payload, "worker_ffmpeg_exit_total", '{exit_code="1"}') == 1
-    assert metric_value(restarted_payload, "worker_ffmpeg_exit_total", '{exit_code="0"}') == 1
+    assert (
+        metric_value(restarted_payload, "worker_ffmpeg_exit_total", '{exit_code="1"}')
+        == 1
+    )
+    assert (
+        metric_value(restarted_payload, "worker_ffmpeg_exit_total", '{exit_code="0"}')
+        == 1
+    )
