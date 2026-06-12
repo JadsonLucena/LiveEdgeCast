@@ -599,13 +599,13 @@ kube_pod_created{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}
 
 ### Pod lifetime para janelas experimentais
 
-Para comparar repetições, integre Pod-segundos no intervalo do experimento. Em
-Grafana, substitua `$__range_s` pela duração da janela em segundos quando não
-estiver usando a variável nativa.
+Para comparar repetições, integre Pod-segundos no intervalo do experimento. Use
+`$window` para a duração da janela, `$sample_step` para uma resolução fixa
+próxima ao scrape interval e `$sample_step_s` para a mesma resolução em segundos.
 
 ```promql
 sum by (component) (
-  avg_over_time(
+  sum_over_time(
     (
       label_replace(
         max by (namespace, pod) (
@@ -613,8 +613,8 @@ sum by (component) (
         ),
         "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
       )
-    )[$__range:]
-  ) * $__range_s
+    )[$window:$sample_step]
+  ) * $sample_step_s
 )
 ```
 
@@ -636,11 +636,16 @@ label_replace(
 As consultas desta seção produzem insumos para uma pontuação experimental de
 custo relativo, não valores monetários. Use-as com uma janela de run fechada:
 substitua `$__range` ou `$window` pela duração exata do run e `$__range_s` ou
-`$window_s` pela mesma duração em segundos. Para comparar cenários, execute as
-consultas sobre ranges equivalentes ou filtre por labels externos estáveis como
-`scenario="$scenario"` quando o Prometheus/Grafana do experimento adicioná-los.
-Não adicione `run_id` de alta cardinalidade às métricas da aplicação; prefira
-delimitar runs por tempo e guardar `run_id` nos artefatos/logs do experimento.
+`$window_s` pela mesma duração em segundos. Para integrais de gauges e indicadores
+de Pod, substitua `$sample_step` e `$sample_step_s` por uma resolução fixa
+alinhada ao scrape interval ou ao step da consulta, por exemplo `15s` e `15`; não
+use média multiplicada pela janela completa para Pods efêmeros, porque séries que
+ficam stale após deleção não contribuem zeros para `avg_over_time()`. Para
+comparar cenários, execute as consultas sobre ranges equivalentes ou filtre por
+labels externos estáveis como `scenario="$scenario"` quando o
+Prometheus/Grafana do experimento adicioná-los. Não adicione `run_id` de alta
+cardinalidade às métricas da aplicação; prefira delimitar runs por tempo e
+guardar `run_id` nos artefatos/logs do experimento.
 
 #### CPU-segundos por componente e run window
 
@@ -671,17 +676,20 @@ sum by (scenario, component) (
 
 #### Memória GiB-segundos por componente e run window
 
-Esta consulta aproxima a integral de memória como média do working set na janela
-multiplicada pela duração em segundos e convertida de bytes para GiB.
+Esta consulta aproxima a integral de memória somando amostras do working set no
+run, multiplicando pela resolução da subquery e convertendo de bytes-segundos
+para GiB-segundos. Essa forma trata séries de Pods efêmeros como contribuição
+apenas enquanto existiram, em vez de multiplicar o último valor observado pela
+janela completa.
 
 ```promql
 sum by (component) (
-  avg_over_time(
+  sum_over_time(
     label_replace(
       container_memory_working_set_bytes{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"},
       "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
-    )[$window:]
-  ) * $window_s / 1024 / 1024 / 1024
+    )[$window:$sample_step]
+  ) * $sample_step_s / 1024 / 1024 / 1024
 )
 ```
 
@@ -734,7 +742,7 @@ Para focar apenas worker e proxy RTMP no denominador de seletividade:
 
 ```promql
 sum by (component) (
-  avg_over_time(
+  sum_over_time(
     (
       label_replace(
         max by (namespace, pod) (
@@ -742,8 +750,8 @@ sum by (component) (
         ),
         "component", "$1", "pod", "^(proxy|worker)-.*"
       )
-    )[$window:]
-  ) * $window_s
+    )[$window:$sample_step]
+  ) * $sample_step_s
 )
 ```
 
@@ -767,12 +775,12 @@ vez da soma ponderada.
 +
 (
   $w_mem * sum by (component) (
-    avg_over_time(
+    sum_over_time(
       label_replace(
         container_memory_working_set_bytes{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"},
         "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
-      )[$window:]
-    ) * $window_s / 1024 / 1024 / 1024
+      )[$window:$sample_step]
+    ) * $sample_step_s / 1024 / 1024 / 1024
   )
 )
 +
@@ -796,7 +804,7 @@ vez da soma ponderada.
 +
 (
   $w_pod * sum by (component) (
-    avg_over_time(
+    sum_over_time(
       (
         label_replace(
           max by (namespace, pod) (
@@ -804,8 +812,8 @@ vez da soma ponderada.
           ),
           "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
         )
-      )[$window:]
-    ) * $window_s
+      )[$window:$sample_step]
+    ) * $sample_step_s
   )
 )
 ```

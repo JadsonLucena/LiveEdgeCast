@@ -78,16 +78,18 @@ fechada `[t0, t1]`, defina:
   (`container!=""`, `container!="POD"`) dos Pods do componente durante a janela.
 - `MEM_GiB_s(c, s, r)`: memória GiB-segundos por componente, calculada como a
   integral do `container_memory_working_set_bytes` no tempo, dividida por
-  `1024^3`. Na prática, use média na janela multiplicada pela duração da janela
-  quando a janela do Prometheus/Grafana coincide exatamente com o run.
+  `1024^3`. Para Pods efêmeros, some amostras em resolução fixa e multiplique
+  pelo step; não use média de série existente multiplicada pela janela completa,
+  pois séries stale após deleção não representam zeros.
 - `NET_RX_B(c, s, r)` e `NET_TX_B(c, s, r)`: bytes de rede recebidos e
   transmitidos por componente, calculados como o incremento de
   `container_network_receive_bytes_total` e
   `container_network_transmit_bytes_total`, excluindo `interface="lo"`.
 - `POD_s_worker(s, r)` e `POD_s_proxy(s, r)`: Pod-segundos de workers e proxies,
-  calculados pela integral do indicador `Pending|Running` de
-  `kube_pod_status_phase` para Pods `worker-*` e `proxy-*`. O HAProxy de entrada
-  (`proxy-lb-*`) deve permanecer separado quando ele fizer parte do ambiente.
+  calculados pela soma temporal do indicador `Pending|Running` de
+  `kube_pod_status_phase` para Pods `worker-*` e `proxy-*`, multiplicada pela
+  resolução da consulta. O HAProxy de entrada (`proxy-lb-*`) deve permanecer
+  separado quando ele fizer parte do ambiente.
 
 Uma pontuação relativa comum pode ser definida como:
 
