@@ -4,21 +4,76 @@ set -e
 
 STREAM_NAME="$1"
 CONTROLLER_API="${CONTROLLER_API:-http://controller.media.svc.cluster.local:8000}"
-PROXY_POD=$(hostname)
+PROXY_POD="${PROXY_POD:-$(hostname)}"
+EXPERIMENT_ID="${EXPERIMENT_ID:-unknown}"
+SCENARIO="${SCENARIO:-unknown}"
+RUN_ID="${RUN_ID:-unknown}"
+
+json_escape() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "$value"
+}
+
+utc_timestamp() {
+  local timestamp
+  timestamp="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || true)"
+  if [[ -n "$timestamp" && "$timestamp" != *N* ]]; then
+    printf '%s' "$timestamp"
+    return
+  fi
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+high_resolution_epoch_seconds() {
+  local epoch
+  epoch="$(date +%s.%N 2>/dev/null || true)"
+  if [[ "$epoch" =~ ^[0-9]+\.[0-9]+$ && "$epoch" != *N* ]]; then
+    printf '%s' "$epoch"
+    return
+  fi
+  date +%s
+}
+
+log_event() {
+  local event_type="$1"
+  local status="$2"
+  printf '{"timestamp":"%s","event_type":"%s","stream":"%s","proxy_pod":"%s","experiment_id":"%s","scenario":"%s","run_id":"%s","status":"%s"}\n' \
+    "$(utc_timestamp)" \
+    "$(json_escape "$event_type")" \
+    "$(json_escape "$STREAM_NAME")" \
+    "$(json_escape "$PROXY_POD")" \
+    "$(json_escape "$EXPERIMENT_ID")" \
+    "$(json_escape "$SCENARIO")" \
+    "$(json_escape "$RUN_ID")" \
+    "$(json_escape "$status")"
+}
 
 notify_stream_started() {
   curl -sf --connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}" --max-time "${CONTROLLER_CALLBACK_MAX_TIME_SECONDS:-2}" -X POST --get \
+    -H "X-LiveEdgeCast-Experiment-Id: ${EXPERIMENT_ID}" \
+    -H "X-LiveEdgeCast-Scenario: ${SCENARIO}" \
+    -H "X-LiveEdgeCast-Run-Id: ${RUN_ID}" \
     --data-urlencode "stream=${STREAM_NAME}" \
     --data-urlencode "proxy_pod=${PROXY_POD}" \
     --data-urlencode "t_publish_start_proxy=${PUBLISH_START_TS}" \
+    --data-urlencode "experiment_id=${EXPERIMENT_ID}" \
+    --data-urlencode "scenario=${SCENARIO}" \
+    --data-urlencode "run_id=${RUN_ID}" \
     "${CONTROLLER_API}/streams/started"
 }
 
-echo "[$(date)] [on_publish_start] Stream '$STREAM_NAME' started on proxy '$PROXY_POD'"
+PUBLISH_START_TS="$(high_resolution_epoch_seconds)"
+log_event "proxy_publish_started" "received"
 
-PUBLISH_START_TS="$(date +%s)"
-notify_stream_started || \
-  echo "[$(date)] [on_publish_start] WARNING: Failed to notify controller stream start"
+if notify_stream_started; then
+  log_event "proxy_publish_start_notified" "success"
+else
+  log_event "proxy_publish_start_notify_failed" "failed"
+fi
 
-echo "[$(date)] [on_publish_start] Controller notified"
 exit 0
