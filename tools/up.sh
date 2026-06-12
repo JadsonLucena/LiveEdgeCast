@@ -143,7 +143,7 @@ kubectl apply -f k8s/controller-rbac.yaml || { print_error "RBAC setup failed"; 
 print_success "Controller RBAC configured"
 
 print_step "Deploying to Kubernetes..."
-kubectl apply -f k8s/ || { print_error "Deployment failed"; exit 1; }
+kubectl apply -R -f k8s/ || { print_error "Deployment failed"; exit 1; }
 print_success "Kubernetes manifests applied"
 
 print_step "Waiting for RTMP Controller deployment to be ready..."

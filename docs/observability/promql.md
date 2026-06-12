@@ -17,9 +17,11 @@ Kubernetes/cAdvisor/kube-state-metrics instaladas pelo stack de monitoramento.
   repetições.
 - Antes de publicar mudanças neste arquivo, execute
   `python3 tools/validate-promql-docs.py` para checar fences Markdown e armadilhas
-  conhecidas dos snippets. Quando `promtool` estiver disponível, valide também as
-  expressões finais no Prometheus/Grafana alvo, principalmente consultas com
-  placeholders como `$window`.
+  conhecidas dos snippets. Para `PrometheusRule`, execute também
+  `python3 tools/validate-prometheus-rules.py`; quando `promtool` estiver
+  disponível, o script extrai `spec.groups` dos CRDs e executa validação
+  parser-level. Valide no Prometheus/Grafana alvo principalmente consultas com
+  placeholders como `$window` ou `$__range`.
 
 ## Cold start P50/P95/P99
 
@@ -459,10 +461,20 @@ sum(proxy_rtmp_stats_up)
 
 ## Recursos por componente
 
-As consultas abaixo agregam por componente inferido pelo nome do Pod. Quando
-possível, prefira labels de workload do kube-state-metrics; os exemplos por regex
+A estratégia primária de coleta de recursos não depende de valores simulados nem
+de gauges auxiliares do controller. Use cAdvisor/kubelet para CPU, memória e rede,
+e kube-state-metrics para contagem, criação, fase e idade de Pods. As consultas
+abaixo agregam por componente inferido pelo nome do Pod; os exemplos por regex
 funcionam com os manifests atuais e separam `proxy-lb-*` de `proxy-*` para não
-misturar o HAProxy de entrada com os Pods RTMP.
+misturar o HAProxy de entrada com os Pods RTMP. Se o cluster tiver labels de
+workload estáveis exportadas pelo kube-state-metrics, elas podem substituir a
+inferência por regex, desde que preservem a mesma separação de componentes.
+
+Os manifests em `k8s/observability/liveedgecast-resource-rules.yaml` materializam
+recording rules para os principais agregados com as séries nativas
+`container_cpu_usage_seconds_total`, `container_memory_working_set_bytes`,
+`container_network_receive_bytes_total`, `container_network_transmit_bytes_total`,
+`kube_pod_status_phase` e `kube_pod_created`.
 
 ### CPU por componente usando cAdvisor
 
@@ -488,10 +500,14 @@ sum by (component) (
 
 ### Tráfego de rede recebido por componente
 
+As consultas de rede excluem `interface="lo"` para não somar tráfego de loopback
+intra-Pod. O matcher negativo também mantém compatibilidade com ambientes em que
+a série não expõe a label `interface`.
+
 ```promql
 sum by (component) (
   label_replace(
-    rate(container_network_receive_bytes_total{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+    rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
     "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 )
@@ -502,18 +518,194 @@ sum by (component) (
 ```promql
 sum by (component) (
   label_replace(
-    rate(container_network_transmit_bytes_total{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+    rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
     "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 )
 ```
 
+### Rede RX/TX por componente em uma única tabela
+
+Use esta consulta quando o painel precisar de uma dimensão `direction` comum para
+entrada e saída. A fonte continua sendo cAdvisor/kubelet; o `label_replace` final
+só adiciona a label de direção para facilitar legendas e tabelas.
+
+```promql
+label_replace(
+  sum by (component) (
+    label_replace(
+      rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+      "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+    )
+  ),
+  "direction", "rx", "component", ".*"
+)
+or
+label_replace(
+  sum by (component) (
+    label_replace(
+      rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+      "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+    )
+  ),
+  "direction", "tx", "component", ".*"
+)
+```
+
+### Pods ativos por componente usando kube-state-metrics
+
+Aqui, "ativo" significa Pod ainda em ciclo de vida operacional (`Pending` ou
+`Running`), excluindo Pods terminados (`Succeeded` ou `Failed`). A consulta usa
+`kube_pod_status_phase`, não métricas sintéticas do controller.
+
+```promql
+sum by (component) (
+  label_replace(
+    max by (namespace, pod) (
+      kube_pod_status_phase{namespace="media",phase=~"Pending|Running",pod=~"(proxy-lb|proxy|worker|controller)-.*"} == 1
+    ),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+)
+```
+
+### Fase/status de Pods por componente
+
+```promql
+sum by (component, phase) (
+  label_replace(
+    kube_pod_status_phase{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"},
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+)
+```
+
+### Tempo de criação e idade de Pods
+
+`kube_pod_created` é um timestamp Unix em segundos. A primeira consulta mostra o
+momento de criação; a segunda mostra a idade dos Pods ainda ativos.
+
+```promql
+kube_pod_created{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}
+```
+
+```promql
+(time() - kube_pod_created{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"})
+* on (namespace, pod) group_left()
+  max by (namespace, pod) (
+    kube_pod_status_phase{namespace="media",phase=~"Pending|Running",pod=~"(proxy-lb|proxy|worker|controller)-.*"} == 1
+  )
+```
+
+### Pod lifetime para janelas experimentais
+
+Para comparar repetições, integre Pod-segundos no intervalo do experimento. Em
+Grafana, substitua `$__range_s` pela duração da janela em segundos quando não
+estiver usando a variável nativa.
+
+```promql
+sum by (component) (
+  avg_over_time(
+    (
+      label_replace(
+        max by (namespace, pod) (
+          kube_pod_status_phase{namespace="media",phase=~"Pending|Running",pod=~"(proxy-lb|proxy|worker|controller)-.*"} == 1
+        ),
+        "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+      )
+    )[$__range:]
+  ) * $__range_s
+)
+```
+
+Para uma visualização instantânea de lifetime por Pod ativo:
+
+```promql
+label_replace(
+  (time() - kube_pod_created{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"})
+  * on (namespace, pod) group_left()
+    max by (namespace, pod) (
+      kube_pod_status_phase{namespace="media",phase=~"Pending|Running",pod=~"(proxy-lb|proxy|worker|controller)-.*"} == 1
+    ),
+  "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+)
+```
+
+### Custo relativo aproximado por Pod-segundo
+
+Esta consulta produz uma unidade relativa, não moeda. Ajuste os pesos para a
+infraestrutura do experimento; por padrão, o exemplo abaixo usa peso `1` por
+Pod-segundo para comparar cenários sem depender de preços externos ou simulados.
+
+```promql
+sum by (component) (
+  avg_over_time(
+    (
+      label_replace(
+        max by (namespace, pod) (
+          kube_pod_status_phase{namespace="media",phase=~"Pending|Running",pod=~"(proxy-lb|proxy|worker|controller)-.*"} == 1
+        ),
+        "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+      )
+    )[$__range:]
+  ) * $__range_s
+)
+```
+
+### Custo relativo aproximado por core-segundo
+
+`increase(container_cpu_usage_seconds_total[$__range])` já retorna core-segundos
+consumidos. Multiplique o resultado por um peso local se quiser converter para
+uma pontuação relativa comum entre CPU e Pod lifetime.
+
+```promql
+sum by (component) (
+  label_replace(
+    increase(container_cpu_usage_seconds_total{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[$__range]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+)
+```
+
+### Recording rules opcionais
+
+Se `k8s/observability/liveedgecast-resource-rules.yaml` estiver aplicado, os
+painéis podem usar as séries pré-agregadas abaixo em vez de repetir as expressões
+longas nos dashboards:
+
+```promql
+liveedgecast:component:cpu_cores:rate5m
+```
+
+```promql
+liveedgecast:component:memory_working_set_bytes
+```
+
+```promql
+liveedgecast:component:network_receive_bytes_per_second:rate5m
+```
+
+```promql
+liveedgecast:component:network_transmit_bytes_per_second:rate5m
+```
+
+```promql
+liveedgecast:component:active_pods
+```
+
+```promql
+liveedgecast:pod:age_seconds
+```
+
 ### Métricas de recurso emitidas pelo controller
 
-A implementação atual do coletor do controller popula readiness e memória
-aproximada, mas não popula CPU nem rede. Assim, use estas séries apenas como
-smoke test de disponibilidade de Pod e prefira cAdvisor/kubelet para resultados
-do artigo.
+As séries `pod_cpu_usage_percent`, `pod_memory_usage_percent` e
+`pod_network_io_bytes_total` são **deprecated como fonte primária** e devem ser
+tratadas somente como auxiliares enquanto não houver coletor real equivalente a
+cAdvisor/kubelet. A implementação atual do coletor do controller popula readiness
+e memória aproximada, mas não popula CPU nem rede. Assim, use estas séries apenas
+como smoke test de disponibilidade de Pod e prefira cAdvisor/kubelet e
+kube-state-metrics para resultados do artigo.
 
 ```promql
 avg by (pod, namespace) (pod_memory_usage_percent{namespace="media"})
@@ -523,9 +715,9 @@ avg by (pod, namespace) (pod_memory_usage_percent{namespace="media"})
 avg by (pod, namespace) (pod_ready_status{namespace="media"})
 ```
 
-Não use `pod_cpu_usage_percent` nem `pod_network_io_bytes_total` como fonte de
-resultado enquanto elas permanecerem apenas declaradas ou dependentes de coletor
-não implementado.
+Não use `pod_cpu_usage_percent`, `pod_memory_usage_percent` nem
+`pod_network_io_bytes_total` como fonte de resultado enquanto elas permanecerem
+declaradas, aproximadas ou dependentes de coletor não implementado.
 
 ## SLOs e critérios resumidos para dashboards
 
