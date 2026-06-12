@@ -110,6 +110,61 @@ all events for a given run. Do not promote `stream`, `proxy_pod`, `worker_pod`,
 `experiment_id`, `scenario`, or `run_id` to Prometheus labels unless an explicit
 cardinality review approves it.
 
+## Proxy publish hook structured JSON logs
+
+Proxy RTMP hooks emit newline-delimited JSON from `docker/proxy/on_publish_start.sh`
+and `docker/proxy/on_publish_done.sh` so publish lifecycle events can be
+correlated with controller and worker logs without adding per-stream labels to
+Prometheus. Each proxy hook log record uses this schema:
+
+| Field | Meaning | Source |
+| --- | --- | --- |
+| `timestamp` | UTC timestamp when the hook event was emitted. | Proxy shell script wall clock. |
+| `event_type` | Proxy hook event name. | One of the proxy event types below. |
+| `stream` | RTMP stream name/key observed by NGINX RTMP. | Hook argument from `$name`. |
+| `proxy_pod` | Proxy pod or host handling the publisher. | `PROXY_POD` when set, otherwise `hostname`. |
+| `experiment_id` | Experiment identifier for controlled test runs. | `EXPERIMENT_ID`, default `unknown`. |
+| `scenario` | Experiment scenario name. | `SCENARIO`, default `unknown`. |
+| `run_id` | Experiment run identifier. | `RUN_ID`, default `unknown`. |
+| `status` | Low-cardinality hook result. | Proxy shell script. |
+
+Minimum proxy event types are:
+
+| Event type | Emitted by | Meaning |
+| --- | --- | --- |
+| `proxy_publish_started` | `on_publish_start.sh` | NGINX RTMP invoked the publish-start hook. |
+| `proxy_publish_start_notified` | `on_publish_start.sh` | The `/streams/started` callback returned a successful HTTP response. |
+| `proxy_publish_start_notify_failed` | `on_publish_start.sh` | The `/streams/started` callback failed after the configured curl timeout. |
+| `proxy_publish_ended` | `on_publish_done.sh` | NGINX RTMP invoked the publish-done hook. |
+| `proxy_publish_done_notified` | `on_publish_done.sh` | The `/streams/ended` callback returned a successful HTTP response. |
+| `proxy_publish_done_notify_failed` | `on_publish_done.sh` | The `/streams/ended` callback failed after the configured curl timeout. |
+
+The start hook sends `t_publish_start_proxy` to the controller as epoch seconds
+with sub-second precision when the runtime `date` implementation supports
+`%N`; it falls back to whole epoch seconds otherwise. The controller stores this
+proxy-origin timestamp as the `t_publish_start_proxy` lifecycle milestone and
+records `t_controller_received_event` from the controller clock when the HTTP
+callback is received. Because these two milestones are sampled on different
+hosts/containers, derived proxy-to-controller latency is sensitive to clock skew
+between the proxy and controller nodes. Keep node time synchronized with NTP/PTP
+and treat negative or unexpectedly large proxy-to-controller durations as a
+clock-synchronization signal before interpreting them as network or controller
+latency.
+
+Experimental context propagation from proxy to controller is controlled by proxy
+environment variables only: `EXPERIMENT_ID`, `SCENARIO`, and `RUN_ID`. The hooks
+sanitize these values to the same bounded character set used by controller log
+context (`a-z`, `A-Z`, `0-9`, `_`, `.`, `:`, `-`, capped at 64 characters, with
+`unknown` for empty values) before forwarding them in both
+`X-LiveEdgeCast-Experiment-Id`, `X-LiveEdgeCast-Scenario`, and
+`X-LiveEdgeCast-Run-Id` headers and the matching `experiment_id`, `scenario`, and
+`run_id` query parameters so the controller log context can capture them. Hook
+JSON is emitted through `jq` rather than hand-written string escaping so unusual
+stream keys remain valid JSON log values. Do not derive experiment context from
+the RTMP stream name, and do not promote `stream`/`streamKey`, `experiment_id`,
+`scenario`, or `run_id` to Prometheus labels unless an explicit cardinality
+review approves it.
+
 ## Proxy RTMP `/stats` metrics
 
 The controller also starts a background asynchronous scraper for every pod labeled
