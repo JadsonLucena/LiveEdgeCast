@@ -24,7 +24,18 @@ DEFAULT_LISTEN_ADDR = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 9113
 
 _PROGRESS_LINE_RE = re.compile(r"^([A-Za-z0-9_]+)=(.*)$")
-_TIME_RE = re.compile(r"^(?P<sign>-)?(?P<hours>\d+):(?P<minutes>\d{2}):(?P<seconds>\d{2})(?:\.(?P<fraction>\d+))?$")
+_TIME_RE = re.compile(
+    r"^(?P<sign>-)?(?P<hours>\d+):(?P<minutes>\d{2}):(?P<seconds>\d{2})(?:\.(?P<fraction>\d+))?$"
+)
+_BITRATE_RE = re.compile(
+    r"^(?P<value>[+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?P<unit>[kKmMgG]?bits/s)?$"
+)
+_BITRATE_UNIT_MULTIPLIERS = {
+    "bits/s": 1.0,
+    "kbits/s": 1_000.0,
+    "mbits/s": 1_000_000.0,
+    "gbits/s": 1_000_000_000.0,
+}
 
 
 def _float_or_none(value: Optional[str]) -> Optional[float]:
@@ -64,6 +75,29 @@ def parse_ffmpeg_time(value: Optional[str]) -> Optional[float]:
         return -parsed if match.group("sign") else parsed
 
     return _float_or_none(value)
+
+
+def parse_bitrate_bits_per_second(record: Dict[str, str]) -> Optional[float]:
+    """Parse FFmpeg progress bitrate values into bits per second."""
+
+    raw_value = record.get("bitrate")
+    if raw_value is None:
+        return None
+
+    value = raw_value.strip()
+    if not value or value == "N/A":
+        return None
+
+    match = _BITRATE_RE.match(value)
+    if not match:
+        return None
+
+    parsed = _float_or_none(match.group("value"))
+    if parsed is None or parsed < 0:
+        return None
+
+    unit = (match.group("unit") or "bits/s").lower()
+    return parsed * _BITRATE_UNIT_MULTIPLIERS[unit]
 
 
 def parse_out_time_seconds(record: Dict[str, str]) -> Optional[float]:
@@ -125,6 +159,7 @@ class ProgressFollower:
     _current_record: Dict[str, str] = field(default_factory=dict)
     latest_record: Dict[str, str] = field(default_factory=dict)
     latest_timestamp: Optional[float] = None
+    first_timestamp: Optional[float] = None
     error_counts: Dict[str, int] = field(default_factory=dict)
 
     def poll(self, now: Optional[float] = None) -> Dict[str, str]:
@@ -140,20 +175,14 @@ class ProgressFollower:
         identity = (stat.st_dev, stat.st_ino)
         if self._identity != identity or stat.st_size < self._offset:
             self._identity = identity
-            self._offset = 0
-            self._buffer = ""
-            self._prefix = ""
-            self._tail = ""
-            self._current_record = {}
+            self._reset_file_state()
         elif not self._file_window_matches():
-            self._offset = 0
-            self._buffer = ""
-            self._prefix = ""
-            self._tail = ""
-            self._current_record = {}
+            self._reset_file_state()
 
         try:
-            with open(self.path, "r", encoding="utf-8", errors="replace") as progress_file:
+            with open(
+                self.path, "r", encoding="utf-8", errors="replace"
+            ) as progress_file:
                 progress_file.seek(self._offset)
                 while True:
                     read_offset = self._offset
@@ -178,12 +207,27 @@ class ProgressFollower:
     def _record_error(self, stage: str) -> None:
         self.error_counts[stage] = self.error_counts.get(stage, 0) + 1
 
+    def _reset_file_state(self) -> None:
+        self._offset = 0
+        self._buffer = ""
+        self._prefix = ""
+        self._tail = ""
+        self._current_record = {}
+        self.latest_record = {}
+        self.latest_timestamp = None
+        self.first_timestamp = None
+
     def _file_window_matches(self) -> bool:
         if not self._prefix and not self._tail:
             return True
         try:
-            with open(self.path, "r", encoding="utf-8", errors="replace") as progress_file:
-                if self._prefix and progress_file.read(len(self._prefix)) != self._prefix:
+            with open(
+                self.path, "r", encoding="utf-8", errors="replace"
+            ) as progress_file:
+                if (
+                    self._prefix
+                    and progress_file.read(len(self._prefix)) != self._prefix
+                ):
                     return False
                 if self._tail:
                     tail_offset = max(0, self._offset - len(self._tail))
@@ -230,6 +274,8 @@ class ProgressFollower:
             self.latest_record = dict(self._current_record)
 
         if observed_complete_line:
+            if self.first_timestamp is None:
+                self.first_timestamp = now
             self.latest_timestamp = now
 
     @staticmethod
@@ -351,7 +397,9 @@ class ExitCounterStore:
                     exit_code = parts[-1]
                     if not re.fullmatch(r"-?\d+", exit_code):
                         continue
-                    event_id = " ".join(parts[:-1]) or f"{self.exit_file}:{index}:{exit_code}"
+                    event_id = (
+                        " ".join(parts[:-1]) or f"{self.exit_file}:{index}:{exit_code}"
+                    )
                     yield event_id, exit_code
         except FileNotFoundError:
             return
@@ -415,14 +463,22 @@ class MetricsCollector:
         now = self.clock()
         record = self.follower.poll(now=now)
         last_timestamp = self.follower.latest_timestamp
+        first_timestamp = self.follower.first_timestamp
         progress_age = (now - last_timestamp) if last_timestamp is not None else 0.0
         running = self._running_value()
-        healthy = 1 if running and last_timestamp is not None and progress_age <= self.stale_seconds else 0
+        healthy = (
+            1
+            if running
+            and last_timestamp is not None
+            and progress_age <= self.stale_seconds
+            else 0
+        )
 
         out_time = parse_out_time_seconds(record) or 0.0
         total_size = _float_or_none(record.get("total_size")) or 0.0
         speed_raw = (record.get("speed") or "").rstrip("x")
         speed = _float_or_none(speed_raw) or 0.0
+        bitrate = parse_bitrate_bits_per_second(record) or 0.0
 
         lines = [
             "# HELP worker_ffmpeg_running Whether the worker FFmpeg process is currently running.",
@@ -437,6 +493,9 @@ class MetricsCollector:
             "# HELP worker_ffmpeg_progress_age_seconds Seconds since the last complete FFmpeg progress line observed by this exporter.",
             "# TYPE worker_ffmpeg_progress_age_seconds gauge",
             f"worker_ffmpeg_progress_age_seconds {progress_age}",
+            "# HELP worker_ffmpeg_first_progress_timestamp_seconds Unix timestamp of the first complete FFmpeg progress line observed by this exporter.",
+            "# TYPE worker_ffmpeg_first_progress_timestamp_seconds gauge",
+            f"worker_ffmpeg_first_progress_timestamp_seconds {first_timestamp or 0.0}",
             "# HELP worker_ffmpeg_out_time_seconds Last FFmpeg out_time value converted to seconds.",
             "# TYPE worker_ffmpeg_out_time_seconds gauge",
             f"worker_ffmpeg_out_time_seconds {out_time}",
@@ -446,21 +505,28 @@ class MetricsCollector:
             "# HELP worker_ffmpeg_speed Last FFmpeg speed multiplier.",
             "# TYPE worker_ffmpeg_speed gauge",
             f"worker_ffmpeg_speed {speed}",
+            "# HELP worker_ffmpeg_bitrate_bits_per_second Last FFmpeg bitrate value converted to bits per second.",
+            "# TYPE worker_ffmpeg_bitrate_bits_per_second gauge",
+            f"worker_ffmpeg_bitrate_bits_per_second {bitrate}",
             "# HELP worker_ffmpeg_exit_total Total unique FFmpeg exits observed by this worker exporter.",
             "# TYPE worker_ffmpeg_exit_total counter",
         ]
         for exit_code, count in sorted(self.exit_store.poll().items()):
             lines.append(f'worker_ffmpeg_exit_total{{exit_code="{exit_code}"}} {count}')
 
-        lines.extend([
-            "# HELP worker_ffmpeg_exporter_errors_total Total worker FFmpeg exporter errors by stage.",
-            "# TYPE worker_ffmpeg_exporter_errors_total counter",
-        ])
+        lines.extend(
+            [
+                "# HELP worker_ffmpeg_exporter_errors_total Total worker FFmpeg exporter errors by stage.",
+                "# TYPE worker_ffmpeg_exporter_errors_total counter",
+            ]
+        )
         error_counts = {**self.follower.error_counts}
         for stage, count in self.exit_store.error_counts.items():
             error_counts[stage] = error_counts.get(stage, 0) + count
         for stage, count in sorted(error_counts.items()):
-            lines.append(f'worker_ffmpeg_exporter_errors_total{{stage="{stage}"}} {count}')
+            lines.append(
+                f'worker_ffmpeg_exporter_errors_total{{stage="{stage}"}} {count}'
+            )
         return "\n".join(lines) + "\n"
 
     def _running_value(self) -> int:
@@ -472,8 +538,13 @@ def build_collector() -> MetricsCollector:
     progress_path = discover_progress_path()
     pid_file = discover_pid_file()
     exit_file = discover_exit_file()
-    state_file = os.environ.get("FFMPEG_EXPORTER_STATE_FILE", f"{exit_file}.metrics_state")
-    stale_seconds = _float_or_none(os.environ.get("FFMPEG_PROGRESS_STALE_SECONDS")) or DEFAULT_PROGRESS_STALE_SECONDS
+    state_file = os.environ.get(
+        "FFMPEG_EXPORTER_STATE_FILE", f"{exit_file}.metrics_state"
+    )
+    stale_seconds = (
+        _float_or_none(os.environ.get("FFMPEG_PROGRESS_STALE_SECONDS"))
+        or DEFAULT_PROGRESS_STALE_SECONDS
+    )
     return MetricsCollector(
         follower=ProgressFollower(progress_path),
         pid_file=pid_file,
