@@ -4,6 +4,8 @@ metadata:
   name: proxy-metrics
   namespace: monitoring
   annotations:
+    # Documentation-only annotations for the observability contract; Prometheus
+    # Operator does not use these keys to change scrape behavior.
     liveedgecast.io/metrics-scope: "nginx-stub-status-only"
     liveedgecast.io/rtmp-traffic-source: "cadvisor-pod-network-counters"
 spec:
@@ -15,8 +17,8 @@ spec:
   endpoints:
     # nginx-prometheus-exporter scrapes /nginx_status and exposes generic NGINX
     # stub_status metrics. RTMP byte-rate dashboards intentionally use cAdvisor
-    # Pod network counters because the current /stats endpoint has no per-stream
-    # RTMP byte counters.
+    # Pod network counters because current controller metrics from /stats publish
+    # activity counts, not RTMP byte counters.
     - port: metrics
       interval: 10s
       path: /metrics

@@ -481,13 +481,14 @@ recording rules para os principais agregados com as séries nativas
 A abordagem adotada para tráfego RTMP é usar as métricas de rede por Pod do
 cAdvisor como proxy operacional para bytes recebidos e transmitidos pelos Pods
 `proxy-*`. O endpoint `/stats` do módulo NGINX RTMP continua útil para atividade
-RTMP (`streams`, `clients` e `publishers`), mas ele não expõe contadores de bytes
-RTMP por stream. O `nginx-prometheus-exporter` configurado para o proxy lê
-`/nginx_status`, ou seja, `stub_status` HTTP genérico; ele não converte o XML de
-`/stats` em métricas de bytes RTMP. Até existir um exporter RTMP específico,
-avaliado e compatível com o módulo usado pela imagem, dashboards e regras de
-tráfego devem tratar RX/TX de cAdvisor como tráfego de rede do Pod e não como
-medição protocolar por stream.
+RTMP e pode conter campos brutos de bytes/bandwidth dependendo da versão do
+módulo, mas as métricas Prometheus atualmente exportadas pelo controller a partir
+de `/stats` publicam somente contagens de `streams`, `clients` e `publishers`.
+O `nginx-prometheus-exporter` configurado para o proxy lê `/nginx_status`, ou
+seja, `stub_status` HTTP genérico; ele não converte o XML de `/stats` em métricas
+RTMP. Até existir um exporter ou parser RTMP específico, avaliado e compatível
+com o módulo usado pela imagem, dashboards e regras de tráfego devem tratar RX/TX
+de cAdvisor como tráfego de rede do Pod e não como medição protocolar por stream.
 
 As recording rules em `k8s/proxy-observability-rules.yaml` materializam esta
 separação para o caminho crítico do proxy:
@@ -496,10 +497,14 @@ separação para o caminho crítico do proxy:
   Pod RTMP proxy.
 - `liveedgecast:proxy:network_transmit_bytes_per_second`: bytes/s transmitidos
   por Pod RTMP proxy.
-- `liveedgecast:component:network_receive_bytes_per_second`: bytes/s recebidos
+- `liveedgecast:component:network_receive_bytes_per_second:rate1m`: bytes/s recebidos
   agregados por componente (`proxy-lb`, `proxy`, `worker` e `controller`).
-- `liveedgecast:component:network_transmit_bytes_per_second`: bytes/s
+- `liveedgecast:component:network_transmit_bytes_per_second:rate1m`: bytes/s
   transmitidos agregados por componente.
+
+O sufixo `:rate1m` diferencia estas séries operacionais de curta janela das
+recording rules de recursos em `k8s/observability/liveedgecast-resource-rules.yaml`,
+que usam `:rate5m` para painéis de custo/recurso mais suavizados.
 
 ### Tráfego recebido por proxy
 
@@ -510,7 +515,7 @@ balanceador de entrada, não o NGINX RTMP.
 ```promql
 sum by (pod) (
   label_replace(
-    rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
+    rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
     "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 )
@@ -521,7 +526,7 @@ Para Mbps por proxy:
 ```promql
 sum by (pod) (
   label_replace(
-    rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
+    rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
     "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 ) * 8 / (1000 * 1000)
@@ -532,7 +537,7 @@ sum by (pod) (
 ```promql
 sum by (pod) (
   label_replace(
-    rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
+    rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
     "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 )
@@ -543,7 +548,7 @@ Para Mbps por proxy:
 ```promql
 sum by (pod) (
   label_replace(
-    rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
+    rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
     "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 ) * 8 / (1000 * 1000)
