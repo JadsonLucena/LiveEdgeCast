@@ -238,10 +238,12 @@ finite `t_destination_received` epoch seconds. The controller returns the active
 `generation` from `/streams/started` and keeps a persisted per-stream generation
 high-water mark so reused stream names receive non-reused generations after
 cleanup; receivers must echo that generation so delayed callbacks from previous
-runs are rejected instead of contaminating the active run. Callback responses
-include whether the accepted timestamp was approximate so receiver experiments
-can detect omitted external timestamps immediately. The derived destination
-phases are
+runs are rejected instead of contaminating the active run. The high-water map is
+bounded by `STREAM_GENERATION_HIGH_WATER_MAX_ENTRIES` (default `10000`); when the
+limit is exceeded, the controller prunes the oldest inactive entries and keeps
+active streams/lifecycle entries protected. Callback responses include whether
+the accepted timestamp was approximate so receiver experiments can detect omitted
+external timestamps immediately. The derived destination phases are
 `ffmpeg_first_progress_to_destination`, `proxy_to_destination`, and
 `controller_to_destination`. If no receiver is instrumented, do not use these
 phases for delivery latency; use the existing first-progress phases instead and

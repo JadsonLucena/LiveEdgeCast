@@ -293,6 +293,26 @@ def test_register_bumps_stale_registryless_generation():
     assert main.stream_generation_high_water['live'] == 4
 
 
+def test_generation_high_water_prunes_only_inactive_entries():
+    reset_state()
+    main.stream_generation_high_water.update({
+        'old-a': 1,
+        'active': 2,
+        'old-b': 3,
+    })
+    main.stream_generation['active'] = 2
+
+    with patch.object(main, 'STREAM_GENERATION_HIGH_WATER_MAX_ENTRIES', 2):
+        with main.allocation_lock:
+            main.prune_stream_generation_high_water_locked()
+
+    assert 'old-a' not in main.stream_generation_high_water
+    assert main.stream_generation_high_water == {
+        'active': 2,
+        'old-b': 3,
+    }
+
+
 def test_recover_state_records_restored_and_missing_outcomes():
     reset_state()
     restored_labels = {'status': 'success', 'reason': 'restored'}

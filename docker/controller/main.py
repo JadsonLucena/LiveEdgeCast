@@ -595,6 +595,7 @@ WORKER_READY_HEALTH_DELAY_SECONDS = 3  # Wait after worker Ready before worker /
 WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS = 60
 WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS = get_int_env("WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS", 5, min_value=1)
 CONTROLLER_DESTINATION_CALLBACK_ENABLED = get_bool_env("CONTROLLER_DESTINATION_CALLBACK_ENABLED", False)
+STREAM_GENERATION_HIGH_WATER_MAX_ENTRIES = get_int_env("STREAM_GENERATION_HIGH_WATER_MAX_ENTRIES", 10000, min_value=1)
 PROXY_READY_HEALTH_DELAY_SECONDS = 3  # Wait after proxy Ready before proxy /health probes.
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
@@ -834,6 +835,38 @@ def generation_to_int(value: Any) -> Optional[int]:
 
 def is_finite_number(value: float) -> bool:
     return value == value and value not in (float("inf"), float("-inf"))
+
+
+def set_stream_generation_high_water_locked(stream: str, generation: Any) -> None:
+    normalized_generation = generation_to_int(generation)
+    if normalized_generation is None:
+        return
+    stream_generation_high_water.pop(stream, None)
+    stream_generation_high_water[stream] = normalized_generation
+
+
+def stream_generation_high_water_entry_is_active_locked(stream: str) -> bool:
+    return (
+        stream in stream_generation
+        or stream in stream_registry
+        or stream in stream_lifecycle_timestamps
+    )
+
+
+def prune_stream_generation_high_water_locked() -> None:
+    excess_entries = len(stream_generation_high_water) - STREAM_GENERATION_HIGH_WATER_MAX_ENTRIES
+    if excess_entries <= 0:
+        return
+    removed_entries = 0
+    for stream in list(stream_generation_high_water):
+        if stream_generation_high_water_entry_is_active_locked(stream):
+            continue
+        stream_generation_high_water.pop(stream, None)
+        removed_entries += 1
+        if removed_entries >= excess_entries:
+            break
+    if removed_entries:
+        logger.info(f"[GenerationHighWater] Pruned {removed_entries} inactive stream generation high-water entries")
 
 
 def lifecycle_key_for_worker_locked(worker_pod: str) -> Optional[Tuple[str, int]]:
@@ -1202,6 +1235,7 @@ def persist_state_locked() -> None:
     Must be called only while holding allocation_lock.
     """
     started_at = time.monotonic()
+    prune_stream_generation_high_water_locked()
     payload = {
         "schema_version": STATE_SCHEMA_VERSION,
         "stream_to_worker": stream_to_worker,
@@ -1305,12 +1339,15 @@ def restore_persisted_state_locked() -> StateRestoreResult:
                 state_persistence_errors_total.labels(operation="restore", reason="invalid_generation_high_water").inc()
                 logger.warning(f"[State Recovery] Invalid stream generation high-water for '{stream}': {generation}")
                 continue
-            stream_generation_high_water[stream] = normalized_generation
+            set_stream_generation_high_water_locked(stream, normalized_generation)
 
     for stream, generation in list(stream_generation.items()):
-        stream_generation_high_water[stream] = max(
-            generation_to_int(stream_generation_high_water.get(stream)) or 0,
-            generation,
+        set_stream_generation_high_water_locked(
+            stream,
+            max(
+                generation_to_int(stream_generation_high_water.get(stream)) or 0,
+                generation,
+            ),
         )
         if stream not in stream_registry:
             logger.warning(
@@ -1318,6 +1355,7 @@ def restore_persisted_state_locked() -> StateRestoreResult:
                 f"after preserving high-water generation {stream_generation_high_water[stream]}"
             )
             stream_generation.pop(stream, None)
+    prune_stream_generation_high_water_locked()
     update_controller_state_gauges_locked()
     return StateRestoreResult(restored=True, reason="restored")
 
@@ -1520,10 +1558,14 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
             previous_high_water_generation,
             previous_active_generation,
         ) + 1
-    stream_generation_high_water[stream] = max(
-        generation_to_int(stream_generation_high_water.get(stream)) or 0,
-        stream_generation[stream],
+    set_stream_generation_high_water_locked(
+        stream,
+        max(
+            generation_to_int(stream_generation_high_water.get(stream)) or 0,
+            stream_generation[stream],
+        ),
     )
+    prune_stream_generation_high_water_locked()
     stream_registry[stream] = {
         "proxy_pod": proxy_pod,
     }
