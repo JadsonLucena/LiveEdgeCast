@@ -132,5 +132,10 @@ fi
 
 kill -TERM "$METRICS_EXPORTER_PID" 2>/dev/null || true
 wait "$METRICS_EXPORTER_PID" 2>/dev/null || true
-log_shutdown_once "nginx_exit_${FINAL_EXIT}"
+if [ "$FINAL_EXIT" -ne 0 ]; then
+  log_json "worker_error" "nginx_exit_${FINAL_EXIT}" "$(elapsed_ms "$ENTRYPOINT_START_MS")"
+  log_shutdown_once "error"
+else
+  log_shutdown_once "nginx_exit_${FINAL_EXIT}"
+fi
 exit "$FINAL_EXIT"

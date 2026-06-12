@@ -7,6 +7,7 @@ PROGRESS_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress"
 EXIT_FILE="/tmp/ffmpeg_${STREAM_KEY}.exit"
 PROGRESS_NOTIFY_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress_notified"
 PROGRESS_NOTIFY_LOCK="/tmp/ffmpeg_${STREAM_KEY}.progress_notify.lock"
+PROGRESS_NOTIFY_ERROR_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress_notify_error_logged"
 PROGRESS_LOG_FILE="/tmp/ffmpeg_${STREAM_KEY}.first_progress_logged"
 PROGRESS_LOG_LOCK="/tmp/ffmpeg_${STREAM_KEY}.first_progress_log.lock"
 PROGRESS_READER_PID=""
@@ -117,7 +118,10 @@ notify_first_progress_once() {
       rmdir "$PROGRESS_NOTIFY_LOCK" 2>/dev/null || true
       return 0
     fi
-    log_json "worker_error" "first_progress_notify_failed" "$(elapsed_ms "$RUNNER_START_MS")"
+    if [ ! -f "$PROGRESS_NOTIFY_ERROR_FILE" ]; then
+      log_json "worker_error" "first_progress_notify_failed" "$(elapsed_ms "$RUNNER_START_MS")"
+      : > "$PROGRESS_NOTIFY_ERROR_FILE"
+    fi
     rmdir "$PROGRESS_NOTIFY_LOCK" 2>/dev/null || true
   fi
   return 1
@@ -129,7 +133,7 @@ cleanup() {
     wait "$PROGRESS_READER_PID" 2>/dev/null || true
   fi
   if [ -n "${STREAM_KEY:-}" ]; then
-    rm -f "$PID_FILE" "$PROGRESS_NOTIFY_FILE" "$PROGRESS_LOG_FILE"
+    rm -f "$PID_FILE" "$PROGRESS_NOTIFY_FILE" "$PROGRESS_NOTIFY_ERROR_FILE" "$PROGRESS_LOG_FILE"
     rm -rf "$PROGRESS_NOTIFY_LOCK" "$PROGRESS_LOG_LOCK"
   fi
 }
@@ -147,7 +151,7 @@ fi
 
 PROXY_RTMP="rtmp://${PROXY_ADDR}:1935/live/${STREAM_KEY}"
 TARGET_RTMP="${RTMP_PUSH_BASE_URL}/${STREAM_KEY}"
-rm -f "$PROGRESS_FILE" "$PROGRESS_NOTIFY_FILE" "$PROGRESS_LOG_FILE"
+rm -f "$PROGRESS_FILE" "$PROGRESS_NOTIFY_FILE" "$PROGRESS_NOTIFY_ERROR_FILE" "$PROGRESS_LOG_FILE"
 rm -rf "$PROGRESS_NOTIFY_LOCK" "$PROGRESS_LOG_LOCK"
 : > "$PROGRESS_FILE"
 
