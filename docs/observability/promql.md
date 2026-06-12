@@ -17,9 +17,11 @@ Kubernetes/cAdvisor/kube-state-metrics instaladas pelo stack de monitoramento.
   repetições.
 - Antes de publicar mudanças neste arquivo, execute
   `python3 tools/validate-promql-docs.py` para checar fences Markdown e armadilhas
-  conhecidas dos snippets. Quando `promtool` estiver disponível, valide também as
-  expressões finais no Prometheus/Grafana alvo, principalmente consultas com
-  placeholders como `$window`.
+  conhecidas dos snippets. Para `PrometheusRule`, execute também
+  `python3 tools/validate-prometheus-rules.py`; quando `promtool` estiver
+  disponível, o script extrai `spec.groups` dos CRDs e executa validação
+  parser-level. Valide no Prometheus/Grafana alvo principalmente consultas com
+  placeholders como `$window` ou `$__range`.
 
 ## Cold start P50/P95/P99
 
@@ -498,10 +500,14 @@ sum by (component) (
 
 ### Tráfego de rede recebido por componente
 
+As consultas de rede excluem `interface="lo"` para não somar tráfego de loopback
+intra-Pod. O matcher negativo também mantém compatibilidade com ambientes em que
+a série não expõe a label `interface`.
+
 ```promql
 sum by (component) (
   label_replace(
-    rate(container_network_receive_bytes_total{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+    rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
     "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 )
@@ -512,7 +518,7 @@ sum by (component) (
 ```promql
 sum by (component) (
   label_replace(
-    rate(container_network_transmit_bytes_total{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+    rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
     "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
   )
 )
@@ -528,7 +534,7 @@ só adiciona a label de direção para facilitar legendas e tabelas.
 label_replace(
   sum by (component) (
     label_replace(
-      rate(container_network_receive_bytes_total{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+      rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
       "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
     )
   ),
@@ -538,7 +544,7 @@ or
 label_replace(
   sum by (component) (
     label_replace(
-      rate(container_network_transmit_bytes_total{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+      rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
       "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
     )
   ),
