@@ -56,10 +56,6 @@ log_json() {
     "$(json_escape "$status")"
 }
 
-log() {
-  log_json "$1" "${2:-ok}" "${3:-$(elapsed_ms "$ENTRYPOINT_START_MS")}"
-}
-
 log_shutdown_once() {
   local status="${1:-ok}"
   if [ "$SHUTDOWN_LOGGED" -eq 0 ]; then
@@ -70,7 +66,7 @@ log_shutdown_once() {
 
 handle_signal() {
   local signal="$1"
-  log_json "worker_shutdown" "signal_${signal}" "$(elapsed_ms "$ENTRYPOINT_START_MS")"
+  log_shutdown_once "signal_${signal}"
   kill -TERM "${RUNNER_PID:-}" "${METRICS_EXPORTER_PID:-}" "${NGINX_PID:-}" 2>/dev/null || true
   wait "${RUNNER_PID:-}" "${METRICS_EXPORTER_PID:-}" "${NGINX_PID:-}" 2>/dev/null || true
   exit 143

@@ -84,7 +84,7 @@ the following schema:
 | `experiment_id` | Experiment identifier for controlled test runs. | `EXPERIMENT_ID`. |
 | `scenario` | Experiment scenario name. | `SCENARIO`. |
 | `run_id` | Experiment run identifier. | `RUN_ID`. |
-| `duration_ms` | Event duration in milliseconds. | Elapsed time from the relevant script/process start. |
+| `duration_ms` | Event duration in milliseconds. | Elapsed time from the event-specific start boundary: entrypoint start for worker entrypoint/shutdown/error events, FFmpeg launch for FFmpeg start/progress/exit events. |
 | `status` | Low-cardinality event result or exit status. | Worker shell script. |
 
 Minimum worker event types are:
@@ -93,7 +93,7 @@ Minimum worker event types are:
 | --- | --- | --- |
 | `worker_entrypoint_started` | `entrypoint.sh` | Entrypoint process started. |
 | `ffmpeg_started` | `worker_stream_runner.sh` | FFmpeg was launched and its PID was recorded. |
-| `ffmpeg_first_progress` | `worker_stream_runner.sh` | The first complete FFmpeg `-progress` line was observed and accepted by the controller callback. |
+| `ffmpeg_first_progress` | `worker_stream_runner.sh` | The first complete FFmpeg `-progress` line was observed locally. Controller callback failures are logged separately as `worker_error` and retried without suppressing this event. |
 | `ffmpeg_exited` | `worker_stream_runner.sh` | FFmpeg process exited; `status` is `exit_<code>`. |
 | `worker_shutdown` | `entrypoint.sh` | The worker container is stopping after normal completion, process exit, or signal handling. |
 | `worker_error` | Both worker shell scripts | A subprocess, notification, startup validation, or FFmpeg failure occurred. |

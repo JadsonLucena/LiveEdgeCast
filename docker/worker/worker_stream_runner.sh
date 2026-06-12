@@ -7,6 +7,8 @@ PROGRESS_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress"
 EXIT_FILE="/tmp/ffmpeg_${STREAM_KEY}.exit"
 PROGRESS_NOTIFY_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress_notified"
 PROGRESS_NOTIFY_LOCK="/tmp/ffmpeg_${STREAM_KEY}.progress_notify.lock"
+PROGRESS_LOG_FILE="/tmp/ffmpeg_${STREAM_KEY}.first_progress_logged"
+PROGRESS_LOG_LOCK="/tmp/ffmpeg_${STREAM_KEY}.first_progress_log.lock"
 PROGRESS_READER_PID=""
 FFMPEG_PID=""
 RUNNER_START_MS="$(python3 - <<'PYMS'
@@ -64,10 +66,6 @@ log_json() {
     "$(json_escape "$status")"
 }
 
-log() {
-  log_json "$1" "${2:-ok}" "${3:-$(elapsed_ms "$RUNNER_START_MS")}"
-}
-
 notify_controller() {
   local path="$1"
   curl -sf --connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}" --max-time "${CONTROLLER_CALLBACK_MAX_TIME_SECONDS:-2}" -X POST --get \
@@ -90,7 +88,22 @@ progress_file_has_complete_line() {
   return 1
 }
 
+log_first_progress_once() {
+  if [ -f "$PROGRESS_LOG_FILE" ]; then
+    return 0
+  fi
+  if mkdir "$PROGRESS_LOG_LOCK" 2>/dev/null; then
+    if [ ! -f "$PROGRESS_LOG_FILE" ]; then
+      log_json "ffmpeg_first_progress" "ok" "$(elapsed_ms "${FFMPEG_START_MS:-$RUNNER_START_MS}")"
+      : > "$PROGRESS_LOG_FILE"
+    fi
+    rmdir "$PROGRESS_LOG_LOCK" 2>/dev/null || true
+  fi
+  return 0
+}
+
 notify_first_progress_once() {
+  log_first_progress_once
   if [ -f "$PROGRESS_NOTIFY_FILE" ]; then
     return 0
   fi
@@ -101,7 +114,6 @@ notify_first_progress_once() {
     set -e
     if [ "$notify_exit" -eq 0 ]; then
       : > "$PROGRESS_NOTIFY_FILE"
-      log_json "ffmpeg_first_progress" "ok" "$(elapsed_ms "${FFMPEG_START_MS:-$RUNNER_START_MS}")"
       rmdir "$PROGRESS_NOTIFY_LOCK" 2>/dev/null || true
       return 0
     fi
@@ -117,8 +129,8 @@ cleanup() {
     wait "$PROGRESS_READER_PID" 2>/dev/null || true
   fi
   if [ -n "${STREAM_KEY:-}" ]; then
-    rm -f "$PID_FILE" "$PROGRESS_NOTIFY_FILE"
-    rm -rf "$PROGRESS_NOTIFY_LOCK"
+    rm -f "$PID_FILE" "$PROGRESS_NOTIFY_FILE" "$PROGRESS_LOG_FILE"
+    rm -rf "$PROGRESS_NOTIFY_LOCK" "$PROGRESS_LOG_LOCK"
   fi
 }
 trap cleanup EXIT
@@ -135,26 +147,14 @@ fi
 
 PROXY_RTMP="rtmp://${PROXY_ADDR}:1935/live/${STREAM_KEY}"
 TARGET_RTMP="${RTMP_PUSH_BASE_URL}/${STREAM_KEY}"
-rm -f "$PROGRESS_FILE" "$PROGRESS_NOTIFY_FILE"
-rm -rf "$PROGRESS_NOTIFY_LOCK"
+rm -f "$PROGRESS_FILE" "$PROGRESS_NOTIFY_FILE" "$PROGRESS_LOG_FILE"
+rm -rf "$PROGRESS_NOTIFY_LOCK" "$PROGRESS_LOG_LOCK"
 : > "$PROGRESS_FILE"
-
-FFMPEG_START_MS="$(current_epoch_ms)"
-(
-  progress_notified=0
-  while [ "$progress_notified" -eq 0 ]; do
-    if progress_file_has_complete_line && notify_first_progress_once; then
-      progress_notified=1
-      break
-    fi
-    sleep "${PROGRESS_NOTIFY_POLL_SECONDS:-0.2}"
-  done
-) &
-PROGRESS_READER_PID=$!
 
 notify_controller "/workers/ffmpeg/started" \
   || log_json "worker_error" "ffmpeg_start_notify_failed" "$(elapsed_ms "$RUNNER_START_MS")"
 
+FFMPEG_START_MS="$(current_epoch_ms)"
 ffmpeg \
   -loglevel warning \
   -nostats \
@@ -171,6 +171,18 @@ FFMPEG_PID=$!
 echo "$FFMPEG_PID" > "$PID_FILE"
 FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-${FFMPEG_PID}-${RANDOM}"
 log_json "ffmpeg_started" "ok" "$(elapsed_ms "$FFMPEG_START_MS")"
+
+(
+  progress_notified=0
+  while [ "$progress_notified" -eq 0 ]; do
+    if progress_file_has_complete_line && notify_first_progress_once; then
+      progress_notified=1
+      break
+    fi
+    sleep "${PROGRESS_NOTIFY_POLL_SECONDS:-0.2}"
+  done
+) &
+PROGRESS_READER_PID=$!
 
 if wait "$FFMPEG_PID"; then
   EXIT_CODE=0
