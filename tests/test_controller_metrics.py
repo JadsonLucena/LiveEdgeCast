@@ -24,6 +24,7 @@ def reset_state():
     main.stream_to_proxy.clear()
     main.stream_registry.clear()
     main.stream_generation.clear()
+    main.stream_generation_high_water.clear()
     main.proxy_health_failures.clear()
     main.proxy_ready_since.clear()
     main.worker_ready_since.clear()
@@ -253,6 +254,63 @@ def test_restore_persisted_state_sets_gauges_and_records_invalid_json_metric():
 
     assert sample_value(main.controller_active_streams, 'controller_active_streams') == 1
     assert sample_value(main.controller_active_allocations, 'controller_active_allocations') == 1
+
+
+def test_restore_drops_registryless_generation_but_preserves_high_water():
+    reset_state()
+    payload = {
+        'stream_to_worker': {'live': 'worker-a'},
+        'worker_to_stream': {'worker-a': 'live'},
+        'stream_to_proxy': {},
+        'stream_registry': {},
+        'stream_generation': {'live': 3},
+    }
+    config_map = SimpleNamespace(data={main.STATE_CONFIGMAP_KEY: json.dumps(payload)})
+
+    with patch.object(main.core, 'read_namespaced_config_map', return_value=config_map):
+        with main.allocation_lock:
+            assert main.restore_persisted_state_locked() == main.StateRestoreResult(
+                restored=True,
+                reason='restored',
+            )
+            assert 'live' not in main.stream_generation
+            assert main.stream_generation_high_water['live'] == 3
+
+            main.register_or_refresh_stream('live', 'proxy-2')
+
+    assert main.stream_generation['live'] == 4
+
+
+def test_register_bumps_stale_registryless_generation():
+    reset_state()
+    with main.allocation_lock:
+        main.stream_generation['live'] = 3
+        main.stream_generation_high_water['live'] = 3
+
+        main.register_or_refresh_stream('live', 'proxy-2')
+
+    assert main.stream_generation['live'] == 4
+    assert main.stream_generation_high_water['live'] == 4
+
+
+def test_generation_high_water_prunes_only_inactive_entries():
+    reset_state()
+    main.stream_generation_high_water.update({
+        'old-a': 1,
+        'active': 2,
+        'old-b': 3,
+    })
+    main.stream_generation['active'] = 2
+
+    with patch.object(main, 'STREAM_GENERATION_HIGH_WATER_MAX_ENTRIES', 2):
+        with main.allocation_lock:
+            main.prune_stream_generation_high_water_locked()
+
+    assert 'old-a' not in main.stream_generation_high_water
+    assert main.stream_generation_high_water == {
+        'active': 2,
+        'old-b': 3,
+    }
 
 
 def test_recover_state_records_restored_and_missing_outcomes():
@@ -2090,3 +2148,117 @@ def test_stream_started_records_proxy_and_controller_lifecycle_timestamps():
     assert entry['t_publish_start_proxy'] == publish_ts
     assert entry['sources']['t_publish_start_proxy'] == 'proxy_hook'
     assert 't_controller_received_event' in entry
+
+
+def test_destination_received_requires_generation_query_parameter():
+    schema = main.app.openapi()
+    parameters = schema['paths']['/streams/destination-received']['post']['parameters']
+    generation_parameter = next(
+        parameter for parameter in parameters
+        if parameter['name'] == 'generation'
+    )
+
+    assert generation_parameter['in'] == 'query'
+    assert generation_parameter['required'] is True
+
+
+@pytest.mark.parametrize('timestamp', [float('nan'), float('inf'), float('-inf')])
+def test_destination_received_rejects_non_finite_timestamp(timestamp):
+    reset_state()
+    with patch.object(main, 'CONTROLLER_DESTINATION_CALLBACK_ENABLED', True):
+        with pytest.raises(main.HTTPException) as exc_info:
+            main.stream_destination_received(
+                stream='live',
+                generation=1,
+                t_destination_received=timestamp,
+            )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == 't_destination_received must be finite epoch seconds'
+
+
+def test_destination_received_ignores_registryless_generation():
+    reset_state()
+    main.stream_generation['live'] = 3
+    main.stream_generation_high_water['live'] = 3
+    main.stream_lifecycle_timestamps['live'] = {
+        3: {
+            'stream': 'live',
+            'generation': 3,
+            't_publish_start_proxy': 30.0,
+            't_controller_received_event': 31.0,
+            't_ffmpeg_first_progress': 32.0,
+            'sources': {},
+            'approximations': {},
+        }
+    }
+
+    with patch.object(main, 'CONTROLLER_DESTINATION_CALLBACK_ENABLED', True):
+        result = main.stream_destination_received(
+            stream='live',
+            generation=3,
+            t_destination_received=33.0,
+        )
+
+    assert result['status'] == 'ignored'
+    assert result['reason'] == 'stream_not_active'
+    assert 't_destination_received' not in main.stream_lifecycle_timestamps['live'][3]
+
+
+def test_reused_stream_generation_rejects_delayed_destination_callback():
+    reset_state()
+    with main.allocation_lock:
+        main.register_or_refresh_stream('live', 'proxy-1')
+        first_generation = main.stream_generation['live']
+        main.stream_lifecycle_timestamps['live'] = {
+            first_generation: {
+                'stream': 'live',
+                'generation': first_generation,
+                't_publish_start_proxy': 10.0,
+                't_controller_received_event': 11.0,
+                't_ffmpeg_first_progress': 12.0,
+                'sources': {},
+                'approximations': {},
+            }
+        }
+        main.cleanup_stream_lifecycle_tracking_locked('live')
+        main.stream_registry.pop('live', None)
+        main.stream_to_proxy.pop('live', None)
+        main.stream_generation.pop('live', None)
+
+        main.register_or_refresh_stream('live', 'proxy-2')
+        second_generation = main.stream_generation['live']
+        main.stream_lifecycle_timestamps['live'] = {
+            second_generation: {
+                'stream': 'live',
+                'generation': second_generation,
+                't_publish_start_proxy': 20.0,
+                't_controller_received_event': 21.0,
+                't_ffmpeg_first_progress': 22.0,
+                'sources': {},
+                'approximations': {},
+            }
+        }
+
+    assert first_generation == 1
+    assert second_generation == 2
+
+    with patch.object(main, 'CONTROLLER_DESTINATION_CALLBACK_ENABLED', True):
+        stale = main.stream_destination_received(
+            stream='live',
+            generation=first_generation,
+            t_destination_received=13.0,
+        )
+        accepted = main.stream_destination_received(
+            stream='live',
+            generation=second_generation,
+            t_destination_received=23.0,
+        )
+
+    assert stale['status'] == 'ignored'
+    assert stale['reason'] == 'stale_generation'
+    assert accepted['status'] == 'observed'
+    assert (
+        main.stream_lifecycle_timestamps['live'][second_generation]['t_destination_received']
+        == 23.0
+    )

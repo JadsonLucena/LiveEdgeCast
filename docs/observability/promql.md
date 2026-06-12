@@ -23,13 +23,17 @@ Kubernetes/cAdvisor/kube-state-metrics instaladas pelo stack de monitoramento.
 
 ## Cold start P50/P95/P99
 
-A métrica mais completa para cold start fim-a-fim é o histograma
+Para cold start sem destino externo, use o histograma
 `stream_lifecycle_phase_seconds` com `phase="proxy_to_first_progress"`, pois mede
 do hook de publicação no proxy até o primeiro progresso do FFmpeg. Para separar
-atrasos do controller, use `phase="controller_to_first_progress"`. Para detalhar
-componentes internos, use as demais fases descritas em `metrics.md`.
+atrasos do controller, use `phase="controller_to_first_progress"`. Para
+experimentos com receptor externo instrumentado, use as fases com destino
+(`proxy_to_destination`, `controller_to_destination` e
+`ffmpeg_first_progress_to_destination`). Essas fases só são válidas quando
+`t_destination_received` é observado por um receptor experimental habilitado no
+controller; sem receptor, use as consultas sem destino externo.
 
-### Percentis fim-a-fim
+### Percentis sem destino externo
 
 ```promql
 histogram_quantile(
@@ -58,7 +62,42 @@ histogram_quantile(
 )
 ```
 
+### Percentis com destino externo experimental
+
+Use estas consultas somente quando o experimento habilitar
+`CONTROLLER_DESTINATION_CALLBACK_ENABLED=true` e o receptor externo enviar
+`/streams/destination-received`.
+
+```promql
+histogram_quantile(
+  0.50,
+  sum by (le) (
+    rate(stream_lifecycle_phase_seconds_bucket{phase="proxy_to_destination"}[5m])
+  )
+)
+```
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le) (
+    rate(stream_lifecycle_phase_seconds_bucket{phase="proxy_to_destination"}[5m])
+  )
+)
+```
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (le) (
+    rate(stream_lifecycle_phase_seconds_bucket{phase="proxy_to_destination"}[5m])
+  )
+)
+```
+
 ### Percentis por ambiente ou região
+
+Sem destino externo:
 
 ```promql
 histogram_quantile(
@@ -69,7 +108,21 @@ histogram_quantile(
 )
 ```
 
+Com destino externo experimental:
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, environment, region) (
+    rate(stream_lifecycle_phase_seconds_bucket{phase="proxy_to_destination"}[5m])
+  )
+)
+```
+
 ### Decomposição do cold start por fase
+
+Use esta consulta para decompor apenas o caminho até o primeiro progresso do
+FFmpeg, sem incluir destino externo.
 
 ```promql
 histogram_quantile(
@@ -77,6 +130,22 @@ histogram_quantile(
   sum by (le, phase) (
     rate(stream_lifecycle_phase_seconds_bucket{
       phase=~"proxy_to_controller|controller_to_worker_create_request|worker_create_request_to_pod_created|pod_created_to_scheduled|scheduled_to_container_started|container_started_to_worker_ready|worker_ready_to_ffmpeg_started|ffmpeg_started_to_first_progress"
+    }[5m])
+  )
+)
+```
+
+### Extensão experimental com destino externo por fase
+
+Use esta consulta somente quando houver receptor experimental instrumentado; ela
+mostra o trecho adicional após o primeiro progresso e os agregados até destino.
+
+```promql
+histogram_quantile(
+  0.95,
+  sum by (le, phase) (
+    rate(stream_lifecycle_phase_seconds_bucket{
+      phase=~"ffmpeg_first_progress_to_destination|proxy_to_destination|controller_to_destination"
     }[5m])
   )
 )
@@ -96,12 +165,26 @@ sum by (phase, reason) (
 )
 ```
 
+```promql
+sum by (phase, timestamp, reason) (
+  increase(stream_lifecycle_missing_timestamp_total[$window])
+)
+```
+
+```promql
+sum by (timestamp, source) (
+  increase(stream_lifecycle_approximate_timestamp_total[$window])
+)
+```
+
 Use a segunda consulta para reportar medições que chegaram à avaliação de fase,
 mas não entraram no histograma por endpoint aproximado ou duração negativa por
-skew de relógio. Fases cujo start ou end timestamp nunca chega não incrementam
-`stream_lifecycle_phase_observations_total` na implementação atual; trate perdas
-de callbacks/eventos como limitação de observabilidade e compare os contadores de
-timestamps observados com a carga esperada.
+skew de relógio. Use `stream_lifecycle_missing_timestamp_total` para medir
+endpoints que nunca chegaram antes do cleanup de lifecycle e
+`stream_lifecycle_approximate_timestamp_total` para quantificar timestamps
+aceitos como aproximações. Em execuções sem receptor externo instrumentado,
+`t_destination_received` ausente em fases com destino é esperado e não deve ser
+tratado como falha da pipeline principal.
 
 ## MTTR de worker
 
