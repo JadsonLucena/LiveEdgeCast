@@ -65,6 +65,51 @@ automatically indexes JSON fields, do not promote request-sourced `metadata.*`
 values (`metadata_sources` of `header` or `query`) to labels/indexes without an
 allowlist.
 
+
+## Worker structured JSON logs
+
+Worker containers emit newline-delimited JSON logs from `docker/worker/entrypoint.sh`
+and `docker/worker/worker_stream_runner.sh` for lifecycle correlation without
+adding high-cardinality labels to Prometheus metrics. Each worker log record uses
+the following schema:
+
+| Field | Meaning | Source |
+| --- | --- | --- |
+| `timestamp` | UTC timestamp when the event was emitted. | Worker shell script wall clock. |
+| `event_type` | Worker lifecycle event name. | One of the worker event types below. |
+| `stream` | Stream key handled by this worker. | `STREAM_KEY`. |
+| `generation` | Stream generation token. | `STREAM_GENERATION`. |
+| `proxy_pod` | Proxy identifier associated with the stream. | `PROXY_POD` when set, otherwise `PROXY_DNS`. |
+| `worker_pod` | Worker pod name. | `WORKER_POD` when set, otherwise `HOSTNAME`. |
+| `experiment_id` | Experiment identifier for controlled test runs. | `EXPERIMENT_ID`. |
+| `scenario` | Experiment scenario name. | `SCENARIO`. |
+| `run_id` | Experiment run identifier. | `RUN_ID`. |
+| `duration_ms` | Event duration in milliseconds. | Elapsed time from the event-specific start boundary: entrypoint start for worker entrypoint/shutdown/error events, FFmpeg launch for FFmpeg start/progress/exit events. |
+| `status` | Low-cardinality event result or exit status. | Worker shell script. |
+
+Minimum worker event types are:
+
+| Event type | Emitted by | Meaning |
+| --- | --- | --- |
+| `worker_entrypoint_started` | `entrypoint.sh` | Entrypoint process started. |
+| `ffmpeg_started` | `worker_stream_runner.sh` | FFmpeg was launched and its PID was recorded. |
+| `ffmpeg_first_progress` | `worker_stream_runner.sh` | The first complete FFmpeg `-progress` line was observed locally. Controller callback failures are logged separately as `worker_error` and retried without suppressing this event. |
+| `ffmpeg_exited` | `worker_stream_runner.sh` | FFmpeg process exited; `status` is `exit_<code>`. |
+| `worker_shutdown` | `entrypoint.sh` | The worker container is stopping after normal completion, process exit, or signal handling. |
+| `worker_error` | Both worker shell scripts | A subprocess, notification, startup validation, or FFmpeg failure occurred. |
+
+`EXPERIMENT_ID`, `SCENARIO`, and `RUN_ID` are intentionally read only from the
+worker environment so experiments can control these values without allowing
+request-controlled cardinality in metrics. For experiment runs, configure these
+variables on the worker Deployment template or have the controller inject them
+when creating the per-stream worker Pod. The controller-created Pod path already
+sets stream-specific variables such as `STREAM_KEY`, `STREAM_GENERATION`,
+`PROXY_DNS`, and `CONTROLLER_API`; experiment metadata must be propagated through
+the same controlled environment mechanism so the worker JSON logs can correlate
+all events for a given run. Do not promote `stream`, `proxy_pod`, `worker_pod`,
+`experiment_id`, `scenario`, or `run_id` to Prometheus labels unless an explicit
+cardinality review approves it.
+
 ## Proxy RTMP `/stats` metrics
 
 The controller also starts a background asynchronous scraper for every pod labeled
