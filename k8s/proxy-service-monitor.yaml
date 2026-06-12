@@ -3,6 +3,9 @@ kind: ServiceMonitor
 metadata:
   name: proxy-metrics
   namespace: monitoring
+  annotations:
+    liveedgecast.io/metrics-scope: "nginx-stub-status-only"
+    liveedgecast.io/rtmp-traffic-source: "cadvisor-pod-network-counters"
 spec:
   namespaceSelector:
     matchNames: ["media"]
@@ -10,6 +13,10 @@ spec:
     matchLabels:
       app: proxy
   endpoints:
+    # nginx-prometheus-exporter scrapes /nginx_status and exposes generic NGINX
+    # stub_status metrics. RTMP byte-rate dashboards intentionally use cAdvisor
+    # Pod network counters because the current /stats endpoint has no per-stream
+    # RTMP byte counters.
     - port: metrics
       interval: 10s
       path: /metrics

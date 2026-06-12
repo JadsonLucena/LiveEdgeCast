@@ -138,6 +138,18 @@ When a proxy pod disappears from Kubernetes discovery, the controller removes
 that pod's RTMP metric series to avoid stale values after rollouts or
 reschedules.
 
+The current `/stats` payload must not be used as a byte-level RTMP traffic
+source. With the NGINX RTMP module configuration used by the proxy, `/stats`
+provides stream, client, and publisher activity counts; it does not provide
+RTMP bytes received/transmitted per stream. The proxy sidecar
+`nginx-prometheus-exporter` is intentionally connected to `/nginx_status`
+(`stub_status`) and exposes generic NGINX process/connection metrics, not RTMP
+per-stream byte counters. Until a compatible NGINX RTMP exporter is selected and
+deployed, use cAdvisor `container_network_receive_bytes_total` and
+`container_network_transmit_bytes_total` as a Pod-level network proxy for RTMP
+traffic, with documentation explicitly noting that these counters include all
+non-loopback network traffic for the Pod.
+
 ## Worker FFmpeg progress metrics
 
 Each worker starts a lightweight standard-library exporter on port `9113` and
@@ -432,6 +444,10 @@ dependem de valores simulados pelo controller.
 | `container_memory_working_set_bytes` | Gauge | `namespace`, `pod`, `container` | bytes | Média: container por Pod. | Working set de memória observado por cAdvisor/kubelet. | Fonte primária para memória por componente. |
 | `container_network_receive_bytes_total` | Counter | `namespace`, `pod`, `interface` e labels do alvo | bytes | Média: interface/Pod conforme runtime. | Bytes recebidos observados por cAdvisor/kubelet; filtre `interface!="lo"` para evitar loopback. | Fonte primária para rede RX por componente. |
 | `container_network_transmit_bytes_total` | Counter | `namespace`, `pod`, `interface` e labels do alvo | bytes | Média: interface/Pod conforme runtime. | Bytes transmitidos observados por cAdvisor/kubelet; filtre `interface!="lo"` para evitar loopback. | Fonte primária para rede TX por componente. |
+| `liveedgecast:proxy:network_receive_bytes_per_second` | Recording rule | `pod` | bytes/s | Baixa: uma série por Pod RTMP proxy. | Taxa RX do Pod `proxy-*` calculada de cAdvisor, excluindo `proxy-lb-*` e loopback. | Proxy atual para tráfego RTMP recebido por proxy; não é bytes por stream. |
+| `liveedgecast:proxy:network_transmit_bytes_per_second` | Recording rule | `pod` | bytes/s | Baixa: uma série por Pod RTMP proxy. | Taxa TX do Pod `proxy-*` calculada de cAdvisor, excluindo `proxy-lb-*` e loopback. | Proxy atual para tráfego RTMP transmitido por proxy; não é bytes por stream. |
+| `liveedgecast:component:network_receive_bytes_per_second` | Recording rule | `component` | bytes/s | Baixa: `proxy-lb`, `proxy`, `worker`, `controller`. | Taxa RX agregada por componente inferido pelo nome do Pod. | Comparação de tráfego recebido por componente. |
+| `liveedgecast:component:network_transmit_bytes_per_second` | Recording rule | `component` | bytes/s | Baixa: `proxy-lb`, `proxy`, `worker`, `controller`. | Taxa TX agregada por componente inferido pelo nome do Pod. | Comparação de tráfego transmitido por componente. |
 | `kube_pod_status_phase` | Gauge | `namespace`, `pod`, `phase` | booleano `0/1` | Média: fase por Pod. | Fase Kubernetes do Pod exportada pelo kube-state-metrics. | Número de Pods ativos, status/phase e denominador de Pod-segundos. |
 | `kube_pod_created` | Gauge | `namespace`, `pod` | Unix timestamp em segundos | Média: uma série por Pod. | Tempo de criação do Pod exportado pelo kube-state-metrics. | Idade/lifetime de Pods e análise de churn. |
 | `pod_cpu_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média: proxy/worker por Pod. | **Deprecated/auxiliar**: declarada pelo controller, mas não populada pelo coletor atual. | Não usar no artigo até haver coleta real; preferir cAdvisor `container_cpu_usage_seconds_total`. |

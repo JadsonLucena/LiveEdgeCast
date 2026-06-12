@@ -476,6 +476,106 @@ recording rules para os principais agregados com as séries nativas
 `container_network_receive_bytes_total`, `container_network_transmit_bytes_total`,
 `kube_pod_status_phase` e `kube_pod_created`.
 
+### Tráfego RTMP: abordagem adotada
+
+A abordagem adotada para tráfego RTMP é usar as métricas de rede por Pod do
+cAdvisor como proxy operacional para bytes recebidos e transmitidos pelos Pods
+`proxy-*`. O endpoint `/stats` do módulo NGINX RTMP continua útil para atividade
+RTMP (`streams`, `clients` e `publishers`), mas ele não expõe contadores de bytes
+RTMP por stream. O `nginx-prometheus-exporter` configurado para o proxy lê
+`/nginx_status`, ou seja, `stub_status` HTTP genérico; ele não converte o XML de
+`/stats` em métricas de bytes RTMP. Até existir um exporter RTMP específico,
+avaliado e compatível com o módulo usado pela imagem, dashboards e regras de
+tráfego devem tratar RX/TX de cAdvisor como tráfego de rede do Pod e não como
+medição protocolar por stream.
+
+As recording rules em `k8s/proxy-observability-rules.yaml` materializam esta
+separação para o caminho crítico do proxy:
+
+- `liveedgecast:proxy:network_receive_bytes_per_second`: bytes/s recebidos por
+  Pod RTMP proxy.
+- `liveedgecast:proxy:network_transmit_bytes_per_second`: bytes/s transmitidos
+  por Pod RTMP proxy.
+- `liveedgecast:component:network_receive_bytes_per_second`: bytes/s recebidos
+  agregados por componente (`proxy-lb`, `proxy`, `worker` e `controller`).
+- `liveedgecast:component:network_transmit_bytes_per_second`: bytes/s
+  transmitidos agregados por componente.
+
+### Tráfego recebido por proxy
+
+Esta consulta separa RX por Pod RTMP proxy. O filtro `pod!~"proxy-lb-.*"` é
+obrigatório porque `proxy-lb-*` também começa com `proxy-`, mas representa o
+balanceador de entrada, não o NGINX RTMP.
+
+```promql
+sum by (pod) (
+  label_replace(
+    rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+)
+```
+
+Para Mbps por proxy:
+
+```promql
+sum by (pod) (
+  label_replace(
+    rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+) * 8 / (1000 * 1000)
+```
+
+### Tráfego transmitido por proxy
+
+```promql
+sum by (pod) (
+  label_replace(
+    rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+)
+```
+
+Para Mbps por proxy:
+
+```promql
+sum by (pod) (
+  label_replace(
+    rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[5m]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+) * 8 / (1000 * 1000)
+```
+
+### Tráfego agregado por componente
+
+Use esta consulta para comparar componentes sem misturar o HAProxy de entrada
+(`proxy-lb`) com os Pods RTMP (`proxy`).
+
+```promql
+sum by (component, direction) (
+  label_replace(
+    label_replace(
+      rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+      "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+    ),
+    "direction", "rx", "pod", ".*"
+  )
+)
+or
+sum by (component, direction) (
+  label_replace(
+    label_replace(
+      rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+      "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+    ),
+    "direction", "tx", "pod", ".*"
+  )
+)
+```
+
 ### CPU por componente usando cAdvisor
 
 ```promql
