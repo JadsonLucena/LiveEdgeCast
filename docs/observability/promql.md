@@ -599,13 +599,13 @@ kube_pod_created{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}
 
 ### Pod lifetime para janelas experimentais
 
-Para comparar repetições, integre Pod-segundos no intervalo do experimento. Em
-Grafana, substitua `$__range_s` pela duração da janela em segundos quando não
-estiver usando a variável nativa.
+Para comparar repetições, integre Pod-segundos no intervalo do experimento. Use
+`$window` para a duração da janela, `$sample_step` para uma resolução fixa
+próxima ao scrape interval e `$sample_step_s` para a mesma resolução em segundos.
 
 ```promql
 sum by (component) (
-  avg_over_time(
+  sum_over_time(
     (
       label_replace(
         max by (namespace, pod) (
@@ -613,8 +613,8 @@ sum by (component) (
         ),
         "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
       )
-    )[$__range:]
-  ) * $__range_s
+    )[$window:$sample_step]
+  ) * $sample_step_s
 )
 ```
 
@@ -631,11 +631,97 @@ label_replace(
 )
 ```
 
-### Custo relativo aproximado por Pod-segundo
+### Custo relativo experimental
 
-Esta consulta produz uma unidade relativa, não moeda. Ajuste os pesos para a
-infraestrutura do experimento; por padrão, o exemplo abaixo usa peso `1` por
-Pod-segundo para comparar cenários sem depender de preços externos ou simulados.
+As consultas desta seção produzem insumos para uma pontuação experimental de
+custo relativo, não valores monetários. Use-as com uma janela de run fechada:
+substitua `$__range` ou `$window` pela duração exata do run e `$__range_s` ou
+`$window_s` pela mesma duração em segundos. Para integrais de gauges e indicadores
+de Pod, substitua `$sample_step` e `$sample_step_s` por uma resolução fixa
+alinhada ao scrape interval ou ao step da consulta, por exemplo `15s` e `15`; não
+use média multiplicada pela janela completa para Pods efêmeros, porque séries que
+ficam stale após deleção não contribuem zeros para `avg_over_time()`. Para
+comparar cenários, execute as consultas sobre ranges equivalentes ou filtre por
+labels externos estáveis como `scenario="$scenario"` quando o
+Prometheus/Grafana do experimento adicioná-los. Não adicione `run_id` de alta
+cardinalidade às métricas da aplicação; prefira delimitar runs por tempo e
+guardar `run_id` nos artefatos/logs do experimento.
+
+#### CPU-segundos por componente e run window
+
+`increase(container_cpu_usage_seconds_total[$window])` já retorna
+core-segundos/CPU-segundos consumidos na janela. A consulta abaixo agrupa por
+componente inferido pelo nome do Pod.
+
+```promql
+sum by (component) (
+  label_replace(
+    increase(container_cpu_usage_seconds_total{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[$window]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+)
+```
+
+Quando houver label externa de cenário no alvo ou no datasource, mantenha a
+mesma expressão e inclua `scenario` no agrupamento:
+
+```promql
+sum by (scenario, component) (
+  label_replace(
+    increase(container_cpu_usage_seconds_total{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[$window]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+)
+```
+
+#### Memória GiB-segundos por componente e run window
+
+Esta consulta aproxima a integral de memória somando amostras do working set no
+run, multiplicando pela resolução da subquery e convertendo de bytes-segundos
+para GiB-segundos. Essa forma trata séries de Pods efêmeros como contribuição
+apenas enquanto existiram, em vez de multiplicar o último valor observado pela
+janela completa.
+
+```promql
+sum by (component) (
+  sum_over_time(
+    label_replace(
+      container_memory_working_set_bytes{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"},
+      "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+    )[$window:$sample_step]
+  ) * $sample_step_s / 1024 / 1024 / 1024
+)
+```
+
+#### Rede recebida/transmitida por componente e run window
+
+As consultas abaixo usam bytes acumulados por cAdvisor/kubelet e excluem
+loopback. Reporte RX e TX separadamente quando os pesos relativos de rede não
+forem definidos antes do experimento.
+
+```promql
+sum by (component) (
+  label_replace(
+    increase(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[$window]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+)
+```
+
+```promql
+sum by (component) (
+  label_replace(
+    increase(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[$window]),
+    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  )
+)
+```
+
+#### Pod-segundos por worker e proxy
+
+Use `Pending|Running` como indicador de Pod ainda ativo operacionalmente. A
+consulta separa workers, proxies RTMP e `proxy-lb` para que a comparação
+always-on vs serverless não misture o balanceador de entrada com os proxies RTMP.
 
 ```promql
 sum by (component) (
@@ -652,20 +738,121 @@ sum by (component) (
 )
 ```
 
-### Custo relativo aproximado por core-segundo
-
-`increase(container_cpu_usage_seconds_total[$__range])` já retorna core-segundos
-consumidos. Multiplique o resultado por um peso local se quiser converter para
-uma pontuação relativa comum entre CPU e Pod lifetime.
+Para focar apenas worker e proxy RTMP no denominador de seletividade:
 
 ```promql
 sum by (component) (
-  label_replace(
-    increase(container_cpu_usage_seconds_total{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[$__range]),
-    "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+  sum_over_time(
+    (
+      label_replace(
+        max by (namespace, pod) (
+          kube_pod_status_phase{namespace="media",phase=~"Pending|Running",pod=~"(proxy|worker)-.*"} == 1
+        ),
+        "component", "$1", "pod", "^(proxy|worker)-.*"
+      )
+    )[$window:$sample_step]
+  ) * $sample_step_s
+)
+```
+
+#### Pontuação relativa por componente
+
+PromQL não conhece preços de cloud. A expressão abaixo combina pesos
+adimensionais definidos pelo experimento (`$w_cpu`, `$w_mem`, `$w_rx`, `$w_tx`,
+`$w_pod`) para produzir uma pontuação comparável entre runs do mesmo cluster. Se
+os pesos não tiverem sido pré-registrados, publique os termos separadamente em
+vez da soma ponderada.
+
+```promql
+(
+  $w_cpu * sum by (component) (
+    label_replace(
+      increase(container_cpu_usage_seconds_total{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[$window]),
+      "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+    )
+  )
+)
++
+(
+  $w_mem * sum by (component) (
+    sum_over_time(
+      label_replace(
+        container_memory_working_set_bytes{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"},
+        "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+      )[$window:$sample_step]
+    ) * $sample_step_s / 1024 / 1024 / 1024
+  )
+)
++
+(
+  $w_rx * sum by (component) (
+    label_replace(
+      increase(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[$window]),
+      "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+    )
+  )
+)
++
+(
+  $w_tx * sum by (component) (
+    label_replace(
+      increase(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[$window]),
+      "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+    )
+  )
+)
++
+(
+  $w_pod * sum by (component) (
+    sum_over_time(
+      (
+        label_replace(
+          max by (namespace, pod) (
+            kube_pod_status_phase{namespace="media",phase=~"Pending|Running",pod=~"(proxy-lb|proxy|worker|controller)-.*"} == 1
+          ),
+          "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+        )
+      )[$window:$sample_step]
+    ) * $sample_step_s
   )
 )
 ```
+
+#### Comparação baseline always-on vs serverless seletivo
+
+Execute a pontuação relativa ou os termos separados sobre janelas equivalentes:
+
+- `always_on`: janela inclui Pods de proxy e worker pré-provisionados, mesmo em
+  períodos ociosos.
+- `serverless_selective`: janela inicia antes da primeira stream e termina após
+  release/cleanup, para incluir criação, processamento e teardown.
+
+Economia relativa por run:
+
+```promql
+(
+  relative_cost_score_always_on - relative_cost_score_serverless_selective
+)
+/
+clamp_min(relative_cost_score_always_on, 1e-9)
+```
+
+`relative_cost_score_*` acima é uma abreviação para a pontuação ponderada
+exportada pelo painel, recording rule experimental ou cálculo offline. Se não
+houver recording rule para essa abreviação, calcule a diferença fora do
+Prometheus usando os snapshots das consultas de CPU, memória, rede e Pod-segundos.
+
+#### Limitações da métrica de custo relativo
+
+- O custo real de cloud não é medido diretamente: não há consulta a billing API,
+  preço de instância, preço de tráfego, desconto, reserva ou taxa regional.
+- Os valores dependem do cluster, requests/limits, autoscaling, CNI, runtime,
+  tipo de nó, overcommit e provedor; compare somente runs controlados.
+- cAdvisor mede uso observado de CPU, memória e rede, não preço. Kube-state-metrics
+  mede estado de Pod, não cobrança mínima, arredondamento de faturamento nem
+  custos indiretos de control plane, storage, registry ou observabilidade.
+- A soma ponderada é sensível aos pesos escolhidos; publique os componentes
+  brutos junto da pontuação para permitir reinterpretação.
 
 ### Recording rules opcionais
 

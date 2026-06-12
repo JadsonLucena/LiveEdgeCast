@@ -24,6 +24,7 @@ com o catálogo de métricas e as consultas PromQL de `docs/observability`.
 | H3: handover preserva ownership sem limpar stream ativo de outro proxy. | `stream_proxy_handover_total`, `handover_conflict_total`, `stale_ended_events_ignored_total`. | Taxa de aceite/conflito em trocas reais usando `stream_proxy_handover_total + handover_conflict_total` como denominador. |
 | H4: recuperação de worker tem MTTR aceitável. | P95 e média de `worker_recovery_duration_seconds` para tentativas de recovery, acompanhados de `worker_recovery_total{status="success",reason="replaced"}`. | MTTR por histograma e taxa de sucesso por contador. |
 | H5: uso de recursos cresce de forma proporcional à carga. | CPU, memória e rede por componente via cAdvisor/kubelet. | Agregações por `component`. |
+| H6: o modo serverless seletivo reduz custo relativo sem degradar métricas primárias além dos limiares. | Pontuação experimental de custo relativo baseada em CPU-segundos, GiB-segundos, bytes de rede e Pod-segundos. | Integrais de cAdvisor/kubelet e kube-state-metrics por cenário e janela de run. |
 
 ## Variáveis experimentais
 
@@ -50,6 +51,8 @@ com o catálogo de métricas e as consultas PromQL de `docs/observability`.
 - Número de workers ativos, proxies ativos, publishers e clientes RTMP.
 - Órfãos aproximados e eventos de exclusão de worker sem stream associado.
 - CPU, memória e rede por componente.
+- Custo relativo experimental por componente e cenário: CPU-segundos,
+  GiB-segundos de memória, bytes RX/TX e Pod-segundos para workers e proxies.
 - Erros de scrape, watch e exporter.
 
 ### Variáveis controladas
@@ -61,6 +64,74 @@ com o catálogo de métricas e as consultas PromQL de `docs/observability`.
 - Região/localidade de execução e latência entre gerador de carga e cluster.
 - Janela de retenção/scrape do Prometheus e intervalo de scrape.
 - Configurações de healthcheck e timeouts do controller.
+
+## Definição experimental de custo relativo
+
+O custo relativo é uma métrica derivada para comparar cenários dentro da mesma
+campanha experimental. Ele não representa moeda nem fatura de cloud; é uma
+pontuação normalizada construída a partir de uso observado de recursos e tempo de
+vida de Pods. Para cada cenário `s`, run `r`, componente `c` e janela temporal
+fechada `[t0, t1]`, defina:
+
+- `CPU_s(c, s, r)`: CPU-segundos por componente, calculado como a soma do
+  incremento de `container_cpu_usage_seconds_total` dos containers reais
+  (`container!=""`, `container!="POD"`) dos Pods do componente durante a janela.
+- `MEM_GiB_s(c, s, r)`: memória GiB-segundos por componente, calculada como a
+  integral do `container_memory_working_set_bytes` no tempo, dividida por
+  `1024^3`. Para Pods efêmeros, some amostras em resolução fixa e multiplique
+  pelo step; não use média de série existente multiplicada pela janela completa,
+  pois séries stale após deleção não representam zeros.
+- `NET_RX_B(c, s, r)` e `NET_TX_B(c, s, r)`: bytes de rede recebidos e
+  transmitidos por componente, calculados como o incremento de
+  `container_network_receive_bytes_total` e
+  `container_network_transmit_bytes_total`, excluindo `interface="lo"`.
+- `POD_s_worker(s, r)` e `POD_s_proxy(s, r)`: Pod-segundos de workers e proxies,
+  calculados pela soma temporal do indicador `Pending|Running` de
+  `kube_pod_status_phase` para Pods `worker-*` e `proxy-*`, multiplicada pela
+  resolução da consulta. O HAProxy de entrada (`proxy-lb-*`) deve permanecer
+  separado quando ele fizer parte do ambiente.
+
+Uma pontuação relativa comum pode ser definida como:
+
+```text
+relative_cost_score =
+  w_cpu * CPU_s
+  + w_mem * MEM_GiB_s
+  + w_rx * NET_RX_B
+  + w_tx * NET_TX_B
+  + w_pod_worker * POD_s_worker
+  + w_pod_proxy * POD_s_proxy
+```
+
+Os pesos `w_*` devem ser fixados antes da campanha e mantidos iguais para todos
+os cenários comparados. Para uma análise sem preços, use pesos adimensionais
+simples, por exemplo `w_cpu=1`, `w_mem=1`, `w_rx=w_tx=0` e
+`w_pod_worker=w_pod_proxy=1`, ou reporte cada termo separadamente sem agregá-los
+em uma pontuação única. Quando pesos diferentes forem usados, documente a
+motivação e faça análise de sensibilidade.
+
+### Comparação baseline always-on vs serverless seletivo
+
+Compare os dois modos somente com carga, duração, bitrate, imagem, manifests,
+requests/limits, número de réplicas de proxy e cluster constantes:
+
+1. **Baseline always-on**: manter capacidade de worker e proxy previamente
+   provisionada durante toda a janela `[t0, t1]`, incluindo períodos ociosos
+   antes, entre e depois das streams. Contabilizar todos os Pod-segundos desses
+   Pods, mesmo sem stream ativa.
+2. **Serverless seletivo**: iniciar workers apenas para streams selecionadas pelo
+   plano de controle e encerrar/recolher workers após release/cleanup.
+   Contabilizar Pod-segundos desde `Pending` até o término efetivo do Pod.
+3. Medir `CPU_s`, `MEM_GiB_s`, `NET_RX_B`, `NET_TX_B` e `POD_s` na mesma janela
+   de run para ambos os modos. Não encerre a janela do serverless antes do
+   cleanup, pois isso subestimaria custo de teardown.
+4. Normalizar resultados por run completo e por unidade de trabalho: por stream
+   bem-sucedida, por minuto de mídia processada ou por byte entregue, conforme o
+   objetivo do experimento.
+5. Reportar economia relativa como
+   `(score_always_on - score_serverless) / score_always_on`, junto com a diferença
+   absoluta de cada termo, e verificar se cold start, allocation success,
+   handover e MTTR continuam dentro dos limiares definidos.
 
 ## Desenho experimental
 

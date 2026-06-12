@@ -393,6 +393,60 @@ enquanto o controller não tiver coletor real equivalente. As recording rules em
 `k8s/observability/liveedgecast-resource-rules.yaml` apenas agregam essas fontes
 nativas por componente; elas não introduzem valores simulados nem preços fixos.
 
+### Definição experimental de custo relativo
+
+O catálogo de métricas não possui uma métrica nativa de preço ou fatura. Para o
+artigo, defina custo relativo como uma família de variáveis derivadas em uma
+janela de run fechada, usando somente fontes observadas no cluster:
+
+| Variável derivada | Fonte primária | Unidade | Interpretação |
+| --- | --- | --- | --- |
+| `CPU_s(component)` | `increase(container_cpu_usage_seconds_total{container!="",container!="POD"}[window])` | CPU-segundos/core-segundos | CPU efetivamente consumida por componente durante o run. |
+| `MEM_GiB_s(component)` | `sum_over_time(container_memory_working_set_bytes[window:sample_step]) * sample_step_seconds / 1024^3` | GiB-segundos | Integral aproximada do working set de memória por componente; evita multiplicar séries efêmeras pela janela inteira. |
+| `NET_RX_B(component)` | `increase(container_network_receive_bytes_total{interface!="lo"}[window])` | bytes | Rede recebida observada por componente, sem loopback. |
+| `NET_TX_B(component)` | `increase(container_network_transmit_bytes_total{interface!="lo"}[window])` | bytes | Rede transmitida observada por componente, sem loopback. |
+| `POD_s_worker` | `sum_over_time((kube_pod_status_phase{phase=~"Pending|Running",pod=~"worker-.*"} == 1)[window:sample_step]) * sample_step_seconds` | Pod-segundos | Tempo total em que workers existiram como Pods ativos no run. |
+| `POD_s_proxy` | `sum_over_time((kube_pod_status_phase{phase=~"Pending|Running",pod=~"proxy-.*"} == 1)[window:sample_step]) * sample_step_seconds` | Pod-segundos | Tempo total em que proxies RTMP existiram como Pods ativos no run; manter `proxy-lb-*` separado quando analisado. |
+
+Uma pontuação agregada opcional pode combinar essas variáveis com pesos
+pré-registrados:
+
+```text
+relative_cost_score =
+  w_cpu * CPU_s
+  + w_mem * MEM_GiB_s
+  + w_rx * NET_RX_B
+  + w_tx * NET_TX_B
+  + w_pod_worker * POD_s_worker
+  + w_pod_proxy * POD_s_proxy
+```
+
+Use a pontuação apenas para comparar cenários executados no mesmo cluster e com
+os mesmos manifests, requests/limits, imagens, bitrate e janela de observação. A
+comparação baseline always-on vs serverless seletivo deve contabilizar o mesmo
+intervalo de run: no baseline, incluir Pods pré-provisionados mesmo quando
+ociosos; no serverless, incluir criação, processamento, release e cleanup dos
+workers seletivos. Normalize também por stream bem-sucedida, minuto de mídia ou
+byte entregue para separar economia de capacidade ociosa de diferenças de carga.
+
+Limitações importantes:
+
+- O custo real de cloud não é medido diretamente; essas variáveis não consultam
+  billing, lista de preços, descontos, reservas, taxas regionais nem custos de
+  control plane.
+- Os valores dependem do cluster, requests/limits, tipo de nó, CNI, runtime,
+  autoscaling e provedor. Uma pontuação obtida em um ambiente não deve ser
+  tratada como preço portátil para outro ambiente.
+- cAdvisor mede uso de CPU, memória e rede, não preço. Kube-state-metrics mede
+  fase/idade de Pod, não arredondamento de cobrança, minimum billing time,
+  tráfego faturável por zona ou custos indiretos de observabilidade.
+- Integrais de gauges são aproximações discretas: escolha `sample_step` próximo
+  ao scrape interval e mantenha o mesmo valor entre cenários para não favorecer
+  Pods curtos ou longos.
+- Pesos `w_*` mudam a conclusão da soma agregada; publique sempre os termos
+  brutos (`CPU_s`, `MEM_GiB_s`, `NET_RX_B`, `NET_TX_B`, `POD_s`) junto com a
+  pontuação ponderada.
+
 ### Cardinalidade e retenção de labels
 
 - **Baixa cardinalidade**: labels com enumeração fixa (`status`, `reason`,
