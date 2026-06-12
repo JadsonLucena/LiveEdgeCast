@@ -133,10 +133,10 @@ Minimum proxy event types are:
 | Event type | Emitted by | Meaning |
 | --- | --- | --- |
 | `proxy_publish_started` | `on_publish_start.sh` | NGINX RTMP invoked the publish-start hook. |
-| `proxy_publish_start_notified` | `on_publish_start.sh` | The controller accepted the `/streams/started` callback. |
+| `proxy_publish_start_notified` | `on_publish_start.sh` | The `/streams/started` callback returned a successful HTTP response. |
 | `proxy_publish_start_notify_failed` | `on_publish_start.sh` | The `/streams/started` callback failed after the configured curl timeout. |
 | `proxy_publish_ended` | `on_publish_done.sh` | NGINX RTMP invoked the publish-done hook. |
-| `proxy_publish_done_notified` | `on_publish_done.sh` | The controller accepted the `/streams/ended` callback. |
+| `proxy_publish_done_notified` | `on_publish_done.sh` | The `/streams/ended` callback returned a successful HTTP response. |
 | `proxy_publish_done_notify_failed` | `on_publish_done.sh` | The `/streams/ended` callback failed after the configured curl timeout. |
 
 The start hook sends `t_publish_start_proxy` to the controller as epoch seconds
@@ -153,12 +153,17 @@ latency.
 
 Experimental context propagation from proxy to controller is controlled by proxy
 environment variables only: `EXPERIMENT_ID`, `SCENARIO`, and `RUN_ID`. The hooks
-forward these values in both `X-LiveEdgeCast-Experiment-Id`,
-`X-LiveEdgeCast-Scenario`, and `X-LiveEdgeCast-Run-Id` headers and the matching
-`experiment_id`, `scenario`, and `run_id` query parameters so the controller log
-context can capture them. Do not derive these values from the RTMP stream name,
-and do not promote `stream`/`streamKey`, `experiment_id`, `scenario`, or `run_id`
-to Prometheus labels unless an explicit cardinality review approves it.
+sanitize these values to the same bounded character set used by controller log
+context (`a-z`, `A-Z`, `0-9`, `_`, `.`, `:`, `-`, capped at 64 characters, with
+`unknown` for empty values) before forwarding them in both
+`X-LiveEdgeCast-Experiment-Id`, `X-LiveEdgeCast-Scenario`, and
+`X-LiveEdgeCast-Run-Id` headers and the matching `experiment_id`, `scenario`, and
+`run_id` query parameters so the controller log context can capture them. Hook
+JSON is emitted through `jq` rather than hand-written string escaping so unusual
+stream keys remain valid JSON log values. Do not derive experiment context from
+the RTMP stream name, and do not promote `stream`/`streamKey`, `experiment_id`,
+`scenario`, or `run_id` to Prometheus labels unless an explicit cardinality
+review approves it.
 
 ## Proxy RTMP `/stats` metrics
 

@@ -5,19 +5,17 @@ set -e
 STREAM_NAME="$1"
 CONTROLLER_API="${CONTROLLER_API:-http://controller.media.svc.cluster.local:8000}"
 PROXY_POD="${PROXY_POD:-$(hostname)}"
-EXPERIMENT_ID="${EXPERIMENT_ID:-unknown}"
-SCENARIO="${SCENARIO:-unknown}"
-RUN_ID="${RUN_ID:-unknown}"
 
-json_escape() {
-  local value="$1"
-  value=${value//\\/\\\\}
-  value=${value//\"/\\\"}
-  value=${value//$'\n'/\\n}
-  value=${value//$'\r'/\\r}
-  value=${value//$'\t'/\\t}
-  printf '%s' "$value"
+sanitize_context_value() {
+  jq -rn --arg value "${1:-unknown}" '
+    ($value | gsub("^\\s+|\\s+$"; "") | gsub("[^a-zA-Z0-9_.:-]+"; "_") | .[:64]) as $sanitized
+    | if $sanitized == "" then "unknown" else $sanitized end
+  '
 }
+
+EXPERIMENT_ID="$(sanitize_context_value "${EXPERIMENT_ID:-unknown}")"
+SCENARIO="$(sanitize_context_value "${SCENARIO:-unknown}")"
+RUN_ID="$(sanitize_context_value "${RUN_ID:-unknown}")"
 
 utc_timestamp() {
   local timestamp
@@ -32,19 +30,21 @@ utc_timestamp() {
 log_event() {
   local event_type="$1"
   local status="$2"
-  printf '{"timestamp":"%s","event_type":"%s","stream":"%s","proxy_pod":"%s","experiment_id":"%s","scenario":"%s","run_id":"%s","status":"%s"}\n' \
-    "$(utc_timestamp)" \
-    "$(json_escape "$event_type")" \
-    "$(json_escape "$STREAM_NAME")" \
-    "$(json_escape "$PROXY_POD")" \
-    "$(json_escape "$EXPERIMENT_ID")" \
-    "$(json_escape "$SCENARIO")" \
-    "$(json_escape "$RUN_ID")" \
-    "$(json_escape "$status")"
+  # stream is intentionally log-only observability context; never use it as a Prometheus label.
+  jq -cn \
+    --arg timestamp "$(utc_timestamp)" \
+    --arg event_type "$event_type" \
+    --arg stream "$STREAM_NAME" \
+    --arg proxy_pod "$PROXY_POD" \
+    --arg experiment_id "$EXPERIMENT_ID" \
+    --arg scenario "$SCENARIO" \
+    --arg run_id "$RUN_ID" \
+    --arg status "$status" \
+    '{timestamp:$timestamp,event_type:$event_type,stream:$stream,proxy_pod:$proxy_pod,experiment_id:$experiment_id,scenario:$scenario,run_id:$run_id,status:$status}'
 }
 
 notify_stream_ended() {
-  curl -sf --connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}" --max-time "${CONTROLLER_CALLBACK_MAX_TIME_SECONDS:-2}" -X POST --get \
+  curl -sfo /dev/null --connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}" --max-time "${CONTROLLER_CALLBACK_MAX_TIME_SECONDS:-2}" -X POST --get \
     -H "X-LiveEdgeCast-Experiment-Id: ${EXPERIMENT_ID}" \
     -H "X-LiveEdgeCast-Scenario: ${SCENARIO}" \
     -H "X-LiveEdgeCast-Run-Id: ${RUN_ID}" \
