@@ -1,0 +1,63 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: liveedgecast-resource-observability
+  namespace: monitoring
+spec:
+  groups:
+    - name: liveedgecast.resources.cadvisor
+      interval: 30s
+      rules:
+        - record: liveedgecast:component:cpu_cores:rate5m
+          expr: |
+            sum by (component) (
+              label_replace(
+                rate(container_cpu_usage_seconds_total{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+                "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+              )
+            )
+        - record: liveedgecast:component:memory_working_set_bytes
+          expr: |
+            sum by (component) (
+              label_replace(
+                container_memory_working_set_bytes{namespace="media",container!="",container!="POD",pod=~"(proxy-lb|proxy|worker|controller)-.*"},
+                "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+              )
+            )
+        - record: liveedgecast:component:network_receive_bytes_per_second:rate5m
+          expr: |
+            sum by (component) (
+              label_replace(
+                rate(container_network_receive_bytes_total{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+                "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+              )
+            )
+        - record: liveedgecast:component:network_transmit_bytes_per_second:rate5m
+          expr: |
+            sum by (component) (
+              label_replace(
+                rate(container_network_transmit_bytes_total{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m]),
+                "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+              )
+            )
+    - name: liveedgecast.resources.kube_state_metrics
+      interval: 30s
+      rules:
+        - record: liveedgecast:pod:active
+          expr: |
+            label_replace(
+              max by (namespace, pod) (
+                kube_pod_status_phase{namespace="media",phase=~"Pending|Running",pod=~"(proxy-lb|proxy|worker|controller)-.*"} == 1
+              ),
+              "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+            )
+        - record: liveedgecast:component:active_pods
+          expr: |
+            sum by (component) (
+              liveedgecast:pod:active{component=~"proxy-lb|proxy|worker|controller"}
+            )
+        - record: liveedgecast:pod:age_seconds
+          expr: |
+            (time() - kube_pod_created{namespace="media",pod=~"(proxy-lb|proxy|worker|controller)-.*"})
+            * on (namespace, pod) group_left(component)
+              liveedgecast:pod:active{component=~"proxy-lb|proxy|worker|controller"}

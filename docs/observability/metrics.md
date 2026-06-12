@@ -367,17 +367,31 @@ limpeza de estado.
 
 ### Métricas de recursos
 
+A fonte primária de consumo de recursos deve ser o pipeline Kubernetes padrão:
+cAdvisor/kubelet para CPU, memória e rede, e kube-state-metrics para estado,
+criação e fase de Pods. Esses sinais são coletados diretamente do cluster e não
+dependem de valores simulados pelo controller.
+
 | Métrica | Tipo | Labels específicos | Unidade | Cardinalidade esperada | Interpretação | Uso no artigo |
 | --- | --- | --- | --- | --- | --- | --- |
-| `pod_cpu_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média: proxy/worker por Pod. | Declarada pelo controller, mas não populada pelo coletor atual. | Não usar no artigo até haver coleta implementada; preferir cAdvisor `container_cpu_usage_seconds_total`. |
-| `pod_memory_usage_bytes` | Gauge | `pod`, `namespace` | bytes | Média. | Uso de memória estimado/coletado por Pod. | Apenas contexto; a implementação pode aproximar valor por limite. |
-| `pod_memory_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média. | Percentual de memória do limite; a implementação atual usa aproximação quando só o limite é conhecido. | Não usar como métrica primária de consumo sem validar origem. |
-| `pod_network_io_bytes_total` | Counter | `pod`, `direction` | bytes | Média: Pod × direção. | Declarada pelo controller, mas não incrementada pelo coletor atual. | Não usar no artigo até haver coleta implementada; preferir cAdvisor por componente. |
+| `container_cpu_usage_seconds_total` | Counter | `namespace`, `pod`, `container` | core-segundos | Média: container por Pod. | CPU acumulada observada por cAdvisor/kubelet. | Fonte primária para CPU por componente e core-segundos. |
+| `container_memory_working_set_bytes` | Gauge | `namespace`, `pod`, `container` | bytes | Média: container por Pod. | Working set de memória observado por cAdvisor/kubelet. | Fonte primária para memória por componente. |
+| `container_network_receive_bytes_total` | Counter | `namespace`, `pod` e labels do alvo | bytes | Média: interface/Pod conforme runtime. | Bytes recebidos observados por cAdvisor/kubelet. | Fonte primária para rede RX por componente. |
+| `container_network_transmit_bytes_total` | Counter | `namespace`, `pod` e labels do alvo | bytes | Média: interface/Pod conforme runtime. | Bytes transmitidos observados por cAdvisor/kubelet. | Fonte primária para rede TX por componente. |
+| `kube_pod_status_phase` | Gauge | `namespace`, `pod`, `phase` | booleano `0/1` | Média: fase por Pod. | Fase Kubernetes do Pod exportada pelo kube-state-metrics. | Número de Pods ativos, status/phase e denominador de Pod-segundos. |
+| `kube_pod_created` | Gauge | `namespace`, `pod` | Unix timestamp em segundos | Média: uma série por Pod. | Tempo de criação do Pod exportado pelo kube-state-metrics. | Idade/lifetime de Pods e análise de churn. |
+| `pod_cpu_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média: proxy/worker por Pod. | **Deprecated/auxiliar**: declarada pelo controller, mas não populada pelo coletor atual. | Não usar no artigo até haver coleta real; preferir cAdvisor `container_cpu_usage_seconds_total`. |
+| `pod_memory_usage_bytes` | Gauge | `pod`, `namespace` | bytes | Média. | Auxiliar: uso de memória estimado/coletado por Pod. | Apenas contexto; a implementação pode aproximar valor por limite. |
+| `pod_memory_usage_percent` | Gauge | `pod`, `namespace` | porcentagem | Média. | **Deprecated/auxiliar**: percentual de memória do limite; a implementação atual usa aproximação quando só o limite é conhecido. | Não usar como métrica primária de consumo; preferir cAdvisor `container_memory_working_set_bytes`. |
+| `pod_network_io_bytes_total` | Counter | `pod`, `direction` | bytes | Média: Pod × direção. | **Deprecated/auxiliar**: declarada pelo controller, mas não incrementada pelo coletor atual. | Não usar no artigo até haver coleta real; preferir cAdvisor RX/TX por componente. |
 
 As métricas de recurso emitidas pelo controller são auxiliares. Para resultados
-quantitativos do artigo, use cAdvisor/kubelet como fonte primária; `pod_cpu_usage_percent`
-e `pod_network_io_bytes_total` não devem ser consideradas disponíveis enquanto o
-coletor atual não as preencher.
+quantitativos do artigo, use cAdvisor/kubelet e kube-state-metrics como fontes
+primárias; `pod_cpu_usage_percent`, `pod_memory_usage_percent` e
+`pod_network_io_bytes_total` permanecem deprecated como fonte de resultado
+enquanto o controller não tiver coletor real equivalente. As recording rules em
+`k8s/observability/liveedgecast-resource-rules.yaml` apenas agregam essas fontes
+nativas por componente; elas não introduzem valores simulados nem preços fixos.
 
 ### Cardinalidade e retenção de labels
 
