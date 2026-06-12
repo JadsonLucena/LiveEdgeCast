@@ -213,6 +213,8 @@ class ProgressFollower:
         self._prefix = ""
         self._tail = ""
         self._current_record = {}
+        self.latest_record = {}
+        self.latest_timestamp = None
         self.first_timestamp = None
 
     def _file_window_matches(self) -> bool:

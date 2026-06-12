@@ -9,16 +9,35 @@ exporter = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = exporter
 spec.loader.exec_module(exporter)
 
-COMPLETE_PROGRESS_WITH_BITRATE = (
-    Path("tests/fixtures/ffmpeg_progress/complete.progress")
-    .read_text()
-    .replace("frame=2\n", "frame=2\nbitrate=1234.5kbits/s\n")
-)
-PARTIAL_PROGRESS_WITH_BITRATE = (
-    Path("tests/fixtures/ffmpeg_progress/partial.progress")
-    .read_text()
-    .replace("total_size=12000\n", "total_size=12000\nbitrate=1.50Mbits/s\n")
-)
+COMPLETE_PROGRESS_WITH_BITRATE = """frame=1
+fps=0.00
+stream_0_0_q=-1.0
+bitrate=N/A
+total_size=4096
+out_time_us=1234567
+out_time_ms=1234567
+out_time=00:00:01.234567
+dup_frames=0
+drop_frames=0
+speed=1.25x
+progress=continue
+frame=2
+bitrate=1234.5kbits/s
+total_size=8192
+out_time=00:00:02.500000
+speed=0.98x
+progress=continue
+"""
+PARTIAL_PROGRESS_WITH_BITRATE = """frame=3
+total_size=12000
+bitrate=1.50Mbits/s
+out_time=00:00:03.250000
+speed=1.50x
+progress=continue
+frame=4
+total_size=16000
+out_time=00:00:04.000000
+speed=2."""
 
 
 def metric_value(payload, metric_name, labels=None):
@@ -85,6 +104,43 @@ def test_progress_follower_handles_partial_write_completion_truncation_and_rotat
     )
     assert follower.poll(now=13.0)["total_size"] == "333"
     assert follower.first_timestamp == 13.0
+
+
+def test_progress_follower_clears_stale_record_and_timestamps_on_empty_truncation(
+    tmp_path,
+):
+    progress = tmp_path / "ffmpeg.progress"
+    progress.write_text(
+        "frame=1\ntotal_size=100\nout_time=00:00:01.000000\nspeed=1.00x\nprogress=continue\n"
+    )
+    follower = exporter.ProgressFollower(str(progress))
+
+    assert follower.poll(now=10.0)["total_size"] == "100"
+    assert follower.latest_timestamp == 10.0
+    assert follower.first_timestamp == 10.0
+
+    progress.write_text("")
+
+    assert follower.poll(now=11.0) == {}
+    assert follower.latest_timestamp is None
+    assert follower.first_timestamp is None
+
+
+def test_progress_follower_exposes_new_partial_record_after_truncation(tmp_path):
+    progress = tmp_path / "ffmpeg.progress"
+    progress.write_text(
+        "frame=1\ntotal_size=100\nout_time=00:00:01.000000\nspeed=1.00x\nprogress=continue\n"
+    )
+    follower = exporter.ProgressFollower(str(progress))
+
+    assert follower.poll(now=20.0)["speed"] == "1.00x"
+
+    progress.write_text("frame=2\ntotal_size=200\n")
+    latest = follower.poll(now=21.0)
+
+    assert latest == {"frame": "2", "total_size": "200"}
+    assert follower.latest_timestamp == 21.0
+    assert follower.first_timestamp == 21.0
 
 
 def test_progress_follower_reads_records_beyond_chunk_boundaries(tmp_path):
