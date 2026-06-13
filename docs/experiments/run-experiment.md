@@ -44,6 +44,8 @@ python tools/experiments/run_experiment.py \
   --output-dir ./reports
 ```
 
+Para cenários `handover` e `duplicate-streamkey`, use `--secondary-rtmp-url` quando quiser direcionar a segunda publicação para outro proxy ou outro caminho RTMP. Se a segunda publicação não puder ser comprovada em outro proxy por eventos do controller, o relatório marca o cenário como inconclusivo para a hipótese de handover/conflito entre proxies.
+
 Também é possível informar as streamKeys diretamente:
 
 ```bash
@@ -64,8 +66,8 @@ python tools/experiments/run_experiment.py \
 - `release`: encerra publishers e observa liberação de workers/estado.
 - `worker-failure`: injeta falha de worker e observa recuperação.
 - `proxy-failure`: injeta falha de proxy e observa limitação do RTMP/reconexão.
-- `handover`: encerra uma publicação e inicia outra com a mesma chave para avaliar transferência de propriedade.
-- `duplicate-streamkey`: tenta publicar a mesma chave simultaneamente para validar rejeição de conflito.
+- `handover`: encerra uma publicação e inicia outra com a mesma chave para avaliar transferência de propriedade. Para validar handover entre proxies, informe `--secondary-rtmp-url` ou confirme no relatório que `secondary_proxy_observed=true`.
+- `duplicate-streamkey`: tenta publicar a mesma chave simultaneamente para validar rejeição de conflito. A rejeição só é considerada sustentada quando há evidência do controller; falhas genéricas do FFmpeg não são tratadas como prova de conflito.
 - `pilot-capacity`: aumenta a concorrência progressivamente usando níveis como `1, 5, 10, 15, N`, sempre incluindo o máximo de streamKeys informado.
 
 ## Observabilidade e correlação
@@ -118,6 +120,8 @@ O runner não altera a documentação do repositório durante a execução. Todo
 - Repetições com erro geram evento `run_failed`, fechando a janela temporal da repetição para evitar contaminação de métricas posteriores.
 - O cenário `release` aguarda `--release-after-seconds` antes de encerrar publishers, permitindo que a stream fique ativa antes da medição de limpeza.
 - Para evitar contaminação em métricas de cAdvisor/kube-state-metrics, execute apenas um experimento por namespace ou use namespaces isolados por execução.
+- Cenários `handover` e `duplicate-streamkey` são marcados como inconclusivos quando a segunda publicação não é observada em outro proxy.
+- `--resume` agrega evidências no mesmo diretório; use um `run_id` único para cada retomada e interprete o relatório como agregado, não como apenas a execução mais recente.
 
 ## Segurança de diretórios e limpeza
 

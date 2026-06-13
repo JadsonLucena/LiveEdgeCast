@@ -20,6 +20,7 @@ def config(tmp_path, scenario="cold-start"):
         warmup_seconds=0,
         cooldown_seconds=0,
         rtmp_url="rtmp://example/live",
+        secondary_rtmp_url=None,
         source_file=None,
         bitrate=None,
         namespace="media",
@@ -345,3 +346,81 @@ def test_worker_overlap_detected_from_controller_events_without_snapshots(tmp_pa
     stream_row = next(row for row in rows if row["stream_key"] == "key1")
     assert stream_row["max_worker_count_observed"] == "2"
     assert stream_row["duplicate_worker_detected"] == "True"
+
+
+def test_handover_counts_are_scoped_per_stream(tmp_path):
+    cfg = config(tmp_path, scenario="concurrency")
+    cfg.stream_keys = ["key1", "key2"]
+    dirs = runner.ensure_layout(cfg.report_root)
+    (dirs["raw"] / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 10.0, "stream_keys": ["key1", "key2"]}) + "\n" +
+        json.dumps({"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 30.0, "stream_keys": ["key1", "key2"]}) + "\n"
+    )
+    (dirs["raw"] / "publishers.jsonl").write_text(
+        json.dumps({"event": "publisher_finished", "run_id": "run", "repetition": 1, "publisher_index": 1, "stream_key": "key1", "started_at": 11.0, "ended_at": 29.0, "returncode": 0}) + "\n" +
+        json.dumps({"event": "publisher_finished", "run_id": "run", "repetition": 1, "publisher_index": 1, "stream_key": "key2", "started_at": 11.0, "ended_at": 29.0, "returncode": 0}) + "\n"
+    )
+    events = [
+        {"timestamp_epoch": 12.0, "event_type": "handover_accepted", "stream": "key1", "proxy_pod": "proxy-b", "run_id": "run", "repetition": 1},
+    ]
+    (dirs["raw"] / "controller_events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    runner.build_metrics(cfg, dirs)
+
+    rows = list(__import__("csv").DictReader((dirs["metrics"] / "correctness_metrics.csv").open()))
+    by_stream = {row["stream_key"]: row for row in rows if row["stream_key"] != "__orphans__"}
+    assert by_stream["key1"]["handover_accepted"] == "1"
+    assert by_stream["key2"]["handover_accepted"] == "0"
+
+
+def test_duplicate_streamkey_inconclusive_without_second_proxy(tmp_path):
+    cfg = config(tmp_path, scenario="duplicate-streamkey")
+    dirs = runner.ensure_layout(cfg.report_root)
+    (dirs["raw"] / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 10.0, "stream_keys": ["key1"]}) + "\n" +
+        json.dumps({"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 30.0, "stream_keys": ["key1"]}) + "\n"
+    )
+    publishers = [
+        {"event": "publisher_finished", "experiment_id": "exp", "scenario": "duplicate-streamkey", "run_id": "run", "repetition": 1, "publisher_index": 1, "stream_key": "key1", "started_at": 11.0, "ended_at": 29.0, "returncode": 0, "publisher_status": "success"},
+        {"event": "publisher_finished", "experiment_id": "exp", "scenario": "duplicate-streamkey", "run_id": "run", "repetition": 1, "publisher_index": 2, "stream_key": "key1", "started_at": 12.0, "ended_at": 13.0, "returncode": 1, "publisher_status": "duplicate_publisher_exited"},
+    ]
+    (dirs["raw"] / "publishers.jsonl").write_text("".join(json.dumps(e) + "\n" for e in publishers))
+    # Only one proxy is observed, so the controller-level between-proxy conflict claim is inconclusive.
+    events = [
+        {"timestamp_epoch": 11.0, "event_type": "publish_received", "stream": "key1", "proxy_pod": "proxy-a", "run_id": "run", "repetition": 1},
+        {"timestamp_epoch": 12.5, "event_type": "handover_denied", "stream": "key1", "proxy_pod": "proxy-a", "run_id": "run", "repetition": 1},
+    ]
+    (dirs["raw"] / "controller_events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    runner.build_metrics(cfg, dirs)
+
+    duplicate_rows = list(__import__("csv").DictReader((dirs["metrics"] / "duplicate_streamkey_metrics.csv").open()))
+    assert duplicate_rows[0]["scenario_inconclusive"] == "True"
+    assert duplicate_rows[0]["status"] == "inconclusive_second_proxy_not_observed"
+
+
+def test_duplicate_streamkey_uses_generic_controller_conflict_evidence(tmp_path):
+    cfg = config(tmp_path, scenario="duplicate-streamkey")
+    dirs = runner.ensure_layout(cfg.report_root)
+    (dirs["raw"] / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 10.0, "stream_keys": ["key1"]}) + "\n" +
+        json.dumps({"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 30.0, "stream_keys": ["key1"]}) + "\n"
+    )
+    publishers = [
+        {"event": "publisher_finished", "run_id": "run", "repetition": 1, "publisher_index": 1, "stream_key": "key1", "started_at": 11.0, "ended_at": 29.0, "returncode": 0, "publisher_status": "success"},
+        {"event": "publisher_finished", "run_id": "run", "repetition": 1, "publisher_index": 2, "stream_key": "key1", "started_at": 12.0, "ended_at": 13.0, "returncode": 1, "publisher_status": "duplicate_publisher_exited"},
+    ]
+    (dirs["raw"] / "publishers.jsonl").write_text("".join(json.dumps(e) + "\n" for e in publishers))
+    events = [
+        {"timestamp_epoch": 11.0, "event_type": "publish_received", "stream": "key1", "proxy_pod": "proxy-a", "run_id": "run", "repetition": 1},
+        {"timestamp_epoch": 12.0, "event_type": "publish_received", "stream": "key1", "proxy_pod": "proxy-b", "run_id": "run", "repetition": 1},
+        {"timestamp_epoch": 12.5, "event_type": "stream_started_conflict", "stream": "key1", "proxy_pod": "proxy-b", "status": "conflict", "run_id": "run", "repetition": 1},
+    ]
+    (dirs["raw"] / "controller_events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    runner.build_metrics(cfg, dirs)
+
+    duplicate_rows = list(__import__("csv").DictReader((dirs["metrics"] / "duplicate_streamkey_metrics.csv").open()))
+    assert duplicate_rows[0]["duplicate_streamkey_rejected"] == "True"
+    assert duplicate_rows[0]["secondary_proxy_observed"] == "True"
+    assert duplicate_rows[0]["status"] == "rejected"

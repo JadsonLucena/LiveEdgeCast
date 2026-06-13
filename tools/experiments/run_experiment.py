@@ -80,6 +80,7 @@ class RunnerConfig:
     warmup_seconds: int
     cooldown_seconds: int
     rtmp_url: str
+    secondary_rtmp_url: str | None
     source_file: str | None
     bitrate: str | None
     namespace: str
@@ -170,6 +171,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--warmup-seconds", type=non_negative_int, default=0)
     parser.add_argument("--cooldown-seconds", type=non_negative_int, default=10)
     parser.add_argument("--rtmp-url", default=os.getenv("LIVEEDGECAST_RTMP_URL", "rtmp://127.0.0.1:1935/live"))
+    parser.add_argument("--secondary-rtmp-url", default=os.getenv("LIVEEDGECAST_SECONDARY_RTMP_URL"), help="Optional RTMP URL used for the second publisher in handover/duplicate-streamkey scenarios; use it to target a different proxy directly.")
     parser.add_argument("--source-file", default=None)
     parser.add_argument("--bitrate", default=None)
     parser.add_argument("--namespace", default=os.getenv("NAMESPACE", "media"))
@@ -218,6 +220,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         warmup_seconds=args.warmup_seconds,
         cooldown_seconds=args.cooldown_seconds,
         rtmp_url=args.rtmp_url.rstrip("/"),
+        secondary_rtmp_url=args.secondary_rtmp_url.rstrip("/") if args.secondary_rtmp_url else None,
         source_file=args.source_file,
         bitrate=args.bitrate,
         namespace=args.namespace,
@@ -414,8 +417,9 @@ def redact_command(command: Sequence[str]) -> list[str]:
 
 
 
-def ffmpeg_command(config: RunnerConfig, stream_key: str) -> list[str]:
-    target = f"{config.rtmp_url}/{quote(stream_key, safe='')}"
+def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None = None) -> list[str]:
+    base_url = (rtmp_url or config.rtmp_url).rstrip("/")
+    target = f"{base_url}/{quote(stream_key, safe='')}"
     command = [config.ffmpeg_path, "-hide_banner", "-nostdin", "-re"]
     if config.source_file:
         command.extend(["-stream_loop", "-1", "-i", config.source_file, "-t", str(config.duration_seconds)])
@@ -442,11 +446,12 @@ def start_publisher(
     repetition: int,
     publisher_index: int,
     suffix: str = "",
+    rtmp_url_override: str | None = None,
 ) -> ManagedPublisher:
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{stream_key}{suffix}")
     stdout_path = dirs["logs"] / f"publisher-{config.experiment_id}-r{repetition:03d}-i{publisher_index:02d}-{safe_name}.stdout.log"
     stderr_path = dirs["logs"] / f"publisher-{config.experiment_id}-r{repetition:03d}-i{publisher_index:02d}-{safe_name}.stderr.log"
-    command = ffmpeg_command(config, stream_key)
+    command = ffmpeg_command(config, stream_key, rtmp_url=rtmp_url_override)
     started_at = now_epoch()
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
@@ -461,6 +466,7 @@ def start_publisher(
         "pid": process.pid,
         "timestamp": started_at,
         "command": redact_command(command),
+        "rtmp_url_role": "secondary" if rtmp_url_override else "primary",
     })
     return ManagedPublisher(config, stream_key, command, process, stdout_path, stderr_path, started_at, repetition, publisher_index)
 
@@ -473,7 +479,7 @@ def publisher_status(config: RunnerConfig, result: dict[str, Any]) -> str:
     if stop_reason.startswith("expected_"):
         return "expected_stopped"
     if config.scenario == "duplicate-streamkey" and int(result.get("publisher_index") or 0) > 1 and rc is not None:
-        return "expected_conflict_or_stopped"
+        return "duplicate_publisher_exited"
     if rc is None:
         return "running_or_unknown"
     return "unexpected_failed"
@@ -971,7 +977,7 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
             key = stream_keys[0]
             publishers.append(start_publisher(config, dirs, key, repetition, 1, suffix="-primary"))
             time.sleep(config.duplicate_attempt_delay_seconds)
-            publishers.append(start_publisher(config, dirs, key, repetition, 2, suffix="-duplicate"))
+            publishers.append(start_publisher(config, dirs, key, repetition, 2, suffix="-duplicate", rtmp_url_override=config.secondary_rtmp_url))
         elif config.scenario == "handover":
             key = stream_keys[0]
             first = start_publisher(config, dirs, key, repetition, 1, suffix="-handover-a")
@@ -980,7 +986,7 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
             first.stop(reason="expected_handover_primary_stop")
             append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "handover_primary_stopped", "experiment_id": config.experiment_id, "scenario": config.scenario, "run_id": config.run_id, "repetition": repetition, "stream_key": key, "timestamp": now_epoch()})
             time.sleep(config.reconnect_delay_seconds)
-            publishers.append(start_publisher(config, dirs, key, repetition, 2, suffix="-handover-b"))
+            publishers.append(start_publisher(config, dirs, key, repetition, 2, suffix="-handover-b", rtmp_url_override=config.secondary_rtmp_url))
         else:
             for index, key in enumerate(stream_keys):
                 publishers.append(start_publisher(config, dirs, key, repetition, index + 1))
@@ -1108,6 +1114,15 @@ def experiment_query_window(dirs: dict[str, Path], fallback_start: float, fallba
     starts = [r.get("timestamp") for r in records if r.get("event") == "run_started" and isinstance(r.get("timestamp"), (int, float))]
     ends = [r.get("ended_at") for r in records if r.get("event") in {"run_finished", "run_failed"} and isinstance(r.get("ended_at"), (int, float))]
     return (min(starts) if starts else fallback_start, max(ends) if ends else fallback_end)
+
+
+def sum_run_window_durations(windows: list[dict[str, Any]]) -> float:
+    total = 0.0
+    for window in windows:
+        duration = delta(window.get("started_at"), window.get("ended_at"))
+        if duration is not None:
+            total += duration
+    return total
 
 
 def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
@@ -1593,6 +1608,90 @@ def worker_overlap_counts_from_controller_events(
     return max_counts
 
 
+
+
+def event_stream_matches(event: dict[str, Any], stream: str) -> bool:
+    return event.get("stream") == stream or event.get("stream_key") == stream
+
+
+def is_controller_denial_event(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("event_type") or "").lower()
+    status = str(event.get("status") or "").lower()
+    message = str(event.get("message") or event.get("detail") or "").lower()
+    if event_type in {"handover_denied", "stream_conflict_denied", "stream_started_conflict", "stream_conflict", "ownership_conflict", "stream_allocation_conflict"}:
+        return True
+    if status in {"denied", "conflict", "rejected"}:
+        return True
+    return "already owned" in message or "conflict" in message or "409" in message
+
+
+def is_controller_acceptance_event(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("event_type") or "").lower()
+    status = str(event.get("status") or "").lower()
+    if event_type in {"handover_accepted", "stream_registered", "worker_created", "publish_received"} and status not in {"denied", "conflict", "rejected"}:
+        return True
+    return event_type == "handover_accepted" or status in {"accepted", "registered", "created", "success"}
+
+
+def proxy_observations_for_stream(
+    controller_events: list[dict[str, Any]],
+    window: dict[str, Any],
+    stream: str,
+    total_windows: int,
+) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for event in controller_events:
+        proxy = event.get("proxy_pod")
+        ts = event.get("timestamp_epoch")
+        if not proxy or not isinstance(ts, (int, float)):
+            continue
+        if not event_stream_matches(event, stream):
+            continue
+        if not event_matches_window_identity(event, window) or not event_in_window(event, window, total_windows):
+            continue
+        observations.append({
+            "timestamp": float(ts),
+            "proxy_pod": str(proxy),
+            "event_type": event.get("event_type"),
+            "status": event.get("status"),
+        })
+    observations.sort(key=lambda item: item["timestamp"])
+    return observations
+
+
+def scenario_proxy_validity_for_total(
+    config: RunnerConfig,
+    controller_events: list[dict[str, Any]],
+    window: dict[str, Any],
+    stream: str,
+    total_windows: int,
+) -> dict[str, Any]:
+    raw_observations = [
+        item for item in proxy_observations_for_stream(controller_events, window, stream, total_windows)
+    ]
+    observations = raw_observations
+    proxies: list[str] = []
+    for item in observations:
+        proxy = str(item.get("proxy_pod") or "")
+        if proxy and proxy not in proxies:
+            proxies.append(proxy)
+    primary = proxies[0] if proxies else None
+    secondary = proxies[1] if len(proxies) > 1 else None
+    secondary_observed = secondary is not None
+    same_proxy_detected = bool(primary and not secondary_observed and len(raw_observations) >= 2)
+    requires_second_proxy = config.scenario in {"handover", "duplicate-streamkey"}
+    inconclusive = requires_second_proxy and not secondary_observed
+    return {
+        "primary_proxy_pod": primary,
+        "secondary_proxy_pod": secondary,
+        "observed_proxy_sequence": ";".join(proxies),
+        "secondary_proxy_observed": secondary_observed,
+        "same_proxy_detected": same_proxy_detected,
+        "scenario_inconclusive": inconclusive,
+        "scenario_inconclusive_reason": "second_proxy_not_observed" if inconclusive else "",
+        "secondary_rtmp_url_configured": bool(config.secondary_rtmp_url),
+    }
+
 def build_duplicate_streamkey_rows(
     config: RunnerConfig,
     dirs: dict[str, Path],
@@ -1613,25 +1712,22 @@ def build_duplicate_streamkey_rows(
             ]
             duplicate_pubs = [row for row in pubs if int(row.get("publisher_index") or 0) > 1]
             attempted = bool(duplicate_pubs)
-            denial_events = [
+            scoped_events = [
                 e for e in controller_events
-                if e.get("event_type") == "handover_denied"
-                and e.get("stream") == stream
+                if event_stream_matches(e, stream)
                 and event_matches_window_identity(e, window)
                 and event_in_window(e, window, len(windows))
             ]
-            accepted_events = [
-                e for e in controller_events
-                if e.get("event_type") == "handover_accepted"
-                and e.get("stream") == stream
-                and event_matches_window_identity(e, window)
-                and event_in_window(e, window, len(windows))
-            ]
+            denial_events = [e for e in scoped_events if is_controller_denial_event(e)]
+            accepted_events = [e for e in scoped_events if is_controller_acceptance_event(e)]
+            proxy_validity = scenario_proxy_validity_for_total(config, controller_events, window, stream, len(windows))
             duplicate_statuses = [row.get("publisher_status") for row in duplicate_pubs]
             rejected = attempted and bool(denial_events)
             unexpectedly_accepted = attempted and not rejected and any(status == "success" for status in duplicate_statuses)
             if not attempted:
                 status = "not_attempted"
+            elif proxy_validity.get("scenario_inconclusive"):
+                status = "inconclusive_second_proxy_not_observed"
             elif rejected:
                 status = "rejected"
             elif unexpectedly_accepted:
@@ -1649,6 +1745,7 @@ def build_duplicate_streamkey_rows(
                 "duplicate_publisher_statuses": ";".join(str(status) for status in duplicate_statuses if status is not None),
                 "controller_denial_events": len(denial_events),
                 "controller_acceptance_events": len(accepted_events),
+                **proxy_validity,
                 "status": status,
             })
     return rows
@@ -1718,9 +1815,15 @@ def build_correctness_rows(
                 "duplicate_streamkey_attempted": duplicate_info.get("duplicate_streamkey_attempted", False),
                 "duplicate_streamkey_rejected": duplicate_info.get("duplicate_streamkey_rejected", False),
                 "duplicate_streamkey_unexpectedly_accepted": duplicate_info.get("duplicate_streamkey_unexpectedly_accepted", False),
-                "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
-                "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
-                "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
+                "primary_proxy_pod": duplicate_info.get("primary_proxy_pod"),
+                "secondary_proxy_pod": duplicate_info.get("secondary_proxy_pod"),
+                "secondary_proxy_observed": duplicate_info.get("secondary_proxy_observed"),
+                "same_proxy_detected": duplicate_info.get("same_proxy_detected"),
+                "scenario_inconclusive": duplicate_info.get("scenario_inconclusive"),
+                "scenario_inconclusive_reason": duplicate_info.get("scenario_inconclusive_reason"),
+                "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_stream_matches(e, key) and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
+                "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_stream_matches(e, key) and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
+                "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_stream_matches(e, key) and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
             })
         rows.append({
             "run_id": run_id,
@@ -1734,6 +1837,12 @@ def build_correctness_rows(
             "duplicate_streamkey_attempted": None,
             "duplicate_streamkey_rejected": None,
             "duplicate_streamkey_unexpectedly_accepted": None,
+            "primary_proxy_pod": None,
+            "secondary_proxy_pod": None,
+            "secondary_proxy_observed": None,
+            "same_proxy_detected": None,
+            "scenario_inconclusive": None,
+            "scenario_inconclusive_reason": None,
             "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
             "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
             "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
@@ -1789,30 +1898,36 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     write_csv(
         dirs["metrics"] / "duplicate_streamkey_metrics.csv",
         duplicate_streamkey_rows,
-        ["run_id", "repetition", "stream_key", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "duplicate_publisher_count", "duplicate_publisher_statuses", "controller_denial_events", "controller_acceptance_events", "status"],
+        ["run_id", "repetition", "stream_key", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "duplicate_publisher_count", "duplicate_publisher_statuses", "controller_denial_events", "controller_acceptance_events", "primary_proxy_pod", "secondary_proxy_pod", "observed_proxy_sequence", "secondary_proxy_observed", "same_proxy_detected", "scenario_inconclusive", "scenario_inconclusive_reason", "secondary_rtmp_url_configured", "status"],
     )
 
     correctness_rows = build_correctness_rows(config, dirs, pod_rows, controller_events, publisher_rows)
     write_csv(
         dirs["metrics"] / "correctness_metrics.csv",
         correctness_rows,
-        ["run_id", "repetition", "stream_key", "max_worker_count_observed", "worker_observed_for_stream", "at_most_one_worker_per_stream", "one_worker_per_stream", "duplicate_worker_detected", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "handover_accepted", "handover_denied", "stale_events_ignored"],
+        ["run_id", "repetition", "stream_key", "max_worker_count_observed", "worker_observed_for_stream", "at_most_one_worker_per_stream", "one_worker_per_stream", "duplicate_worker_detected", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "primary_proxy_pod", "secondary_proxy_pod", "secondary_proxy_observed", "same_proxy_detected", "scenario_inconclusive", "scenario_inconclusive_reason", "handover_accepted", "handover_denied", "stale_events_ignored"],
     )
 
 
     metadata = json.loads((config.report_root / "metadata.json").read_text(encoding="utf-8")) if (config.report_root / "metadata.json").exists() else {}
-    duration = max(0.0, (metadata.get("ended_at") or 0) - (metadata.get("started_at") or 0))
-    worker_pod_seconds, worker_cost_source = prom_time_integral(prom.get("workers_active", {}), fallback_duration=duration)
-    proxy_pod_seconds, proxy_cost_source = prom_time_integral(prom.get("proxies_active", {}), fallback_duration=duration)
-    controller_pod_seconds = duration
-    # Reference assumes one always-on worker capacity unit per streamKey for the whole experiment duration.
-    always_on_worker_pod_seconds = max(1, len(config.stream_keys)) * duration
+    execution = json.loads((config.report_root / "execution.json").read_text(encoding="utf-8")) if (config.report_root / "execution.json").exists() else {}
+    prom_window = execution.get("prometheus_window") or {}
+    query_duration = delta(prom_window.get("started_at"), prom_window.get("ended_at"))
+    if query_duration is None:
+        query_duration = max(0.0, (metadata.get("ended_at") or 0) - (metadata.get("started_at") or 0))
+    run_duration_sum = sum_run_window_durations(load_run_windows(config, dirs))
+    reference_duration = run_duration_sum if run_duration_sum > 0 else query_duration
+    worker_pod_seconds, worker_cost_source = prom_time_integral(prom.get("workers_active", {}), fallback_duration=query_duration)
+    proxy_pod_seconds, proxy_cost_source = prom_time_integral(prom.get("proxies_active", {}), fallback_duration=query_duration)
+    controller_pod_seconds = query_duration
+    # Reference assumes one always-on worker capacity unit per streamKey for the observed run windows.
+    always_on_worker_pod_seconds = max(1, len(config.stream_keys)) * reference_duration
     economy_relative = None if (worker_pod_seconds is None or always_on_worker_pod_seconds <= 0) else 1 - (worker_pod_seconds / always_on_worker_pod_seconds)
     cost_rows = [
         {"metric": "worker_pod_seconds", "value": worker_pod_seconds, "source": worker_cost_source},
         {"metric": "proxy_pod_seconds", "value": proxy_pod_seconds, "source": proxy_cost_source},
-        {"metric": "controller_pod_seconds", "value": controller_pod_seconds, "source": "experiment_duration_assumes_single_controller"},
-        {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds, "source": "len_stream_keys_times_duration_reference"},
+        {"metric": "controller_pod_seconds", "value": controller_pod_seconds, "source": "prometheus_query_window_assumes_single_controller"},
+        {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds, "source": "len_stream_keys_times_observed_run_window_reference"},
         {"metric": "relative_worker_activity_reduction_vs_always_on", "value": economy_relative, "source": "resource_activity_time_integral_estimate" if worker_pod_seconds is not None else "not_supported_without_prometheus"},
     ]
     write_csv(dirs["metrics"] / "cost_estimation.csv", cost_rows, ["metric", "value", "source"])
@@ -2000,6 +2115,7 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
     correctness = {(row.get("run_id") or config.run_id, str(row.get("repetition")), row.get("stream_key")): row for row in csv_rows(dirs["metrics"] / "correctness_metrics.csv")}
     publishers = [row for row in read_jsonl(dirs["raw"] / "publishers.jsonl") if row.get("event") == "publisher_finished"]
     pods = extract_pod_rows(dirs, config.stream_keys)
+    controller_events = read_jsonl(dirs["raw"] / "controller_events.jsonl")
     windows = load_run_windows(config, dirs)
     pod_history: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for row in pods:
@@ -2009,6 +2125,30 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
             run_id = str(window.get("run_id") or config.run_id)
             rep = str(window.get("repetition") or 1)
             pod_history.setdefault((run_id, rep, stream), []).append(row)
+    # Enrich worker history with controller lifecycle events so short-lived workers
+    # deleted between Kubernetes snapshots still appear in the per-stream report.
+    for event in controller_events:
+        stream = event.get("stream") or event.get("stream_key")
+        worker = event.get("worker_pod")
+        ts = event.get("timestamp_epoch")
+        if not stream or not worker or not isinstance(ts, (int, float)):
+            continue
+        window = window_for_timestamp(windows, ts, event.get("run_id"))
+        if window is None:
+            continue
+        if not event_matches_window_identity(event, window) or not event_in_window(event, window, len(windows)):
+            continue
+        run_id = str(window.get("run_id") or config.run_id)
+        rep = str(window.get("repetition") or 1)
+        pod_history.setdefault((run_id, rep, stream), []).append({
+            "snapshot_at": ts,
+            "pod": worker,
+            "component": "worker",
+            "stream_key": stream,
+            "proxy_pod": event.get("proxy_pod"),
+            "phase": "ControllerEvent",
+            "event_type": event.get("event_type"),
+        })
     release_by_key = {(row.get("run_id") or config.run_id, str(row.get("repetition")), row.get("stream_key")): row for row in release}
     publisher_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in publishers:
@@ -2050,7 +2190,9 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
             "duplicate_streamkey_unexpectedly_accepted": corr.get("duplicate_streamkey_unexpectedly_accepted"),
             "handover_accepted": corr.get("handover_accepted"),
             "handover_denied": corr.get("handover_denied"),
-            "observations": row.get("status"),
+            "secondary_proxy_observed": corr.get("secondary_proxy_observed"),
+            "scenario_inconclusive": corr.get("scenario_inconclusive"),
+            "observations": corr.get("scenario_inconclusive_reason") or row.get("status"),
         })
     if not rows:
         for key in config.stream_keys:
@@ -2061,7 +2203,7 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
 def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict[str, Any], metrics: dict[str, Any], charts: dict[str, str]) -> dict[str, Any]:
     metadata = json.loads((dirs["root"] / "metadata.json").read_text(encoding="utf-8"))
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
-    success_count = len([r for r in publisher_rows if r.get("publisher_status") in {"success", "expected_stopped", "expected_conflict_or_stopped"}])
+    success_count = len([r for r in publisher_rows if r.get("publisher_status") in {"success", "expected_stopped"}])
     failure_count = len([r for r in publisher_rows if r.get("publisher_status") == "unexpected_failed"])
     unavailable = metrics.get("missing", [])
     activation_csv_rows = csv_rows(dirs["metrics"] / "activation_metrics.csv")
@@ -2078,6 +2220,8 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
             "invalid_activation_samples": invalid_activation_samples,
             "duplicate_streamkey_rejected": any(str(row.get("duplicate_streamkey_rejected")).lower() == "true" for row in duplicate_rows),
             "duplicate_streamkey_unexpectedly_accepted": any(str(row.get("duplicate_streamkey_unexpectedly_accepted")).lower() == "true" for row in duplicate_rows),
+            "scenario_inconclusive": any(str(row.get("scenario_inconclusive")).lower() == "true" for row in duplicate_rows),
+            "secondary_proxy_observed": any(str(row.get("secondary_proxy_observed")).lower() == "true" for row in duplicate_rows),
             "missing_metrics": unavailable,
         },
         "metrics": metrics,
@@ -2116,7 +2260,7 @@ Amostras de ativação válidas: {report_json["summary"]["valid_activation_sampl
 
 ## Resultado por streamKey
 
-{md_table(build_stream_result_rows(config, dirs), ['run_id','repetition','streamKey','initial_worker','final_worker','worker_replacements_count','proxy_owner','publisher_status','activation_seconds','release_seconds','worker_observed','duplicate_worker','duplicate_streamkey_rejected','duplicate_streamkey_unexpectedly_accepted','handover_accepted','handover_denied','observations'])}
+{md_table(build_stream_result_rows(config, dirs), ['run_id','repetition','streamKey','initial_worker','final_worker','worker_replacements_count','proxy_owner','publisher_status','activation_seconds','release_seconds','worker_observed','duplicate_worker','duplicate_streamkey_rejected','duplicate_streamkey_unexpectedly_accepted','handover_accepted','handover_denied','secondary_proxy_observed','scenario_inconclusive','observations'])}
 
 ## Uso de recursos
 
@@ -2138,7 +2282,7 @@ A verificação de um worker por streamKey e candidatos a órfãos foi salva em 
 
 ## Verificação de streamKey duplicada
 
-{md_table(csv_rows(dirs["metrics"] / "duplicate_streamkey_metrics.csv"), ['run_id','repetition','stream_key','duplicate_streamkey_attempted','duplicate_streamkey_rejected','duplicate_streamkey_unexpectedly_accepted','duplicate_publisher_count','controller_denial_events','status'])}
+{md_table(csv_rows(dirs["metrics"] / "duplicate_streamkey_metrics.csv"), ['run_id','repetition','stream_key','duplicate_streamkey_attempted','duplicate_streamkey_rejected','duplicate_streamkey_unexpectedly_accepted','primary_proxy_pod','secondary_proxy_pod','secondary_proxy_observed','scenario_inconclusive','scenario_inconclusive_reason','duplicate_publisher_count','controller_denial_events','status'])}
 
 ## Limitações
 

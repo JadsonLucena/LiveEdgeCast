@@ -92,3 +92,10 @@ O runner só gera gráficos com dados reais. Quando as amostras necessárias nã
 O runner não mistura execuções por padrão. Se o diretório de saída já existir, a execução falha, exceto quando `--overwrite` ou `--resume` for informado. Essa regra evita que evidências antigas contaminem métricas novas.
 
 Os resultados por streamKey no `report.md` são calculados por `run_id + repetition + streamKey`, usando as janelas de execução registradas em `raw/streams.jsonl`. O uso de `--resume` deve ser acompanhado de um `--run-id` novo; o runner agora recusa retomar quando encontra colisão de `run_id + repetition` já existente no diretório.
+
+
+## Validade de handover e streamKey duplicada
+
+Os relatórios incluem campos como `primary_proxy_pod`, `secondary_proxy_pod`, `secondary_proxy_observed`, `same_proxy_detected` e `scenario_inconclusive`. Para sustentar conclusões sobre handover ou rejeição de `streamKey` duplicada entre proxies, `secondary_proxy_observed` deve ser `true` ou a execução deve usar uma URL secundária que direcione a segunda publicação a outro proxy observável.
+
+A coluna `duplicate_streamkey_rejected` depende de evidência explícita do controller, como eventos `handover_denied`, status `denied/conflict/rejected` ou mensagem de conflito. Encerramento genérico do FFmpeg não é prova suficiente de rejeição arquitetural.
