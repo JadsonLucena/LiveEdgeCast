@@ -823,6 +823,12 @@ def test_collect_prometheus_writes_per_run_files_and_loads_resume_safe_evidence(
         }
 
     monkeypatch.setattr(runner, "prometheus_query", fake_prometheus_query)
+    monkeypatch.setattr(runner, "prometheus_instant_query", lambda config, query, ts, controller_label_selector=None: {
+        "available": True,
+        "query": query,
+        "rendered_query": query,
+        "response": {"status": "success", "data": {"result": []}},
+    })
 
     runner.collect_prometheus(cfg, dirs, start=10.0, end=20.0)
     cfg.run_id = "run2"
@@ -1184,19 +1190,8 @@ def test_prometheus_samples_observed_ignores_extra_stale_runs(tmp_path):
     assert report["summary"]["prometheus_extra_run_ids"] == ["stale"]
 
 
-def test_cost_estimation_legacy_alias_is_opt_in(tmp_path):
+def test_cost_estimation_legacy_alias_is_generated_for_prompt_compatibility(tmp_path):
     cfg = config(tmp_path)
-    dirs = runner.ensure_layout(cfg.report_root)
-
-    runner.build_metrics(cfg, dirs)
-
-    assert (dirs["metrics"] / "resource_activity.csv").exists()
-    assert not (dirs["metrics"] / "cost_estimation.csv").exists()
-
-
-def test_cost_estimation_legacy_alias_generated_when_requested(tmp_path):
-    cfg = config(tmp_path)
-    cfg.legacy_output = True
     dirs = runner.ensure_layout(cfg.report_root)
 
     runner.build_metrics(cfg, dirs)
@@ -1204,3 +1199,21 @@ def test_cost_estimation_legacy_alias_generated_when_requested(tmp_path):
     assert (dirs["metrics"] / "resource_activity.csv").exists()
     assert (dirs["metrics"] / "cost_estimation.csv").exists()
     assert "deprecated_alias_notice" in (dirs["metrics"] / "cost_estimation.csv").read_text(encoding="utf-8")
+
+
+def test_experiment_id_can_be_derived_from_output_dir(tmp_path):
+    stream_file = tmp_path / "stream_keys.txt"
+    stream_file.write_text("key1\n", encoding="utf-8")
+    cfg = runner.parse_args([
+        "--stream-keys-file", str(stream_file),
+        "--scenario", "cold-start",
+        "--duration-seconds", "120",
+        "--repetitions", "30",
+        "--prometheus-url", "http://localhost:9090",
+        "--namespace", "media",
+        "--output-dir", str(tmp_path / "reports" / "teste-final"),
+    ])
+
+    assert cfg.experiment_id == "teste-final"
+    assert cfg.output_dir == tmp_path / "reports"
+    assert cfg.report_root == tmp_path / "reports" / "teste-final"

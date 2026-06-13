@@ -30,6 +30,8 @@ Linhas vazias e linhas iniciadas por `#` são ignoradas.
 
 ## Execução básica
 
+Com `--experiment-id` explícito, o relatório é gravado em `--output-dir/--experiment-id`:
+
 ```bash
 python tools/experiments/run_experiment.py \
   --stream-keys-file ./tools/experiments/stream_keys.txt \
@@ -42,6 +44,19 @@ python tools/experiments/run_experiment.py \
   --namespace media \
   --experiment-id exp-rtmp-coldstart-001 \
   --output-dir ./reports
+```
+
+Para compatibilidade com o critério de aceite do plano experimental, `--experiment-id` também pode ser omitido. Nesse caso, o runner deriva o `experiment_id` do último componente de `--output-dir` e grava o relatório exatamente nesse diretório:
+
+```bash
+python tools/experiments/run_experiment.py \
+  --stream-keys-file ./stream_keys.txt \
+  --scenario cold-start \
+  --duration-seconds 120 \
+  --repetitions 30 \
+  --prometheus-url http://localhost:9090 \
+  --namespace media \
+  --output-dir ./reports/teste-final
 ```
 
 Para cenários `handover` e `duplicate-streamkey`, use `--secondary-rtmp-url` quando quiser direcionar a segunda publicação para outro proxy ou outro caminho RTMP. Se a segunda publicação não puder ser comprovada em outro proxy por eventos do controller, o relatório marca o cenário como inconclusivo para a hipótese de handover/conflito entre proxies.
@@ -147,7 +162,7 @@ Evite essa opção em namespaces compartilhados.
 
 Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI. Use `--allow-unscoped-context` somente quando aceita que logs/métricas do controller podem não estar correlacionados por labels de experimento. Use `--allow-restore-failure` somente após confirmar limpeza manual do cluster, pois a restauração malsucedida pode deixar deployments com variáveis de ambiente experimentais. Use `--allow-inconclusive` apenas quando a execução será analisada manualmente e não será tratada como evidência conclusiva automática. Para coleta de dados de artigo, use `--require-prometheus-analysis` junto com `--prometheus-url`; assim o comando falha quando os arquivos Prometheus existem, mas as séries obrigatórias (`workers_active`, `proxies_active`, `pod_cpu_rate`) não possuem amostras utilizáveis.
 
-Use `--legacy-output` somente quando precisar gerar o alias antigo `metrics/cost_estimation.csv`. O artefato primário para a discussão do artigo é `metrics/resource_activity.csv`, pois representa atividade relativa por pod-seconds, não custo financeiro real.
+`metrics/cost_estimation.csv` é gerado por padrão como alias de compatibilidade com o plano original, sempre com aviso de depreciação. O artefato primário para a discussão do artigo continua sendo `metrics/resource_activity.csv`, pois representa atividade relativa por pod-seconds, não custo financeiro real. `--legacy-output` permanece aceito por compatibilidade, mas não é mais necessário para gerar o alias.
 
 ## Logs por fase
 
@@ -157,6 +172,15 @@ Além dos logs finais, o runner pode gravar subpastas em `logs/`, por exemplo:
 logs/r1-before-release/
 logs/r1-after-run/
 logs/final-before-restore/
+```
+
+Para compatibilidade com o formato de artefatos do plano original, o runner também mantém aliases na raiz de `logs/` para a última fase coletada:
+
+```text
+logs/controller.log
+logs/proxy.log
+logs/worker.log
+logs/publishers.log
 ```
 
 Quando `--patch-proxy-context` é usado, os logs finais são coletados antes da restauração dos deployments para reduzir o risco de perder logs por rollout.

@@ -14,7 +14,8 @@ reports/<experiment-id>/
     worker_events.jsonl
     kubernetes_events.jsonl
     pod_snapshots.jsonl
-    prometheus_range_queries.json              # última coleta, compatibilidade
+    prometheus_range_queries.json
+    prometheus_instant_queries.json              # última coleta, compatibilidade
     prometheus_range_queries.run.<run-id>.json     # coleta Prometheus por run_id, segura para --resume
     prometheus_range_queries.__index__.json        # índice das coletas Prometheus
     proxy_context_patch.json
@@ -29,7 +30,7 @@ reports/<experiment-id>/
     duplicate_streamkey_metrics.csv
     prometheus_metric_coverage.csv
     resource_activity.csv
-    cost_estimation.csv  # opcional com --legacy-output; alias legado de compatibilidade
+    cost_estimation.csv  # alias legado gerado por padrão com aviso de depreciação
   logs/
     final-before-restore/
       controller.log
@@ -93,7 +94,7 @@ Calcula uma estimativa relativa de atividade por pod-seconds. A coluna `source` 
 
 ### `cost_estimation.csv`
 
-Alias legado opcional gerado somente quando `--legacy-output` é informado. O arquivo existe apenas para compatibilidade com consumidores antigos do plano experimental e contém uma linha de aviso de depreciação. Para o artigo e para novas análises, use `resource_activity.csv`.
+Alias legado gerado por padrão para compatibilidade com o plano experimental original. O arquivo contém uma linha de aviso de depreciação e não deve ser usado como evidência de custo financeiro. Para o artigo e para novas análises, use `resource_activity.csv`.
 
 ## Gráficos
 
@@ -137,3 +138,8 @@ O campo `report.json.summary` inclui marcadores para auditoria metodológica:
 - `automation_status`, `automation_exit_code` e `automation_failure_reasons`: veredito final usado pela automação/CI.
 
 Esses marcadores devem ser arquivados junto com o relatório antes de usar os dados na discussão final do artigo.
+
+
+### Evidências Prometheus instantâneas
+
+Além de `raw/prometheus_range_queries.run.<run-id>.json`, o runner salva `raw/prometheus_instant_queries.run.<run-id>.json` e `raw/prometheus_instant_queries.json` com consultas instantâneas no final da janela de observação. Elas complementam a auditoria; as métricas consolidadas usam as range queries.
