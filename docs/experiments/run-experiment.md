@@ -147,6 +147,8 @@ Evite essa opção em namespaces compartilhados.
 
 Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI. Use `--allow-unscoped-context` somente quando aceita que logs/métricas do controller podem não estar correlacionados por labels de experimento. Use `--allow-restore-failure` somente após confirmar limpeza manual do cluster, pois a restauração malsucedida pode deixar deployments com variáveis de ambiente experimentais. Use `--allow-inconclusive` apenas quando a execução será analisada manualmente e não será tratada como evidência conclusiva automática. Para coleta de dados de artigo, use `--require-prometheus-analysis` junto com `--prometheus-url`; assim o comando falha quando os arquivos Prometheus existem, mas as séries obrigatórias (`workers_active`, `proxies_active`, `pod_cpu_rate`) não possuem amostras utilizáveis.
 
+Use `--legacy-output` somente quando precisar gerar o alias antigo `metrics/cost_estimation.csv`. O artefato primário para a discussão do artigo é `metrics/resource_activity.csv`, pois representa atividade relativa por pod-seconds, não custo financeiro real.
+
 ## Logs por fase
 
 Além dos logs finais, o runner pode gravar subpastas em `logs/`, por exemplo:

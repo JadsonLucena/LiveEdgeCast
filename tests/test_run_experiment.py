@@ -1182,3 +1182,25 @@ def test_prometheus_samples_observed_ignores_extra_stale_runs(tmp_path):
 
     assert report["summary"]["prometheus_samples_observed"] is False
     assert report["summary"]["prometheus_extra_run_ids"] == ["stale"]
+
+
+def test_cost_estimation_legacy_alias_is_opt_in(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+
+    runner.build_metrics(cfg, dirs)
+
+    assert (dirs["metrics"] / "resource_activity.csv").exists()
+    assert not (dirs["metrics"] / "cost_estimation.csv").exists()
+
+
+def test_cost_estimation_legacy_alias_generated_when_requested(tmp_path):
+    cfg = config(tmp_path)
+    cfg.legacy_output = True
+    dirs = runner.ensure_layout(cfg.report_root)
+
+    runner.build_metrics(cfg, dirs)
+
+    assert (dirs["metrics"] / "resource_activity.csv").exists()
+    assert (dirs["metrics"] / "cost_estimation.csv").exists()
+    assert "deprecated_alias_notice" in (dirs["metrics"] / "cost_estimation.csv").read_text(encoding="utf-8")

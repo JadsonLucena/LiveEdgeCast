@@ -117,6 +117,7 @@ class RunnerConfig:
     allow_unscoped_context: bool = False
     allow_inconclusive: bool = False
     require_prometheus_analysis: bool = False
+    legacy_output: bool = False
     proxy_container: str | None = None
     controller_container: str | None = None
     worker_metric_label_selector: str | None = 'namespace="$namespace"'
@@ -225,6 +226,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--allow-unscoped-context", action="store_true", help="Return exit code 0 when --patch-proxy-context was requested but proxy/controller context patching was not fully effective.")
     parser.add_argument("--allow-inconclusive", action="store_true", help="Return exit code 0 for handover/duplicate-streamkey runs whose between-proxy hypothesis remains inconclusive. By default inconclusive hypothesis tests fail automation.")
     parser.add_argument("--require-prometheus-analysis", action="store_true", help="Return exit code 1 when --prometheus-url is configured but required Prometheus samples for resource/activity analysis are incomplete.")
+    parser.add_argument("--legacy-output", action="store_true", help="Generate legacy compatibility artifacts such as metrics/cost_estimation.csv. By default only resource_activity.csv is generated for resource pod-second analysis.")
     parser.add_argument("--proxy-container", default=os.getenv("LIVEEDGECAST_PROXY_CONTAINER"), help="Container name to patch in deployment/proxy. Required when deployment/proxy has multiple containers.")
     parser.add_argument("--controller-container", default=os.getenv("LIVEEDGECAST_CONTROLLER_CONTAINER"), help="Container name to patch in deployment/controller. Required when deployment/controller has multiple containers.")
     parser.add_argument("--worker-metric-label-selector", default=os.getenv("LIVEEDGECAST_WORKER_METRIC_LABEL_SELECTOR", 'namespace="$namespace"'), help="Prometheus labels used to scope worker FFmpeg exporter metrics. Use an empty string only if those metrics do not carry scrape labels.")
@@ -281,6 +283,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         allow_unscoped_context=args.allow_unscoped_context,
         allow_inconclusive=args.allow_inconclusive,
         require_prometheus_analysis=args.require_prometheus_analysis,
+        legacy_output=args.legacy_output,
         proxy_container=args.proxy_container,
         controller_container=args.controller_container,
         worker_metric_label_selector=args.worker_metric_label_selector,
@@ -2510,9 +2513,10 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
         {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds, "source": always_on_source},
         {"metric": "relative_worker_activity_reduction_vs_always_on", "value": economy_relative, "source": economy_source},
     ]
-    legacy_cost_rows = cost_rows + [{"metric": "deprecated_alias_notice", "value": "", "source": "cost_estimation.csv is a legacy alias; use resource_activity.csv for resource pod-second activity, not financial cost"}]
-    write_csv(dirs["metrics"] / "cost_estimation.csv", legacy_cost_rows, ["metric", "value", "source"])
     write_csv(dirs["metrics"] / "resource_activity.csv", cost_rows, ["metric", "value", "source"])
+    if config.legacy_output:
+        legacy_cost_rows = cost_rows + [{"metric": "deprecated_alias_notice", "value": "", "source": "cost_estimation.csv is a legacy alias; use resource_activity.csv for resource pod-second activity, not financial cost"}]
+        write_csv(dirs["metrics"] / "cost_estimation.csv", legacy_cost_rows, ["metric", "value", "source"])
 
     lifecycle_values = {name: prom_values(prom.get(name, {})) for name in ("stream_lifecycle_phase_seconds_p50", "stream_lifecycle_phase_seconds_p95", "stream_lifecycle_phase_seconds_p99")}
     activation_stats = {k: stats(v) for k, v in lifecycle_values.items()}

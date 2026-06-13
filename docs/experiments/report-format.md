@@ -29,7 +29,7 @@ reports/<experiment-id>/
     duplicate_streamkey_metrics.csv
     prometheus_metric_coverage.csv
     resource_activity.csv
-    cost_estimation.csv  # alias compatível; contém a mesma estimativa de atividade relativa
+    cost_estimation.csv  # opcional com --legacy-output; alias legado de compatibilidade
   logs/
     final-before-restore/
       controller.log
@@ -87,9 +87,13 @@ Registra explicitamente se houve tentativa de publicar uma `streamKey` duplicada
 
 Arquivo de cobertura por `run_id` e métrica Prometheus. Cada linha separa `query_success` de `samples_observed`: uma query Prometheus pode retornar `success` com resultado vazio e, nesse caso, `available_for_analysis=false`. A coluna `expected_by_run_windows` indica se aquele `run_id` pertence às janelas de execução esperadas ou se veio de evidência extra/stale preservada em `raw/`. Em execuções com `--resume`, use esse arquivo para verificar se a agregação comparou janelas com cobertura equivalente e amostras suficientes.
 
-### `resource_activity.csv` e `cost_estimation.csv`
+### `resource_activity.csv`
 
-Calculam uma estimativa relativa de atividade por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada. Esses arquivos não representam cobrança financeira real de provedor de nuvem. O arquivo `resource_activity.csv` é o artefato primário; `cost_estimation.csv` é gerado apenas como alias legado do plano original e contém uma linha de aviso de depreciação. O relatório usa linguagem mais conservadora de “atividade relativa de recursos”. A referência `always_on_worker_pod_seconds_reference` é consciente das janelas de execução: soma `streamKeys_ativas_na_janela * duração_da_janela` para cada `run_id + repetition`, em vez de usar uma única duração global.
+Calcula uma estimativa relativa de atividade por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada. Esse arquivo não representa cobrança financeira real de provedor de nuvem. O relatório usa linguagem mais conservadora de “atividade relativa de recursos”. A referência `always_on_worker_pod_seconds_reference` é consciente das janelas de execução: soma `streamKeys_ativas_na_janela * duração_da_janela` para cada `run_id + repetition`, em vez de usar uma única duração global.
+
+### `cost_estimation.csv`
+
+Alias legado opcional gerado somente quando `--legacy-output` é informado. O arquivo existe apenas para compatibilidade com consumidores antigos do plano experimental e contém uma linha de aviso de depreciação. Para o artigo e para novas análises, use `resource_activity.csv`.
 
 ## Gráficos
 
