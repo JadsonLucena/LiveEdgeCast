@@ -1225,7 +1225,10 @@ def test_ffmpeg_command_generates_1080p30_testsrc_by_default(tmp_path):
     command = runner.ffmpeg_command(cfg, "key1")
 
     assert "testsrc=size=1920x1080:rate=30" in command
-    assert "6000k" in command
+    assert "10000k" in command
+    assert "-minrate" in command
+    assert "20000k" in command
+    assert "44100" in command
     assert "-pix_fmt" in command and "yuv420p" in command
     assert "-g" in command and "60" in command
     assert command[-1] == "rtmp://example/live/key1"

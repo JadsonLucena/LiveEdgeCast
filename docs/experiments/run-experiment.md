@@ -46,7 +46,7 @@ python tools/experiments/run_experiment.py \
   --output-dir ./reports
 ```
 
-Quando `--source-file` é omitido, o runner gera uma transmissão sintética por `streamKey` com FFmpeg/lavfi usando `testsrc` em `1920x1080` a `30fps`, áudio `anullsrc` e bitrate de vídeo padrão `6000k`. Esses valores podem ser ajustados por `--testsrc-size`, `--testsrc-rate`, `--bitrate` e `--audio-bitrate`. Exemplo de comando gerado por chave: `ffmpeg -re -f lavfi -i testsrc=size=1920x1080:rate=30 ... -b:v 6000k -f flv rtmp://.../<streamKey>`.
+Quando `--source-file` é omitido, o runner gera uma transmissão sintética por `streamKey` com FFmpeg/lavfi usando `testsrc` em `1920x1080` a `30fps`, áudio `anullsrc` e bitrate de vídeo padrão `10000k`. Esses valores podem ser ajustados por `--testsrc-size`, `--testsrc-rate`, `--bitrate` e `--audio-bitrate`. Exemplo de comando gerado por chave: `ffmpeg -re -f lavfi -i testsrc=size=1920x1080:rate=30 -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=44100 ... -b:v 10000k -minrate 10000k -maxrate 10000k -bufsize 20000k -c:a aac -b:a 128k -ar 44100 -f flv rtmp://.../<streamKey>`.
 
 Para compatibilidade com o critério de aceite do plano experimental, `--experiment-id` também pode ser omitido. Nesse caso, o runner deriva o `experiment_id` do último componente de `--output-dir` e grava o relatório exatamente nesse diretório:
 
@@ -196,13 +196,13 @@ Há um script opcional para validação manual em cluster real:
 LIVEEDGECAST_RTMP_URL=rtmp://127.0.0.1:1935/live \
 PROMETHEUS_URL=http://127.0.0.1:9090 \
 NAMESPACE=media \
-BITRATE=6000k \
+BITRATE=10000k \
 TESTSRC_SIZE=1920x1080 \
 TESTSRC_RATE=30 \
 ./tools/experiments/smoke_k8s_experiment.sh
 ```
 
-O script executa um `cold-start` mínimo em namespace dedicado ou controlado usando publisher sintético FFmpeg/lavfi por streamKey. Por padrão, a fonte é `testsrc=size=1920x1080:rate=30`, com `BITRATE=6000k` e áudio AAC `128k`. Além da existência dos arquivos, o smoke test exige pelo menos uma amostra com `total_activation_seconds` finito e uma linha de correção com worker observado; linhas parciais ou apenas `not_observable` não são suficientes para aprovar o teste. Para múltiplas chaves, informe `STREAM_KEYS=key1,key2` ou `STREAM_KEYS_FILE=./stream_keys.txt`.
+O script executa um `cold-start` mínimo em namespace dedicado ou controlado usando publisher sintético FFmpeg/lavfi por streamKey. Por padrão, a fonte é `testsrc=size=1920x1080:rate=30`, com `BITRATE=10000k`, CBR aproximado, áudio AAC `128k` e sample rate `44.1kHz`. Além da existência dos arquivos, o smoke test exige pelo menos uma amostra com `total_activation_seconds` finito e uma linha de correção com worker observado; linhas parciais ou apenas `not_observable` não são suficientes para aprovar o teste. Para múltiplas chaves, informe `STREAM_KEYS=key1,key2` ou `STREAM_KEYS_FILE=./stream_keys.txt`.
 
 ## Checklist de validação pré-artigo
 

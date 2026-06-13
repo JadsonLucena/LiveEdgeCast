@@ -203,7 +203,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--rtmp-url", default=os.getenv("LIVEEDGECAST_RTMP_URL", "rtmp://127.0.0.1:1935/live"))
     parser.add_argument("--secondary-rtmp-url", default=os.getenv("LIVEEDGECAST_SECONDARY_RTMP_URL"), help="Optional RTMP URL used for the second publisher in handover/duplicate-streamkey scenarios; use it to target a different proxy directly.")
     parser.add_argument("--source-file", default=None)
-    parser.add_argument("--bitrate", default=None, help="Video bitrate for generated publishers or transcoded source files. Defaults to 6000k for generated 1080p30 test streams.")
+    parser.add_argument("--bitrate", default=None, help="Video bitrate for generated publishers or transcoded source files. Defaults to 10000k for generated YouTube-aligned 1080p30 H.264 test streams.")
     parser.add_argument("--testsrc-size", default=os.getenv("LIVEEDGECAST_TESTSRC_SIZE", "1920x1080"), help="Synthetic lavfi testsrc size used when --source-file is omitted. Default: 1920x1080.")
     parser.add_argument("--testsrc-rate", default=os.getenv("LIVEEDGECAST_TESTSRC_RATE", "30"), help="Synthetic lavfi testsrc frame rate used when --source-file is omitted. Default: 30.")
     parser.add_argument("--audio-bitrate", default=os.getenv("LIVEEDGECAST_AUDIO_BITRATE", "128k"), help="AAC audio bitrate used by generated publishers. Default: 128k.")
@@ -512,16 +512,17 @@ def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None =
         else:
             command.extend(["-c", "copy"])
     else:
-        video_bitrate = config.bitrate or "6000k"
+        video_bitrate = config.bitrate or "10000k"
         command.extend([
             "-f", "lavfi", "-i", f"testsrc=size={config.testsrc_size}:rate={config.testsrc_rate}",
-            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
             "-t", str(config.duration_seconds),
             "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            "-c:v", "libx264", "-preset", "veryfast",
             "-pix_fmt", "yuv420p", "-r", config.testsrc_rate, "-g", "60", "-keyint_min", "60",
-            "-b:v", video_bitrate, "-maxrate", video_bitrate, "-bufsize", "12000k",
-            "-c:a", "aac", "-b:a", config.audio_bitrate, "-ar", "48000",
+            "-sc_threshold", "0", "-bf", "2", "-refs", "1", "-coder", "1",
+            "-b:v", video_bitrate, "-minrate", video_bitrate, "-maxrate", video_bitrate, "-bufsize", "20000k",
+            "-c:a", "aac", "-b:a", config.audio_bitrate, "-ar", "44100",
         ])
     command.extend(["-f", "flv", target])
     return command
@@ -3036,7 +3037,7 @@ Amostras de ativação válidas: {report_json["summary"]["valid_activation_sampl
 - Prometheus URL configurado: `{config.prometheus_url or 'não configurado'}`
 - Controller URL configurado: `{config.controller_url or 'não configurado'}`
 - Source file: `{config.source_file or f'gerado por lavfi/testsrc {config.testsrc_size}@{config.testsrc_rate}fps'}`
-- Generated publisher bitrate: `{config.bitrate or '6000k'}`
+- Generated publisher bitrate: `{config.bitrate or '10000k'}`
 - Bitrate: `{config.bitrate or 'padrão/copy'}`
 - Baseline informado: `{config.baseline or 'não informado'}`
 - Patch de contexto em deployments: `{'ativado' if config.patch_proxy_context else 'desativado'}`
