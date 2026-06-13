@@ -259,13 +259,31 @@ def load_stream_keys(inline: str | None, file_path: Path | None) -> list[str]:
     return keys
 
 
+def existing_run_keys(root: Path) -> set[tuple[str, int]]:
+    """Return run_id/repetition keys already present in a report directory."""
+    stream_log = root / "raw" / "streams.jsonl"
+    keys: set[tuple[str, int]] = set()
+    if not stream_log.exists():
+        return keys
+    for record in read_jsonl(stream_log):
+        if record.get("event") not in {"run_started", "run_finished", "run_failed", "run_interrupted"}:
+            continue
+        run_id = record.get("run_id")
+        repetition = record.get("repetition")
+        if run_id is None or not isinstance(repetition, int):
+            continue
+        keys.add((str(run_id), repetition))
+    return keys
+
+
 def prepare_report_root(config: RunnerConfig) -> Path:
     """Prepare report directory safely.
 
     By default experiments refuse to reuse a non-empty report directory, because
     JSONL raw evidence is append-only and mixing two executions would invalidate
     the resulting metrics. Use --overwrite to delete the existing directory or
-    --resume when intentional continuation is desired.
+    --resume when intentional continuation is desired. Resume is accepted only
+    when the requested run_id/repetition keys are not already present.
     """
     root = config.report_root
     if root.exists() and any(root.iterdir()):
@@ -276,6 +294,16 @@ def prepare_report_root(config: RunnerConfig) -> Path:
                 f"report directory already exists and is not empty: {root}. "
                 "Use --overwrite to replace it or --resume to append intentionally."
             )
+        else:
+            existing = existing_run_keys(root)
+            requested = {(str(config.run_id), rep) for rep in range(1, config.repetitions + 1)}
+            collisions = sorted(existing & requested, key=lambda item: item[1])
+            if collisions:
+                formatted = ", ".join(f"{run_id}/r{rep}" for run_id, rep in collisions[:10])
+                raise RuntimeError(
+                    "--resume would reuse existing run_id/repetition evidence: "
+                    f"{formatted}. Use a new --run-id or --overwrite to replace the report directory."
+                )
     return root
 
 
@@ -647,12 +675,13 @@ def collect_controller_http(config: RunnerConfig, dirs: dict[str, Path], phase: 
 def deployment_env_snapshot(config: RunnerConfig, deployment: str, keys: Sequence[str]) -> dict[str, Any]:
     """Capture current env values for the first container of a deployment.
 
-    This is a best-effort snapshot used only to restore experiment context keys after
-    --patch-proxy-context. It intentionally does not run unless the user opts in.
+    Snapshot correctness is required for safe restoration. If the snapshot fails,
+    patching that deployment is skipped to avoid later deleting unknown env vars.
     """
     result = kubectl_json(config, ["get", f"deployment/{deployment}", "-n", config.namespace, "-o", "json"], timeout=60)
     values = {key: None for key in keys}
-    if result.get("returncode") == 0:
+    snapshot_ok = result.get("returncode") == 0
+    if snapshot_ok:
         try:
             containers = (((result.get("json") or {}).get("spec") or {}).get("template") or {}).get("spec", {}).get("containers") or []
             for container in containers:
@@ -662,7 +691,8 @@ def deployment_env_snapshot(config: RunnerConfig, deployment: str, keys: Sequenc
                         values[name] = item.get("value")
         except Exception as exc:
             result["snapshot_error"] = str(exc)
-    return {"deployment": deployment, "values": values, "kubectl": result}
+            snapshot_ok = False
+    return {"deployment": deployment, "values": values, "kubectl": result, "snapshot_ok": snapshot_ok}
 
 
 def restore_context_keys(config: RunnerConfig, dirs: dict[str, Path], patch_result: dict[str, Any]) -> dict[str, Any]:
@@ -682,6 +712,9 @@ def restore_context_keys(config: RunnerConfig, dirs: dict[str, Path], patch_resu
     previous_env = patch_result.get("previous_env") or {}
     for deployment in patched_deployments:
         snapshot = previous_env.get(deployment) or {}
+        if not snapshot.get("snapshot_ok", True):
+            commands.append({"deployment": deployment, "returncode": 0, "skipped": True, "reason": "previous_env_snapshot_not_available"})
+            continue
         values = snapshot.get("values") or {}
         args = [config.kubectl_path, "set", "env", f"deployment/{deployment}"]
         for key, old_value in values.items():
@@ -740,7 +773,16 @@ def patch_proxy_context(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str
         "-n", config.namespace,
     ]
     patched_deployments: list[str] = []
+    skipped_deployments: list[dict[str, Any]] = []
     for command, deployment in ((proxy_set_env, "proxy"), (controller_set_env, "controller")):
+        snapshot = previous_env.get(deployment) or {}
+        if not snapshot.get("snapshot_ok"):
+            skipped_deployments.append({
+                "deployment": deployment,
+                "reason": "env_snapshot_failed",
+                "snapshot": snapshot,
+            })
+            continue
         commands.append(run_cmd(command, timeout=60))
         if commands[-1].get("returncode") == 0:
             patched_deployments.append(deployment)
@@ -749,8 +791,9 @@ def patch_proxy_context(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str
         "available": True,
         "skipped": False,
         "patched": bool(patched_deployments),
-        "all_patched": all(c.get("returncode") == 0 for c in commands),
+        "all_patched": bool(patched_deployments) and all(c.get("returncode") == 0 for c in commands) and not skipped_deployments,
         "patched_deployments": patched_deployments,
+        "skipped_deployments": skipped_deployments,
         "commands": commands,
         "previous_env": previous_env,
         "metric_scope": prometheus_controller_label_selector(config),
@@ -994,6 +1037,18 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
     except KeyboardInterrupt:
         for publisher in publishers:
             publisher.stop(reason="interrupted_by_user")
+        if publishers:
+            record_publisher_results(config, dirs, publishers)
+        append_jsonl(dirs["raw"] / "streams.jsonl", {
+            "event": "run_interrupted",
+            "experiment_id": config.experiment_id,
+            "scenario": config.scenario,
+            "run_id": config.run_id,
+            "repetition": repetition,
+            "started_at": run_started,
+            "ended_at": now_epoch(),
+            "stream_keys": stream_keys,
+        })
         raise
     except Exception as exc:
         for publisher in publishers:
@@ -1335,9 +1390,9 @@ def load_run_windows(config: RunnerConfig, dirs: dict[str, Path]) -> list[dict[s
         if record.get("event") == "run_started":
             current["started_at"] = record.get("timestamp")
             current["stream_keys"] = record.get("stream_keys") or current["stream_keys"]
-        elif record.get("event") in {"run_finished", "run_failed"}:
+        elif record.get("event") in {"run_finished", "run_failed", "run_interrupted"}:
             current["ended_at"] = record.get("ended_at") or record.get("timestamp")
-            current["status"] = "failed" if record.get("event") == "run_failed" else "finished"
+            current["status"] = "failed" if record.get("event") == "run_failed" else ("interrupted" if record.get("event") == "run_interrupted" else "finished")
             current["stream_keys"] = record.get("stream_keys") or current["stream_keys"]
     if windows:
         return [windows[key] for key in sorted(windows, key=lambda item: (item[0], item[1]))]
@@ -1492,17 +1547,128 @@ def repetition_for_timestamp(windows: list[dict[str, Any]], timestamp: Any) -> i
     return int(window.get("repetition") or 1) if window else None
 
 
+def worker_overlap_counts_from_controller_events(
+    config: RunnerConfig,
+    windows: list[dict[str, Any]],
+    controller_events: list[dict[str, Any]],
+) -> dict[tuple[str, int, str], int]:
+    """Best-effort overlap detector based on controller worker lifecycle events.
+
+    Pod snapshots can miss short overlaps. Controller events provide a denser
+    lifecycle signal when available. The result is the maximum simultaneously
+    active worker count observed per run/repetition/stream.
+    """
+    max_counts: dict[tuple[str, int, str], int] = {}
+    for window in windows:
+        run_id = str(window.get("run_id") or config.run_id)
+        rep = int(window.get("repetition") or 1)
+        for stream in (window.get("stream_keys") or config.stream_keys):
+            timeline: list[tuple[float, int, str]] = []
+            for event in controller_events:
+                if event.get("stream") != stream:
+                    continue
+                if not event_matches_window_identity(event, window) or not event_in_window(event, window, len(windows)):
+                    continue
+                worker_pod = event.get("worker_pod")
+                ts = event.get("timestamp_epoch")
+                if not worker_pod or not isinstance(ts, (int, float)):
+                    continue
+                event_type = event.get("event_type")
+                if event_type == "worker_deleted":
+                    timeline.append((float(ts), -1, str(worker_pod)))
+                elif event_type == "worker_created":
+                    timeline.append((float(ts), 1, str(worker_pod)))
+            active: set[str] = set()
+            max_count = 0
+            # Deletions first at the same timestamp avoid false positives when
+            # replacement events are emitted with coarse timestamp resolution.
+            for _ts, action, worker_pod in sorted(timeline, key=lambda item: (item[0], item[1])):
+                if action < 0:
+                    active.discard(worker_pod)
+                else:
+                    active.add(worker_pod)
+                    max_count = max(max_count, len(active))
+            if max_count:
+                max_counts[(run_id, rep, stream)] = max_count
+    return max_counts
+
+
+def build_duplicate_streamkey_rows(
+    config: RunnerConfig,
+    dirs: dict[str, Path],
+    controller_events: list[dict[str, Any]],
+    publisher_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    windows = load_run_windows(config, dirs)
+    rows: list[dict[str, Any]] = []
+    for window in windows:
+        run_id = str(window.get("run_id") or config.run_id)
+        rep = int(window.get("repetition") or 1)
+        for stream in (window.get("stream_keys") or config.stream_keys):
+            pubs = [
+                row for row in publisher_rows
+                if str(row.get("run_id") or config.run_id) == run_id
+                and int(row.get("repetition") or 0) == rep
+                and row.get("stream_key") == stream
+            ]
+            duplicate_pubs = [row for row in pubs if int(row.get("publisher_index") or 0) > 1]
+            attempted = bool(duplicate_pubs)
+            denial_events = [
+                e for e in controller_events
+                if e.get("event_type") == "handover_denied"
+                and e.get("stream") == stream
+                and event_matches_window_identity(e, window)
+                and event_in_window(e, window, len(windows))
+            ]
+            accepted_events = [
+                e for e in controller_events
+                if e.get("event_type") == "handover_accepted"
+                and e.get("stream") == stream
+                and event_matches_window_identity(e, window)
+                and event_in_window(e, window, len(windows))
+            ]
+            duplicate_statuses = [row.get("publisher_status") for row in duplicate_pubs]
+            rejected = attempted and bool(denial_events)
+            unexpectedly_accepted = attempted and not rejected and any(status == "success" for status in duplicate_statuses)
+            if not attempted:
+                status = "not_attempted"
+            elif rejected:
+                status = "rejected"
+            elif unexpectedly_accepted:
+                status = "unexpectedly_accepted"
+            else:
+                status = "attempted_without_controller_rejection_observed"
+            rows.append({
+                "run_id": run_id,
+                "repetition": rep,
+                "stream_key": stream,
+                "duplicate_streamkey_attempted": attempted,
+                "duplicate_streamkey_rejected": rejected,
+                "duplicate_streamkey_unexpectedly_accepted": unexpectedly_accepted,
+                "duplicate_publisher_count": len(duplicate_pubs),
+                "duplicate_publisher_statuses": ";".join(str(status) for status in duplicate_statuses if status is not None),
+                "controller_denial_events": len(denial_events),
+                "controller_acceptance_events": len(accepted_events),
+                "status": status,
+            })
+    return rows
+
+
 def build_correctness_rows(
     config: RunnerConfig,
     dirs: dict[str, Path],
     pod_rows: list[dict[str, Any]],
     controller_events: list[dict[str, Any]],
+    publisher_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     windows = load_run_windows(config, dirs)
     # Track worker pods by snapshot to detect simultaneous duplication, not historical replacement across repetitions or resumed run ids.
     snapshot_workers: dict[tuple[str, int, Any, str], set[str]] = {}
     max_workers_by_stream: dict[tuple[str, int, str], int] = {}
+    event_max_workers_by_stream = worker_overlap_counts_from_controller_events(config, windows, controller_events)
     duplicate_by_stream: dict[tuple[str, int, str], bool] = {}
+    duplicate_rows = build_duplicate_streamkey_rows(config, dirs, controller_events, publisher_rows)
+    duplicate_by_key = {(str(row.get("run_id") or config.run_id), int(row.get("repetition") or 0), row.get("stream_key")): row for row in duplicate_rows}
     orphan_by_window: dict[tuple[str, int], set[str]] = {
         (str(w.get("run_id") or config.run_id), int(w.get("repetition") or 1)): set() for w in windows
     }
@@ -1538,7 +1704,8 @@ def build_correctness_rows(
         rep = int(window.get("repetition") or 1)
         stream_keys = window.get("stream_keys") or config.stream_keys
         for key in stream_keys:
-            max_count = max_workers_by_stream.get((run_id, rep, key), 0)
+            max_count = max(max_workers_by_stream.get((run_id, rep, key), 0), event_max_workers_by_stream.get((run_id, rep, key), 0))
+            duplicate_info = duplicate_by_key.get((run_id, rep, key), {})
             rows.append({
                 "run_id": run_id,
                 "repetition": rep,
@@ -1547,7 +1714,10 @@ def build_correctness_rows(
                 "worker_observed_for_stream": max_count >= 1,
                 "at_most_one_worker_per_stream": max_count <= 1,
                 "one_worker_per_stream": max_count == 1,
-                "duplicate_worker_detected": bool(duplicate_by_stream.get((run_id, rep, key), False)),
+                "duplicate_worker_detected": bool(duplicate_by_stream.get((run_id, rep, key), False)) or event_max_workers_by_stream.get((run_id, rep, key), 0) > 1,
+                "duplicate_streamkey_attempted": duplicate_info.get("duplicate_streamkey_attempted", False),
+                "duplicate_streamkey_rejected": duplicate_info.get("duplicate_streamkey_rejected", False),
+                "duplicate_streamkey_unexpectedly_accepted": duplicate_info.get("duplicate_streamkey_unexpectedly_accepted", False),
                 "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
                 "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
                 "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
@@ -1561,6 +1731,9 @@ def build_correctness_rows(
             "at_most_one_worker_per_stream": None,
             "one_worker_per_stream": None,
             "duplicate_worker_detected": None,
+            "duplicate_streamkey_attempted": None,
+            "duplicate_streamkey_rejected": None,
+            "duplicate_streamkey_unexpectedly_accepted": None,
             "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
             "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
             "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
@@ -1612,11 +1785,18 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
             resource_rows.append({"metric": metric_name, "component": component, **stats(values)})
     write_csv(dirs["metrics"] / "resource_usage.csv", resource_rows, ["metric", "component", "samples", "mean", "median", "stddev", "p50", "p95", "p99", "min", "max", "ci95_low", "ci95_high"])
 
-    correctness_rows = build_correctness_rows(config, dirs, pod_rows, controller_events)
+    duplicate_streamkey_rows = build_duplicate_streamkey_rows(config, dirs, controller_events, publisher_rows)
+    write_csv(
+        dirs["metrics"] / "duplicate_streamkey_metrics.csv",
+        duplicate_streamkey_rows,
+        ["run_id", "repetition", "stream_key", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "duplicate_publisher_count", "duplicate_publisher_statuses", "controller_denial_events", "controller_acceptance_events", "status"],
+    )
+
+    correctness_rows = build_correctness_rows(config, dirs, pod_rows, controller_events, publisher_rows)
     write_csv(
         dirs["metrics"] / "correctness_metrics.csv",
         correctness_rows,
-        ["run_id", "repetition", "stream_key", "max_worker_count_observed", "worker_observed_for_stream", "at_most_one_worker_per_stream", "one_worker_per_stream", "duplicate_worker_detected", "handover_accepted", "handover_denied", "stale_events_ignored"],
+        ["run_id", "repetition", "stream_key", "max_worker_count_observed", "worker_observed_for_stream", "at_most_one_worker_per_stream", "one_worker_per_stream", "duplicate_worker_detected", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "handover_accepted", "handover_denied", "stale_events_ignored"],
     )
 
 
@@ -1636,13 +1816,14 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
         {"metric": "relative_worker_activity_reduction_vs_always_on", "value": economy_relative, "source": "resource_activity_time_integral_estimate" if worker_pod_seconds is not None else "not_supported_without_prometheus"},
     ]
     write_csv(dirs["metrics"] / "cost_estimation.csv", cost_rows, ["metric", "value", "source"])
+    write_csv(dirs["metrics"] / "resource_activity.csv", cost_rows, ["metric", "value", "source"])
 
     lifecycle_values = {name: prom_values(prom.get(name, {})) for name in ("stream_lifecycle_phase_seconds_p50", "stream_lifecycle_phase_seconds_p95", "stream_lifecycle_phase_seconds_p99")}
     activation_stats = {k: stats(v) for k, v in lifecycle_values.items()}
     activation_stats["total_activation_seconds_per_stream"] = stats([r["total_activation_seconds"] for r in activation_rows if r.get("total_activation_seconds") is not None])
     activation_stats["event_detection_seconds_per_stream"] = stats([r["event_detection_seconds"] for r in activation_rows if r.get("event_detection_seconds") is not None])
     activation_stats["worker_ready_seconds_per_stream"] = stats([r["worker_ready_seconds"] for r in activation_rows if r.get("worker_ready_seconds") is not None])
-    return {"activation": activation_stats, "resources": resource_rows, "correctness": correctness_rows, "cost": cost_rows, "missing": missing_metrics(config, prom, activation_rows, release_rows)}
+    return {"activation": activation_stats, "resources": resource_rows, "correctness": correctness_rows, "duplicate_streamkey": duplicate_streamkey_rows, "cost": cost_rows, "missing": missing_metrics(config, prom, activation_rows, release_rows)}
 
 
 def missing_metrics(config: RunnerConfig, prom: dict[str, Any], activation_rows: list[dict[str, Any]] | None = None, release_rows: list[dict[str, Any]] | None = None) -> list[str]:
@@ -1865,6 +2046,8 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
             "release_seconds": rel.get("total_release_seconds") or "não observável",
             "worker_observed": corr.get("worker_observed_for_stream"),
             "duplicate_worker": corr.get("duplicate_worker_detected"),
+            "duplicate_streamkey_rejected": corr.get("duplicate_streamkey_rejected"),
+            "duplicate_streamkey_unexpectedly_accepted": corr.get("duplicate_streamkey_unexpectedly_accepted"),
             "handover_accepted": corr.get("handover_accepted"),
             "handover_denied": corr.get("handover_denied"),
             "observations": row.get("status"),
@@ -1881,9 +2064,22 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
     success_count = len([r for r in publisher_rows if r.get("publisher_status") in {"success", "expected_stopped", "expected_conflict_or_stopped"}])
     failure_count = len([r for r in publisher_rows if r.get("publisher_status") == "unexpected_failed"])
     unavailable = metrics.get("missing", [])
+    activation_csv_rows = csv_rows(dirs["metrics"] / "activation_metrics.csv")
+    valid_activation_samples = len([row for row in activation_csv_rows if row.get("total_activation_seconds") not in (None, "", "None")])
+    invalid_activation_samples = max(0, len(activation_csv_rows) - valid_activation_samples)
+    duplicate_rows = csv_rows(dirs["metrics"] / "duplicate_streamkey_metrics.csv")
     report_json = {
         "metadata": metadata,
-        "summary": {"publishers": len(publisher_rows), "publisher_success_count": success_count, "publisher_failure_count": failure_count, "missing_metrics": unavailable},
+        "summary": {
+            "publishers": len(publisher_rows),
+            "publisher_success_count": success_count,
+            "publisher_failure_count": failure_count,
+            "valid_activation_samples": valid_activation_samples,
+            "invalid_activation_samples": invalid_activation_samples,
+            "duplicate_streamkey_rejected": any(str(row.get("duplicate_streamkey_rejected")).lower() == "true" for row in duplicate_rows),
+            "duplicate_streamkey_unexpectedly_accepted": any(str(row.get("duplicate_streamkey_unexpectedly_accepted")).lower() == "true" for row in duplicate_rows),
+            "missing_metrics": unavailable,
+        },
         "metrics": metrics,
         "charts": charts,
     }
@@ -1900,6 +2096,8 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
 ## Resumo executivo
 
 Experimento `{config.experiment_id}` executado no cenário `{config.scenario}` com {len(config.stream_keys)} streamKey(s), duração nominal de {config.duration_seconds}s e {config.repetitions} repetição(ões). Foram registrados {success_count} publisher(s) com encerramento bem-sucedido e {failure_count} publisher(s) com falha observada. O relatório diferencia métricas reais, inferidas e ausentes; conclusões sobre métricas ausentes não são assumidas.
+
+Amostras de ativação válidas: {report_json["summary"]["valid_activation_samples"]}. Amostras de ativação sem métrica observável: {report_json["summary"]["invalid_activation_samples"]}.
 
 ## Ambiente experimental
 
@@ -1918,13 +2116,13 @@ Experimento `{config.experiment_id}` executado no cenário `{config.scenario}` c
 
 ## Resultado por streamKey
 
-{md_table(build_stream_result_rows(config, dirs), ['run_id','repetition','streamKey','initial_worker','final_worker','worker_replacements_count','proxy_owner','publisher_status','activation_seconds','release_seconds','worker_observed','duplicate_worker','handover_accepted','handover_denied','observations'])}
+{md_table(build_stream_result_rows(config, dirs), ['run_id','repetition','streamKey','initial_worker','final_worker','worker_replacements_count','proxy_owner','publisher_status','activation_seconds','release_seconds','worker_observed','duplicate_worker','duplicate_streamkey_rejected','duplicate_streamkey_unexpectedly_accepted','handover_accepted','handover_denied','observations'])}
 
 ## Uso de recursos
 
 {md_table(resource_rows, ['metric','component','samples','mean','median','p95','p99','min','max'])}
 
-## Custo relativo
+## Atividade relativa de recursos
 
 {md_table(cost_rows, ['metric','value','source'])}
 
@@ -1936,14 +2134,18 @@ O tempo de recuperação só deve ser usado quando as métricas de recuperação
 
 ## Correção arquitetural
 
-A verificação de um worker por streamKey e candidatos a órfãos foi salva em `metrics/correctness_metrics.csv`. Essa verificação combina snapshots de pods e anotações Kubernetes; ela é uma evidência operacional, não substitui métricas per-stream completas do controller.
+A verificação de um worker por streamKey e candidatos a órfãos foi salva em `metrics/correctness_metrics.csv`. Essa verificação combina snapshots de pods, eventos estruturados do controller e anotações Kubernetes; ela é uma evidência operacional, não substitui métricas per-stream completas do controller.
+
+## Verificação de streamKey duplicada
+
+{md_table(csv_rows(dirs["metrics"] / "duplicate_streamkey_metrics.csv"), ['run_id','repetition','stream_key','duplicate_streamkey_attempted','duplicate_streamkey_rejected','duplicate_streamkey_unexpectedly_accepted','duplicate_publisher_count','controller_denial_events','status'])}
 
 ## Limitações
 
 - Métricas ausentes ou não observáveis nesta execução: {', '.join(unavailable) if unavailable else 'nenhuma limitação automática detectada'}.
 - Tempos per-stream de cold start dependem da exportação de timestamps pelo controller; quando não há endpoint per-stream, o relatório usa apenas histogramas Prometheus agregados.
 - `t_destination_received` só pode ser sustentado se houver callback/observação no destino externo.
-- A estimativa é uma redução relativa de atividade de workers/proxies por pod-seconds; não equivale a custo financeiro real de provedor de nuvem sem CPU/memória request-seconds e modelo de preço.
+- A seção de atividade relativa de recursos usa pod-seconds e séries de pods ativos; ela não representa custo financeiro real de provedor de nuvem sem CPU/memória request-seconds e modelo de preço.
 - Métricas de cAdvisor/kube-state-metrics são isoladas por namespace; para evitar contaminação, execute cada experimento em namespace dedicado ou use `--patch-proxy-context` para escopo das métricas do controller.
 - A validade estatística depende do número de repetições e da disponibilidade de amostras em Prometheus.
 

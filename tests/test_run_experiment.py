@@ -237,3 +237,111 @@ def test_correctness_marks_zero_workers_as_not_valid(tmp_path):
     assert stream_row["worker_observed_for_stream"] == "False"
     assert stream_row["at_most_one_worker_per_stream"] == "True"
     assert stream_row["one_worker_per_stream"] == "False"
+
+
+def test_resume_rejects_existing_run_id_repetition(tmp_path):
+    cfg = config(tmp_path)
+    cfg.resume = True
+    root = cfg.report_root
+    (root / "raw").mkdir(parents=True)
+    (root / "raw" / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 10.0}) + "\n"
+    )
+
+    try:
+        runner.prepare_report_root(cfg)
+    except RuntimeError as exc:
+        assert "run_id/repetition" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_resume_allows_new_run_id(tmp_path):
+    cfg = config(tmp_path)
+    root = cfg.report_root
+    (root / "raw").mkdir(parents=True)
+    (root / "raw" / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "old-run", "repetition": 1, "timestamp": 10.0}) + "\n"
+    )
+    cfg.resume = True
+    cfg.run_id = "new-run"
+
+    assert runner.prepare_report_root(cfg) == root
+
+
+def test_patch_proxy_context_skips_deployment_when_snapshot_fails(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    cfg.kubectl_path = "/bin/true"
+    cfg.patch_proxy_context = True
+    dirs = runner.ensure_layout(cfg.report_root)
+    commands = []
+
+    def fake_snapshot(config_arg, deployment, keys):
+        return {"deployment": deployment, "values": {key: None for key in keys}, "snapshot_ok": deployment != "proxy", "kubectl": {"returncode": 1 if deployment == "proxy" else 0}}
+
+    def fake_run_cmd(command, timeout=60):
+        commands.append(command)
+        return {"returncode": 0, "command": command, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(runner, "deployment_env_snapshot", fake_snapshot)
+    monkeypatch.setattr(runner, "run_cmd", fake_run_cmd)
+
+    result = runner.patch_proxy_context(cfg, dirs)
+
+    assert "proxy" not in result["patched_deployments"]
+    assert "controller" in result["patched_deployments"]
+    assert any(item["deployment"] == "proxy" for item in result["skipped_deployments"])
+    assert not any("deployment/proxy" in part for command in commands for part in command)
+
+
+def test_duplicate_streamkey_metrics_report_controller_rejection(tmp_path):
+    cfg = config(tmp_path, scenario="duplicate-streamkey")
+    dirs = runner.ensure_layout(cfg.report_root)
+    (dirs["raw"] / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 10.0, "stream_keys": ["key1"]}) + "\n" +
+        json.dumps({"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 30.0, "stream_keys": ["key1"]}) + "\n"
+    )
+    publishers = [
+        {"event": "publisher_finished", "experiment_id": "exp", "scenario": "duplicate-streamkey", "run_id": "run", "repetition": 1, "publisher_index": 1, "stream_key": "key1", "started_at": 11.0, "ended_at": 29.0, "returncode": 0, "publisher_status": "success"},
+        {"event": "publisher_finished", "experiment_id": "exp", "scenario": "duplicate-streamkey", "run_id": "run", "repetition": 1, "publisher_index": 2, "stream_key": "key1", "started_at": 12.0, "ended_at": 13.0, "returncode": 1, "publisher_status": "expected_conflict_or_stopped"},
+    ]
+    (dirs["raw"] / "publishers.jsonl").write_text("".join(json.dumps(e) + "\n" for e in publishers))
+    events = [
+        {"timestamp_epoch": 12.5, "event_type": "handover_denied", "stream": "key1", "run_id": "run", "repetition": 1},
+    ]
+    (dirs["raw"] / "controller_events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    runner.build_metrics(cfg, dirs)
+
+    duplicate_rows = list(__import__("csv").DictReader((dirs["metrics"] / "duplicate_streamkey_metrics.csv").open()))
+    assert duplicate_rows[0]["duplicate_streamkey_attempted"] == "True"
+    assert duplicate_rows[0]["duplicate_streamkey_rejected"] == "True"
+    assert duplicate_rows[0]["duplicate_streamkey_unexpectedly_accepted"] == "False"
+    correctness_rows = list(__import__("csv").DictReader((dirs["metrics"] / "correctness_metrics.csv").open()))
+    stream_row = next(row for row in correctness_rows if row["stream_key"] == "key1")
+    assert stream_row["duplicate_streamkey_rejected"] == "True"
+
+
+def test_worker_overlap_detected_from_controller_events_without_snapshots(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    (dirs["raw"] / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 10.0, "stream_keys": ["key1"]}) + "\n" +
+        json.dumps({"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 30.0, "stream_keys": ["key1"]}) + "\n"
+    )
+    (dirs["raw"] / "publishers.jsonl").write_text(
+        json.dumps({"event": "publisher_finished", "run_id": "run", "repetition": 1, "publisher_index": 1, "stream_key": "key1", "started_at": 11.0, "ended_at": 29.0, "returncode": 0}) + "\n"
+    )
+    events = [
+        {"timestamp_epoch": 12.0, "event_type": "worker_created", "stream": "key1", "worker_pod": "worker-a", "run_id": "run", "repetition": 1},
+        {"timestamp_epoch": 13.0, "event_type": "worker_created", "stream": "key1", "worker_pod": "worker-b", "run_id": "run", "repetition": 1},
+        {"timestamp_epoch": 14.0, "event_type": "worker_deleted", "stream": "key1", "worker_pod": "worker-a", "run_id": "run", "repetition": 1},
+    ]
+    (dirs["raw"] / "controller_events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    runner.build_metrics(cfg, dirs)
+
+    rows = list(__import__("csv").DictReader((dirs["metrics"] / "correctness_metrics.csv").open()))
+    stream_row = next(row for row in rows if row["stream_key"] == "key1")
+    assert stream_row["max_worker_count_observed"] == "2"
+    assert stream_row["duplicate_worker_detected"] == "True"

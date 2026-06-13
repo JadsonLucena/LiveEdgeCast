@@ -77,7 +77,7 @@ kubectl set env deployment/proxy EXPERIMENT_ID=<id> SCENARIO=<scenario> RUN_ID=<
 kubectl set env deployment/controller LIVEEDGECAST_EXPERIMENT_ID=<id> LIVEEDGECAST_SCENARIO=<scenario> LIVEEDGECAST_RUN_ID=<run> LIVEEDGECAST_TENANT=<id> LIVEEDGECAST_ENVIRONMENT=<scenario> LIVEEDGECAST_REGION=<run> -n <namespace>
 ```
 
-O patch é opt-in porque reinicia os deployments e pode interromper sessões RTMP ativas. Use preferencialmente um namespace dedicado por experimento. O resultado do patch e da restauração fica em `raw/proxy_context_patch.json` e `raw/proxy_context_restore.json`.
+O patch é opt-in porque reinicia os deployments e pode interromper sessões RTMP ativas. Use preferencialmente um namespace dedicado por experimento. O runner captura o estado anterior das variáveis antes de alterar cada deployment; se o snapshot falhar para algum deployment, esse deployment não é alterado para evitar restauração destrutiva. O resultado do patch e da restauração fica em `raw/proxy_context_patch.json` e `raw/proxy_context_restore.json`.
 
 O runner também coleta logs estruturados e gera:
 
@@ -110,7 +110,7 @@ O runner não altera a documentação do repositório durante a execução. Todo
 - `t_destination_received` só é observável se houver callback do destino ou receptor experimental.
 - Métricas per-stream dependem de logs estruturados do controller/worker.
 - Gráficos só são gerados quando há amostras reais; caso contrário, o runner cria um `.txt` explicando a ausência de dados.
-- A estimativa é uma redução relativa de atividade por pod-seconds, não uma cobrança real de provedor de nuvem.
+- A estimativa é uma redução relativa de atividade por pod-seconds, não uma cobrança real de provedor de nuvem. O relatório chama essa seção de “Atividade relativa de recursos”.
 
 ## Validade do experimento
 
@@ -124,7 +124,7 @@ O runner não altera a documentação do repositório durante a execução. Todo
 Por padrão, o runner recusa executar quando `reports/<experiment-id>/` já existe e contém arquivos, pois os arquivos JSONL são evidência bruta append-only. Use uma das opções abaixo de forma explícita:
 
 - `--overwrite`: apaga o diretório anterior antes de executar.
-- `--resume`: permite continuar e anexar evidências ao diretório existente. Use um `--run-id` novo para cada retomada; as métricas são separadas por `run_id + repetition`.
+- `--resume`: permite continuar e anexar evidências ao diretório existente. Use um `--run-id` novo para cada retomada; as métricas são separadas por `run_id + repetition`. O runner recusa a execução se detectar que o mesmo `run_id + repetition` já existe no diretório.
 
 O cenário `cold-start` também é conservador por padrão. Se houver workers ativos, o experimento falha em vez de apagar pods automaticamente. Para permitir a limpeza de workers residuais em um namespace dedicado ao experimento, use:
 

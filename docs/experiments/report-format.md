@@ -24,7 +24,9 @@ reports/<experiment-id>/
     resilience_metrics.csv
     resource_usage.csv
     correctness_metrics.csv
-    cost_estimation.csv
+    duplicate_streamkey_metrics.csv
+    resource_activity.csv
+    cost_estimation.csv  # alias compatível; contém a mesma estimativa de atividade relativa
   logs/
     final-before-restore/
       controller.log
@@ -71,11 +73,15 @@ Resume séries do Prometheus para CPU, memória e rede, incluindo média, median
 
 ### `correctness_metrics.csv`
 
-Resume indícios de correção por `run_id + repetition + streamKey`. O arquivo separa `worker_observed_for_stream`, `at_most_one_worker_per_stream` e `one_worker_per_stream`, evitando considerar uma stream sem worker observado como válida. Duplicidade só considera workers simultâneos dentro da janela da repetição; substituições históricas entre repetições não são tratadas como duplicidade.
+Resume indícios de correção por `run_id + repetition + streamKey`. O arquivo separa `worker_observed_for_stream`, `at_most_one_worker_per_stream` e `one_worker_per_stream`, evitando considerar uma stream sem worker observado como válida. Duplicidade combina snapshots de pods com eventos estruturados do controller para reduzir o risco de perder sobreposições transitórias; substituições históricas entre repetições não são tratadas como duplicidade.
 
-### `cost_estimation.csv`
+### `duplicate_streamkey_metrics.csv`
 
-Calcula uma estimativa relativa de atividade por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada. Esse arquivo não representa cobrança financeira real de provedor de nuvem.
+Registra explicitamente se houve tentativa de publicar uma `streamKey` duplicada, se o controller observou rejeição por conflito/handover negado e se houve aceitação inesperada. Esse arquivo deve ser usado na discussão sobre prevenção de duplicidade ou roubo de sessão.
+
+### `resource_activity.csv` e `cost_estimation.csv`
+
+Calculam uma estimativa relativa de atividade por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada. Esses arquivos não representam cobrança financeira real de provedor de nuvem. O arquivo `cost_estimation.csv` é mantido por compatibilidade com o plano original; o relatório usa linguagem mais conservadora de “atividade relativa de recursos”.
 
 ## Gráficos
 
@@ -85,4 +91,4 @@ O runner só gera gráficos com dados reais. Quando as amostras necessárias nã
 
 O runner não mistura execuções por padrão. Se o diretório de saída já existir, a execução falha, exceto quando `--overwrite` ou `--resume` for informado. Essa regra evita que evidências antigas contaminem métricas novas.
 
-Os resultados por streamKey no `report.md` são calculados por `run_id + repetition + streamKey`, usando as janelas de execução registradas em `raw/streams.jsonl`. O uso de `--resume` deve ser acompanhado de um `--run-id` novo para evitar colisão lógica entre retomadas.
+Os resultados por streamKey no `report.md` são calculados por `run_id + repetition + streamKey`, usando as janelas de execução registradas em `raw/streams.jsonl`. O uso de `--resume` deve ser acompanhado de um `--run-id` novo; o runner agora recusa retomar quando encontra colisão de `run_id + repetition` já existente no diretório.
