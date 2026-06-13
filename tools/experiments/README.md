@@ -9,6 +9,8 @@ This directory contains runnable experiment drivers for load and failure scenari
 - `--duration-seconds` / `--duration_seconds`
 - `--bitrate`
 
+Quando os scripts geram fonte sintética com FFmpeg/lavfi, o padrão recomendado para os testes atuais é `testsrc=size=1920x1080:rate=30` com `6000k` de bitrate de vídeo, áudio AAC `128k`, GOP de 60 frames e saída FLV/RTMP por streamKey.
+
 Every script validates arguments before starting, writes execution logs, and creates per-run artifacts under:
 
 ```text
@@ -32,7 +34,7 @@ Runs increasing concurrency levels until `--concurrency` is reached or the obser
   --run-id run-001 \
   --concurrency 10 \
   --duration-seconds 60 \
-  --bitrate 800k
+  --bitrate 6000k
 ```
 
 Useful optional parameters:
@@ -53,7 +55,7 @@ This scenario exercises Kubernetes Pod disruption/orphan behavior. Do not use it
   --run-id run-001 \
   --concurrency 3 \
   --duration-seconds 90 \
-  --bitrate 800k
+  --bitrate 6000k
 ```
 
 ### Kill proxy
@@ -67,7 +69,7 @@ Starts the requested streams, waits `--kill-after-seconds`, deletes the explicit
   --run-id run-001 \
   --concurrency 3 \
   --duration-seconds 90 \
-  --bitrate 800k
+  --bitrate 6000k
 ```
 
 ### Reconnect and duplicate `streamKey`
@@ -81,7 +83,7 @@ Starts a primary publisher, launches a second publisher with the same `streamKey
   --run-id run-001 \
   --concurrency 2 \
   --duration-seconds 60 \
-  --bitrate 800k
+  --bitrate 6000k
 ```
 
 Useful optional parameters:

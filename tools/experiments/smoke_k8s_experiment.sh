@@ -4,15 +4,28 @@ set -euo pipefail
 : "${LIVEEDGECAST_RTMP_URL:?Set LIVEEDGECAST_RTMP_URL, e.g. rtmp://127.0.0.1:1935/live}"
 : "${PROMETHEUS_URL:?Set PROMETHEUS_URL, e.g. http://127.0.0.1:9090}"
 
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 NAMESPACE="${NAMESPACE:-media}"
 OUTPUT_DIR="${OUTPUT_DIR:-./reports-smoke}"
 EXPERIMENT_ID="${EXPERIMENT_ID:-smoke-cold-start-$(date +%s)}"
 RUN_ID="${RUN_ID:-smoke-run}"
-STREAM_KEY="${STREAM_KEY:-smoke-key-$(date +%s)}"
+STREAM_KEYS="${STREAM_KEYS:-${STREAM_KEY:-smoke-key-$(date +%s)}}"
+STREAM_KEYS_FILE="${STREAM_KEYS_FILE:-}"
 DURATION_SECONDS="${DURATION_SECONDS:-30}"
+BITRATE="${BITRATE:-6000k}"
+TESTSRC_SIZE="${TESTSRC_SIZE:-1920x1080}"
+TESTSRC_RATE="${TESTSRC_RATE:-30}"
+AUDIO_BITRATE="${AUDIO_BITRATE:-128k}"
 
-python3 tools/experiments/run_experiment.py \
-  --stream-keys "${STREAM_KEY}" \
+STREAM_ARGS=()
+if [[ -n "${STREAM_KEYS_FILE}" ]]; then
+  STREAM_ARGS=(--stream-keys-file "${STREAM_KEYS_FILE}")
+else
+  STREAM_ARGS=(--stream-keys "${STREAM_KEYS}")
+fi
+
+"${PYTHON_BIN}" tools/experiments/run_experiment.py \
+  "${STREAM_ARGS[@]}" \
   --scenario cold-start \
   --experiment-id "${EXPERIMENT_ID}" \
   --run-id "${RUN_ID}" \
@@ -22,6 +35,10 @@ python3 tools/experiments/run_experiment.py \
   --prometheus-url "${PROMETHEUS_URL}" \
   --namespace "${NAMESPACE}" \
   --output-dir "${OUTPUT_DIR}" \
+  --bitrate "${BITRATE}" \
+  --testsrc-size "${TESTSRC_SIZE}" \
+  --testsrc-rate "${TESTSRC_RATE}" \
+  --audio-bitrate "${AUDIO_BITRATE}" \
   --require-prometheus-analysis \
   --overwrite
 
@@ -30,7 +47,7 @@ test -s "${REPORT_ROOT}/report.md"
 test -s "${REPORT_ROOT}/metrics/activation_metrics.csv"
 test -s "${REPORT_ROOT}/metrics/correctness_metrics.csv"
 
-python3 - <<PY
+"${PYTHON_BIN}" - <<PY
 import csv
 import json
 from pathlib import Path
@@ -58,10 +75,6 @@ def finite_number(raw):
 observable_activation = [
     row for row in activation
     if finite_number(row.get('total_activation_seconds'))
-]
-partial_lifecycle_observed = [
-    row for row in activation
-    if row.get('status') == 'derived_from_controller_structured_logs'
 ]
 worker_observed = [
     row for row in correctness

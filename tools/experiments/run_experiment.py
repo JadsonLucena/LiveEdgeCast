@@ -120,6 +120,9 @@ class RunnerConfig:
     allow_inconclusive: bool = False
     require_prometheus_analysis: bool = False
     legacy_output: bool = False
+    testsrc_size: str = "1920x1080"
+    testsrc_rate: str = "30"
+    audio_bitrate: str = "128k"
     proxy_container: str | None = None
     controller_container: str | None = None
     worker_metric_label_selector: str | None = 'namespace="$namespace"'
@@ -200,7 +203,10 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--rtmp-url", default=os.getenv("LIVEEDGECAST_RTMP_URL", "rtmp://127.0.0.1:1935/live"))
     parser.add_argument("--secondary-rtmp-url", default=os.getenv("LIVEEDGECAST_SECONDARY_RTMP_URL"), help="Optional RTMP URL used for the second publisher in handover/duplicate-streamkey scenarios; use it to target a different proxy directly.")
     parser.add_argument("--source-file", default=None)
-    parser.add_argument("--bitrate", default=None)
+    parser.add_argument("--bitrate", default=None, help="Video bitrate for generated publishers or transcoded source files. Defaults to 6000k for generated 1080p30 test streams.")
+    parser.add_argument("--testsrc-size", default=os.getenv("LIVEEDGECAST_TESTSRC_SIZE", "1920x1080"), help="Synthetic lavfi testsrc size used when --source-file is omitted. Default: 1920x1080.")
+    parser.add_argument("--testsrc-rate", default=os.getenv("LIVEEDGECAST_TESTSRC_RATE", "30"), help="Synthetic lavfi testsrc frame rate used when --source-file is omitted. Default: 30.")
+    parser.add_argument("--audio-bitrate", default=os.getenv("LIVEEDGECAST_AUDIO_BITRATE", "128k"), help="AAC audio bitrate used by generated publishers. Default: 128k.")
     parser.add_argument("--namespace", default=os.getenv("NAMESPACE", "media"))
     parser.add_argument("--prometheus-url", default=os.getenv("PROMETHEUS_URL"))
     parser.add_argument("--controller-url", default=os.getenv("LIVEEDGECAST_CONTROLLER_URL"))
@@ -241,6 +247,10 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         parser.error("duplicated streamKeys are not allowed outside duplicate-streamkey scenario")
     if args.source_file and not Path(args.source_file).exists():
         parser.error(f"--source-file not found: {args.source_file}")
+    if not re.match(r"^[1-9][0-9]*x[1-9][0-9]*$", args.testsrc_size):
+        parser.error("--testsrc-size must use WIDTHxHEIGHT format, for example 1920x1080")
+    if not re.match(r"^[1-9][0-9]*(?:\.[0-9]+)?$", args.testsrc_rate):
+        parser.error("--testsrc-rate must be a positive frame rate, for example 30")
     if args.saturation_error_rate > 1:
         parser.error("--saturation-error-rate must be between 0 and 1")
     if args.overwrite and args.resume:
@@ -303,6 +313,9 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         allow_inconclusive=args.allow_inconclusive,
         require_prometheus_analysis=args.require_prometheus_analysis,
         legacy_output=args.legacy_output,
+        testsrc_size=args.testsrc_size,
+        testsrc_rate=args.testsrc_rate,
+        audio_bitrate=args.audio_bitrate,
         proxy_container=args.proxy_container,
         controller_container=args.controller_container,
         worker_metric_label_selector=args.worker_metric_label_selector,
@@ -499,12 +512,16 @@ def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None =
         else:
             command.extend(["-c", "copy"])
     else:
+        video_bitrate = config.bitrate or "6000k"
         command.extend([
-            "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=30",
-            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-f", "lavfi", "-i", f"testsrc=size={config.testsrc_size}:rate={config.testsrc_rate}",
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
             "-t", str(config.duration_seconds),
+            "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-            "-b:v", config.bitrate or "1200k", "-c:a", "aac",
+            "-pix_fmt", "yuv420p", "-r", config.testsrc_rate, "-g", "60", "-keyint_min", "60",
+            "-b:v", video_bitrate, "-maxrate", video_bitrate, "-bufsize", "12000k",
+            "-c:a", "aac", "-b:a", config.audio_bitrate, "-ar", "48000",
         ])
     command.extend(["-f", "flv", target])
     return command
@@ -3018,7 +3035,8 @@ Amostras de ativação válidas: {report_json["summary"]["valid_activation_sampl
 - RTMP URL: `{config.rtmp_url}`
 - Prometheus URL configurado: `{config.prometheus_url or 'não configurado'}`
 - Controller URL configurado: `{config.controller_url or 'não configurado'}`
-- Source file: `{config.source_file or 'gerado por lavfi/testsrc'}`
+- Source file: `{config.source_file or f'gerado por lavfi/testsrc {config.testsrc_size}@{config.testsrc_rate}fps'}`
+- Generated publisher bitrate: `{config.bitrate or '6000k'}`
 - Bitrate: `{config.bitrate or 'padrão/copy'}`
 - Baseline informado: `{config.baseline or 'não informado'}`
 - Patch de contexto em deployments: `{'ativado' if config.patch_proxy_context else 'desativado'}`

@@ -33,7 +33,7 @@ Linhas vazias e linhas iniciadas por `#` são ignoradas.
 Com `--experiment-id` explícito, o relatório é gravado em `--output-dir/--experiment-id`:
 
 ```bash
-python3 tools/experiments/run_experiment.py \
+python tools/experiments/run_experiment.py \
   --stream-keys-file ./tools/experiments/stream_keys.txt \
   --scenario cold-start \
   --rtmp-url rtmp://127.0.0.1:1935/live \
@@ -46,10 +46,12 @@ python3 tools/experiments/run_experiment.py \
   --output-dir ./reports
 ```
 
+Quando `--source-file` é omitido, o runner gera uma transmissão sintética por `streamKey` com FFmpeg/lavfi usando `testsrc` em `1920x1080` a `30fps`, áudio `anullsrc` e bitrate de vídeo padrão `6000k`. Esses valores podem ser ajustados por `--testsrc-size`, `--testsrc-rate`, `--bitrate` e `--audio-bitrate`. Exemplo de comando gerado por chave: `ffmpeg -re -f lavfi -i testsrc=size=1920x1080:rate=30 ... -b:v 6000k -f flv rtmp://.../<streamKey>`.
+
 Para compatibilidade com o critério de aceite do plano experimental, `--experiment-id` também pode ser omitido. Nesse caso, o runner deriva o `experiment_id` do último componente de `--output-dir` e grava o relatório exatamente nesse diretório:
 
 ```bash
-python3 tools/experiments/run_experiment.py \
+python tools/experiments/run_experiment.py \
   --stream-keys-file ./stream_keys.txt \
   --scenario cold-start \
   --duration-seconds 120 \
@@ -64,7 +66,7 @@ Para cenários `handover` e `duplicate-streamkey`, use `--secondary-rtmp-url` qu
 Também é possível informar as streamKeys diretamente:
 
 ```bash
-python3 tools/experiments/run_experiment.py \
+python tools/experiments/run_experiment.py \
   --stream-keys key1,key2,key3 \
   --scenario concurrency \
   --duration-seconds 180 \
@@ -194,10 +196,13 @@ Há um script opcional para validação manual em cluster real:
 LIVEEDGECAST_RTMP_URL=rtmp://127.0.0.1:1935/live \
 PROMETHEUS_URL=http://127.0.0.1:9090 \
 NAMESPACE=media \
+BITRATE=6000k \
+TESTSRC_SIZE=1920x1080 \
+TESTSRC_RATE=30 \
 ./tools/experiments/smoke_k8s_experiment.sh
 ```
 
-O script executa um `cold-start` mínimo em namespace dedicado ou controlado e valida se `report.md`, `activation_metrics.csv` e `correctness_metrics.csv` foram gerados. Além da existência dos arquivos, o smoke test exige pelo menos uma amostra com `total_activation_seconds` finito e uma linha de correção com worker observado; linhas parciais ou apenas `not_observable` não são suficientes para aprovar o teste.
+O script executa um `cold-start` mínimo em namespace dedicado ou controlado usando publisher sintético FFmpeg/lavfi por streamKey. Por padrão, a fonte é `testsrc=size=1920x1080:rate=30`, com `BITRATE=6000k` e áudio AAC `128k`. Além da existência dos arquivos, o smoke test exige pelo menos uma amostra com `total_activation_seconds` finito e uma linha de correção com worker observado; linhas parciais ou apenas `not_observable` não são suficientes para aprovar o teste. Para múltiplas chaves, informe `STREAM_KEYS=key1,key2` ou `STREAM_KEYS_FILE=./stream_keys.txt`.
 
 ## Checklist de validação pré-artigo
 

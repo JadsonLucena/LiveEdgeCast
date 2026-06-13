@@ -1217,3 +1217,34 @@ def test_experiment_id_can_be_derived_from_output_dir(tmp_path):
     assert cfg.experiment_id == "teste-final"
     assert cfg.output_dir == tmp_path / "reports"
     assert cfg.report_root == tmp_path / "reports" / "teste-final"
+
+
+def test_ffmpeg_command_generates_1080p30_testsrc_by_default(tmp_path):
+    cfg = config(tmp_path)
+
+    command = runner.ffmpeg_command(cfg, "key1")
+
+    assert "testsrc=size=1920x1080:rate=30" in command
+    assert "6000k" in command
+    assert "-pix_fmt" in command and "yuv420p" in command
+    assert "-g" in command and "60" in command
+    assert command[-1] == "rtmp://example/live/key1"
+
+
+def test_parse_args_accepts_generated_source_controls(tmp_path):
+    cfg = runner.parse_args([
+        "--stream-keys", "key1,key2",
+        "--scenario", "cold-start",
+        "--duration-seconds", "30",
+        "--output-dir", str(tmp_path / "reports" / "smoke"),
+        "--bitrate", "6500k",
+        "--testsrc-size", "1920x1080",
+        "--testsrc-rate", "30",
+        "--audio-bitrate", "128k",
+    ])
+
+    assert cfg.stream_keys == ["key1", "key2"]
+    assert cfg.bitrate == "6500k"
+    assert cfg.testsrc_size == "1920x1080"
+    assert cfg.testsrc_rate == "30"
+    assert cfg.audio_bitrate == "128k"
