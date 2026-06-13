@@ -86,7 +86,7 @@ Registra explicitamente se houve tentativa de publicar uma `streamKey` duplicada
 
 ### `prometheus_metric_coverage.csv`
 
-Arquivo de cobertura por `run_id` e métrica Prometheus. Cada linha separa `query_success` de `samples_observed`: uma query Prometheus pode retornar `success` com resultado vazio e, nesse caso, `available_for_analysis=false`. A coluna `expected_by_run_windows` indica se aquele `run_id` pertence às janelas de execução esperadas ou se veio de evidência extra/stale preservada em `raw/`. Em execuções com `--resume`, use esse arquivo para verificar se a agregação comparou janelas com cobertura equivalente e amostras suficientes.
+Arquivo de cobertura por `run_id` e métrica Prometheus. Cada linha separa `query_success` de `samples_observed`: uma query Prometheus pode retornar `success` com resultado vazio e, nesse caso, `available_for_analysis=false`. A coluna `expected_by_run_windows` indica se aquele `run_id` pertence às janelas de execução esperadas ou se veio de evidência extra/stale preservada em `raw/`. As colunas `metric_expected_for_scenario` e `required_for_analysis` indicam se a métrica é obrigatória para o cenário executado; métricas opcionais continuam listadas para diagnóstico, mas não bloqueiam `--require-prometheus-analysis`. As colunas `query` e `rendered_query` registram a PromQL efetivamente enviada ao Prometheus, já com placeholders como `$namespace` e `$controller_label_selector` resolvidos. Em execuções com `--resume`, use esse arquivo para verificar se a agregação comparou janelas com cobertura equivalente e amostras suficientes.
 
 ### `resource_activity.csv`
 
@@ -129,7 +129,8 @@ O campo `report.json.summary` inclui marcadores para auditoria metodológica:
 
 - `prometheus_resume_safe`: alias compatível de `prometheus_evidence_files_complete`; indica que todas as janelas `run_id + repetition` possuem arquivo Prometheus correspondente;
 - `prometheus_missing_run_ids`: `run_id`s esperados pelas janelas, mas sem evidência Prometheus;
-- `prometheus_incomplete_metrics`: métricas ausentes em pelo menos um `run_id`;
+- `prometheus_incomplete_metrics`: métricas obrigatórias para o cenário que ficaram ausentes em pelo menos um `run_id`;
+- `prometheus_optional_incomplete_metrics`: métricas coletadas como evidência opcional, mas ausentes no ambiente ou no cenário;
 - `prometheus_samples_observed`: pelo menos uma série Prometheus retornou amostras;
 - `resource_baseline_window_aware`: a referência de atividade relativa usa janelas `run_id + repetition`;
 - `observable_activation_samples`: quantidade de linhas com `total_activation_seconds` finito;

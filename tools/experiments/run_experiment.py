@@ -46,7 +46,60 @@ PROMETHEUS_LEGACY_LATEST_FILENAME = "prometheus_range_queries.json"
 PROMETHEUS_INSTANT_LATEST_FILENAME = "prometheus_instant_queries.json"
 PROMETHEUS_INSTANT_RUN_PREFIX = "prometheus_instant_queries.run."
 PROMETHEUS_RUN_PREFIX = "prometheus_range_queries.run."
-REQUIRED_PROMETHEUS_METRICS_FOR_ANALYSIS = {"workers_active", "proxies_active", "pod_cpu_rate"}
+CORE_PROMETHEUS_METRICS_FOR_ANALYSIS = {
+    "workers_active",
+    "proxies_active",
+    "controllers_active",
+    "pod_cpu_rate",
+    "pod_memory_working_set",
+}
+
+SCENARIO_PROMETHEUS_METRICS_FOR_ANALYSIS = {
+    "cold-start": {
+        "controller_active_streams",
+        "controller_active_allocations",
+        "stream_lifecycle_phase_seconds_p95",
+    },
+    "concurrency": {
+        "controller_active_streams",
+        "controller_active_allocations",
+        "stream_lifecycle_phase_seconds_p95",
+    },
+    "release": {
+        "controller_active_streams",
+        "controller_active_allocations",
+    },
+    "worker-failure": {
+        "worker_recovery_total",
+        "worker_recovery_duration_seconds_p95",
+    },
+    "proxy-failure": {
+        "controller_active_streams",
+        "controller_active_allocations",
+        "proxy_rtmp_active_streams",
+    },
+    "handover": {
+        "handover_attempts_total",
+        "handover_success_total",
+        "handover_conflict_total",
+    },
+    "duplicate-streamkey": {
+        "handover_attempts_total",
+        "handover_success_total",
+        "handover_conflict_total",
+    },
+    "pilot-capacity": {
+        "controller_active_streams",
+        "controller_active_allocations",
+        "stream_lifecycle_phase_seconds_p95",
+    },
+}
+
+# Metrics such as proxy_network_receive_bps/proxy_network_transmit_bps are
+# intentionally collected when available, but are not required for local smoke
+# success because some Kubernetes distributions do not expose container_network_*
+# through cAdvisor. They remain visible in prometheus_metric_coverage.csv as
+# optional evidence.
 
 DEFAULT_PROMQL = {
     # Controller metrics can be scoped by tenant/environment/region when --patch-proxy-context is used.
@@ -57,8 +110,8 @@ DEFAULT_PROMQL = {
     "workers_active": 'count(kube_pod_info{namespace="$namespace", pod=~"worker-.*"})',
     "proxies_active": 'count(kube_pod_info{namespace="$namespace", pod=~"proxy-.*"})',
     "controllers_active": 'count(kube_pod_info{namespace="$namespace", pod=~"controller-.*"})',
-    "pod_cpu_rate": 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="", pod=~"(worker|proxy|controller).*"}[1m]))',
-    "pod_memory_working_set": 'sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="", pod=~"(worker|proxy|controller).*"})',
+    "pod_cpu_rate": 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", pod=~"(worker|proxy|controller).*"}[1m]))',
+    "pod_memory_working_set": 'sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", pod=~"(worker|proxy|controller).*"})',
     "proxy_network_receive_bps": 'sum by (pod) (rate(container_network_receive_bytes_total{namespace="$namespace", pod=~"proxy-.*"}[1m]))',
     "proxy_network_transmit_bps": 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="$namespace", pod=~"proxy-.*"}[1m]))',
     "stream_lifecycle_phase_seconds_p50": 'histogram_quantile(0.50, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
@@ -1043,7 +1096,7 @@ def render_promql(config: RunnerConfig, query: str, controller_label_selector: s
     selector = prometheus_controller_label_selector(config) if controller_label_selector is None else controller_label_selector
     return (
         query
-        .replace("$namespace", config.namespace)
+        .replace("$namespace", prom_label_value(config.namespace))
         .replace("$experiment_id", prom_label_value(config.experiment_id))
         .replace("$scenario", prom_label_value(config.scenario))
         .replace("$run_id", prom_label_value(config.run_id))
@@ -1054,30 +1107,30 @@ def render_promql(config: RunnerConfig, query: str, controller_label_selector: s
 
 def prometheus_query(config: RunnerConfig, query: str, start: float, end: float, step: int = 5, controller_label_selector: str | None = None) -> dict[str, Any]:
     if not config.prometheus_url:
-        return {"available": False, "reason": "prometheus_url_not_configured", "query": query}
+        return {"available": False, "reason": "prometheus_url_not_configured", "query": query, "template_query": query}
     rendered_query = render_promql(config, query, controller_label_selector=controller_label_selector)
     params = urlencode({"query": rendered_query, "start": f"{start:.3f}", "end": f"{end:.3f}", "step": str(step)})
     url = f"{config.prometheus_url}/api/v1/query_range?{params}"
     try:
         with urlopen(Request(url, headers={"User-Agent": "liveedgecast-experiment/1"}), timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        return {"available": True, "query": query, "rendered_query": rendered_query, "response": payload}
+        return {"available": True, "query": rendered_query, "template_query": query, "rendered_query": rendered_query, "response": payload}
     except Exception as exc:
-        return {"available": False, "query": query, "rendered_query": locals().get("rendered_query", query), "error": {"type": type(exc).__name__, "message": str(exc)}}
+        return {"available": False, "query": locals().get("rendered_query", query), "template_query": query, "rendered_query": locals().get("rendered_query", query), "error": {"type": type(exc).__name__, "message": str(exc)}}
 
 
 def prometheus_instant_query(config: RunnerConfig, query: str, ts: float, controller_label_selector: str | None = None) -> dict[str, Any]:
     if not config.prometheus_url:
-        return {"available": False, "reason": "prometheus_url_not_configured", "query": query}
+        return {"available": False, "reason": "prometheus_url_not_configured", "query": query, "template_query": query}
     rendered_query = render_promql(config, query, controller_label_selector=controller_label_selector)
     params = urlencode({"query": rendered_query, "time": f"{ts:.3f}"})
     url = f"{config.prometheus_url}/api/v1/query?{params}"
     try:
         with urlopen(Request(url, headers={"User-Agent": "liveedgecast-experiment/1"}), timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        return {"available": True, "query": query, "rendered_query": rendered_query, "response": payload}
+        return {"available": True, "query": rendered_query, "template_query": query, "rendered_query": rendered_query, "response": payload}
     except Exception as exc:
-        return {"available": False, "query": query, "rendered_query": locals().get("rendered_query", query), "error": {"type": type(exc).__name__, "message": str(exc)}}
+        return {"available": False, "query": locals().get("rendered_query", query), "template_query": query, "rendered_query": locals().get("rendered_query", query), "error": {"type": type(exc).__name__, "message": str(exc)}}
 
 
 def prometheus_result_path(config: RunnerConfig, dirs: dict[str, Path]) -> Path:
@@ -1301,16 +1354,21 @@ def prometheus_metric_coverage_rows(config: RunnerConfig, dirs: dict[str, Path],
             query_success = bool(isinstance(value, dict) and value.get("available") and (value.get("response") or {}).get("status") == "success")
             samples_observed = sample_count > 0
             available_for_analysis = query_success and samples_observed
+            required_for_analysis = metric_expected_for_analysis(config, metric)
             rows.append({
                 "run_id": run_id,
                 "metric": metric,
                 "expected_by_run_windows": expected_by_run_windows,
+                "metric_expected_for_scenario": required_for_analysis,
+                "required_for_analysis": required_for_analysis,
                 # Backward-compatible field: true only when the metric produced usable samples.
                 "available": available_for_analysis,
                 "query_success": query_success,
                 "samples_observed": samples_observed,
                 "available_for_analysis": available_for_analysis,
                 "sample_count": sample_count,
+                "query": (value.get("query") if isinstance(value, dict) else None),
+                "rendered_query": (value.get("rendered_query") if isinstance(value, dict) else None),
                 "status": ((value.get("response") or {}).get("status") if isinstance(value, dict) else None),
                 "error": ((value.get("error") or value.get("reason")) if isinstance(value, dict) else "prometheus_evidence_missing_for_run"),
             })
@@ -1322,10 +1380,12 @@ def coverage_value_true(row: dict[str, Any], field: str) -> bool:
     return value is True or str(value).lower() == "true"
 
 
-def incomplete_prometheus_metric_names(rows: list[dict[str, Any]]) -> list[str]:
+def incomplete_prometheus_metric_names(rows: list[dict[str, Any]], *, required_only: bool = False) -> list[str]:
     by_metric: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         if not coverage_value_true(row, "expected_by_run_windows"):
+            continue
+        if required_only and not coverage_value_true(row, "required_for_analysis"):
             continue
         by_metric.setdefault(str(row.get("metric")), []).append(row)
     incomplete = []
@@ -2484,7 +2544,7 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     write_csv(
         dirs["metrics"] / "prometheus_metric_coverage.csv",
         prom_metric_rows,
-        ["run_id", "metric", "expected_by_run_windows", "available", "query_success", "samples_observed", "available_for_analysis", "sample_count", "status", "error"],
+        ["run_id", "metric", "expected_by_run_windows", "metric_expected_for_scenario", "required_for_analysis", "available", "query_success", "samples_observed", "available_for_analysis", "sample_count", "query", "rendered_query", "status", "error"],
     )
     pod_rows = extract_pod_rows(dirs, config.stream_keys)
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
@@ -2887,14 +2947,30 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
     return rows
 
 
-def metrics_prometheus_analysis_ready(metrics: dict[str, Any]) -> bool:
+
+
+def required_prometheus_metrics_for_analysis(config: RunnerConfig) -> set[str]:
+    """Return the Prometheus metrics that must have samples for this scenario.
+
+    The runner still collects every query in DEFAULT_PROMQL, but a smoke/cold-start
+    run must not fail just because handover, recovery, orphan cleanup, or optional
+    network metrics did not occur in that scenario.
+    """
+    return set(CORE_PROMETHEUS_METRICS_FOR_ANALYSIS) | set(SCENARIO_PROMETHEUS_METRICS_FOR_ANALYSIS.get(config.scenario, set()))
+
+
+def metric_expected_for_analysis(config: RunnerConfig, metric: str) -> bool:
+    return metric in required_prometheus_metrics_for_analysis(config)
+
+
+def metrics_prometheus_analysis_ready(config: RunnerConfig, metrics: dict[str, Any]) -> bool:
     prom_coverage = metrics.get("prometheus_coverage") or {}
     expected_run_ids = set(prom_coverage.get("expected_run_ids") or [])
     if not bool(prom_coverage.get("complete")):
         return False
     return prometheus_required_metrics_ready(
         metrics.get("prometheus_metric_coverage") or [],
-        REQUIRED_PROMETHEUS_METRICS_FOR_ANALYSIS,
+        required_prometheus_metrics_for_analysis(config),
         expected_run_ids,
     )
 
@@ -2923,7 +2999,7 @@ def automation_verdict(config: RunnerConfig, execution: dict[str, Any], metrics:
         reasons.append("scenario_hypothesis_inconclusive")
     if duplicate_process_invalid and not config.allow_inconclusive:
         reasons.append("duplicate_publisher_nonzero_without_controller_rejection")
-    if config.require_prometheus_analysis and config.prometheus_url and not metrics_prometheus_analysis_ready(metrics):
+    if config.require_prometheus_analysis and config.prometheus_url and not metrics_prometheus_analysis_ready(config, metrics):
         reasons.append("prometheus_analysis_not_ready")
     # Preserve order while removing duplicates.
     deduped_reasons = list(dict.fromkeys(reasons))
@@ -2952,7 +3028,8 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
     prometheus_files = [path.name for path in prometheus_run_files(dirs)]
     prom_coverage = metrics.get("prometheus_coverage") or prometheus_run_coverage(config, dirs)
     prom_metric_coverage = metrics.get("prometheus_metric_coverage") or prometheus_metric_coverage_rows(config, dirs)
-    incomplete_prom_metrics = incomplete_prometheus_metric_names(prom_metric_coverage)
+    incomplete_prom_metrics = incomplete_prometheus_metric_names(prom_metric_coverage, required_only=True)
+    optional_incomplete_prom_metrics = incomplete_prometheus_metric_names(prom_metric_coverage, required_only=False)
     expected_prom_run_ids = set(prom_coverage.get("expected_run_ids") or [])
     prom_results_by_run = load_prometheus_results_by_run(dirs)
     if expected_prom_run_ids:
@@ -2969,7 +3046,7 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
         if not str(name).startswith("_") and isinstance(value, dict)
     )
     prometheus_evidence_files_complete = bool(prom_coverage.get("complete"))
-    prometheus_analysis_ready = prometheus_evidence_files_complete and prometheus_required_metrics_ready(prom_metric_coverage, REQUIRED_PROMETHEUS_METRICS_FOR_ANALYSIS, expected_prom_run_ids)
+    prometheus_analysis_ready = prometheus_evidence_files_complete and prometheus_required_metrics_ready(prom_metric_coverage, required_prometheus_metrics_for_analysis(config), expected_prom_run_ids)
     verdict = verdict or automation_verdict(config, execution, metrics)
     report_json = {
         "metadata": metadata,
@@ -3001,6 +3078,7 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
             "prometheus_extra_run_ids": prom_coverage.get("extra_run_ids") or [],
             "prometheus_coverage_by_run": prom_coverage.get("coverage_by_run") or [],
             "prometheus_incomplete_metrics": incomplete_prom_metrics,
+            "prometheus_optional_incomplete_metrics": [m for m in optional_incomplete_prom_metrics if m not in set(incomplete_prom_metrics)],
             "prometheus_samples_observed": prometheus_samples_observed,
             "resource_baseline_window_aware": True,
             "observable_activation_samples": valid_activation_samples,
