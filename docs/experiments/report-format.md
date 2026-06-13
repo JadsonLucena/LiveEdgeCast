@@ -122,7 +122,7 @@ Quando `--patch-proxy-context` é usado, `report.json.summary.restore_ok=false` 
 
 O campo `report.json.summary` inclui marcadores para auditoria metodológica:
 
-- `prometheus_resume_safe`: todas as janelas `run_id + repetition` possuem arquivo Prometheus correspondente;
+- `prometheus_resume_safe`: alias compatível de `prometheus_evidence_files_complete`; indica que todas as janelas `run_id + repetition` possuem arquivo Prometheus correspondente;
 - `prometheus_missing_run_ids`: `run_id`s esperados pelas janelas, mas sem evidência Prometheus;
 - `prometheus_incomplete_metrics`: métricas ausentes em pelo menos um `run_id`;
 - `prometheus_samples_observed`: pelo menos uma série Prometheus retornou amostras;

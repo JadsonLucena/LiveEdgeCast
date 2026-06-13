@@ -896,7 +896,7 @@ def test_report_json_exposes_evidence_validity_summary(tmp_path):
 
     summary = report["summary"]
     assert summary["prometheus_evidence_files_complete"] is True
-    assert summary["prometheus_resume_safe"] is False
+    assert summary["prometheus_resume_safe"] is True
     assert summary["prometheus_analysis_ready"] is False
     assert summary["prometheus_samples_observed"] is True
     assert summary["resource_baseline_window_aware"] is True
@@ -1075,3 +1075,33 @@ def test_require_prometheus_analysis_affects_automation_verdict(tmp_path):
 
     assert verdict["automation_exit_code"] == 1
     assert "prometheus_analysis_not_ready" in verdict["automation_failure_reasons"]
+
+
+def test_report_root_always_uses_experiment_child_directory(tmp_path):
+    parent = tmp_path / "exp"
+    cfg = config(parent)
+    cfg.experiment_id = "exp"
+
+    assert cfg.report_root == parent / "exp"
+
+
+def test_incomplete_prometheus_metrics_ignore_extra_run_files(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "expected", "repetition": 1, "timestamp": 1.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "expected", "repetition": 1, "ended_at": 2.0, "stream_keys": ["key1"]})
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run.expected.json",
+        {"_metadata": {"run_id": "expected"}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[1.0, "1"]]}]}}}},
+    )
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run.stale.json",
+        {"_metadata": {"run_id": "stale"}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": []}}}},
+    )
+
+    rows = runner.prometheus_metric_coverage_rows(cfg, dirs)
+    stale_rows = [row for row in rows if row["run_id"] == "stale"]
+
+    assert stale_rows
+    assert all(row["expected_by_run_windows"] is False for row in stale_rows)
+    assert "workers_active" not in runner.incomplete_prometheus_metric_names(rows)

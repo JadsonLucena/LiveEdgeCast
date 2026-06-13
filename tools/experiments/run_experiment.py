@@ -123,8 +123,10 @@ class RunnerConfig:
 
     @property
     def report_root(self) -> Path:
-        if self.output_dir.name == self.experiment_id:
-            return self.output_dir
+        # Always place each experiment in its own child directory. Earlier
+        # versions allowed output_dir itself to be the report root when its
+        # basename matched experiment_id; that made --overwrite capable of
+        # deleting a shared parent reports directory.
         return self.output_dir / self.experiment_id
 
 
@@ -333,7 +335,7 @@ def prepare_report_root(config: RunnerConfig) -> Path:
     when the requested run_id/repetition keys are not already present.
     """
     root = config.report_root
-    output_root = config.output_dir if config.output_dir.name == config.experiment_id else config.output_dir / config.experiment_id
+    output_root = config.output_dir / config.experiment_id
     if root.resolve() != output_root.resolve() or not path_is_relative_to(root, config.output_dir):
         raise RuntimeError(f"unsafe report directory resolved outside output directory: {root}")
     if root.exists() and any(root.iterdir()):
@@ -1208,6 +1210,7 @@ def prometheus_metric_coverage_rows(config: RunnerConfig, dirs: dict[str, Path],
     rows: list[dict[str, Any]] = []
     for run_id in sorted(set(expected_run_ids) | set(results_by_run)):
         payload = results_by_run.get(run_id) or {}
+        expected_by_run_windows = run_id in set(expected_run_ids)
         for metric in DEFAULT_PROMQL:
             value = payload.get(metric) if isinstance(payload, dict) else None
             sample_count = prometheus_metric_sample_count(value) if isinstance(value, dict) else 0
@@ -1217,6 +1220,7 @@ def prometheus_metric_coverage_rows(config: RunnerConfig, dirs: dict[str, Path],
             rows.append({
                 "run_id": run_id,
                 "metric": metric,
+                "expected_by_run_windows": expected_by_run_windows,
                 # Backward-compatible field: true only when the metric produced usable samples.
                 "available": available_for_analysis,
                 "query_success": query_success,
@@ -1237,6 +1241,8 @@ def coverage_value_true(row: dict[str, Any], field: str) -> bool:
 def incomplete_prometheus_metric_names(rows: list[dict[str, Any]]) -> list[str]:
     by_metric: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
+        if not coverage_value_true(row, "expected_by_run_windows"):
+            continue
         by_metric.setdefault(str(row.get("metric")), []).append(row)
     incomplete = []
     for metric, metric_rows in by_metric.items():
@@ -2887,7 +2893,7 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
             "context_scope_ok": execution.get("context_scope_ok"),
             "context_patch_status": execution.get("context_patch_status"),
             "controller_scope_effective": bool(((execution.get("preflight") or {}).get("proxy_context_patch") or {}).get("controller_scope_effective")),
-            "prometheus_resume_safe": prometheus_analysis_ready,
+            "prometheus_resume_safe": prometheus_evidence_files_complete,
             "prometheus_evidence_files_complete": prometheus_evidence_files_complete,
             "prometheus_analysis_ready": prometheus_analysis_ready,
             "prometheus_evidence_files": prometheus_files,

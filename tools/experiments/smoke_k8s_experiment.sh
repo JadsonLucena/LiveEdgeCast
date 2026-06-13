@@ -22,23 +22,27 @@ python tools/experiments/run_experiment.py \
   --prometheus-url "${PROMETHEUS_URL}" \
   --namespace "${NAMESPACE}" \
   --output-dir "${OUTPUT_DIR}" \
+  --require-prometheus-analysis \
   --overwrite
 
-if [[ "$(basename "${OUTPUT_DIR%/}")" == "${EXPERIMENT_ID}" ]]; then
-  REPORT_ROOT="${OUTPUT_DIR%/}"
-else
-  REPORT_ROOT="${OUTPUT_DIR%/}/${EXPERIMENT_ID}"
-fi
+REPORT_ROOT="${OUTPUT_DIR%/}/${EXPERIMENT_ID}"
 test -s "${REPORT_ROOT}/report.md"
 test -s "${REPORT_ROOT}/metrics/activation_metrics.csv"
 test -s "${REPORT_ROOT}/metrics/correctness_metrics.csv"
 
 python - <<PY
 import csv
+import json
 from pathlib import Path
 root = Path('${REPORT_ROOT}')
 activation = list(csv.DictReader((root / 'metrics' / 'activation_metrics.csv').open()))
 correctness = list(csv.DictReader((root / 'metrics' / 'correctness_metrics.csv').open()))
+report = json.loads((root / 'report.json').read_text())
+summary = report.get('summary') or {}
+if not summary.get('prometheus_analysis_ready'):
+    raise SystemExit(f"prometheus_analysis_ready is false; incomplete metrics: {summary.get('prometheus_incomplete_metrics')}")
+if summary.get('prometheus_incomplete_metrics'):
+    raise SystemExit(f"Prometheus metrics incomplete: {summary.get('prometheus_incomplete_metrics')}")
 if not activation:
     raise SystemExit('activation_metrics.csv has no rows')
 if not correctness:
