@@ -9,7 +9,8 @@ from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from kubernetes.client.exceptions import ApiException
+kubernetes_exceptions = pytest.importorskip("kubernetes.client.exceptions")
+ApiException = kubernetes_exceptions.ApiException
 
 with patch('kubernetes.config.load_incluster_config', return_value=None), \
      patch('kubernetes.config.load_kube_config', return_value=None):

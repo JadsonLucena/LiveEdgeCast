@@ -8,7 +8,7 @@ O runner unificado executa publishers RTMP com FFmpeg, coleta evidências de Kub
 - Namespace `media` com proxy, controller e workers do LiveEdgeCast.
 - FFmpeg instalado localmente para gerar publishers sintéticos.
 - Prometheus acessível por URL HTTP, normalmente via port-forward.
-- Permissão para ler pods/events/logs e, opcionalmente, executar `kubectl set env deployment/proxy` para propagar `EXPERIMENT_ID`, `SCENARIO` e `RUN_ID` aos hooks do proxy.
+- Permissão para ler pods/events/logs. A propagação de contexto via `kubectl set env` é opcional e só ocorre quando `--patch-proxy-context` é informado.
 
 Exemplo de port-forward do Prometheus:
 
@@ -70,13 +70,14 @@ python tools/experiments/run_experiment.py \
 
 ## Observabilidade e correlação
 
-Antes de executar o experimento, o runner tenta propagar o contexto para o deployment `proxy` com:
+Por padrão, o runner **não altera deployments** do cluster. Para propagar contexto experimental aos hooks do proxy e às métricas/logs do controller, execute com `--patch-proxy-context`. Nesse modo, o runner aplica temporariamente variáveis de ambiente nos deployments `proxy` e `controller`, aguarda rollout e tenta restaurar os valores anteriores ao final:
 
 ```bash
 kubectl set env deployment/proxy EXPERIMENT_ID=<id> SCENARIO=<scenario> RUN_ID=<run> -n <namespace>
+kubectl set env deployment/controller LIVEEDGECAST_EXPERIMENT_ID=<id> LIVEEDGECAST_SCENARIO=<scenario> LIVEEDGECAST_RUN_ID=<run> LIVEEDGECAST_TENANT=<id> LIVEEDGECAST_ENVIRONMENT=<scenario> LIVEEDGECAST_REGION=<run> -n <namespace>
 ```
 
-Isso permite que os hooks `exec_publish` enviem metadados ao controller. Caso essa etapa falhe, o experimento continua, mas o relatório registra a limitação em `raw/proxy_context_patch.json`.
+O patch é opt-in porque reinicia os deployments e pode interromper sessões RTMP ativas. Use preferencialmente um namespace dedicado por experimento. O resultado do patch e da restauração fica em `raw/proxy_context_patch.json` e `raw/proxy_context_restore.json`.
 
 O runner também coleta logs estruturados e gera:
 
@@ -110,3 +111,10 @@ O runner não altera a documentação do repositório durante a execução. Todo
 - Métricas per-stream dependem de logs estruturados do controller/worker.
 - Gráficos só são gerados quando há amostras reais; caso contrário, o runner cria um `.txt` explicando a ausência de dados.
 - A estimativa de custo é relativa e baseada em pod-seconds, não em cobrança real de provedor de nuvem.
+
+## Validade do experimento
+
+- O cenário `cold-start` falha o comando quando não consegue confirmar zero workers antes da execução.
+- Repetições com erro geram evento `run_failed`, fechando a janela temporal da repetição para evitar contaminação de métricas posteriores.
+- O cenário `release` aguarda `--release-after-seconds` antes de encerrar publishers, permitindo que a stream fique ativa antes da medição de limpeza.
+- Para evitar contaminação em métricas de cAdvisor/kube-state-metrics, execute apenas um experimento por namespace ou use namespaces isolados por execução.

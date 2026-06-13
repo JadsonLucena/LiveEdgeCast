@@ -39,6 +39,8 @@ def config(tmp_path, scenario="cold-start"):
         saturation_p95_seconds=5.0,
         saturation_error_rate=0.2,
         baseline=None,
+        release_after_seconds=1,
+        patch_proxy_context=False,
     )
 
 

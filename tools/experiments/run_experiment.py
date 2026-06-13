@@ -41,30 +41,32 @@ SCENARIOS = (
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 DEFAULT_PROMQL = {
-    "controller_active_streams": "controller_active_streams",
-    "controller_active_allocations": "controller_active_allocations",
-    "worker_pods_available": "worker_pods_available",
+    # Controller metrics can be scoped by tenant/environment/region when --patch-proxy-context is used.
+    "controller_active_streams": "controller_active_streams$controller_label_selector",
+    "controller_active_allocations": "controller_active_allocations$controller_label_selector",
+    "worker_pods_available": "worker_pods_available$controller_label_selector",
+    # Kubernetes/cAdvisor metrics are scoped by namespace and pod name; use a dedicated namespace to avoid contamination.
     "workers_active": 'count(kube_pod_info{namespace="$namespace", pod=~"worker-.*"})',
     "proxies_active": 'count(kube_pod_info{namespace="$namespace", pod=~"proxy-.*"})',
     "pod_cpu_rate": 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="", pod=~"(worker|proxy|controller).*"}[1m]))',
     "pod_memory_working_set": 'sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="", pod=~"(worker|proxy|controller).*"})',
     "proxy_network_receive_bps": 'sum by (pod) (rate(container_network_receive_bytes_total{namespace="$namespace", pod=~"proxy-.*"}[1m]))',
     "proxy_network_transmit_bps": 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="$namespace", pod=~"proxy-.*"}[1m]))',
-    "stream_lifecycle_phase_seconds_p50": 'histogram_quantile(0.50, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket[5m])))',
-    "stream_lifecycle_phase_seconds_p95": 'histogram_quantile(0.95, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket[5m])))',
-    "stream_lifecycle_phase_seconds_p99": 'histogram_quantile(0.99, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket[5m])))',
-    "handover_attempts_total": "handover_attempts_total",
-    "handover_success_total": "handover_success_total",
-    "handover_conflict_total": "handover_conflict_total",
-    "orphan_workers_deleted_total": "orphan_workers_deleted_total",
-    "worker_recovery_total": "worker_recovery_total",
-    "worker_recovery_duration_seconds_p95": 'histogram_quantile(0.95, sum by (le) (rate(worker_recovery_duration_seconds_bucket[5m])))',
+    "stream_lifecycle_phase_seconds_p50": 'histogram_quantile(0.50, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
+    "stream_lifecycle_phase_seconds_p95": 'histogram_quantile(0.95, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
+    "stream_lifecycle_phase_seconds_p99": 'histogram_quantile(0.99, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
+    "handover_attempts_total": "handover_attempts_total$controller_label_selector",
+    "handover_success_total": "handover_success_total$controller_label_selector",
+    "handover_conflict_total": "handover_conflict_total$controller_label_selector",
+    "orphan_workers_deleted_total": "orphan_workers_deleted_total$controller_label_selector",
+    "worker_recovery_total": "worker_recovery_total$controller_label_selector",
+    "worker_recovery_duration_seconds_p95": 'histogram_quantile(0.95, sum by (le) (rate(worker_recovery_duration_seconds_bucket$controller_label_selector[5m])))',
     "ffmpeg_running": "worker_ffmpeg_running",
     "ffmpeg_progress_age": "worker_ffmpeg_progress_age_seconds",
     "ffmpeg_out_time_seconds": "worker_ffmpeg_out_time_seconds",
-    "proxy_rtmp_active_streams": "proxy_rtmp_active_streams",
-    "proxy_rtmp_active_publishers": "proxy_rtmp_active_publishers",
-    "proxy_rtmp_active_clients": "proxy_rtmp_active_clients",
+    "proxy_rtmp_active_streams": "proxy_rtmp_active_streams$controller_label_selector",
+    "proxy_rtmp_active_publishers": "proxy_rtmp_active_publishers$controller_label_selector",
+    "proxy_rtmp_active_clients": "proxy_rtmp_active_clients$controller_label_selector",
 }
 
 @dataclass
@@ -97,6 +99,8 @@ class RunnerConfig:
     saturation_p95_seconds: float
     saturation_error_rate: float
     baseline: str | None
+    release_after_seconds: int
+    patch_proxy_context: bool
 
     @property
     def report_root(self) -> Path:
@@ -181,6 +185,8 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--saturation-p95-seconds", type=non_negative_float, default=5.0)
     parser.add_argument("--saturation-error-rate", type=non_negative_float, default=0.20)
     parser.add_argument("--baseline", choices=("always-on", "polling", "event-driven"), default=None)
+    parser.add_argument("--release-after-seconds", type=non_negative_int, default=20, help="How long release scenario waits before stopping publishers.")
+    parser.add_argument("--patch-proxy-context", action="store_true", help="Opt-in: temporarily patch proxy/controller deployments with experiment context and restore afterwards.")
     args = parser.parse_args(argv)
 
     keys = load_stream_keys(args.stream_keys, args.stream_keys_file)
@@ -221,6 +227,8 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         saturation_p95_seconds=args.saturation_p95_seconds,
         saturation_error_rate=args.saturation_error_rate,
         baseline=args.baseline,
+        release_after_seconds=args.release_after_seconds,
+        patch_proxy_context=args.patch_proxy_context,
     )
 
 
@@ -541,39 +549,140 @@ def collect_controller_http(config: RunnerConfig, dirs: dict[str, Path], phase: 
     return result
 
 
-def patch_proxy_context(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
-    """Best-effort propagation of experiment context to proxy hook scripts."""
-    if not shutil.which(config.kubectl_path) and not Path(config.kubectl_path).exists():
-        result = {"available": False, "skipped": True, "reason": f"kubectl not found: {config.kubectl_path}"}
-        write_json(dirs["raw"] / "proxy_context_patch.json", result)
+def deployment_env_snapshot(config: RunnerConfig, deployment: str, keys: Sequence[str]) -> dict[str, Any]:
+    """Capture current env values for the first container of a deployment.
+
+    This is a best-effort snapshot used only to restore experiment context keys after
+    --patch-proxy-context. It intentionally does not run unless the user opts in.
+    """
+    result = kubectl_json(config, ["get", f"deployment/{deployment}", "-n", config.namespace, "-o", "json"], timeout=60)
+    values = {key: None for key in keys}
+    if result.get("returncode") == 0:
+        try:
+            containers = (((result.get("json") or {}).get("spec") or {}).get("template") or {}).get("spec", {}).get("containers") or []
+            for container in containers:
+                for item in container.get("env") or []:
+                    name = item.get("name")
+                    if name in values:
+                        values[name] = item.get("value")
+        except Exception as exc:
+            result["snapshot_error"] = str(exc)
+    return {"deployment": deployment, "values": values, "kubectl": result}
+
+
+def restore_context_keys(config: RunnerConfig, dirs: dict[str, Path], patch_result: dict[str, Any]) -> dict[str, Any]:
+    """Restore context env keys changed by patch_proxy_context()."""
+    if not patch_result.get("patched"):
+        result = {"skipped": True, "reason": "context_was_not_patched"}
+        write_json(dirs["raw"] / "proxy_context_restore.json", result)
         return result
     commands = []
-    set_env = [
+    for deployment, snapshot in (patch_result.get("previous_env") or {}).items():
+        values = snapshot.get("values") or {}
+        args = [config.kubectl_path, "set", "env", f"deployment/{deployment}"]
+        for key, old_value in values.items():
+            args.append(f"{key}-" if old_value is None else f"{key}={old_value}")
+        args.extend(["-n", config.namespace])
+        commands.append(run_cmd(args, timeout=60))
+        if commands[-1].get("returncode") == 0:
+            commands.append(run_cmd([config.kubectl_path, "rollout", "status", f"deployment/{deployment}", "-n", config.namespace, "--timeout=120s"], timeout=150))
+    result = {"commands": commands, "ok": all(c.get("returncode") == 0 for c in commands)}
+    write_json(dirs["raw"] / "proxy_context_restore.json", result)
+    return result
+
+
+def patch_proxy_context(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
+    """Opt-in propagation of experiment context to proxy hooks and controller metrics/logs."""
+    if not config.patch_proxy_context:
+        result = {"available": True, "skipped": True, "patched": False, "reason": "--patch-proxy-context not enabled"}
+        write_json(dirs["raw"] / "proxy_context_patch.json", result)
+        return result
+    if not shutil.which(config.kubectl_path) and not Path(config.kubectl_path).exists():
+        result = {"available": False, "skipped": True, "patched": False, "reason": f"kubectl not found: {config.kubectl_path}"}
+        write_json(dirs["raw"] / "proxy_context_patch.json", result)
+        return result
+
+    proxy_keys = ["EXPERIMENT_ID", "SCENARIO", "RUN_ID"]
+    controller_keys = [
+        "LIVEEDGECAST_EXPERIMENT_ID", "LIVEEDGECAST_SCENARIO", "LIVEEDGECAST_RUN_ID",
+        "LIVEEDGECAST_TENANT", "LIVEEDGECAST_ENVIRONMENT", "LIVEEDGECAST_REGION",
+    ]
+    previous_env = {
+        "proxy": deployment_env_snapshot(config, "proxy", proxy_keys),
+        "controller": deployment_env_snapshot(config, "controller", controller_keys),
+    }
+    commands = []
+    proxy_set_env = [
         config.kubectl_path, "set", "env", "deployment/proxy",
         f"EXPERIMENT_ID={config.experiment_id}",
         f"SCENARIO={config.scenario}",
         f"RUN_ID={config.run_id}",
         "-n", config.namespace,
     ]
-    commands.append(run_cmd(set_env, timeout=60))
-    if commands[-1].get("returncode") == 0:
-        commands.append(run_cmd([config.kubectl_path, "rollout", "status", "deployment/proxy", "-n", config.namespace, "--timeout=120s"], timeout=150))
-    result = {"available": True, "commands": commands, "ok": all(c.get("returncode") == 0 for c in commands)}
+    controller_set_env = [
+        config.kubectl_path, "set", "env", "deployment/controller",
+        f"LIVEEDGECAST_EXPERIMENT_ID={config.experiment_id}",
+        f"LIVEEDGECAST_SCENARIO={config.scenario}",
+        f"LIVEEDGECAST_RUN_ID={config.run_id}",
+        f"LIVEEDGECAST_TENANT={config.experiment_id}",
+        f"LIVEEDGECAST_ENVIRONMENT={config.scenario}",
+        f"LIVEEDGECAST_REGION={config.run_id}",
+        "-n", config.namespace,
+    ]
+    for command, deployment in ((proxy_set_env, "proxy"), (controller_set_env, "controller")):
+        commands.append(run_cmd(command, timeout=60))
+        if commands[-1].get("returncode") == 0:
+            commands.append(run_cmd([config.kubectl_path, "rollout", "status", f"deployment/{deployment}", "-n", config.namespace, "--timeout=120s"], timeout=150))
+    result = {
+        "available": True,
+        "skipped": False,
+        "patched": all(c.get("returncode") == 0 for c in commands),
+        "commands": commands,
+        "previous_env": previous_env,
+        "metric_scope": prometheus_controller_label_selector(config),
+    }
     write_json(dirs["raw"] / "proxy_context_patch.json", result)
     return result
+
+
+
+def prometheus_controller_label_selector(config: RunnerConfig) -> str:
+    if not config.patch_proxy_context:
+        return ""
+    return '{tenant="%s",environment="%s",region="%s"}' % (
+        prom_label_value(config.experiment_id),
+        prom_label_value(config.scenario),
+        prom_label_value(config.run_id),
+    )
+
+
+def prom_label_value(value: str) -> str:
+    return str(value).replace('\\', '\\\\').replace('"', '\\"')
+
+
+def render_promql(config: RunnerConfig, query: str) -> str:
+    return (
+        query
+        .replace("$namespace", config.namespace)
+        .replace("$experiment_id", prom_label_value(config.experiment_id))
+        .replace("$scenario", prom_label_value(config.scenario))
+        .replace("$run_id", prom_label_value(config.run_id))
+        .replace("$controller_label_selector", prometheus_controller_label_selector(config))
+    )
 
 
 def prometheus_query(config: RunnerConfig, query: str, start: float, end: float, step: int = 5) -> dict[str, Any]:
     if not config.prometheus_url:
         return {"available": False, "reason": "prometheus_url_not_configured", "query": query}
-    params = urlencode({"query": query.replace("$namespace", config.namespace), "start": f"{start:.3f}", "end": f"{end:.3f}", "step": str(step)})
+    rendered_query = render_promql(config, query)
+    params = urlencode({"query": rendered_query, "start": f"{start:.3f}", "end": f"{end:.3f}", "step": str(step)})
     url = f"{config.prometheus_url}/api/v1/query_range?{params}"
     try:
         with urlopen(Request(url, headers={"User-Agent": "liveedgecast-experiment/1"}), timeout=30) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        return {"available": True, "query": query, "response": payload}
+        return {"available": True, "query": query, "rendered_query": rendered_query, "response": payload}
     except Exception as exc:
-        return {"available": False, "query": query, "error": {"type": type(exc).__name__, "message": str(exc)}}
+        return {"available": False, "query": query, "rendered_query": locals().get("rendered_query", query), "error": {"type": type(exc).__name__, "message": str(exc)}}
 
 
 def collect_prometheus(config: RunnerConfig, dirs: dict[str, Path], start: float, end: float) -> dict[str, Any]:
@@ -705,23 +814,25 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
                 publishers.append(start_publisher(config, dirs, key, repetition, index + 1))
                 if index < len(stream_keys) - 1 and config.startup_interval_seconds:
                     time.sleep(config.startup_interval_seconds)
+        if config.scenario == "release":
+            time.sleep(min(config.release_after_seconds, config.duration_seconds))
         if config.scenario == "worker-failure" or config.kill_worker:
             time.sleep(min(config.kill_after_seconds, max(1, config.duration_seconds - 1)))
             target_stream = stream_keys[0]
             pod = select_pod_by_selector(config, "app=worker", stream_key=target_stream) or select_pod_by_selector(config, "app=worker")
             if pod:
                 deleted = delete_pod(config, pod)
-                injected.append({"type": "worker-failure", "pod": pod, "timestamp": now_epoch(), "result": deleted})
+                injected.append({"type": "worker-failure", "stream_key": target_stream, "pod": pod, "timestamp": now_epoch(), "result": deleted})
             else:
-                injected.append({"type": "worker-failure", "status": "pod_not_found", "timestamp": now_epoch()})
+                injected.append({"type": "worker-failure", "stream_key": target_stream, "status": "pod_not_found", "timestamp": now_epoch()})
         if config.scenario == "proxy-failure" or config.kill_proxy:
             time.sleep(min(config.kill_after_seconds, max(1, config.duration_seconds - 1)))
             pod = select_pod_by_selector(config, "app=proxy")
             if pod:
                 deleted = delete_pod(config, pod)
-                injected.append({"type": "proxy-failure", "pod": pod, "timestamp": now_epoch(), "result": deleted})
+                injected.append({"type": "proxy-failure", "stream_key": stream_keys[0] if stream_keys else None, "pod": pod, "timestamp": now_epoch(), "result": deleted})
             else:
-                injected.append({"type": "proxy-failure", "status": "pod_not_found", "timestamp": now_epoch()})
+                injected.append({"type": "proxy-failure", "stream_key": stream_keys[0] if stream_keys else None, "status": "pod_not_found", "timestamp": now_epoch()})
         # Release scenario intentionally stops publishers and waits for cleanup observation.
         results = wait_or_stop_publishers(config, dirs, publishers, wait=(config.scenario != "release"))
         if config.cooldown_seconds:
@@ -749,7 +860,18 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
     except Exception as exc:
         for publisher in publishers:
             publisher.stop()
-        return {"repetition": repetition, "started_at": run_started, "ended_at": now_epoch(), "stream_keys": stream_keys, "error": {"type": type(exc).__name__, "message": str(exc)}, "injected_failures": injected}
+        run_ended = now_epoch()
+        failure_summary = {
+            "event": "run_failed",
+            "repetition": repetition,
+            "started_at": run_started,
+            "ended_at": run_ended,
+            "stream_keys": stream_keys,
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+            "injected_failures": injected,
+        }
+        append_jsonl(dirs["raw"] / "streams.jsonl", failure_summary)
+        return {k: v for k, v in failure_summary.items() if k != "event"}
 
 
 
@@ -770,34 +892,64 @@ def build_pilot_levels(max_n: int, step_size: int) -> list[int]:
     return levels
 
 
+def activation_p95_for_repetition(config: RunnerConfig, dirs: dict[str, Path], repetition: int) -> float | None:
+    publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
+    activation_rows, _, _ = build_lifecycle_rows(config, dirs, publisher_rows)
+    values = sorted(
+        float(r["total_activation_seconds"])
+        for r in activation_rows
+        if int(r.get("repetition") or -1) == repetition and r.get("total_activation_seconds") is not None
+    )
+    return percentile(values, 95) if values else None
+
+
 def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
     if config.dry_run:
-        return {"dry_run": True, "would_run": config.scenario, "stream_keys": config.stream_keys}
+        return {"dry_run": True, "would_run": config.scenario, "stream_keys": config.stream_keys, "status": "valid"}
     if not shutil.which(config.ffmpeg_path) and not Path(config.ffmpeg_path).exists():
         raise RuntimeError(f"ffmpeg not found: {config.ffmpeg_path}")
     start = now_epoch()
+    patch_result = patch_proxy_context(config, dirs)
     preflight = {
-        "proxy_context_patch": patch_proxy_context(config, dirs),
+        "proxy_context_patch": patch_result,
         "controller_before": collect_controller_http(config, dirs, "before"),
     }
     run_summaries: list[dict[str, Any]] = []
-    if config.scenario == "pilot-capacity":
-        for level in build_pilot_levels(len(config.stream_keys), config.pilot_step_size):
-            keys = config.stream_keys[:level]
-            summary = execute_single_run(config, dirs, level, keys)
-            summary["pilot_concurrency"] = level
-            run_summaries.append(summary)
-            if summary.get("error_rate", 0) >= config.saturation_error_rate:
-                summary["saturation_reason"] = "publisher_error_rate"
-                break
-    else:
-        for repetition in range(1, config.repetitions + 1):
-            run_summaries.append(execute_single_run(config, dirs, repetition, config.stream_keys))
+    status = "valid"
+    try:
+        if config.scenario == "pilot-capacity":
+            for level in build_pilot_levels(len(config.stream_keys), config.pilot_step_size):
+                keys = config.stream_keys[:level]
+                summary = execute_single_run(config, dirs, level, keys)
+                summary["pilot_concurrency"] = level
+                run_summaries.append(summary)
+                saturation_reasons = []
+                if summary.get("error_rate", 0) >= config.saturation_error_rate:
+                    saturation_reasons.append("publisher_error_rate")
+                # Best-effort latency criterion: collect logs after each level and evaluate observed P95.
+                collect_logs(config, dirs)
+                observed_p95 = activation_p95_for_repetition(config, dirs, repetition=level)
+                summary["activation_p95_seconds"] = observed_p95
+                if observed_p95 is not None and observed_p95 >= config.saturation_p95_seconds:
+                    saturation_reasons.append("activation_p95_threshold")
+                if summary.get("error"):
+                    saturation_reasons.append("run_error")
+                if saturation_reasons:
+                    summary["saturation_reason"] = ",".join(saturation_reasons)
+                    break
+        else:
+            for repetition in range(1, config.repetitions + 1):
+                run_summaries.append(execute_single_run(config, dirs, repetition, config.stream_keys))
+        if any(run.get("error") for run in run_summaries):
+            status = "failed" if config.scenario == "cold-start" else "partial"
+    finally:
+        restore_result = restore_context_keys(config, dirs, patch_result)
     end = now_epoch()
     prometheus = collect_prometheus(config, dirs, start, end)
     logs = collect_logs(config, dirs)
     controller_after = collect_controller_http(config, dirs, "after")
     return {
+        "status": status,
         "started_at": start,
         "ended_at": end,
         "preflight": preflight,
@@ -805,6 +957,7 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
         "prometheus": summarize_prometheus_availability(prometheus),
         "logs": logs,
         "controller_after": controller_after,
+        "context_restore": restore_result,
     }
 
 
@@ -878,6 +1031,76 @@ def prom_values(result: dict[str, Any]) -> list[float]:
     return values
 
 
+
+def prom_series_values_by_component(result: dict[str, Any]) -> dict[str, list[float]]:
+    response = result.get("response") or {}
+    data = response.get("data") or {}
+    grouped: dict[str, list[float]] = {}
+    for series in data.get("result") or []:
+        metric = series.get("metric") or {}
+        component = infer_component(metric.get("pod") or metric.get("pod_name") or metric.get("container") or "")
+        if component == "unknown" and metric.get("job"):
+            component = infer_component(str(metric.get("job")))
+        bucket = grouped.setdefault(component, [])
+        for _, value in series.get("values") or []:
+            try:
+                bucket.append(float(value))
+            except Exception:
+                continue
+    return grouped
+
+
+def prom_time_integral(result: dict[str, Any], fallback_duration: float = 0.0) -> tuple[float | None, str]:
+    """Integrate a Prometheus count-like query over time using step-wise samples."""
+    response = result.get("response") or {}
+    data = response.get("data") or {}
+    total = 0.0
+    saw_values = False
+    for series in data.get("result") or []:
+        samples = []
+        for ts, value in series.get("values") or []:
+            try:
+                samples.append((float(ts), float(value)))
+            except Exception:
+                continue
+        if not samples:
+            continue
+        saw_values = True
+        samples.sort()
+        if len(samples) == 1:
+            total += samples[0][1] * fallback_duration
+            continue
+        for (t1, v1), (t2, _v2) in zip(samples, samples[1:]):
+            if t2 > t1:
+                total += v1 * (t2 - t1)
+    if not saw_values:
+        return None, "no_prometheus_samples"
+    return total, "prometheus_time_integral"
+
+
+def first_observable_recovery_event(events: list[dict[str, Any]], injected_ts: Any, stream_key: str | None) -> tuple[float | None, str | None]:
+    if not isinstance(injected_ts, (int, float)):
+        return None, None
+    preferred_fields = ("t_ffmpeg_first_progress", "t_worker_ready", "t_worker_pod_created")
+    candidates: list[tuple[int, float, str]] = []
+    for event in events:
+        ts = event.get("timestamp_epoch")
+        if not isinstance(ts, (int, float)) or ts < injected_ts:
+            continue
+        if stream_key and event.get("stream") not in (stream_key, None):
+            continue
+        field = lifecycle_field_from_event(event)
+        if field in preferred_fields:
+            candidates.append((preferred_fields.index(field), ts, field))
+        elif event.get("event_type") in {"worker_recovered", "worker_replacement_completed"}:
+            candidates.append((0, ts, str(event.get("event_type"))))
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][1], candidates[0][2]
+
+
+
 def stats(values: Sequence[float]) -> dict[str, Any]:
     clean = [float(v) for v in values if v is not None and math.isfinite(float(v))]
     if not clean:
@@ -945,8 +1168,9 @@ def load_run_windows(config: RunnerConfig, dirs: dict[str, Path]) -> list[dict[s
         if record.get("event") == "run_started":
             current["started_at"] = record.get("timestamp")
             current["stream_keys"] = record.get("stream_keys") or current["stream_keys"]
-        elif record.get("event") == "run_finished":
+        elif record.get("event") in {"run_finished", "run_failed"}:
             current["ended_at"] = record.get("ended_at") or record.get("timestamp")
+            current["status"] = "failed" if record.get("event") == "run_failed" else "finished"
             current["stream_keys"] = record.get("stream_keys") or current["stream_keys"]
     if windows:
         return [windows[key] for key in sorted(windows)]
@@ -1083,20 +1307,31 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
 
     resilience_rows = []
     for run in read_jsonl(dirs["raw"] / "streams.jsonl"):
-        if run.get("event") == "run_finished":
+        if run.get("event") in {"run_finished", "run_failed"}:
             for injected in run.get("injected_failures") or []:
                 injected_ts = injected.get("timestamp")
-                recovery_end = None
-                if injected.get("type") == "worker-failure":
-                    candidates = [e.get("timestamp_epoch") for e in controller_events if e.get("event_type") in {"worker_deleted", "stream_lifecycle_timestamp_observed"} and isinstance(e.get("timestamp_epoch"), (int, float)) and (not injected_ts or e.get("timestamp_epoch") >= injected_ts)]
-                    recovery_end = min(candidates) if candidates else None
-                resilience_rows.append({"type": injected.get("type"), "pod": injected.get("pod"), "timestamp": injected_ts, "recovery_seconds": delta(injected_ts, recovery_end), "status": injected.get("status") or ("injected" if injected.get("pod") else "not_injected")})
-    write_csv(dirs["metrics"] / "resilience_metrics.csv", resilience_rows, ["type", "pod", "timestamp", "recovery_seconds", "status"])
+                stream_key = injected.get("stream_key")
+                recovery_end, recovery_event = first_observable_recovery_event(controller_events, injected_ts, stream_key)
+                resilience_rows.append({
+                    "type": injected.get("type"),
+                    "stream_key": stream_key,
+                    "pod": injected.get("pod"),
+                    "timestamp": injected_ts,
+                    "recovery_completed_at": recovery_end,
+                    "recovery_event": recovery_event,
+                    "recovery_seconds": delta(injected_ts, recovery_end),
+                    "status": injected.get("status") or ("injected" if injected.get("pod") else "not_injected"),
+                })
+    write_csv(dirs["metrics"] / "resilience_metrics.csv", resilience_rows, ["type", "stream_key", "pod", "timestamp", "recovery_completed_at", "recovery_event", "recovery_seconds", "status"])
 
     resource_rows = []
-    for metric_name, component in [("pod_cpu_rate", "cpu"), ("pod_memory_working_set", "memory"), ("proxy_network_receive_bps", "network_receive"), ("proxy_network_transmit_bps", "network_transmit")]:
-        s = stats(prom_values(prom.get(metric_name, {})))
-        resource_rows.append({"metric": metric_name, "component": component, **s})
+    for metric_name in ("pod_cpu_rate", "pod_memory_working_set", "proxy_network_receive_bps", "proxy_network_transmit_bps"):
+        grouped_components = prom_series_values_by_component(prom.get(metric_name, {}))
+        if not grouped_components:
+            resource_rows.append({"metric": metric_name, "component": "not_observable", **stats([])})
+            continue
+        for component, values in sorted(grouped_components.items()):
+            resource_rows.append({"metric": metric_name, "component": component, **stats(values)})
     write_csv(dirs["metrics"] / "resource_usage.csv", resource_rows, ["metric", "component", "samples", "mean", "median", "stddev", "p50", "p95", "p99", "min", "max", "ci95_low", "ci95_high"])
 
     workers_by_stream = {}
@@ -1118,23 +1353,20 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     correctness_rows.append({"stream_key": "__orphans__", "worker_count_observed": orphan_candidates, "one_worker_per_stream": None, "duplicate_worker_detected": None, "handover_accepted": handover_accepted, "handover_denied": handover_denied, "stale_events_ignored": stale_ignored})
     write_csv(dirs["metrics"] / "correctness_metrics.csv", correctness_rows, ["stream_key", "worker_count_observed", "one_worker_per_stream", "duplicate_worker_detected", "handover_accepted", "handover_denied", "stale_events_ignored"])
 
-    workers_active_values = prom_values(prom.get("workers_active", {}))
-    proxies_active_values = prom_values(prom.get("proxies_active", {}))
     metadata = json.loads((config.report_root / "metadata.json").read_text(encoding="utf-8")) if (config.report_root / "metadata.json").exists() else {}
     duration = max(0.0, (metadata.get("ended_at") or 0) - (metadata.get("started_at") or 0))
-    observed_worker_count = statistics.mean(workers_active_values) if workers_active_values else None
-    observed_proxy_count = statistics.mean(proxies_active_values) if proxies_active_values else None
-    worker_pod_seconds = (observed_worker_count or 0) * duration
-    proxy_pod_seconds = (observed_proxy_count or 0) * duration
+    worker_pod_seconds, worker_cost_source = prom_time_integral(prom.get("workers_active", {}), fallback_duration=duration)
+    proxy_pod_seconds, proxy_cost_source = prom_time_integral(prom.get("proxies_active", {}), fallback_duration=duration)
     controller_pod_seconds = duration
+    # Reference assumes one always-on worker capacity unit per streamKey for the whole experiment duration.
     always_on_worker_pod_seconds = max(1, len(config.stream_keys)) * duration
-    economy_relative = None if (not workers_active_values or always_on_worker_pod_seconds <= 0) else 1 - (worker_pod_seconds / always_on_worker_pod_seconds)
+    economy_relative = None if (worker_pod_seconds is None or always_on_worker_pod_seconds <= 0) else 1 - (worker_pod_seconds / always_on_worker_pod_seconds)
     cost_rows = [
-        {"metric": "worker_pod_seconds", "value": worker_pod_seconds, "source": "prometheus_workers_active_mean" if workers_active_values else "no_prometheus_samples"},
-        {"metric": "proxy_pod_seconds", "value": proxy_pod_seconds, "source": "prometheus_proxies_active_mean" if proxies_active_values else "no_prometheus_samples"},
-        {"metric": "controller_pod_seconds", "value": controller_pod_seconds, "source": "experiment_duration"},
-        {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds, "source": "len_stream_keys_times_duration"},
-        {"metric": "relative_savings_vs_always_on_workers", "value": economy_relative, "source": "derived_estimate" if workers_active_values else "not_supported_without_prometheus"},
+        {"metric": "worker_pod_seconds", "value": worker_pod_seconds, "source": worker_cost_source},
+        {"metric": "proxy_pod_seconds", "value": proxy_pod_seconds, "source": proxy_cost_source},
+        {"metric": "controller_pod_seconds", "value": controller_pod_seconds, "source": "experiment_duration_assumes_single_controller"},
+        {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds, "source": "len_stream_keys_times_duration_reference"},
+        {"metric": "relative_savings_vs_always_on_workers", "value": economy_relative, "source": "resource_time_estimate" if worker_pod_seconds is not None else "not_supported_without_prometheus"},
     ]
     write_csv(dirs["metrics"] / "cost_estimation.csv", cost_rows, ["metric", "value", "source"])
 
@@ -1288,6 +1520,48 @@ def format_cell(value: Any) -> str:
     return str(value).replace("|", "\\|")
 
 
+
+def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> list[dict[str, Any]]:
+    activation = csv_rows(dirs["metrics"] / "activation_metrics.csv")
+    release = csv_rows(dirs["metrics"] / "release_metrics.csv")
+    correctness = {row.get("stream_key"): row for row in csv_rows(dirs["metrics"] / "correctness_metrics.csv")}
+    publishers = [row for row in read_jsonl(dirs["raw"] / "publishers.jsonl") if row.get("event") == "publisher_finished"]
+    pods = extract_pod_rows(dirs, config.stream_keys)
+    pod_by_stream: dict[str, dict[str, Any]] = {}
+    for row in pods:
+        stream = row.get("stream_key")
+        if stream and row.get("component") == "worker":
+            pod_by_stream[stream] = row
+    release_by_key = {(str(row.get("repetition")), row.get("stream_key")): row for row in release}
+    publisher_by_key = {(str(row.get("repetition")), row.get("stream_key")): row for row in publishers}
+    rows: list[dict[str, Any]] = []
+    for row in activation:
+        key = row.get("stream_key")
+        rep = str(row.get("repetition"))
+        rel = release_by_key.get((rep, key), {})
+        pub = publisher_by_key.get((rep, key), {})
+        corr = correctness.get(key, {})
+        pod = pod_by_stream.get(key, {})
+        rows.append({
+            "repetition": rep,
+            "streamKey": key,
+            "worker": pod.get("pod") or "não observado",
+            "proxy_owner": pod.get("proxy_pod") or "não observado",
+            "publisher_status": "success" if pub.get("returncode") == 0 else ("running_or_unknown" if pub.get("returncode") is None else "failed"),
+            "activation_seconds": row.get("total_activation_seconds") or "não observável",
+            "release_seconds": rel.get("total_release_seconds") or "não observável",
+            "duplicate_worker": corr.get("duplicate_worker_detected"),
+            "handover_accepted": corr.get("handover_accepted"),
+            "handover_denied": corr.get("handover_denied"),
+            "observations": row.get("status"),
+        })
+    if not rows:
+        for key in config.stream_keys:
+            rows.append({"repetition": "-", "streamKey": key, "worker": "não observado", "proxy_owner": "não observado", "publisher_status": "não observado", "activation_seconds": "não observável", "release_seconds": "não observável", "duplicate_worker": "não observado", "handover_accepted": "0", "handover_denied": "0", "observations": "sem linhas de ativação"})
+    return rows
+
+
+
 def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict[str, Any], metrics: dict[str, Any], charts: dict[str, str]) -> dict[str, Any]:
     metadata = json.loads((dirs["root"] / "metadata.json").read_text(encoding="utf-8"))
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
@@ -1323,6 +1597,7 @@ Experimento `{config.experiment_id}` executado no cenário `{config.scenario}` c
 - Source file: `{config.source_file or 'gerado por lavfi/testsrc'}`
 - Bitrate: `{config.bitrate or 'padrão/copy'}`
 - Baseline informado: `{config.baseline or 'não informado'}`
+- Patch de contexto em deployments: `{'ativado' if config.patch_proxy_context else 'desativado'}`
 
 ## Métricas principais
 
@@ -1330,7 +1605,7 @@ Experimento `{config.experiment_id}` executado no cenário `{config.scenario}` c
 
 ## Resultado por streamKey
 
-{md_table([{'streamKey': k, 'status': 'verificar metrics/correctness_metrics.csv e raw/publishers.jsonl'} for k in config.stream_keys], ['streamKey','status'])}
+{md_table(build_stream_result_rows(config, dirs), ['repetition','streamKey','worker','proxy_owner','publisher_status','activation_seconds','release_seconds','duplicate_worker','handover_accepted','handover_denied','observations'])}
 
 ## Uso de recursos
 
@@ -1353,7 +1628,8 @@ A verificação de um worker por streamKey e candidatos a órfãos foi salva em 
 - Métricas ausentes ou não observáveis nesta execução: {', '.join(unavailable) if unavailable else 'nenhuma limitação automática detectada'}.
 - Tempos per-stream de cold start dependem da exportação de timestamps pelo controller; quando não há endpoint per-stream, o relatório usa apenas histogramas Prometheus agregados.
 - `t_destination_received` só pode ser sustentado se houver callback/observação no destino externo.
-- A estimativa de custo relativo é uma aproximação por pod-seconds; não equivale a cobrança real de provedor de nuvem.
+- A estimativa de custo relativo é uma aproximação por resource-time/pod-seconds; não equivale a cobrança real de provedor de nuvem.
+- Métricas de cAdvisor/kube-state-metrics são isoladas por namespace; para evitar contaminação, execute cada experimento em namespace dedicado ou use `--patch-proxy-context` para escopo das métricas do controller.
 - A validade estatística depende do número de repetições e da disponibilidade de amostras em Prometheus.
 
 ## Texto-base para Discussão dos Resultados
@@ -1387,58 +1663,6 @@ def discussion_text(config: RunnerConfig, report_json: dict[str, Any]) -> str:
     return "\n\n".join(lines)
 
 
-def write_docs(repo_root: Path) -> None:
-    docs_exp = repo_root / "docs" / "experiments"
-    docs_obs = repo_root / "docs" / "observability"
-    docs_exp.mkdir(parents=True, exist_ok=True)
-    docs_obs.mkdir(parents=True, exist_ok=True)
-    (docs_exp / "run-experiment.md").write_text("""# Executando experimentos com `run_experiment.py`
-
-O runner unificado executa publishers RTMP com FFmpeg, coleta evidências de Kubernetes/Prometheus, consolida métricas e gera `report.md` e `report.json`.
-
-Exemplo:
-
-```bash
-python tools/experiments/run_experiment.py \\
-  --stream-keys-file ./tools/experiments/stream_keys.txt \\
-  --scenario cold-start \\
-  --rtmp-url rtmp://127.0.0.1:1935/live \\
-  --duration-seconds 120 \\
-  --repetitions 30 \\
-  --prometheus-url http://localhost:9090 \\
-  --namespace media \\
-  --experiment-id exp-rtmp-coldstart-001 \\
-  --output-dir ./reports
-```
-
-Cenários suportados: `cold-start`, `concurrency`, `release`, `worker-failure`, `proxy-failure`, `handover`, `duplicate-streamkey` e `pilot-capacity`.
-
-Quando uma métrica não estiver disponível, o runner registra `null` nos CSVs e declara a limitação no relatório. O script não inventa tempos não observáveis.
-""", encoding="utf-8")
-    (docs_exp / "report-format.md").write_text("""# Formato do relatório experimental
-
-Cada execução cria:
-
-```text
-reports/<experiment-id>/
-  metadata.json
-  raw/
-  metrics/
-  logs/
-  charts/
-  report.md
-  report.json
-```
-
-Os CSVs em `metrics/` são a base para tabelas e discussão do artigo. Os arquivos em `raw/` preservam evidências brutas para auditoria e reprocessamento.
-""", encoding="utf-8")
-    promql_path = docs_obs / "promql.md"
-    with promql_path.open("a", encoding="utf-8") as fh:
-        fh.write("\n\n## Consultas usadas pelo runner unificado\n\n")
-        for name, query in DEFAULT_PROMQL.items():
-            fh.write(f"### {name}\n\n```promql\n{query}\n```\n\n")
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     config = parse_args(argv)
     dirs = ensure_layout(config.report_root)
@@ -1462,6 +1686,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     metrics = build_metrics(config, dirs)
     charts = generate_charts(dirs)
     generate_report(config, dirs, execution, metrics, charts)
+    if execution.get("status") == "failed":
+        exit_code = 1
     print(f"Report generated at: {dirs['root'] / 'report.md'}")
     return exit_code
 
