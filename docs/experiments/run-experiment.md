@@ -79,7 +79,7 @@ kubectl set env deployment/proxy EXPERIMENT_ID=<id> SCENARIO=<scenario> RUN_ID=<
 kubectl set env deployment/controller LIVEEDGECAST_EXPERIMENT_ID=<id> LIVEEDGECAST_SCENARIO=<scenario> LIVEEDGECAST_RUN_ID=<run> LIVEEDGECAST_TENANT=<id> LIVEEDGECAST_ENVIRONMENT=<scenario> LIVEEDGECAST_REGION=<run> -n <namespace>
 ```
 
-O patch é opt-in porque reinicia os deployments e pode interromper sessões RTMP ativas. Use preferencialmente um namespace dedicado por experimento. O runner captura o estado anterior das variáveis antes de alterar cada deployment; se o snapshot falhar para algum deployment, esse deployment não é alterado para evitar restauração destrutiva. O resultado do patch e da restauração fica em `raw/proxy_context_patch.json` e `raw/proxy_context_restore.json`. O escopo de métricas do controller só é usado quando o deployment `controller` foi efetivamente alterado e o rollout concluiu com sucesso; se o patch do controller for ignorado ou falhar, as queries do Prometheus não aplicam labels de experimento para evitar falso vazio. Quando `--patch-proxy-context` é solicitado e o patch não fica plenamente efetivo, o experimento passa a ser tratado como parcial/inválido para automação, salvo uso explícito de `--allow-unscoped-context`.
+O patch é opt-in porque reinicia os deployments e pode interromper sessões RTMP ativas. Use preferencialmente um namespace dedicado por experimento. O runner captura o estado anterior das variáveis antes de alterar cada deployment; se o snapshot falhar para algum deployment, esse deployment não é alterado para evitar restauração destrutiva. Para segurança, o patch também é recusado quando uma variável-alvo já existe com `valueFrom` de Secret/ConfigMap, pois `kubectl set env` não restaura esse tipo de referência de forma confiável a partir de um valor escalar. Em deployments com sidecars ou múltiplos containers, informe `--proxy-container` e/ou `--controller-container`; sem isso, o runner recusa o patch para evitar alterar o container errado. O resultado do patch e da restauração fica em `raw/proxy_context_patch.json` e `raw/proxy_context_restore.json`. O escopo de métricas do controller só é usado quando o deployment `controller` foi efetivamente alterado e o rollout concluiu com sucesso; se o patch do controller for ignorado ou falhar, as queries do Prometheus não aplicam labels de experimento para evitar falso vazio. Quando `--patch-proxy-context` é solicitado e o patch não fica plenamente efetivo, o experimento passa a ser tratado como parcial/inválido para automação, salvo uso explícito de `--allow-unscoped-context`.
 
 O runner também coleta logs estruturados e gera:
 
@@ -121,7 +121,8 @@ O runner não altera a documentação do repositório durante a execução. Todo
 - Repetições com erro geram evento `run_failed`, fechando a janela temporal da repetição para evitar contaminação de métricas posteriores.
 - O cenário `release` aguarda `--release-after-seconds` antes de encerrar publishers, permitindo que a stream fique ativa antes da medição de limpeza.
 - Para evitar contaminação em métricas de cAdvisor/kube-state-metrics, execute apenas um experimento por namespace ou use namespaces isolados por execução.
-- Cenários `handover` e `duplicate-streamkey` são marcados como inconclusivos quando a segunda publicação não é observada em outro proxy após o timestamp da segunda tentativa. A rejeição do controller e a validade entre proxies são reportadas separadamente.
+- Cenários `handover` e `duplicate-streamkey` são marcados como inconclusivos quando a segunda publicação não é observada em outro proxy após o timestamp da segunda tentativa. A rejeição do controller e a validade entre proxies são reportadas separadamente. Por padrão, uma hipótese inconclusiva nesses cenários retorna código de saída `1`; use `--allow-inconclusive` apenas quando deseja preservar o relatório sem tratar a execução como evidência conclusiva.
+- No cenário `duplicate-streamkey`, saída não-zero do segundo publisher sem rejeição observada pelo controller também torna a amostra inválida/inconclusiva para automação. O processo FFmpeg e a rejeição arquitetural são avaliados separadamente.
 - `--resume` agrega evidências no mesmo diretório; use um `run_id` único para cada retomada e interprete o relatório como agregado, não como apenas a execução mais recente.
 
 ## Segurança de diretórios e limpeza
@@ -141,10 +142,10 @@ Evite essa opção em namespaces compartilhados.
 
 ## Códigos de saída
 
-- `0`: experimento válido, `partial` aceito explicitamente com `--allow-partial`, ou patch de contexto incompleto aceito explicitamente com `--allow-unscoped-context`.
-- `1`: experimento `failed`, `partial` sem `--allow-partial`, patch de contexto solicitado mas inefetivo sem `--allow-unscoped-context`, ou falha de restauração de contexto após `--patch-proxy-context` sem `--allow-restore-failure`.
+- `0`: experimento válido, `partial` aceito explicitamente com `--allow-partial`, patch de contexto incompleto aceito explicitamente com `--allow-unscoped-context`, ou hipótese inconclusiva aceita explicitamente com `--allow-inconclusive`.
+- `1`: experimento `failed`, `partial` sem `--allow-partial`, patch de contexto solicitado mas inefetivo sem `--allow-unscoped-context`, falha de restauração de contexto após `--patch-proxy-context` sem `--allow-restore-failure`, ou cenário `handover`/`duplicate-streamkey` inconclusivo sem `--allow-inconclusive`.
 
-Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI. Use `--allow-unscoped-context` somente quando aceita que logs/métricas do controller podem não estar correlacionados por labels de experimento. Use `--allow-restore-failure` somente após confirmar limpeza manual do cluster, pois a restauração malsucedida pode deixar deployments com variáveis de ambiente experimentais.
+Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI. Use `--allow-unscoped-context` somente quando aceita que logs/métricas do controller podem não estar correlacionados por labels de experimento. Use `--allow-restore-failure` somente após confirmar limpeza manual do cluster, pois a restauração malsucedida pode deixar deployments com variáveis de ambiente experimentais. Use `--allow-inconclusive` apenas quando a execução será analisada manualmente e não será tratada como evidência conclusiva automática.
 
 ## Logs por fase
 

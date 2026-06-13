@@ -629,3 +629,180 @@ def test_context_patch_incomplete_can_be_allowed_explicitly(monkeypatch, tmp_pat
     monkeypatch.setattr(runner, "generate_report", lambda config_arg, dirs, execution, metrics, charts: {})
 
     assert runner.main([]) == 0
+
+
+def test_deployment_env_snapshot_refuses_value_from_target_keys(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+
+    def fake_kubectl_json(config_arg, args, timeout=60):
+        return {
+            "returncode": 0,
+            "json": {
+                "spec": {"template": {"spec": {"containers": [{
+                    "name": "proxy",
+                    "env": [{"name": "EXPERIMENT_ID", "valueFrom": {"secretKeyRef": {"name": "ctx", "key": "experiment"}}}],
+                }]}}}
+            },
+        }
+
+    monkeypatch.setattr(runner, "kubectl_json", fake_kubectl_json)
+
+    snapshot = runner.deployment_env_snapshot(cfg, "proxy", ["EXPERIMENT_ID", "SCENARIO", "RUN_ID"])
+
+    assert snapshot["snapshot_ok"] is True
+    assert snapshot["safe_to_patch"] is False
+    assert snapshot["unsafe_value_from_keys"] == ["EXPERIMENT_ID"]
+    assert snapshot["reason"] == "target_keys_use_valueFrom"
+
+
+def test_deployment_env_snapshot_requires_container_for_sidecars(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+
+    def fake_kubectl_json(config_arg, args, timeout=60):
+        return {
+            "returncode": 0,
+            "json": {
+                "spec": {"template": {"spec": {"containers": [
+                    {"name": "proxy", "env": []},
+                    {"name": "sidecar", "env": []},
+                ]}}}
+            },
+        }
+
+    monkeypatch.setattr(runner, "kubectl_json", fake_kubectl_json)
+
+    snapshot = runner.deployment_env_snapshot(cfg, "proxy", ["EXPERIMENT_ID", "SCENARIO", "RUN_ID"])
+
+    assert snapshot["safe_to_patch"] is False
+    assert snapshot["reason"] == "multiple_containers_require_explicit_container"
+
+
+def test_deployment_env_snapshot_allows_explicit_container_with_sidecars(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    cfg.proxy_container = "proxy"
+
+    def fake_kubectl_json(config_arg, args, timeout=60):
+        return {
+            "returncode": 0,
+            "json": {
+                "spec": {"template": {"spec": {"containers": [
+                    {"name": "proxy", "env": [{"name": "SCENARIO", "value": "old"}]},
+                    {"name": "sidecar", "env": [{"name": "SCENARIO", "value": "sidecar"}]},
+                ]}}}
+            },
+        }
+
+    monkeypatch.setattr(runner, "kubectl_json", fake_kubectl_json)
+
+    snapshot = runner.deployment_env_snapshot(cfg, "proxy", ["EXPERIMENT_ID", "SCENARIO", "RUN_ID"])
+
+    assert snapshot["safe_to_patch"] is True
+    assert snapshot["target_container"] == "proxy"
+    assert snapshot["values"]["SCENARIO"] == "old"
+
+
+def test_restore_context_keys_targets_original_container(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    commands = []
+
+    def fake_run_cmd(command, timeout=60):
+        commands.append(command)
+        return {"returncode": 0, "command": command, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(runner, "run_cmd", fake_run_cmd)
+    patch_result = {
+        "patched_deployments": ["proxy"],
+        "previous_env": {
+            "proxy": {
+                "snapshot_ok": True,
+                "safe_to_patch": True,
+                "target_container": "proxy",
+                "values": {"EXPERIMENT_ID": None, "SCENARIO": "old", "RUN_ID": None},
+            }
+        },
+    }
+
+    result = runner.restore_context_keys(cfg, dirs, patch_result)
+
+    assert result["ok"] is True
+    assert any("--containers=proxy" in part for command in commands for part in command)
+
+
+def test_inconclusive_duplicate_streamkey_changes_exit_code_by_default(monkeypatch, tmp_path):
+    cfg = config(tmp_path, scenario="duplicate-streamkey")
+    cfg.ffmpeg_path = "/bin/true"
+    cfg.output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(runner, "parse_args", lambda argv=None: cfg)
+    monkeypatch.setattr(runner, "execute_experiment", lambda config_arg, dirs: {
+        "status": "valid",
+        "restore_ok": True,
+        "context_scope_ok": True,
+        "started_at": 1.0,
+        "ended_at": 2.0,
+        "preflight": {"proxy_context_patch": {"controller_scope_effective": False}},
+        "runs": [],
+        "prometheus": {},
+    })
+    monkeypatch.setattr(runner, "build_metrics", lambda config_arg, dirs: {
+        "activation": {}, "resources": [], "cost": [], "missing": [],
+        "duplicate_streamkey": [{"scenario_inconclusive": True}],
+    })
+    monkeypatch.setattr(runner, "generate_charts", lambda dirs: {})
+    monkeypatch.setattr(runner, "generate_report", lambda config_arg, dirs, execution, metrics, charts: {})
+
+    assert runner.main([]) == 1
+
+
+def test_inconclusive_duplicate_streamkey_can_be_allowed(monkeypatch, tmp_path):
+    cfg = config(tmp_path, scenario="duplicate-streamkey")
+    cfg.allow_inconclusive = True
+    cfg.ffmpeg_path = "/bin/true"
+    cfg.output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(runner, "parse_args", lambda argv=None: cfg)
+    monkeypatch.setattr(runner, "execute_experiment", lambda config_arg, dirs: {
+        "status": "valid",
+        "restore_ok": True,
+        "context_scope_ok": True,
+        "started_at": 1.0,
+        "ended_at": 2.0,
+        "preflight": {"proxy_context_patch": {"controller_scope_effective": False}},
+        "runs": [],
+        "prometheus": {},
+    })
+    monkeypatch.setattr(runner, "build_metrics", lambda config_arg, dirs: {
+        "activation": {}, "resources": [], "cost": [], "missing": [],
+        "duplicate_streamkey": [{"scenario_inconclusive": True}],
+    })
+    monkeypatch.setattr(runner, "generate_charts", lambda dirs: {})
+    monkeypatch.setattr(runner, "generate_report", lambda config_arg, dirs, execution, metrics, charts: {})
+
+    assert runner.main([]) == 0
+
+
+def test_duplicate_publisher_nonzero_without_rejection_changes_exit_code(monkeypatch, tmp_path):
+    cfg = config(tmp_path, scenario="duplicate-streamkey")
+    cfg.ffmpeg_path = "/bin/true"
+    cfg.output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(runner, "parse_args", lambda argv=None: cfg)
+    monkeypatch.setattr(runner, "execute_experiment", lambda config_arg, dirs: {
+        "status": "valid",
+        "restore_ok": True,
+        "context_scope_ok": True,
+        "started_at": 1.0,
+        "ended_at": 2.0,
+        "preflight": {"proxy_context_patch": {"controller_scope_effective": False}},
+        "runs": [],
+        "prometheus": {},
+    })
+    monkeypatch.setattr(runner, "build_metrics", lambda config_arg, dirs: {
+        "activation": {}, "resources": [], "cost": [], "missing": [],
+        "duplicate_streamkey": [{"duplicate_publisher_nonzero_without_controller_rejection": True}],
+    })
+    monkeypatch.setattr(runner, "generate_charts", lambda dirs: {})
+    monkeypatch.setattr(runner, "generate_report", lambda config_arg, dirs, execution, metrics, charts: {})
+
+    assert runner.main([]) == 1

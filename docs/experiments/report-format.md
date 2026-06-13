@@ -77,11 +77,11 @@ Resume indícios de correção por `run_id + repetition + streamKey`. O arquivo 
 
 ### `duplicate_streamkey_metrics.csv`
 
-Registra explicitamente se houve tentativa de publicar uma `streamKey` duplicada, se o controller observou rejeição por conflito/handover negado e se houve aceitação inesperada. O arquivo também separa `duplicate_publisher_statuses` de `duplicate_publisher_process_statuses`; a primeira coluna é interpretação arquitetural, enquanto a segunda descreve o processo FFmpeg, como `nonzero_exit`, `success` ou `expected_stopped`. Esse arquivo deve ser usado na discussão sobre prevenção de duplicidade ou roubo de sessão.
+Registra explicitamente se houve tentativa de publicar uma `streamKey` duplicada, se o controller observou rejeição por conflito/handover negado e se houve aceitação inesperada. O arquivo também separa `duplicate_publisher_statuses` de `duplicate_publisher_process_statuses`; a primeira coluna é interpretação arquitetural, enquanto a segunda descreve o processo FFmpeg, como `nonzero_exit`, `success` ou `expected_stopped`. A coluna `duplicate_publisher_nonzero_without_controller_rejection=true` indica que o segundo publisher terminou com erro de processo sem rejeição observada do controller; por padrão isso invalida/parcializa a hipótese automatizada porque pode representar erro de RTMP/FFmpeg, e não proteção arquitetural. Esse arquivo deve ser usado na discussão sobre prevenção de duplicidade ou roubo de sessão.
 
 ### `resource_activity.csv` e `cost_estimation.csv`
 
-Calculam uma estimativa relativa de atividade por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada. Esses arquivos não representam cobrança financeira real de provedor de nuvem. O arquivo `cost_estimation.csv` é mantido por compatibilidade com o plano original; o relatório usa linguagem mais conservadora de “atividade relativa de recursos”.
+Calculam uma estimativa relativa de atividade por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada. Esses arquivos não representam cobrança financeira real de provedor de nuvem. O arquivo `resource_activity.csv` é o artefato primário; `cost_estimation.csv` é gerado apenas como alias legado do plano original e contém uma linha de aviso de depreciação. O relatório usa linguagem mais conservadora de “atividade relativa de recursos”.
 
 ## Gráficos
 
@@ -106,3 +106,5 @@ A coluna `duplicate_streamkey_rejected` depende de evidência explícita do cont
 Quando `--patch-proxy-context` é usado, `report.json.summary.restore_ok=false` indica que a restauração das variáveis de ambiente falhou. Nesse caso, o comando retorna código diferente de zero por padrão, e o cluster deve ser inspecionado manualmente antes de nova coleta.
 
 `report.json.summary.context_scope_ok=false` indica que o patch de contexto foi solicitado, mas não ficou totalmente efetivo. Por padrão, isso também faz o comando retornar código diferente de zero, pois a correlação por experimento pode estar incompleta. `report.json.summary.controller_scope_effective=true` indica que o escopo de labels do controller foi efetivamente aplicado nas consultas Prometheus. Quando esse campo é falso, as métricas do controller são consultadas sem labels de experimento para evitar falsos negativos.
+
+`report.json.summary.scenario_inconclusive=true` em `handover` ou `duplicate-streamkey` indica que a hipótese entre proxies não foi sustentada automaticamente, mesmo que a execução técnica tenha terminado. Por padrão isso retorna código diferente de zero, salvo `--allow-inconclusive`. `report.json.summary.duplicate_publisher_nonzero_without_controller_rejection=true` indica erro de processo do segundo publisher sem rejeição observada pelo controller e também deve ser tratado como evidência inválida/inconclusiva para a hipótese de proteção contra duplicidade.
