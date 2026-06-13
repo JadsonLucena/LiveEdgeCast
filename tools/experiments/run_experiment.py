@@ -39,6 +39,12 @@ SCENARIOS = (
 )
 
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+RESERVED_RUN_IDS = {"index", "latest", "__index__", "legacy"}
+PROMETHEUS_INDEX_FILENAME = "prometheus_range_queries.__index__.json"
+PROMETHEUS_LEGACY_INDEX_FILENAME = "prometheus_range_queries.index.json"
+PROMETHEUS_LEGACY_LATEST_FILENAME = "prometheus_range_queries.json"
+PROMETHEUS_RUN_PREFIX = "prometheus_range_queries.run."
+REQUIRED_PROMETHEUS_METRICS_FOR_ANALYSIS = {"workers_active", "proxies_active", "pod_cpu_rate"}
 
 DEFAULT_PROMQL = {
     # Controller metrics can be scoped by tenant/environment/region when --patch-proxy-context is used.
@@ -110,6 +116,7 @@ class RunnerConfig:
     allow_restore_failure: bool = False
     allow_unscoped_context: bool = False
     allow_inconclusive: bool = False
+    require_prometheus_analysis: bool = False
     proxy_container: str | None = None
     controller_container: str | None = None
     worker_metric_label_selector: str | None = 'namespace="$namespace"'
@@ -138,6 +145,8 @@ def safe_id(value: str, field: str) -> str:
     # accidentally make --overwrite delete an unintended directory.
     if value in {".", ".."} or Path(value).name != value:
         raise argparse.ArgumentTypeError(f"{field} must be a single safe path component, not {value!r}")
+    if field == "run_id" and value.lower() in RESERVED_RUN_IDS:
+        raise argparse.ArgumentTypeError(f"{field} value {value!r} is reserved for internal artifact names")
     return value
 
 
@@ -213,6 +222,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--allow-restore-failure", action="store_true", help="Return exit code 0 even if opt-in deployment context restoration fails. Use only after manual cluster cleanup.")
     parser.add_argument("--allow-unscoped-context", action="store_true", help="Return exit code 0 when --patch-proxy-context was requested but proxy/controller context patching was not fully effective.")
     parser.add_argument("--allow-inconclusive", action="store_true", help="Return exit code 0 for handover/duplicate-streamkey runs whose between-proxy hypothesis remains inconclusive. By default inconclusive hypothesis tests fail automation.")
+    parser.add_argument("--require-prometheus-analysis", action="store_true", help="Return exit code 1 when --prometheus-url is configured but required Prometheus samples for resource/activity analysis are incomplete.")
     parser.add_argument("--proxy-container", default=os.getenv("LIVEEDGECAST_PROXY_CONTAINER"), help="Container name to patch in deployment/proxy. Required when deployment/proxy has multiple containers.")
     parser.add_argument("--controller-container", default=os.getenv("LIVEEDGECAST_CONTROLLER_CONTAINER"), help="Container name to patch in deployment/controller. Required when deployment/controller has multiple containers.")
     parser.add_argument("--worker-metric-label-selector", default=os.getenv("LIVEEDGECAST_WORKER_METRIC_LABEL_SELECTOR", 'namespace="$namespace"'), help="Prometheus labels used to scope worker FFmpeg exporter metrics. Use an empty string only if those metrics do not carry scrape labels.")
@@ -268,6 +278,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         allow_restore_failure=args.allow_restore_failure,
         allow_unscoped_context=args.allow_unscoped_context,
         allow_inconclusive=args.allow_inconclusive,
+        require_prometheus_analysis=args.require_prometheus_analysis,
         proxy_container=args.proxy_container,
         controller_container=args.controller_container,
         worker_metric_label_selector=args.worker_metric_label_selector,
@@ -1002,16 +1013,33 @@ def prometheus_query(config: RunnerConfig, query: str, start: float, end: float,
 
 
 def prometheus_result_path(config: RunnerConfig, dirs: dict[str, Path]) -> Path:
-    return dirs["raw"] / f"prometheus_range_queries.{config.run_id}.json"
+    return dirs["raw"] / f"{PROMETHEUS_RUN_PREFIX}{config.run_id}.json"
+
+
+def prometheus_result_run_id_from_path(path: Path) -> str | None:
+    name = path.name
+    if name.startswith(PROMETHEUS_RUN_PREFIX) and name.endswith(".json"):
+        run_id = name[len(PROMETHEUS_RUN_PREFIX):-len(".json")]
+        if run_id:
+            return run_id
+    # Backward-compatible support for older per-run files named
+    # prometheus_range_queries.<run-id>.json. Reserved artifact names are not
+    # interpreted as run ids.
+    if name.startswith("prometheus_range_queries.") and name.endswith(".json"):
+        stem = name[len("prometheus_range_queries."):-len(".json")]
+        if stem and stem not in {"index", "__index__"}:
+            return stem
+    return None
 
 
 def prometheus_run_files(dirs: dict[str, Path]) -> list[Path]:
-    excluded = {"prometheus_range_queries.json", "prometheus_range_queries.index.json"}
-    return sorted(path for path in dirs["raw"].glob("prometheus_range_queries.*.json") if path.name not in excluded)
+    excluded = {PROMETHEUS_LEGACY_LATEST_FILENAME, PROMETHEUS_INDEX_FILENAME, PROMETHEUS_LEGACY_INDEX_FILENAME}
+    candidates = [path for path in dirs["raw"].glob("prometheus_range_queries.*.json") if path.name not in excluded]
+    return sorted(path for path in candidates if prometheus_result_run_id_from_path(path))
 
 
 def update_prometheus_index(config: RunnerConfig, dirs: dict[str, Path], path: Path, start: float, end: float) -> None:
-    index_path = dirs["raw"] / "prometheus_range_queries.index.json"
+    index_path = dirs["raw"] / PROMETHEUS_INDEX_FILENAME
     payload: dict[str, Any] = {"schema": "prometheus-range-query-index/v1", "runs": []}
     if index_path.exists():
         try:
@@ -1050,7 +1078,7 @@ def collect_prometheus(config: RunnerConfig, dirs: dict[str, Path], start: float
     update_prometheus_index(config, dirs, per_run_path, start, end)
     # Compatibility artifact for tools that still expect the latest run at the legacy path.
     # Aggregation in this runner reads per-run files first so resume does not lose prior evidence.
-    write_json(dirs["raw"] / "prometheus_range_queries.json", results)
+    write_json(dirs["raw"] / PROMETHEUS_LEGACY_LATEST_FILENAME, results)
     return results
 
 
@@ -1093,7 +1121,7 @@ def load_prometheus_evidence(dirs: dict[str, Path]) -> dict[str, Any]:
             continue
     if results:
         return merge_prometheus_results(results)
-    legacy = dirs["raw"] / "prometheus_range_queries.json"
+    legacy = dirs["raw"] / PROMETHEUS_LEGACY_LATEST_FILENAME
     if legacy.exists():
         try:
             return json.loads(legacy.read_text(encoding="utf-8"))
@@ -1122,12 +1150,12 @@ def load_prometheus_results_by_run(dirs: dict[str, Path]) -> dict[str, dict[str,
             payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             continue
-        run_id = prometheus_result_run_id(payload, fallback=path.stem.replace("prometheus_range_queries.", ""))
+        run_id = prometheus_result_run_id(payload, fallback=prometheus_result_run_id_from_path(path))
         if run_id:
             results[run_id] = payload
     if results:
         return results
-    legacy = dirs["raw"] / "prometheus_range_queries.json"
+    legacy = dirs["raw"] / PROMETHEUS_LEGACY_LATEST_FILENAME
     if legacy.exists():
         try:
             payload = json.loads(legacy.read_text(encoding="utf-8"))
@@ -2351,9 +2379,17 @@ def build_correctness_rows(
 
 
 def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
-    prom = load_prometheus_evidence(dirs)
     run_windows = load_run_windows(config, dirs)
     prom_coverage = prometheus_run_coverage(config, dirs, run_windows)
+    prom_results_by_run = load_prometheus_results_by_run(dirs)
+    expected_prom_run_ids = set(prom_coverage.get("expected_run_ids") or [])
+    # Use only Prometheus evidence tied to expected run windows for analysis.
+    # Extra/stale per-run files may exist after manual file copies or failed
+    # resume attempts; they should be reported as extras, not merged into
+    # resource/activity numerators.
+    prom_run_ids_for_analysis = expected_prom_run_ids if expected_prom_run_ids else set(prom_results_by_run)
+    prom_results_for_analysis = [prom_results_by_run[run_id] for run_id in sorted(prom_run_ids_for_analysis) if run_id in prom_results_by_run]
+    prom = merge_prometheus_results(prom_results_for_analysis) if prom_results_for_analysis else load_prometheus_evidence(dirs)
     prom_metric_rows = prometheus_metric_coverage_rows(config, dirs, run_windows)
     write_csv(
         dirs["metrics"] / "prometheus_metric_coverage.csv",
@@ -2759,6 +2795,18 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
     return rows
 
 
+def metrics_prometheus_analysis_ready(metrics: dict[str, Any]) -> bool:
+    prom_coverage = metrics.get("prometheus_coverage") or {}
+    expected_run_ids = set(prom_coverage.get("expected_run_ids") or [])
+    if not bool(prom_coverage.get("complete")):
+        return False
+    return prometheus_required_metrics_ready(
+        metrics.get("prometheus_metric_coverage") or [],
+        REQUIRED_PROMETHEUS_METRICS_FOR_ANALYSIS,
+        expected_run_ids,
+    )
+
+
 def automation_verdict(config: RunnerConfig, execution: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
     duplicate_rows = metrics.get("duplicate_streamkey") or []
     hypothesis_inconclusive = config.scenario in {"handover", "duplicate-streamkey"} and any(bool(row.get("scenario_inconclusive")) for row in duplicate_rows)
@@ -2783,6 +2831,8 @@ def automation_verdict(config: RunnerConfig, execution: dict[str, Any], metrics:
         reasons.append("scenario_hypothesis_inconclusive")
     if duplicate_process_invalid and not config.allow_inconclusive:
         reasons.append("duplicate_publisher_nonzero_without_controller_rejection")
+    if config.require_prometheus_analysis and config.prometheus_url and not metrics_prometheus_analysis_ready(metrics):
+        reasons.append("prometheus_analysis_not_ready")
     # Preserve order while removing duplicates.
     deduped_reasons = list(dict.fromkeys(reasons))
     exit_code = 1 if deduped_reasons else 0
@@ -2814,9 +2864,8 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
     incomplete_prom_metrics = incomplete_prometheus_metric_names(prom_metric_coverage)
     prometheus_samples_observed = any(prom_values(value) for name, value in prom.items() if not str(name).startswith("_") and isinstance(value, dict))
     expected_prom_run_ids = set(prom_coverage.get("expected_run_ids") or [])
-    required_prometheus_metrics_for_analysis = {"workers_active", "proxies_active", "pod_cpu_rate"}
     prometheus_evidence_files_complete = bool(prom_coverage.get("complete"))
-    prometheus_analysis_ready = prometheus_evidence_files_complete and prometheus_required_metrics_ready(prom_metric_coverage, required_prometheus_metrics_for_analysis, expected_prom_run_ids)
+    prometheus_analysis_ready = prometheus_evidence_files_complete and prometheus_required_metrics_ready(prom_metric_coverage, REQUIRED_PROMETHEUS_METRICS_FOR_ANALYSIS, expected_prom_run_ids)
     verdict = verdict or automation_verdict(config, execution, metrics)
     report_json = {
         "metadata": metadata,

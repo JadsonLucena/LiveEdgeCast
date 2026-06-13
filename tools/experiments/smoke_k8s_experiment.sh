@@ -24,7 +24,11 @@ python tools/experiments/run_experiment.py \
   --output-dir "${OUTPUT_DIR}" \
   --overwrite
 
-REPORT_ROOT="${OUTPUT_DIR%/}/${EXPERIMENT_ID}"
+if [[ "$(basename "${OUTPUT_DIR%/}")" == "${EXPERIMENT_ID}" ]]; then
+  REPORT_ROOT="${OUTPUT_DIR%/}"
+else
+  REPORT_ROOT="${OUTPUT_DIR%/}/${EXPERIMENT_ID}"
+fi
 test -s "${REPORT_ROOT}/report.md"
 test -s "${REPORT_ROOT}/metrics/activation_metrics.csv"
 test -s "${REPORT_ROOT}/metrics/correctness_metrics.csv"

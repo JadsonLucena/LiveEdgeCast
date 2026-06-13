@@ -828,9 +828,10 @@ def test_collect_prometheus_writes_per_run_files_and_loads_resume_safe_evidence(
     cfg.run_id = "run2"
     runner.collect_prometheus(cfg, dirs, start=100.0, end=110.0)
 
-    assert (dirs["raw"] / "prometheus_range_queries.run.json").exists()
-    assert (dirs["raw"] / "prometheus_range_queries.run2.json").exists()
-    assert not any(path.name == "prometheus_range_queries.index.json" for path in runner.prometheus_run_files(dirs))
+    assert (dirs["raw"] / "prometheus_range_queries.run.run.json").exists()
+    assert (dirs["raw"] / "prometheus_range_queries.run.run2.json").exists()
+    assert (dirs["raw"] / "prometheus_range_queries.__index__.json").exists()
+    assert not any(path.name in {"prometheus_range_queries.index.json", "prometheus_range_queries.__index__.json"} for path in runner.prometheus_run_files(dirs))
 
     merged = runner.load_prometheus_evidence(dirs)
     assert [run["run_id"] for run in merged["_metadata"]["runs"]] == ["run", "run2"]
@@ -878,6 +879,8 @@ def test_report_json_exposes_evidence_validity_summary(tmp_path):
     runner.write_csv(dirs["metrics"] / "resilience_metrics.csv", [], ["run_id"])
     (dirs["raw"] / "publishers.jsonl").write_text("", encoding="utf-8")
     (dirs["raw"] / "controller_events.jsonl").write_text('{"event_type":"publish_received"}\n', encoding="utf-8")
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 1.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 2.0, "stream_keys": ["key1"]})
     runner.write_json(
         dirs["raw"] / "prometheus_range_queries.run.json",
         {"_metadata": {"run_id": "run", "started_at": 1.0, "ended_at": 2.0}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[1.0, "1"]]}]}}}},
@@ -981,6 +984,18 @@ def test_safe_id_rejects_path_dot_components():
             raise AssertionError(f"expected unsafe id to be rejected: {value}")
 
 
+def test_safe_id_rejects_reserved_run_ids():
+    import argparse
+
+    for value in ["index", "latest", "__index__"]:
+        try:
+            runner.safe_id(value, "run_id")
+        except argparse.ArgumentTypeError:
+            pass
+        else:
+            raise AssertionError(f"expected reserved run id to be rejected: {value}")
+
+
 def test_prometheus_success_without_samples_is_not_available_for_analysis(tmp_path):
     cfg = config(tmp_path)
     dirs = runner.ensure_layout(cfg.report_root)
@@ -1019,3 +1034,44 @@ def test_resource_activity_reduction_requires_worker_samples(tmp_path):
     assert relative["value"] is None
     assert relative["source"] == "insufficient_prometheus_worker_samples"
     assert worker["source"] == "insufficient_prometheus_worker_samples"
+
+
+def test_resource_activity_ignores_extra_prometheus_run_files(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.write_json(dirs["root"] / "metadata.json", {"started_at": 0.0, "ended_at": 10.0})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "run-a", "repetition": 1, "timestamp": 0.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "run-a", "repetition": 1, "ended_at": 10.0, "stream_keys": ["key1"]})
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run.run-a.json",
+        {"_metadata": {"run_id": "run-a", "started_at": 0.0, "ended_at": 10.0}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[0.0, "1"], [10.0, "1"]]}]}}}, "proxies_active": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[0.0, "1"], [10.0, "1"]]}]}}}, "pod_cpu_rate": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[0.0, "1"], [10.0, "1"]]}]}}}},
+    )
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run.stale.json",
+        {"_metadata": {"run_id": "stale", "started_at": 0.0, "ended_at": 10.0}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[0.0, "100"], [10.0, "100"]]}]}}}},
+    )
+
+    metrics = runner.build_metrics(cfg, dirs)
+    worker = next(row for row in metrics["cost"] if row["metric"] == "worker_pod_seconds")
+
+    assert worker["value"] == 10.0
+    assert metrics["prometheus_coverage"]["extra_run_ids"] == ["stale"]
+
+
+def test_require_prometheus_analysis_affects_automation_verdict(tmp_path):
+    cfg = config(tmp_path)
+    cfg.prometheus_url = "http://prometheus.example"
+    cfg.require_prometheus_analysis = True
+    metrics = {
+        "duplicate_streamkey": [],
+        "prometheus_coverage": {"complete": True, "expected_run_ids": ["run"]},
+        "prometheus_metric_coverage": [
+            {"run_id": "run", "metric": "workers_active", "available_for_analysis": True},
+            {"run_id": "run", "metric": "proxies_active", "available_for_analysis": False},
+            {"run_id": "run", "metric": "pod_cpu_rate", "available_for_analysis": True},
+        ],
+    }
+    verdict = runner.automation_verdict(cfg, {"status": "valid"}, metrics)
+
+    assert verdict["automation_exit_code"] == 1
+    assert "prometheus_analysis_not_ready" in verdict["automation_failure_reasons"]

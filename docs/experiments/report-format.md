@@ -15,8 +15,8 @@ reports/<experiment-id>/
     kubernetes_events.jsonl
     pod_snapshots.jsonl
     prometheus_range_queries.json              # última coleta, compatibilidade
-    prometheus_range_queries.<run-id>.json     # coleta Prometheus por run_id, segura para --resume
-    prometheus_range_queries.index.json        # índice das coletas Prometheus
+    prometheus_range_queries.run.<run-id>.json     # coleta Prometheus por run_id, segura para --resume
+    prometheus_range_queries.__index__.json        # índice das coletas Prometheus
     proxy_context_patch.json
     controller_http_before.json
     controller_http_after.json
@@ -97,9 +97,9 @@ O runner só gera gráficos com dados reais. Quando as amostras necessárias nã
 
 ## Integridade do relatório
 
-O runner não mistura execuções por padrão. Se o diretório de saída já existir, a execução falha, exceto quando `--overwrite` ou `--resume` for informado. Essa regra evita que evidências antigas contaminem métricas novas. Em modo `--resume`, as séries Prometheus são preservadas em arquivos por `run_id`; o agregador lê `raw/prometheus_range_queries.<run-id>.json` e evita depender do arquivo legado `raw/prometheus_range_queries.json`, que contém apenas a coleta mais recente.
+O runner não mistura execuções por padrão. Se o diretório de saída já existir, a execução falha, exceto quando `--overwrite` ou `--resume` for informado. Essa regra evita que evidências antigas contaminem métricas novas. Em modo `--resume`, as séries Prometheus são preservadas em arquivos por `run_id`; o agregador lê `raw/prometheus_range_queries.run.<run-id>.json` e evita depender do arquivo legado `raw/prometheus_range_queries.json`, que contém apenas a coleta mais recente. Arquivos Prometheus extras são reportados em `prometheus_extra_run_ids`, mas não entram nos numeradores de atividade relativa quando não pertencem às janelas de execução esperadas.
 
-Os resultados por streamKey no `report.md` são calculados por `run_id + repetition + streamKey`, usando as janelas de execução registradas em `raw/streams.jsonl`. O uso de `--resume` deve ser acompanhado de um `--run-id` novo; o runner agora recusa retomar quando encontra colisão de `run_id + repetition` já existente no diretório.
+Os resultados por streamKey no `report.md` são calculados por `run_id + repetition + streamKey`, usando as janelas de execução registradas em `raw/streams.jsonl`. O uso de `--resume` deve ser acompanhado de um `--run-id` novo; o runner recusa retomar quando encontra colisão de `run_id + repetition` já existente no diretório e também recusa identificadores internos reservados como `index`, `latest` e `__index__`.
 
 
 ## Validade de handover e streamKey duplicada
