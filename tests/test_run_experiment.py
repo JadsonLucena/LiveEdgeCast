@@ -396,7 +396,8 @@ def test_duplicate_streamkey_inconclusive_without_second_proxy(tmp_path):
 
     duplicate_rows = list(__import__("csv").DictReader((dirs["metrics"] / "duplicate_streamkey_metrics.csv").open()))
     assert duplicate_rows[0]["scenario_inconclusive"] == "True"
-    assert duplicate_rows[0]["status"] == "inconclusive_second_proxy_not_observed"
+    assert duplicate_rows[0]["controller_rejection_status"] == "rejected"
+    assert duplicate_rows[0]["between_proxy_validity_status"] == "inconclusive"
 
 
 def test_duplicate_streamkey_uses_generic_controller_conflict_evidence(tmp_path):
@@ -424,3 +425,108 @@ def test_duplicate_streamkey_uses_generic_controller_conflict_evidence(tmp_path)
     assert duplicate_rows[0]["duplicate_streamkey_rejected"] == "True"
     assert duplicate_rows[0]["secondary_proxy_observed"] == "True"
     assert duplicate_rows[0]["status"] == "rejected"
+
+
+def test_prometheus_scope_uses_effective_patch_result(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    cfg.patch_proxy_context = True
+    cfg.prometheus_url = "http://prometheus.example"
+    dirs = runner.ensure_layout(cfg.report_root)
+    captured = []
+
+    def fake_urlopen(request, timeout=30):
+        captured.append(request.full_url)
+        class Response:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self): return b'{"status":"success","data":{"result":[]}}'
+        return Response()
+
+    monkeypatch.setattr(runner, "urlopen", fake_urlopen)
+
+    # Empty selector simulates --patch-proxy-context being requested while the
+    # controller deployment was not effectively patched/rolled out.
+    runner.collect_prometheus(cfg, dirs, start=1.0, end=2.0, controller_label_selector="")
+
+    joined = "\n".join(captured)
+    assert 'tenant%3D%22exp%22' not in joined
+    assert json.loads((dirs["raw"] / "prometheus_range_queries.json").read_text())["_metadata"]["controller_scope_effective"] is False
+
+
+def test_restore_failure_changes_exit_code_by_default(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    cfg.patch_proxy_context = True
+    cfg.kubectl_path = "/bin/true"
+    cfg.ffmpeg_path = "/bin/true"
+    cfg.output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(runner, "parse_args", lambda argv=None: cfg)
+    monkeypatch.setattr(runner, "execute_experiment", lambda config_arg, dirs: {
+        "status": "failed_restore",
+        "restore_ok": False,
+        "started_at": 1.0,
+        "ended_at": 2.0,
+        "preflight": {"proxy_context_patch": {"controller_scope_effective": False}},
+        "runs": [],
+        "prometheus": {},
+    })
+    monkeypatch.setattr(runner, "build_metrics", lambda config_arg, dirs: {"activation": {}, "resources": [], "cost": [], "missing": []})
+    monkeypatch.setattr(runner, "generate_charts", lambda dirs: {})
+    monkeypatch.setattr(runner, "generate_report", lambda config_arg, dirs, execution, metrics, charts: {})
+
+    assert runner.main([]) == 1
+
+
+def test_restore_failure_can_be_allowed_explicitly(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    cfg.patch_proxy_context = True
+    cfg.allow_restore_failure = True
+    cfg.kubectl_path = "/bin/true"
+    cfg.ffmpeg_path = "/bin/true"
+    cfg.output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(runner, "parse_args", lambda argv=None: cfg)
+    monkeypatch.setattr(runner, "execute_experiment", lambda config_arg, dirs: {
+        "status": "failed_restore",
+        "restore_ok": False,
+        "started_at": 1.0,
+        "ended_at": 2.0,
+        "preflight": {"proxy_context_patch": {"controller_scope_effective": False}},
+        "runs": [],
+        "prometheus": {},
+    })
+    monkeypatch.setattr(runner, "build_metrics", lambda config_arg, dirs: {"activation": {}, "resources": [], "cost": [], "missing": []})
+    monkeypatch.setattr(runner, "generate_charts", lambda dirs: {})
+    monkeypatch.setattr(runner, "generate_report", lambda config_arg, dirs, execution, metrics, charts: {})
+
+    assert runner.main([]) == 0
+
+
+def test_second_proxy_must_be_correlated_after_second_attempt(tmp_path):
+    cfg = config(tmp_path, scenario="duplicate-streamkey")
+    dirs = runner.ensure_layout(cfg.report_root)
+    (dirs["raw"] / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 10.0, "stream_keys": ["key1"]}) + "\n" +
+        json.dumps({"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 30.0, "stream_keys": ["key1"]}) + "\n"
+    )
+    publishers = [
+        {"event": "publisher_finished", "run_id": "run", "repetition": 1, "publisher_index": 1, "stream_key": "key1", "started_at": 11.0, "ended_at": 29.0, "returncode": 0, "publisher_status": "success"},
+        {"event": "publisher_finished", "run_id": "run", "repetition": 1, "publisher_index": 2, "stream_key": "key1", "started_at": 20.0, "ended_at": 22.0, "returncode": 1, "publisher_status": "duplicate_publisher_exited"},
+    ]
+    (dirs["raw"] / "publishers.jsonl").write_text("".join(json.dumps(e) + "\n" for e in publishers))
+    events = [
+        {"timestamp_epoch": 11.0, "event_type": "publish_received", "stream": "key1", "proxy_pod": "proxy-a", "run_id": "run", "repetition": 1},
+        {"timestamp_epoch": 12.0, "event_type": "publish_received", "stream": "key1", "proxy_pod": "proxy-b", "run_id": "run", "repetition": 1},
+        {"timestamp_epoch": 21.0, "event_type": "stream_started_conflict", "stream": "key1", "proxy_pod": "proxy-a", "status": "conflict", "run_id": "run", "repetition": 1},
+    ]
+    (dirs["raw"] / "controller_events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    runner.build_metrics(cfg, dirs)
+
+    duplicate_rows = list(__import__("csv").DictReader((dirs["metrics"] / "duplicate_streamkey_metrics.csv").open()))
+    assert duplicate_rows[0]["second_attempt_proxy_pod"] == "proxy-a"
+    assert duplicate_rows[0]["secondary_proxy_observed"] == "False"
+    assert duplicate_rows[0]["scenario_inconclusive"] == "True"
+    assert duplicate_rows[0]["controller_rejection_status"] == "rejected"
+    assert duplicate_rows[0]["between_proxy_validity_status"] == "inconclusive"

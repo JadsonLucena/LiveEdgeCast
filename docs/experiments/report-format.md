@@ -98,4 +98,11 @@ Os resultados por streamKey no `report.md` são calculados por `run_id + repetit
 
 Os relatórios incluem campos como `primary_proxy_pod`, `secondary_proxy_pod`, `secondary_proxy_observed`, `same_proxy_detected` e `scenario_inconclusive`. Para sustentar conclusões sobre handover ou rejeição de `streamKey` duplicada entre proxies, `secondary_proxy_observed` deve ser `true` ou a execução deve usar uma URL secundária que direcione a segunda publicação a outro proxy observável.
 
-A coluna `duplicate_streamkey_rejected` depende de evidência explícita do controller, como eventos `handover_denied`, status `denied/conflict/rejected` ou mensagem de conflito. Encerramento genérico do FFmpeg não é prova suficiente de rejeição arquitetural.
+A coluna `duplicate_streamkey_rejected` depende de evidência explícita do controller, como eventos `handover_denied`, status `denied/conflict/rejected` ou mensagem de conflito. Encerramento genérico do FFmpeg não é prova suficiente de rejeição arquitetural. O relatório separa `controller_rejection_status` de `between_proxy_validity_status`: uma rejeição pode ser válida como comportamento do controller, mas a hipótese entre proxies só deve ser sustentada quando `second_attempt_proxy_correlated=true` e `secondary_proxy_observed=true`.
+
+
+## Validade operacional do cluster
+
+Quando `--patch-proxy-context` é usado, `report.json.summary.restore_ok=false` indica que a restauração das variáveis de ambiente falhou. Nesse caso, o comando retorna código diferente de zero por padrão, e o cluster deve ser inspecionado manualmente antes de nova coleta.
+
+`report.json.summary.controller_scope_effective=true` indica que o escopo de labels do controller foi efetivamente aplicado nas consultas Prometheus. Quando esse campo é falso, as métricas do controller são consultadas sem labels de experimento para evitar falsos negativos.

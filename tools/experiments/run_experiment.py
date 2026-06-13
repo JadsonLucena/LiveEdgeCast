@@ -106,6 +106,7 @@ class RunnerConfig:
     resume: bool = False
     allow_partial: bool = False
     allow_worker_cleanup: bool = False
+    allow_restore_failure: bool = False
 
     @property
     def report_root(self) -> Path:
@@ -197,6 +198,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--resume", action="store_true", help="Allow appending raw evidence into an existing report directory. Mutually exclusive with --overwrite.")
     parser.add_argument("--allow-partial", action="store_true", help="Return exit code 0 for partial experiments. By default partial runs fail automation.")
     parser.add_argument("--allow-worker-cleanup", action="store_true", help="Allow cold-start precondition to delete existing worker pods. Without this flag, existing workers make the cold-start run invalid.")
+    parser.add_argument("--allow-restore-failure", action="store_true", help="Return exit code 0 even if opt-in deployment context restoration fails. Use only after manual cluster cleanup.")
     args = parser.parse_args(argv)
 
     keys = load_stream_keys(args.stream_keys, args.stream_keys_file)
@@ -246,6 +248,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         resume=args.resume,
         allow_partial=args.allow_partial,
         allow_worker_cleanup=args.allow_worker_cleanup,
+        allow_restore_failure=args.allow_restore_failure,
     )
 
 
@@ -710,7 +713,7 @@ def restore_context_keys(config: RunnerConfig, dirs: dict[str, Path], patch_resu
     """
     patched_deployments = list(patch_result.get("patched_deployments") or [])
     if not patched_deployments:
-        result = {"skipped": True, "reason": "context_was_not_patched"}
+        result = {"skipped": True, "reason": "context_was_not_patched", "ok": True}
         write_json(dirs["raw"] / "proxy_context_restore.json", result)
         return result
     commands = []
@@ -778,7 +781,11 @@ def patch_proxy_context(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str
         f"LIVEEDGECAST_REGION={config.run_id}",
         "-n", config.namespace,
     ]
+    # patched_deployments means the environment mutation was applied and must be restored.
+    # effective_deployments means the mutation also rolled out successfully and can be used
+    # for measurement assumptions such as controller metric scoping.
     patched_deployments: list[str] = []
+    effective_deployments: list[str] = []
     skipped_deployments: list[dict[str, Any]] = []
     for command, deployment in ((proxy_set_env, "proxy"), (controller_set_env, "controller")):
         snapshot = previous_env.get(deployment) or {}
@@ -789,20 +796,28 @@ def patch_proxy_context(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str
                 "snapshot": snapshot,
             })
             continue
-        commands.append(run_cmd(command, timeout=60))
-        if commands[-1].get("returncode") == 0:
+        set_env_result = run_cmd(command, timeout=60)
+        commands.append(set_env_result)
+        if set_env_result.get("returncode") == 0:
             patched_deployments.append(deployment)
-            commands.append(run_cmd([config.kubectl_path, "rollout", "status", f"deployment/{deployment}", "-n", config.namespace, "--timeout=120s"], timeout=150))
+            rollout_result = run_cmd([config.kubectl_path, "rollout", "status", f"deployment/{deployment}", "-n", config.namespace, "--timeout=120s"], timeout=150)
+            commands.append(rollout_result)
+            if rollout_result.get("returncode") == 0:
+                effective_deployments.append(deployment)
+    effective_metric_scope = prometheus_controller_label_selector(config) if "controller" in effective_deployments else ""
     result = {
         "available": True,
         "skipped": False,
         "patched": bool(patched_deployments),
-        "all_patched": bool(patched_deployments) and all(c.get("returncode") == 0 for c in commands) and not skipped_deployments,
+        "all_patched": bool(effective_deployments) and all(c.get("returncode") == 0 for c in commands) and not skipped_deployments,
         "patched_deployments": patched_deployments,
+        "effective_deployments": effective_deployments,
         "skipped_deployments": skipped_deployments,
         "commands": commands,
         "previous_env": previous_env,
         "metric_scope": prometheus_controller_label_selector(config),
+        "effective_metric_scope": effective_metric_scope,
+        "controller_scope_effective": bool(effective_metric_scope),
     }
     write_json(dirs["raw"] / "proxy_context_patch.json", result)
     return result
@@ -823,21 +838,22 @@ def prom_label_value(value: str) -> str:
     return str(value).replace('\\', '\\\\').replace('"', '\\"')
 
 
-def render_promql(config: RunnerConfig, query: str) -> str:
+def render_promql(config: RunnerConfig, query: str, controller_label_selector: str | None = None) -> str:
+    selector = prometheus_controller_label_selector(config) if controller_label_selector is None else controller_label_selector
     return (
         query
         .replace("$namespace", config.namespace)
         .replace("$experiment_id", prom_label_value(config.experiment_id))
         .replace("$scenario", prom_label_value(config.scenario))
         .replace("$run_id", prom_label_value(config.run_id))
-        .replace("$controller_label_selector", prometheus_controller_label_selector(config))
+        .replace("$controller_label_selector", selector)
     )
 
 
-def prometheus_query(config: RunnerConfig, query: str, start: float, end: float, step: int = 5) -> dict[str, Any]:
+def prometheus_query(config: RunnerConfig, query: str, start: float, end: float, step: int = 5, controller_label_selector: str | None = None) -> dict[str, Any]:
     if not config.prometheus_url:
         return {"available": False, "reason": "prometheus_url_not_configured", "query": query}
-    rendered_query = render_promql(config, query)
+    rendered_query = render_promql(config, query, controller_label_selector=controller_label_selector)
     params = urlencode({"query": rendered_query, "start": f"{start:.3f}", "end": f"{end:.3f}", "step": str(step)})
     url = f"{config.prometheus_url}/api/v1/query_range?{params}"
     try:
@@ -848,10 +864,17 @@ def prometheus_query(config: RunnerConfig, query: str, start: float, end: float,
         return {"available": False, "query": query, "rendered_query": locals().get("rendered_query", query), "error": {"type": type(exc).__name__, "message": str(exc)}}
 
 
-def collect_prometheus(config: RunnerConfig, dirs: dict[str, Path], start: float, end: float) -> dict[str, Any]:
-    results = {}
+def collect_prometheus(config: RunnerConfig, dirs: dict[str, Path], start: float, end: float, controller_label_selector: str | None = None) -> dict[str, Any]:
+    results = {
+        "_metadata": {
+            "started_at": start,
+            "ended_at": end,
+            "controller_label_selector": controller_label_selector or "",
+            "controller_scope_effective": bool(controller_label_selector),
+        }
+    }
     for name, query in DEFAULT_PROMQL.items():
-        results[name] = prometheus_query(config, query, start, end)
+        results[name] = prometheus_query(config, query, start, end, controller_label_selector=controller_label_selector)
     write_json(dirs["raw"] / "prometheus_range_queries.json", results)
     return results
 
@@ -1174,7 +1197,7 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
 
         experiment_ended_at = now_epoch()
         query_start, query_end = experiment_query_window(dirs, experiment_started_at, experiment_ended_at)
-        prometheus = collect_prometheus(config, dirs, query_start, query_end)
+        prometheus = collect_prometheus(config, dirs, query_start, query_end, controller_label_selector=patch_result.get("effective_metric_scope") or "")
         # Collect logs and controller state before restoring patched deployments; restore may roll pods.
         logs = collect_logs(config, dirs, phase="final-before-restore")
         controller_after = collect_controller_http(config, dirs, "after")
@@ -1182,8 +1205,12 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
         restore_result = restore_context_keys(config, dirs, patch_result)
 
     ended_at = now_epoch()
+    restore_ok = bool(restore_result.get("ok", True))
+    if config.patch_proxy_context and not restore_ok:
+        status = "failed_restore" if status == "valid" else f"{status}_restore_failed"
     return {
         "status": status,
+        "restore_ok": restore_ok,
         "setup_started_at": setup_started_at,
         "started_at": experiment_started_at,
         "ended_at": ended_at,
@@ -1665,32 +1692,58 @@ def scenario_proxy_validity_for_total(
     window: dict[str, Any],
     stream: str,
     total_windows: int,
+    second_attempt_started_at: float | None = None,
 ) -> dict[str, Any]:
-    raw_observations = [
-        item for item in proxy_observations_for_stream(controller_events, window, stream, total_windows)
-    ]
-    observations = raw_observations
+    raw_observations = proxy_observations_for_stream(controller_events, window, stream, total_windows)
     proxies: list[str] = []
-    for item in observations:
+    for item in raw_observations:
         proxy = str(item.get("proxy_pod") or "")
         if proxy and proxy not in proxies:
             proxies.append(proxy)
-    primary = proxies[0] if proxies else None
-    secondary = proxies[1] if len(proxies) > 1 else None
+
+    first_observation = raw_observations[0] if raw_observations else None
+    primary = str(first_observation.get("proxy_pod")) if first_observation else None
+    second_attempt_observations = [
+        item for item in raw_observations
+        if second_attempt_started_at is not None and item["timestamp"] >= second_attempt_started_at
+    ]
+    second_attempt_proxy = str(second_attempt_observations[0].get("proxy_pod")) if second_attempt_observations else None
+    secondary = None
+    if primary and second_attempt_proxy and second_attempt_proxy != primary:
+        secondary = second_attempt_proxy
+    elif not second_attempt_started_at and len(proxies) > 1:
+        # Backward-compatible fallback for historical evidence without publisher timestamps.
+        secondary = proxies[1]
+
     secondary_observed = secondary is not None
-    same_proxy_detected = bool(primary and not secondary_observed and len(raw_observations) >= 2)
+    second_attempt_proxy_correlated = bool(second_attempt_started_at is not None and second_attempt_proxy is not None)
+    same_proxy_detected = bool(primary and second_attempt_proxy and second_attempt_proxy == primary)
     requires_second_proxy = config.scenario in {"handover", "duplicate-streamkey"}
     inconclusive = requires_second_proxy and not secondary_observed
+    reason = ""
+    if inconclusive:
+        if second_attempt_started_at is None:
+            reason = "second_publisher_attempt_timestamp_not_observed"
+        elif not second_attempt_proxy_correlated:
+            reason = "second_attempt_proxy_not_observed"
+        elif same_proxy_detected:
+            reason = "second_attempt_reached_same_proxy"
+        else:
+            reason = "second_proxy_not_observed"
     return {
         "primary_proxy_pod": primary,
         "secondary_proxy_pod": secondary,
+        "second_attempt_proxy_pod": second_attempt_proxy,
         "observed_proxy_sequence": ";".join(proxies),
         "secondary_proxy_observed": secondary_observed,
+        "second_attempt_proxy_correlated": second_attempt_proxy_correlated,
         "same_proxy_detected": same_proxy_detected,
         "scenario_inconclusive": inconclusive,
-        "scenario_inconclusive_reason": "second_proxy_not_observed" if inconclusive else "",
+        "scenario_inconclusive_reason": reason,
+        "between_proxy_validity_status": "valid_between_proxy_observation" if secondary_observed else ("inconclusive" if requires_second_proxy else "not_applicable"),
         "secondary_rtmp_url_configured": bool(config.secondary_rtmp_url),
     }
+
 
 def build_duplicate_streamkey_rows(
     config: RunnerConfig,
@@ -1710,34 +1763,58 @@ def build_duplicate_streamkey_rows(
                 and int(row.get("repetition") or 0) == rep
                 and row.get("stream_key") == stream
             ]
-            duplicate_pubs = [row for row in pubs if int(row.get("publisher_index") or 0) > 1]
+            second_publishers = [row for row in pubs if int(row.get("publisher_index") or 0) > 1]
+            duplicate_pubs = second_publishers if config.scenario == "duplicate-streamkey" else []
             attempted = bool(duplicate_pubs)
+            second_attempt_started_values = [
+                float(row.get("started_at")) for row in second_publishers
+                if isinstance(row.get("started_at"), (int, float))
+            ]
+            second_attempt_started_at = min(second_attempt_started_values) if second_attempt_started_values else None
             scoped_events = [
                 e for e in controller_events
                 if event_stream_matches(e, stream)
                 and event_matches_window_identity(e, window)
                 and event_in_window(e, window, len(windows))
             ]
-            denial_events = [e for e in scoped_events if is_controller_denial_event(e)]
-            accepted_events = [e for e in scoped_events if is_controller_acceptance_event(e)]
-            proxy_validity = scenario_proxy_validity_for_total(config, controller_events, window, stream, len(windows))
+            if second_attempt_started_at is not None:
+                scoped_events_after_second_attempt = [
+                    e for e in scoped_events
+                    if not isinstance(e.get("timestamp_epoch"), (int, float)) or float(e.get("timestamp_epoch")) >= second_attempt_started_at
+                ]
+            else:
+                scoped_events_after_second_attempt = scoped_events
+            denial_events = [e for e in scoped_events_after_second_attempt if is_controller_denial_event(e)]
+            accepted_events = [e for e in scoped_events_after_second_attempt if is_controller_acceptance_event(e)]
+            proxy_validity = scenario_proxy_validity_for_total(config, controller_events, window, stream, len(windows), second_attempt_started_at=second_attempt_started_at)
             duplicate_statuses = [row.get("publisher_status") for row in duplicate_pubs]
             rejected = attempted and bool(denial_events)
             unexpectedly_accepted = attempted and not rejected and any(status == "success" for status in duplicate_statuses)
             if not attempted:
-                status = "not_attempted"
-            elif proxy_validity.get("scenario_inconclusive"):
-                status = "inconclusive_second_proxy_not_observed"
+                controller_rejection_status = "not_attempted"
             elif rejected:
-                status = "rejected"
+                controller_rejection_status = "rejected"
             elif unexpectedly_accepted:
-                status = "unexpectedly_accepted"
+                controller_rejection_status = "unexpectedly_accepted"
             else:
+                controller_rejection_status = "not_observed"
+            between_proxy_status = str(proxy_validity.get("between_proxy_validity_status") or "not_applicable")
+            if attempted and rejected:
+                status = "rejected"
+            elif attempted and unexpectedly_accepted:
+                status = "unexpectedly_accepted"
+            elif attempted and proxy_validity.get("scenario_inconclusive"):
+                status = "attempted_controller_rejection_not_observed_between_proxy_inconclusive"
+            elif attempted:
                 status = "attempted_without_controller_rejection_observed"
+            else:
+                status = "not_attempted"
             rows.append({
                 "run_id": run_id,
                 "repetition": rep,
                 "stream_key": stream,
+                "second_publication_attempted": bool(second_publishers),
+                "second_attempt_started_at": second_attempt_started_at,
                 "duplicate_streamkey_attempted": attempted,
                 "duplicate_streamkey_rejected": rejected,
                 "duplicate_streamkey_unexpectedly_accepted": unexpectedly_accepted,
@@ -1745,6 +1822,8 @@ def build_duplicate_streamkey_rows(
                 "duplicate_publisher_statuses": ";".join(str(status) for status in duplicate_statuses if status is not None),
                 "controller_denial_events": len(denial_events),
                 "controller_acceptance_events": len(accepted_events),
+                "controller_rejection_status": controller_rejection_status,
+                "between_proxy_validity_status": between_proxy_status,
                 **proxy_validity,
                 "status": status,
             })
@@ -1818,6 +1897,10 @@ def build_correctness_rows(
                 "primary_proxy_pod": duplicate_info.get("primary_proxy_pod"),
                 "secondary_proxy_pod": duplicate_info.get("secondary_proxy_pod"),
                 "secondary_proxy_observed": duplicate_info.get("secondary_proxy_observed"),
+                "second_attempt_proxy_correlated": duplicate_info.get("second_attempt_proxy_correlated"),
+                "second_attempt_proxy_pod": duplicate_info.get("second_attempt_proxy_pod"),
+                "controller_rejection_status": duplicate_info.get("controller_rejection_status"),
+                "between_proxy_validity_status": duplicate_info.get("between_proxy_validity_status"),
                 "same_proxy_detected": duplicate_info.get("same_proxy_detected"),
                 "scenario_inconclusive": duplicate_info.get("scenario_inconclusive"),
                 "scenario_inconclusive_reason": duplicate_info.get("scenario_inconclusive_reason"),
@@ -1840,6 +1923,10 @@ def build_correctness_rows(
             "primary_proxy_pod": None,
             "secondary_proxy_pod": None,
             "secondary_proxy_observed": None,
+            "second_attempt_proxy_correlated": None,
+            "second_attempt_proxy_pod": None,
+            "controller_rejection_status": None,
+            "between_proxy_validity_status": None,
             "same_proxy_detected": None,
             "scenario_inconclusive": None,
             "scenario_inconclusive_reason": None,
@@ -1898,14 +1985,14 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     write_csv(
         dirs["metrics"] / "duplicate_streamkey_metrics.csv",
         duplicate_streamkey_rows,
-        ["run_id", "repetition", "stream_key", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "duplicate_publisher_count", "duplicate_publisher_statuses", "controller_denial_events", "controller_acceptance_events", "primary_proxy_pod", "secondary_proxy_pod", "observed_proxy_sequence", "secondary_proxy_observed", "same_proxy_detected", "scenario_inconclusive", "scenario_inconclusive_reason", "secondary_rtmp_url_configured", "status"],
+        ["run_id", "repetition", "stream_key", "second_publication_attempted", "second_attempt_started_at", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "duplicate_publisher_count", "duplicate_publisher_statuses", "controller_denial_events", "controller_acceptance_events", "controller_rejection_status", "between_proxy_validity_status", "primary_proxy_pod", "secondary_proxy_pod", "second_attempt_proxy_pod", "observed_proxy_sequence", "secondary_proxy_observed", "second_attempt_proxy_correlated", "same_proxy_detected", "scenario_inconclusive", "scenario_inconclusive_reason", "secondary_rtmp_url_configured", "status"],
     )
 
     correctness_rows = build_correctness_rows(config, dirs, pod_rows, controller_events, publisher_rows)
     write_csv(
         dirs["metrics"] / "correctness_metrics.csv",
         correctness_rows,
-        ["run_id", "repetition", "stream_key", "max_worker_count_observed", "worker_observed_for_stream", "at_most_one_worker_per_stream", "one_worker_per_stream", "duplicate_worker_detected", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "primary_proxy_pod", "secondary_proxy_pod", "secondary_proxy_observed", "same_proxy_detected", "scenario_inconclusive", "scenario_inconclusive_reason", "handover_accepted", "handover_denied", "stale_events_ignored"],
+        ["run_id", "repetition", "stream_key", "max_worker_count_observed", "worker_observed_for_stream", "at_most_one_worker_per_stream", "one_worker_per_stream", "duplicate_worker_detected", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "primary_proxy_pod", "secondary_proxy_pod", "secondary_proxy_observed", "second_attempt_proxy_correlated", "second_attempt_proxy_pod", "controller_rejection_status", "between_proxy_validity_status", "same_proxy_detected", "scenario_inconclusive", "scenario_inconclusive_reason", "handover_accepted", "handover_denied", "stale_events_ignored"],
     )
 
 
@@ -1991,6 +2078,8 @@ def write_chart_limitation(path: Path, reason: str) -> str:
 
 def generate_charts(dirs: dict[str, Path]) -> dict[str, str]:
     paths: dict[str, str] = {}
+    metadata = json.loads((dirs["root"] / "metadata.json").read_text(encoding="utf-8")) if (dirs["root"] / "metadata.json").exists() else {}
+    scenario = metadata.get("scenario")
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except Exception:
@@ -2023,19 +2112,19 @@ def generate_charts(dirs: dict[str, Path]) -> dict[str, str]:
                 grouped_by_concurrency.setdefault(conc, []).append(float(row.get("total_activation_seconds") or "nan"))
             except ValueError:
                 pass
-    if grouped_by_concurrency:
+    if scenario in {"concurrency", "pilot-capacity"} and grouped_by_concurrency:
         labels = sorted(grouped_by_concurrency, key=lambda value: int(value) if str(value).isdigit() else str(value))
         values = [percentile(sorted([v for v in grouped_by_concurrency[label] if math.isfinite(v)]), 95) or 0 for label in labels]
         plt.figure()
         plt.bar(labels, values)
         plt.ylabel("seconds")
         plt.xlabel("concurrency")
-        plt.title("Activation P95 by concurrency")
+        plt.title("Activation P95 by observed concurrency")
         plt.savefig(path, bbox_inches="tight")
         plt.close()
         paths["activation_p95_by_concurrency"] = str(path)
     else:
-        paths["activation_p95_by_concurrency"] = write_chart_limitation(path, "No per-concurrency activation samples available; use pilot-capacity with concurrency metadata.")
+        paths["activation_p95_by_concurrency"] = write_chart_limitation(path, "Per-concurrency chart is generated only for concurrency or pilot-capacity scenarios with observed samples.")
     current_path = dirs["charts"] / "activation_p95_current_run.png"
     if activation_values:
         plt.figure()
@@ -2222,6 +2311,10 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
             "duplicate_streamkey_unexpectedly_accepted": any(str(row.get("duplicate_streamkey_unexpectedly_accepted")).lower() == "true" for row in duplicate_rows),
             "scenario_inconclusive": any(str(row.get("scenario_inconclusive")).lower() == "true" for row in duplicate_rows),
             "secondary_proxy_observed": any(str(row.get("secondary_proxy_observed")).lower() == "true" for row in duplicate_rows),
+            "second_attempt_proxy_correlated": any(str(row.get("second_attempt_proxy_correlated")).lower() == "true" for row in duplicate_rows),
+            "between_proxy_claim_valid": any(str(row.get("between_proxy_validity_status")) == "valid_between_proxy_observation" for row in duplicate_rows),
+            "restore_ok": execution.get("restore_ok"),
+            "controller_scope_effective": bool(((execution.get("preflight") or {}).get("proxy_context_patch") or {}).get("controller_scope_effective")),
             "missing_metrics": unavailable,
         },
         "metrics": metrics,
@@ -2253,6 +2346,8 @@ Amostras de ativação válidas: {report_json["summary"]["valid_activation_sampl
 - Bitrate: `{config.bitrate or 'padrão/copy'}`
 - Baseline informado: `{config.baseline or 'não informado'}`
 - Patch de contexto em deployments: `{'ativado' if config.patch_proxy_context else 'desativado'}`
+- Restauração de contexto: `{report_json["summary"].get("restore_ok")}`
+- Escopo efetivo de métricas do controller: `{report_json["summary"].get("controller_scope_effective")}`
 
 ## Métricas principais
 
@@ -2282,7 +2377,7 @@ A verificação de um worker por streamKey e candidatos a órfãos foi salva em 
 
 ## Verificação de streamKey duplicada
 
-{md_table(csv_rows(dirs["metrics"] / "duplicate_streamkey_metrics.csv"), ['run_id','repetition','stream_key','duplicate_streamkey_attempted','duplicate_streamkey_rejected','duplicate_streamkey_unexpectedly_accepted','primary_proxy_pod','secondary_proxy_pod','secondary_proxy_observed','scenario_inconclusive','scenario_inconclusive_reason','duplicate_publisher_count','controller_denial_events','status'])}
+{md_table(csv_rows(dirs["metrics"] / "duplicate_streamkey_metrics.csv"), ['run_id','repetition','stream_key','duplicate_streamkey_attempted','duplicate_streamkey_rejected','controller_rejection_status','between_proxy_validity_status','primary_proxy_pod','second_attempt_proxy_pod','secondary_proxy_pod','second_attempt_proxy_correlated','secondary_proxy_observed','scenario_inconclusive','scenario_inconclusive_reason','duplicate_publisher_count','controller_denial_events','status'])}
 
 ## Limitações
 
@@ -2290,7 +2385,8 @@ A verificação de um worker por streamKey e candidatos a órfãos foi salva em 
 - Tempos per-stream de cold start dependem da exportação de timestamps pelo controller; quando não há endpoint per-stream, o relatório usa apenas histogramas Prometheus agregados.
 - `t_destination_received` só pode ser sustentado se houver callback/observação no destino externo.
 - A seção de atividade relativa de recursos usa pod-seconds e séries de pods ativos; ela não representa custo financeiro real de provedor de nuvem sem CPU/memória request-seconds e modelo de preço.
-- Métricas de cAdvisor/kube-state-metrics são isoladas por namespace; para evitar contaminação, execute cada experimento em namespace dedicado ou use `--patch-proxy-context` para escopo das métricas do controller.
+- Métricas de cAdvisor/kube-state-metrics são isoladas por namespace; para evitar contaminação, execute cada experimento em namespace dedicado ou use `--patch-proxy-context` para escopo das métricas do controller. O escopo do controller só é aplicado quando o patch do deployment `controller` foi efetivamente concluído.
+- Se a restauração de contexto falhar, o experimento deve ser tratado como inválido até limpeza manual do cluster.
 - A validade estatística depende do número de repetições e da disponibilidade de amostras em Prometheus.
 
 ## Texto-base para Discussão dos Resultados
@@ -2348,7 +2444,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     metrics = build_metrics(config, dirs)
     charts = generate_charts(dirs)
     generate_report(config, dirs, execution, metrics, charts)
-    if execution.get("status") == "failed" or (execution.get("status") == "partial" and not config.allow_partial):
+    status = str(execution.get("status") or "")
+    restore_failed = config.patch_proxy_context and execution.get("restore_ok") is False
+    if (
+        status == "failed"
+        or (status == "failed_restore" and not config.allow_restore_failure)
+        or (status.startswith("partial") and not config.allow_partial)
+        or (restore_failed and not config.allow_restore_failure)
+    ):
         exit_code = 1
     print(f"Report generated at: {dirs['root'] / 'report.md'}")
     return exit_code

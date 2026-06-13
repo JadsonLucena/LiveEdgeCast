@@ -79,7 +79,7 @@ kubectl set env deployment/proxy EXPERIMENT_ID=<id> SCENARIO=<scenario> RUN_ID=<
 kubectl set env deployment/controller LIVEEDGECAST_EXPERIMENT_ID=<id> LIVEEDGECAST_SCENARIO=<scenario> LIVEEDGECAST_RUN_ID=<run> LIVEEDGECAST_TENANT=<id> LIVEEDGECAST_ENVIRONMENT=<scenario> LIVEEDGECAST_REGION=<run> -n <namespace>
 ```
 
-O patch é opt-in porque reinicia os deployments e pode interromper sessões RTMP ativas. Use preferencialmente um namespace dedicado por experimento. O runner captura o estado anterior das variáveis antes de alterar cada deployment; se o snapshot falhar para algum deployment, esse deployment não é alterado para evitar restauração destrutiva. O resultado do patch e da restauração fica em `raw/proxy_context_patch.json` e `raw/proxy_context_restore.json`.
+O patch é opt-in porque reinicia os deployments e pode interromper sessões RTMP ativas. Use preferencialmente um namespace dedicado por experimento. O runner captura o estado anterior das variáveis antes de alterar cada deployment; se o snapshot falhar para algum deployment, esse deployment não é alterado para evitar restauração destrutiva. O resultado do patch e da restauração fica em `raw/proxy_context_patch.json` e `raw/proxy_context_restore.json`. O escopo de métricas do controller só é usado quando o deployment `controller` foi efetivamente alterado e o rollout concluiu com sucesso; se o patch do controller for ignorado ou falhar, as queries do Prometheus não aplicam labels de experimento para evitar falso vazio.
 
 O runner também coleta logs estruturados e gera:
 
@@ -120,7 +120,7 @@ O runner não altera a documentação do repositório durante a execução. Todo
 - Repetições com erro geram evento `run_failed`, fechando a janela temporal da repetição para evitar contaminação de métricas posteriores.
 - O cenário `release` aguarda `--release-after-seconds` antes de encerrar publishers, permitindo que a stream fique ativa antes da medição de limpeza.
 - Para evitar contaminação em métricas de cAdvisor/kube-state-metrics, execute apenas um experimento por namespace ou use namespaces isolados por execução.
-- Cenários `handover` e `duplicate-streamkey` são marcados como inconclusivos quando a segunda publicação não é observada em outro proxy.
+- Cenários `handover` e `duplicate-streamkey` são marcados como inconclusivos quando a segunda publicação não é observada em outro proxy após o timestamp da segunda tentativa. A rejeição do controller e a validade entre proxies são reportadas separadamente.
 - `--resume` agrega evidências no mesmo diretório; use um `run_id` único para cada retomada e interprete o relatório como agregado, não como apenas a execução mais recente.
 
 ## Segurança de diretórios e limpeza
@@ -141,9 +141,9 @@ Evite essa opção em namespaces compartilhados.
 ## Códigos de saída
 
 - `0`: experimento válido ou `partial` aceito explicitamente com `--allow-partial`.
-- `1`: experimento `failed` ou `partial` sem `--allow-partial`.
+- `1`: experimento `failed`, `partial` sem `--allow-partial`, ou falha de restauração de contexto após `--patch-proxy-context` sem `--allow-restore-failure`.
 
-Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI.
+Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI. Use `--allow-restore-failure` somente após confirmar limpeza manual do cluster, pois a restauração malsucedida pode deixar deployments com variáveis de ambiente experimentais.
 
 ## Logs por fase
 
@@ -156,3 +156,17 @@ logs/final-before-restore/
 ```
 
 Quando `--patch-proxy-context` é usado, os logs finais são coletados antes da restauração dos deployments para reduzir o risco de perder logs por rollout.
+
+
+## Smoke test end-to-end
+
+Há um script opcional para validação manual em cluster real:
+
+```bash
+LIVEEDGECAST_RTMP_URL=rtmp://127.0.0.1:1935/live \
+PROMETHEUS_URL=http://127.0.0.1:9090 \
+NAMESPACE=media \
+./tools/experiments/smoke_k8s_experiment.sh
+```
+
+O script executa um `cold-start` mínimo em namespace dedicado ou controlado e valida se `report.md`, `activation_metrics.csv` e `correctness_metrics.csv` foram gerados com linhas de evidência.
