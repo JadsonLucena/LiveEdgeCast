@@ -11,7 +11,7 @@ RUN_ID="${RUN_ID:-smoke-run}"
 STREAM_KEY="${STREAM_KEY:-smoke-key-$(date +%s)}"
 DURATION_SECONDS="${DURATION_SECONDS:-30}"
 
-python tools/experiments/run_experiment.py \
+python3 tools/experiments/run_experiment.py \
   --stream-keys "${STREAM_KEY}" \
   --scenario cold-start \
   --experiment-id "${EXPERIMENT_ID}" \
@@ -30,7 +30,7 @@ test -s "${REPORT_ROOT}/report.md"
 test -s "${REPORT_ROOT}/metrics/activation_metrics.csv"
 test -s "${REPORT_ROOT}/metrics/correctness_metrics.csv"
 
-python - <<PY
+python3 - <<PY
 import csv
 import json
 from pathlib import Path

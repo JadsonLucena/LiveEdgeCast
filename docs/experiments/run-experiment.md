@@ -33,7 +33,7 @@ Linhas vazias e linhas iniciadas por `#` são ignoradas.
 Com `--experiment-id` explícito, o relatório é gravado em `--output-dir/--experiment-id`:
 
 ```bash
-python tools/experiments/run_experiment.py \
+python3 tools/experiments/run_experiment.py \
   --stream-keys-file ./tools/experiments/stream_keys.txt \
   --scenario cold-start \
   --rtmp-url rtmp://127.0.0.1:1935/live \
@@ -49,7 +49,7 @@ python tools/experiments/run_experiment.py \
 Para compatibilidade com o critério de aceite do plano experimental, `--experiment-id` também pode ser omitido. Nesse caso, o runner deriva o `experiment_id` do último componente de `--output-dir` e grava o relatório exatamente nesse diretório:
 
 ```bash
-python tools/experiments/run_experiment.py \
+python3 tools/experiments/run_experiment.py \
   --stream-keys-file ./stream_keys.txt \
   --scenario cold-start \
   --duration-seconds 120 \
@@ -64,7 +64,7 @@ Para cenários `handover` e `duplicate-streamkey`, use `--secondary-rtmp-url` qu
 Também é possível informar as streamKeys diretamente:
 
 ```bash
-python tools/experiments/run_experiment.py \
+python3 tools/experiments/run_experiment.py \
   --stream-keys key1,key2,key3 \
   --scenario concurrency \
   --duration-seconds 180 \

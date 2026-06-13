@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-python -m py_compile docker/controller/main.py
+python3 -m py_compile docker/controller/main.py
 bash -n docker/worker/worker_stream_runner.sh
 bash -n docker/proxy/on_publish_done.sh
 rg -n "STATE_SCHEMA_VERSION|stream_generation|monitor_worker_health|stream_assignment_info|generation" docker/controller/main.py >/dev/null
