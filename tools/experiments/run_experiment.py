@@ -473,6 +473,10 @@ def wait_or_stop_publishers(
                 publisher.stop(reason=stop_reason)
             else:
                 publisher.ended_at = publisher.ended_at or now_epoch()
+    return record_publisher_results(config, dirs, publishers)
+
+
+def record_publisher_results(config: RunnerConfig, dirs: dict[str, Path], publishers: list[ManagedPublisher]) -> list[dict[str, Any]]:
     results = [publisher.result() for publisher in publishers]
     for result in results:
         result["publisher_status"] = publisher_status(config, result)
@@ -662,13 +666,22 @@ def deployment_env_snapshot(config: RunnerConfig, deployment: str, keys: Sequenc
 
 
 def restore_context_keys(config: RunnerConfig, dirs: dict[str, Path], patch_result: dict[str, Any]) -> dict[str, Any]:
-    """Restore context env keys changed by patch_proxy_context()."""
-    if not patch_result.get("patched"):
+    """Restore context env keys changed by patch_proxy_context().
+
+    Restoration is tracked per deployment. A partial patch can still mutate one
+    Deployment even when a later Deployment or rollout fails, so restoration must
+    not depend on a single all-or-nothing boolean.
+    """
+    patched_deployments = list(patch_result.get("patched_deployments") or [])
+    if not patched_deployments:
         result = {"skipped": True, "reason": "context_was_not_patched"}
         write_json(dirs["raw"] / "proxy_context_restore.json", result)
         return result
     commands = []
-    for deployment, snapshot in (patch_result.get("previous_env") or {}).items():
+    restored_deployments = []
+    previous_env = patch_result.get("previous_env") or {}
+    for deployment in patched_deployments:
+        snapshot = previous_env.get(deployment) or {}
         values = snapshot.get("values") or {}
         args = [config.kubectl_path, "set", "env", f"deployment/{deployment}"]
         for key, old_value in values.items():
@@ -676,8 +689,14 @@ def restore_context_keys(config: RunnerConfig, dirs: dict[str, Path], patch_resu
         args.extend(["-n", config.namespace])
         commands.append(run_cmd(args, timeout=60))
         if commands[-1].get("returncode") == 0:
+            restored_deployments.append(deployment)
             commands.append(run_cmd([config.kubectl_path, "rollout", "status", f"deployment/{deployment}", "-n", config.namespace, "--timeout=120s"], timeout=150))
-    result = {"commands": commands, "ok": all(c.get("returncode") == 0 for c in commands)}
+    result = {
+        "commands": commands,
+        "patched_deployments": patched_deployments,
+        "restored_deployments": restored_deployments,
+        "ok": all(c.get("returncode") == 0 for c in commands),
+    }
     write_json(dirs["raw"] / "proxy_context_restore.json", result)
     return result
 
@@ -720,14 +739,18 @@ def patch_proxy_context(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str
         f"LIVEEDGECAST_REGION={config.run_id}",
         "-n", config.namespace,
     ]
+    patched_deployments: list[str] = []
     for command, deployment in ((proxy_set_env, "proxy"), (controller_set_env, "controller")):
         commands.append(run_cmd(command, timeout=60))
         if commands[-1].get("returncode") == 0:
+            patched_deployments.append(deployment)
             commands.append(run_cmd([config.kubectl_path, "rollout", "status", f"deployment/{deployment}", "-n", config.namespace, "--timeout=120s"], timeout=150))
     result = {
         "available": True,
         "skipped": False,
-        "patched": all(c.get("returncode") == 0 for c in commands),
+        "patched": bool(patched_deployments),
+        "all_patched": all(c.get("returncode") == 0 for c in commands),
+        "patched_deployments": patched_deployments,
         "commands": commands,
         "previous_env": previous_env,
         "metric_scope": prometheus_controller_label_selector(config),
@@ -975,6 +998,7 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
     except Exception as exc:
         for publisher in publishers:
             publisher.stop(reason="unexpected_run_exception")
+        publisher_results = record_publisher_results(config, dirs, publishers) if publishers else []
         run_ended = now_epoch()
         failure_summary = {
             "event": "run_failed",
@@ -985,6 +1009,9 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
             "started_at": run_started,
             "ended_at": run_ended,
             "stream_keys": stream_keys,
+            "publishers": publisher_results,
+            "failure_count": len([r for r in publisher_results if r.get("publisher_status") == "unexpected_failed"]),
+            "error_rate": (len([r for r in publisher_results if r.get("publisher_status") == "unexpected_failed"]) / len(publisher_results)) if publisher_results else 1.0,
             "error": {"type": type(exc).__name__, "message": str(exc)},
             "injected_failures": injected,
         }
@@ -1298,12 +1325,13 @@ def latest_event_time(events: list[dict[str, Any]], event_type: str, stream: str
 
 
 def load_run_windows(config: RunnerConfig, dirs: dict[str, Path]) -> list[dict[str, Any]]:
-    windows: dict[int, dict[str, Any]] = {}
+    windows: dict[tuple[str, int], dict[str, Any]] = {}
     for record in read_jsonl(dirs["raw"] / "streams.jsonl"):
         repetition = record.get("repetition")
         if not isinstance(repetition, int):
             continue
-        current = windows.setdefault(repetition, {"repetition": repetition, "stream_keys": list(config.stream_keys)})
+        run_id = str(record.get("run_id") or config.run_id)
+        current = windows.setdefault((run_id, repetition), {"run_id": run_id, "repetition": repetition, "stream_keys": list(config.stream_keys)})
         if record.get("event") == "run_started":
             current["started_at"] = record.get("timestamp")
             current["stream_keys"] = record.get("stream_keys") or current["stream_keys"]
@@ -1312,12 +1340,21 @@ def load_run_windows(config: RunnerConfig, dirs: dict[str, Path]) -> list[dict[s
             current["status"] = "failed" if record.get("event") == "run_failed" else "finished"
             current["stream_keys"] = record.get("stream_keys") or current["stream_keys"]
     if windows:
-        return [windows[key] for key in sorted(windows)]
+        return [windows[key] for key in sorted(windows, key=lambda item: (item[0], item[1]))]
     return [
-        {"repetition": rep, "started_at": None, "ended_at": None, "stream_keys": list(config.stream_keys)}
+        {"run_id": config.run_id, "repetition": rep, "started_at": None, "ended_at": None, "stream_keys": list(config.stream_keys)}
         for rep in range(1, config.repetitions + 1)
     ]
 
+
+def event_matches_window_identity(event: dict[str, Any], window: dict[str, Any]) -> bool:
+    event_run_id = event.get("run_id")
+    if event_run_id and window.get("run_id") and str(event_run_id) != str(window.get("run_id")):
+        return False
+    event_rep = event.get("repetition")
+    if isinstance(event_rep, int) and isinstance(window.get("repetition"), int) and event_rep != window.get("repetition"):
+        return False
+    return True
 
 def event_in_window(event: dict[str, Any], window: dict[str, Any], total_windows: int) -> bool:
     ts = event.get("timestamp_epoch")
@@ -1333,15 +1370,16 @@ def event_in_window(event: dict[str, Any], window: dict[str, Any], total_windows
     return True
 
 
-def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[tuple[int, str], dict[str, Any]]]:
+def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[tuple[str, int, str], dict[str, Any]]]:
     events = read_jsonl(dirs["raw"] / "controller_events.jsonl")
     run_windows = load_run_windows(config, dirs)
-    grouped: dict[tuple[int, str], dict[str, Any]] = {}
+    grouped: dict[tuple[str, int, str], dict[str, Any]] = {}
 
     for window in run_windows:
         repetition = int(window.get("repetition") or 1)
         for key in (window.get("stream_keys") or config.stream_keys):
-            grouped[(repetition, key)] = {"repetition": repetition, "stream_key": key, "concurrency": len(window.get("stream_keys") or config.stream_keys)}
+            run_id = str(window.get("run_id") or config.run_id)
+            grouped[(run_id, repetition, key)] = {"run_id": run_id, "repetition": repetition, "stream_key": key, "concurrency": len(window.get("stream_keys") or config.stream_keys)}
 
     for event in events:
         stream = event.get("stream")
@@ -1353,13 +1391,14 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
         ts = event.get("timestamp_epoch")
         if not isinstance(ts, (int, float)):
             continue
-        matching_windows = [w for w in run_windows if stream in (w.get("stream_keys") or config.stream_keys) and event_in_window(event, w, len(run_windows))]
+        matching_windows = [w for w in run_windows if stream in (w.get("stream_keys") or config.stream_keys) and event_matches_window_identity(event, w) and event_in_window(event, w, len(run_windows))]
         # Without usable run windows, only a single repetition can be safely inferred.
         if not matching_windows and len(run_windows) == 1:
             matching_windows = run_windows
         for window in matching_windows:
             repetition = int(window.get("repetition") or 1)
-            entry = grouped.setdefault((repetition, stream), {"repetition": repetition, "stream_key": stream, "concurrency": len(window.get("stream_keys") or config.stream_keys)})
+            run_id = str(window.get("run_id") or config.run_id)
+            entry = grouped.setdefault((run_id, repetition, stream), {"run_id": run_id, "repetition": repetition, "stream_key": stream, "concurrency": len(window.get("stream_keys") or config.stream_keys)})
             if field in entry:
                 if field in {"t_worker_terminated", "t_controller_received_end", "t_destination_received"}:
                     entry[field] = max(entry[field], ts)
@@ -1371,8 +1410,9 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
     for row in publisher_rows:
         key = row.get("stream_key")
         repetition = int(row.get("repetition") or 1)
+        run_id = str(row.get("run_id") or config.run_id)
         if key in config.stream_keys:
-            entry = grouped.setdefault((repetition, key), {"repetition": repetition, "stream_key": key, "concurrency": None})
+            entry = grouped.setdefault((run_id, repetition, key), {"run_id": run_id, "repetition": repetition, "stream_key": key, "concurrency": None})
             current_start = entry.get("t_publish_start_client")
             candidate_start = row.get("started_at")
             if isinstance(candidate_start, (int, float)) and (current_start is None or candidate_start < current_start):
@@ -1384,9 +1424,10 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
 
     activation_rows: list[dict[str, Any]] = []
     release_rows: list[dict[str, Any]] = []
-    for repetition, key in sorted(grouped):
-        entry = grouped[(repetition, key)]
+    for run_id, repetition, key in sorted(grouped):
+        entry = grouped[(run_id, repetition, key)]
         activation = {
+            "run_id": run_id,
             "repetition": repetition,
             "stream_key": key,
             "concurrency": entry.get("concurrency"),
@@ -1400,6 +1441,7 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
             "t_worker_ready": entry.get("t_worker_ready"),
             "t_ffmpeg_started": entry.get("t_ffmpeg_started"),
             "t_ffmpeg_first_progress": entry.get("t_ffmpeg_first_progress"),
+            "t_destination_received": entry.get("t_destination_received"),
         }
         activation["event_detection_seconds"] = delta(activation.get("t_publish_start_proxy"), activation.get("t_controller_received_event"))
         activation["worker_create_seconds"] = delta(activation.get("t_worker_create_requested"), activation.get("t_worker_pod_created"))
@@ -1413,6 +1455,7 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
         activation["status"] = "derived_from_controller_structured_logs" if observed else "not_observable"
         activation_rows.append(activation)
         release = {
+            "run_id": run_id,
             "repetition": repetition,
             "stream_key": key,
             "release_detection_seconds": delta(entry.get("t_publish_end_client"), entry.get("t_controller_received_end")),
@@ -1432,13 +1475,21 @@ def delta(start: Any, end: Any) -> float | None:
     return value
 
 
-def repetition_for_timestamp(windows: list[dict[str, Any]], timestamp: Any) -> int | None:
+def window_for_timestamp(windows: list[dict[str, Any]], timestamp: Any, run_id: str | None = None) -> dict[str, Any] | None:
+    candidates = windows
+    if run_id:
+        candidates = [w for w in windows if str(w.get("run_id") or "") == str(run_id)]
     if not isinstance(timestamp, (int, float)):
-        return int(windows[0]["repetition"]) if len(windows) == 1 else None
-    for window in windows:
+        return candidates[0] if len(candidates) == 1 else None
+    for window in candidates:
         if event_in_window({"timestamp_epoch": timestamp}, window, len(windows)):
-            return int(window.get("repetition") or 1)
+            return window
     return None
+
+
+def repetition_for_timestamp(windows: list[dict[str, Any]], timestamp: Any) -> int | None:
+    window = window_for_timestamp(windows, timestamp)
+    return int(window.get("repetition") or 1) if window else None
 
 
 def build_correctness_rows(
@@ -1448,16 +1499,20 @@ def build_correctness_rows(
     controller_events: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     windows = load_run_windows(config, dirs)
-    # Track worker pods by snapshot to detect simultaneous duplication, not historical replacement across repetitions.
-    snapshot_workers: dict[tuple[int, Any, str], set[str]] = {}
-    max_workers_by_stream: dict[tuple[int, str], int] = {}
-    duplicate_by_stream: dict[tuple[int, str], bool] = {}
-    orphan_by_rep: dict[int, set[str]] = {int(w.get("repetition") or 1): set() for w in windows}
+    # Track worker pods by snapshot to detect simultaneous duplication, not historical replacement across repetitions or resumed run ids.
+    snapshot_workers: dict[tuple[str, int, Any, str], set[str]] = {}
+    max_workers_by_stream: dict[tuple[str, int, str], int] = {}
+    duplicate_by_stream: dict[tuple[str, int, str], bool] = {}
+    orphan_by_window: dict[tuple[str, int], set[str]] = {
+        (str(w.get("run_id") or config.run_id), int(w.get("repetition") or 1)): set() for w in windows
+    }
 
     for row in pod_rows:
-        rep = repetition_for_timestamp(windows, row.get("snapshot_at"))
-        if rep is None or row.get("component") != "worker":
+        window = window_for_timestamp(windows, row.get("snapshot_at"), row.get("run_id"))
+        if window is None or row.get("component") != "worker":
             continue
+        run_id = str(window.get("run_id") or config.run_id)
+        rep = int(window.get("repetition") or 1)
         stream = row.get("stream_key")
         pod = row.get("pod")
         snapshot_at = row.get("snapshot_at")
@@ -1465,43 +1520,50 @@ def build_correctness_rows(
         if phase not in {"Running", "Pending"}:
             continue
         if stream:
-            key = (rep, snapshot_at, stream)
+            key = (run_id, rep, snapshot_at, stream)
             bucket = snapshot_workers.setdefault(key, set())
             if pod:
                 bucket.add(str(pod))
             count = len(bucket)
-            max_key = (rep, stream)
+            max_key = (run_id, rep, stream)
             max_workers_by_stream[max_key] = max(max_workers_by_stream.get(max_key, 0), count)
             if count > 1:
                 duplicate_by_stream[max_key] = True
         elif pod:
-            orphan_by_rep.setdefault(rep, set()).add(str(pod))
+            orphan_by_window.setdefault((run_id, rep), set()).add(str(pod))
 
     rows: list[dict[str, Any]] = []
     for window in windows:
+        run_id = str(window.get("run_id") or config.run_id)
         rep = int(window.get("repetition") or 1)
         stream_keys = window.get("stream_keys") or config.stream_keys
         for key in stream_keys:
-            max_count = max_workers_by_stream.get((rep, key), 0)
+            max_count = max_workers_by_stream.get((run_id, rep, key), 0)
             rows.append({
+                "run_id": run_id,
                 "repetition": rep,
                 "stream_key": key,
                 "max_worker_count_observed": max_count,
-                "one_worker_per_stream": max_count <= 1,
-                "duplicate_worker_detected": bool(duplicate_by_stream.get((rep, key), False)),
-                "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_in_window(e, window, len(windows))),
-                "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_in_window(e, window, len(windows))),
-                "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_in_window(e, window, len(windows))),
+                "worker_observed_for_stream": max_count >= 1,
+                "at_most_one_worker_per_stream": max_count <= 1,
+                "one_worker_per_stream": max_count == 1,
+                "duplicate_worker_detected": bool(duplicate_by_stream.get((run_id, rep, key), False)),
+                "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
+                "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
+                "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
             })
         rows.append({
+            "run_id": run_id,
             "repetition": rep,
             "stream_key": "__orphans__",
-            "max_worker_count_observed": len(orphan_by_rep.get(rep, set())),
+            "max_worker_count_observed": len(orphan_by_window.get((run_id, rep), set())),
+            "worker_observed_for_stream": None,
+            "at_most_one_worker_per_stream": None,
             "one_worker_per_stream": None,
             "duplicate_worker_detected": None,
-            "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_in_window(e, window, len(windows))),
-            "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_in_window(e, window, len(windows))),
-            "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_in_window(e, window, len(windows))),
+            "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
+            "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
+            "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_matches_window_identity(e, window) and event_in_window(e, window, len(windows))),
         })
     return rows
 
@@ -1514,10 +1576,10 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
 
     activation_rows, release_rows, lifecycle_by_stream = build_lifecycle_rows(config, dirs, publisher_rows)
     activation_fields = [
-        "repetition", "stream_key", "concurrency", "t_publish_start_client", "t_publish_start_proxy", "t_controller_received_event", "t_worker_create_requested", "t_worker_pod_created", "t_worker_scheduled", "t_worker_container_started", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress", "event_detection_seconds", "worker_create_seconds", "worker_scheduling_seconds", "worker_ready_seconds", "ffmpeg_start_seconds", "ffmpeg_first_progress_seconds", "total_activation_seconds", "status"
+        "run_id", "repetition", "stream_key", "concurrency", "t_publish_start_client", "t_publish_start_proxy", "t_controller_received_event", "t_worker_create_requested", "t_worker_pod_created", "t_worker_scheduled", "t_worker_container_started", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress", "t_destination_received", "event_detection_seconds", "worker_create_seconds", "worker_scheduling_seconds", "worker_ready_seconds", "ffmpeg_start_seconds", "ffmpeg_first_progress_seconds", "total_activation_seconds", "status"
     ]
     write_csv(dirs["metrics"] / "activation_metrics.csv", activation_rows, activation_fields)
-    write_csv(dirs["metrics"] / "release_metrics.csv", release_rows, ["repetition", "stream_key", "release_detection_seconds", "worker_delete_seconds", "total_release_seconds", "status"])
+    write_csv(dirs["metrics"] / "release_metrics.csv", release_rows, ["run_id", "repetition", "stream_key", "release_detection_seconds", "worker_delete_seconds", "total_release_seconds", "status"])
 
     resilience_rows = []
     for run in read_jsonl(dirs["raw"] / "streams.jsonl"):
@@ -1527,6 +1589,8 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
                 stream_key = injected.get("stream_key")
                 recovery_end, recovery_event = first_observable_recovery_event(controller_events, injected_ts, stream_key)
                 resilience_rows.append({
+                    "run_id": run.get("run_id"),
+                    "repetition": run.get("repetition"),
                     "type": injected.get("type"),
                     "stream_key": stream_key,
                     "pod": injected.get("pod"),
@@ -1536,7 +1600,7 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
                     "recovery_seconds": delta(injected_ts, recovery_end),
                     "status": injected.get("status") or ("injected" if injected.get("pod") else "not_injected"),
                 })
-    write_csv(dirs["metrics"] / "resilience_metrics.csv", resilience_rows, ["type", "stream_key", "pod", "timestamp", "recovery_completed_at", "recovery_event", "recovery_seconds", "status"])
+    write_csv(dirs["metrics"] / "resilience_metrics.csv", resilience_rows, ["run_id", "repetition", "type", "stream_key", "pod", "timestamp", "recovery_completed_at", "recovery_event", "recovery_seconds", "status"])
 
     resource_rows = []
     for metric_name in ("pod_cpu_rate", "pod_memory_working_set", "proxy_network_receive_bps", "proxy_network_transmit_bps"):
@@ -1552,7 +1616,7 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     write_csv(
         dirs["metrics"] / "correctness_metrics.csv",
         correctness_rows,
-        ["repetition", "stream_key", "max_worker_count_observed", "one_worker_per_stream", "duplicate_worker_detected", "handover_accepted", "handover_denied", "stale_events_ignored"],
+        ["run_id", "repetition", "stream_key", "max_worker_count_observed", "worker_observed_for_stream", "at_most_one_worker_per_stream", "one_worker_per_stream", "duplicate_worker_detected", "handover_accepted", "handover_denied", "stale_events_ignored"],
     )
 
 
@@ -1569,7 +1633,7 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
         {"metric": "proxy_pod_seconds", "value": proxy_pod_seconds, "source": proxy_cost_source},
         {"metric": "controller_pod_seconds", "value": controller_pod_seconds, "source": "experiment_duration_assumes_single_controller"},
         {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds, "source": "len_stream_keys_times_duration_reference"},
-        {"metric": "relative_savings_vs_always_on_workers", "value": economy_relative, "source": "resource_time_estimate" if worker_pod_seconds is not None else "not_supported_without_prometheus"},
+        {"metric": "relative_worker_activity_reduction_vs_always_on", "value": economy_relative, "source": "resource_activity_time_integral_estimate" if worker_pod_seconds is not None else "not_supported_without_prometheus"},
     ]
     write_csv(dirs["metrics"] / "cost_estimation.csv", cost_rows, ["metric", "value", "source"])
 
@@ -1594,7 +1658,8 @@ def missing_metrics(config: RunnerConfig, prom: dict[str, Any], activation_rows:
             missing.append(f"per_stream_{field}")
     if not any(row.get("total_release_seconds") is not None for row in release_rows):
         missing.append("per_stream_total_release_seconds")
-    missing.append("t_destination_received")
+    if not any(row.get("t_destination_received") is not None for row in activation_rows):
+        missing.append("t_destination_received")
     return sorted(set(missing))
 
 
@@ -1751,43 +1816,54 @@ def format_cell(value: Any) -> str:
 def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> list[dict[str, Any]]:
     activation = csv_rows(dirs["metrics"] / "activation_metrics.csv")
     release = csv_rows(dirs["metrics"] / "release_metrics.csv")
-    correctness = {(str(row.get("repetition")), row.get("stream_key")): row for row in csv_rows(dirs["metrics"] / "correctness_metrics.csv")}
+    correctness = {(row.get("run_id") or config.run_id, str(row.get("repetition")), row.get("stream_key")): row for row in csv_rows(dirs["metrics"] / "correctness_metrics.csv")}
     publishers = [row for row in read_jsonl(dirs["raw"] / "publishers.jsonl") if row.get("event") == "publisher_finished"]
     pods = extract_pod_rows(dirs, config.stream_keys)
     windows = load_run_windows(config, dirs)
-    pod_by_stream: dict[tuple[str, str], dict[str, Any]] = {}
+    pod_history: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for row in pods:
         stream = row.get("stream_key")
-        rep = repetition_for_timestamp(windows, row.get("snapshot_at"))
-        if stream and rep is not None and row.get("component") == "worker":
-            # Keep the latest observed worker in that repetition only.
-            key = (str(rep), stream)
-            existing = pod_by_stream.get(key)
-            if existing is None or float(row.get("snapshot_at") or 0) >= float(existing.get("snapshot_at") or 0):
-                pod_by_stream[key] = row
-    release_by_key = {(str(row.get("repetition")), row.get("stream_key")): row for row in release}
-    publisher_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        window = window_for_timestamp(windows, row.get("snapshot_at"), row.get("run_id"))
+        if stream and window is not None and row.get("component") == "worker":
+            run_id = str(window.get("run_id") or config.run_id)
+            rep = str(window.get("repetition") or 1)
+            pod_history.setdefault((run_id, rep, stream), []).append(row)
+    release_by_key = {(row.get("run_id") or config.run_id, str(row.get("repetition")), row.get("stream_key")): row for row in release}
+    publisher_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in publishers:
-        key = (str(row.get("repetition")), row.get("stream_key"))
+        key = (str(row.get("run_id") or config.run_id), str(row.get("repetition")), row.get("stream_key"))
         # Prefer the first publisher for primary stream result rows.
         if key not in publisher_by_key or int(row.get("publisher_index") or 0) < int(publisher_by_key[key].get("publisher_index") or 9999):
             publisher_by_key[key] = row
     rows: list[dict[str, Any]] = []
     for row in activation:
-        key = row.get("stream_key")
+        stream_key = row.get("stream_key")
+        run_id = row.get("run_id") or config.run_id
         rep = str(row.get("repetition"))
-        rel = release_by_key.get((rep, key), {})
-        pub = publisher_by_key.get((rep, key), {})
-        corr = correctness.get((rep, key), {})
-        pod = pod_by_stream.get((rep, key), {})
+        key = (run_id, rep, stream_key)
+        rel = release_by_key.get(key, {})
+        pub = publisher_by_key.get(key, {})
+        corr = correctness.get(key, {})
+        history = sorted(pod_history.get(key, []), key=lambda item: float(item.get("snapshot_at") or 0))
+        worker_names = [str(item.get("pod")) for item in history if item.get("pod")]
+        distinct_workers = []
+        for name in worker_names:
+            if name not in distinct_workers:
+                distinct_workers.append(name)
+        initial_pod = history[0] if history else {}
+        final_pod = history[-1] if history else {}
         rows.append({
+            "run_id": run_id,
             "repetition": rep,
-            "streamKey": key,
-            "worker": pod.get("pod") or "não observado",
-            "proxy_owner": pod.get("proxy_pod") or "não observado",
+            "streamKey": stream_key,
+            "initial_worker": initial_pod.get("pod") or "não observado",
+            "final_worker": final_pod.get("pod") or "não observado",
+            "worker_replacements_count": max(0, len(distinct_workers) - 1),
+            "proxy_owner": final_pod.get("proxy_pod") or "não observado",
             "publisher_status": pub.get("publisher_status") or publisher_status(config, pub) if pub else "não observado",
             "activation_seconds": row.get("total_activation_seconds") or "não observável",
             "release_seconds": rel.get("total_release_seconds") or "não observável",
+            "worker_observed": corr.get("worker_observed_for_stream"),
             "duplicate_worker": corr.get("duplicate_worker_detected"),
             "handover_accepted": corr.get("handover_accepted"),
             "handover_denied": corr.get("handover_denied"),
@@ -1795,9 +1871,8 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
         })
     if not rows:
         for key in config.stream_keys:
-            rows.append({"repetition": "-", "streamKey": key, "worker": "não observado", "proxy_owner": "não observado", "publisher_status": "não observado", "activation_seconds": "não observável", "release_seconds": "não observável", "duplicate_worker": "não observado", "handover_accepted": "0", "handover_denied": "0", "observations": "sem linhas de ativação"})
+            rows.append({"run_id": config.run_id, "repetition": "-", "streamKey": key, "initial_worker": "não observado", "final_worker": "não observado", "worker_replacements_count": "0", "proxy_owner": "não observado", "publisher_status": "não observado", "activation_seconds": "não observável", "release_seconds": "não observável", "worker_observed": "não observado", "duplicate_worker": "não observado", "handover_accepted": "0", "handover_denied": "0", "observations": "sem linhas de ativação"})
     return rows
-
 
 
 def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict[str, Any], metrics: dict[str, Any], charts: dict[str, str]) -> dict[str, Any]:
@@ -1843,7 +1918,7 @@ Experimento `{config.experiment_id}` executado no cenário `{config.scenario}` c
 
 ## Resultado por streamKey
 
-{md_table(build_stream_result_rows(config, dirs), ['repetition','streamKey','worker','proxy_owner','publisher_status','activation_seconds','release_seconds','duplicate_worker','handover_accepted','handover_denied','observations'])}
+{md_table(build_stream_result_rows(config, dirs), ['run_id','repetition','streamKey','initial_worker','final_worker','worker_replacements_count','proxy_owner','publisher_status','activation_seconds','release_seconds','worker_observed','duplicate_worker','handover_accepted','handover_denied','observations'])}
 
 ## Uso de recursos
 
@@ -1855,7 +1930,9 @@ Experimento `{config.experiment_id}` executado no cenário `{config.scenario}` c
 
 ## Resiliência
 
-Os cenários de falha registram injeções em `metrics/resilience_metrics.csv` e nos logs de Kubernetes. O tempo de recuperação só deve ser usado quando as métricas de recuperação do controller e/ou Prometheus estiverem disponíveis.
+{md_table(csv_rows(dirs["metrics"] / "resilience_metrics.csv"), ['run_id','repetition','type','stream_key','pod','recovery_seconds','recovery_event','status'])}
+
+O tempo de recuperação só deve ser usado quando as métricas de recuperação do controller e/ou Prometheus estiverem disponíveis; linhas sem `recovery_seconds` indicam recuperação não observável nesta execução.
 
 ## Correção arquitetural
 
@@ -1866,7 +1943,7 @@ A verificação de um worker por streamKey e candidatos a órfãos foi salva em 
 - Métricas ausentes ou não observáveis nesta execução: {', '.join(unavailable) if unavailable else 'nenhuma limitação automática detectada'}.
 - Tempos per-stream de cold start dependem da exportação de timestamps pelo controller; quando não há endpoint per-stream, o relatório usa apenas histogramas Prometheus agregados.
 - `t_destination_received` só pode ser sustentado se houver callback/observação no destino externo.
-- A estimativa de custo relativo é uma aproximação por resource-time/pod-seconds; não equivale a cobrança real de provedor de nuvem.
+- A estimativa é uma redução relativa de atividade de workers/proxies por pod-seconds; não equivale a custo financeiro real de provedor de nuvem sem CPU/memória request-seconds e modelo de preço.
 - Métricas de cAdvisor/kube-state-metrics são isoladas por namespace; para evitar contaminação, execute cada experimento em namespace dedicado ou use `--patch-proxy-context` para escopo das métricas do controller.
 - A validade estatística depende do número de repetições e da disponibilidade de amostras em Prometheus.
 

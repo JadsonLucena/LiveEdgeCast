@@ -190,3 +190,50 @@ def test_cold_start_precondition_requires_cleanup_flag(monkeypatch, tmp_path):
         assert "allow-worker-cleanup" in str(exc)
     else:
         raise AssertionError("expected RuntimeError")
+
+
+def test_restore_context_keys_restores_partially_patched_deployment(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    commands = []
+
+    def fake_run_cmd(command, timeout=60):
+        commands.append(command)
+        return {"returncode": 0, "command": command, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(runner, "run_cmd", fake_run_cmd)
+    patch_result = {
+        "patched": True,
+        "patched_deployments": ["proxy"],
+        "previous_env": {
+            "proxy": {"values": {"EXPERIMENT_ID": None, "SCENARIO": "old", "RUN_ID": None}},
+            "controller": {"values": {"LIVEEDGECAST_EXPERIMENT_ID": "old"}},
+        },
+    }
+
+    result = runner.restore_context_keys(cfg, dirs, patch_result)
+
+    assert result["restored_deployments"] == ["proxy"]
+    assert any("deployment/proxy" in cmd for command in commands for cmd in command)
+    assert not any("deployment/controller" in cmd for command in commands for cmd in command)
+
+
+def test_correctness_marks_zero_workers_as_not_valid(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    (dirs["raw"] / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 10.0, "stream_keys": ["key1"]}) + "\n" +
+        json.dumps({"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 20.0, "stream_keys": ["key1"]}) + "\n"
+    )
+    (dirs["raw"] / "publishers.jsonl").write_text(
+        json.dumps({"event": "publisher_finished", "run_id": "run", "repetition": 1, "publisher_index": 1, "stream_key": "key1", "started_at": 11.0, "ended_at": 19.0, "returncode": 0}) + "\n"
+    )
+    (dirs["raw"] / "controller_events.jsonl").write_text("")
+
+    runner.build_metrics(cfg, dirs)
+
+    rows = list(__import__("csv").DictReader((dirs["metrics"] / "correctness_metrics.csv").open()))
+    stream_row = next(row for row in rows if row["stream_key"] == "key1")
+    assert stream_row["worker_observed_for_stream"] == "False"
+    assert stream_row["at_most_one_worker_per_stream"] == "True"
+    assert stream_row["one_worker_per_stream"] == "False"

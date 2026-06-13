@@ -55,11 +55,11 @@ reports/<experiment-id>/
 
 ### `activation_metrics.csv`
 
-Contém timestamps e durações por streamKey. O campo `status` informa se os valores foram derivados de logs estruturados ou se não eram observáveis.
+Contém timestamps e durações por `run_id + repetition + streamKey`. O campo `status` informa se os valores foram derivados de logs estruturados ou se não eram observáveis.
 
 ### `release_metrics.csv`
 
-Contém tempos entre fim do publisher, recebimento do evento de encerramento e término/deleção do worker.
+Contém tempos entre fim do publisher, recebimento do evento de encerramento e término/deleção do worker por `run_id + repetition + streamKey`.
 
 ### `resilience_metrics.csv`
 
@@ -71,11 +71,11 @@ Resume séries do Prometheus para CPU, memória e rede, incluindo média, median
 
 ### `correctness_metrics.csv`
 
-Resume indícios de um worker por streamKey por repetição, duplicidade simultânea dentro da janela da repetição, handovers, eventos stale ignorados e candidatos a órfãos. Substituições históricas de worker entre repetições não são tratadas como duplicidade.
+Resume indícios de correção por `run_id + repetition + streamKey`. O arquivo separa `worker_observed_for_stream`, `at_most_one_worker_per_stream` e `one_worker_per_stream`, evitando considerar uma stream sem worker observado como válida. Duplicidade só considera workers simultâneos dentro da janela da repetição; substituições históricas entre repetições não são tratadas como duplicidade.
 
 ### `cost_estimation.csv`
 
-Calcula uma estimativa relativa por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada.
+Calcula uma estimativa relativa de atividade por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada. Esse arquivo não representa cobrança financeira real de provedor de nuvem.
 
 ## Gráficos
 
@@ -85,4 +85,4 @@ O runner só gera gráficos com dados reais. Quando as amostras necessárias nã
 
 O runner não mistura execuções por padrão. Se o diretório de saída já existir, a execução falha, exceto quando `--overwrite` ou `--resume` for informado. Essa regra evita que evidências antigas contaminem métricas novas.
 
-Os resultados por streamKey no `report.md` são calculados por `repetition + streamKey`, usando as janelas de execução registradas em `raw/streams.jsonl`.
+Os resultados por streamKey no `report.md` são calculados por `run_id + repetition + streamKey`, usando as janelas de execução registradas em `raw/streams.jsonl`. O uso de `--resume` deve ser acompanhado de um `--run-id` novo para evitar colisão lógica entre retomadas.

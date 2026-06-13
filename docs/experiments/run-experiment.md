@@ -59,7 +59,7 @@ python tools/experiments/run_experiment.py \
 
 ## Cenários suportados
 
-- `cold-start`: mede ativação sob demanda a partir de zero workers. Antes de iniciar cada repetição, o runner verifica pods `app=worker`, remove resíduos ativos no namespace do experimento e falha a repetição se não conseguir confirmar zero workers.
+- `cold-start`: mede ativação sob demanda a partir de zero workers. Antes de iniciar cada repetição, o runner verifica pods `app=worker`; por padrão, ele falha se houver workers ativos. A remoção de resíduos só ocorre quando `--allow-worker-cleanup` é informado explicitamente.
 - `concurrency`: inicia múltiplas transmissões simultâneas.
 - `release`: encerra publishers e observa liberação de workers/estado.
 - `worker-failure`: injeta falha de worker e observa recuperação.
@@ -110,7 +110,7 @@ O runner não altera a documentação do repositório durante a execução. Todo
 - `t_destination_received` só é observável se houver callback do destino ou receptor experimental.
 - Métricas per-stream dependem de logs estruturados do controller/worker.
 - Gráficos só são gerados quando há amostras reais; caso contrário, o runner cria um `.txt` explicando a ausência de dados.
-- A estimativa de custo é relativa e baseada em pod-seconds, não em cobrança real de provedor de nuvem.
+- A estimativa é uma redução relativa de atividade por pod-seconds, não uma cobrança real de provedor de nuvem.
 
 ## Validade do experimento
 
@@ -124,7 +124,7 @@ O runner não altera a documentação do repositório durante a execução. Todo
 Por padrão, o runner recusa executar quando `reports/<experiment-id>/` já existe e contém arquivos, pois os arquivos JSONL são evidência bruta append-only. Use uma das opções abaixo de forma explícita:
 
 - `--overwrite`: apaga o diretório anterior antes de executar.
-- `--resume`: permite continuar e anexar evidências ao diretório existente.
+- `--resume`: permite continuar e anexar evidências ao diretório existente. Use um `--run-id` novo para cada retomada; as métricas são separadas por `run_id + repetition`.
 
 O cenário `cold-start` também é conservador por padrão. Se houver workers ativos, o experimento falha em vez de apagar pods automaticamente. Para permitir a limpeza de workers residuais em um namespace dedicado ao experimento, use:
 
