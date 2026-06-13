@@ -39,5 +39,18 @@ if not activation:
     raise SystemExit('activation_metrics.csv has no rows')
 if not correctness:
     raise SystemExit('correctness_metrics.csv has no rows')
-print(f'Smoke experiment OK: {root}')
+observable_activation = [
+    row for row in activation
+    if row.get('total_activation_seconds') not in (None, '', 'None', 'null')
+    or row.get('status') == 'derived_from_controller_structured_logs'
+]
+worker_observed = [
+    row for row in correctness
+    if str(row.get('worker_observed_for_stream')).lower() == 'true'
+]
+if not observable_activation:
+    raise SystemExit('no observable activation sample found; inspect controller lifecycle logs and Prometheus scrape configuration')
+if not worker_observed:
+    raise SystemExit('no worker observation found in correctness_metrics.csv; inspect Kubernetes annotations/controller events')
+print(f'Smoke experiment OK with observable lifecycle and worker evidence: {root}')
 PY

@@ -79,7 +79,7 @@ kubectl set env deployment/proxy EXPERIMENT_ID=<id> SCENARIO=<scenario> RUN_ID=<
 kubectl set env deployment/controller LIVEEDGECAST_EXPERIMENT_ID=<id> LIVEEDGECAST_SCENARIO=<scenario> LIVEEDGECAST_RUN_ID=<run> LIVEEDGECAST_TENANT=<id> LIVEEDGECAST_ENVIRONMENT=<scenario> LIVEEDGECAST_REGION=<run> -n <namespace>
 ```
 
-O patch é opt-in porque reinicia os deployments e pode interromper sessões RTMP ativas. Use preferencialmente um namespace dedicado por experimento. O runner captura o estado anterior das variáveis antes de alterar cada deployment; se o snapshot falhar para algum deployment, esse deployment não é alterado para evitar restauração destrutiva. O resultado do patch e da restauração fica em `raw/proxy_context_patch.json` e `raw/proxy_context_restore.json`. O escopo de métricas do controller só é usado quando o deployment `controller` foi efetivamente alterado e o rollout concluiu com sucesso; se o patch do controller for ignorado ou falhar, as queries do Prometheus não aplicam labels de experimento para evitar falso vazio.
+O patch é opt-in porque reinicia os deployments e pode interromper sessões RTMP ativas. Use preferencialmente um namespace dedicado por experimento. O runner captura o estado anterior das variáveis antes de alterar cada deployment; se o snapshot falhar para algum deployment, esse deployment não é alterado para evitar restauração destrutiva. O resultado do patch e da restauração fica em `raw/proxy_context_patch.json` e `raw/proxy_context_restore.json`. O escopo de métricas do controller só é usado quando o deployment `controller` foi efetivamente alterado e o rollout concluiu com sucesso; se o patch do controller for ignorado ou falhar, as queries do Prometheus não aplicam labels de experimento para evitar falso vazio. Quando `--patch-proxy-context` é solicitado e o patch não fica plenamente efetivo, o experimento passa a ser tratado como parcial/inválido para automação, salvo uso explícito de `--allow-unscoped-context`.
 
 O runner também coleta logs estruturados e gera:
 
@@ -111,6 +111,7 @@ O runner não altera a documentação do repositório durante a execução. Todo
 
 - `t_destination_received` só é observável se houver callback do destino ou receptor experimental.
 - Métricas per-stream dependem de logs estruturados do controller/worker.
+- Métricas FFmpeg exportadas pelos workers são escopadas por padrão com `namespace="$namespace"`. Ajuste `--worker-metric-label-selector` ou `LIVEEDGECAST_WORKER_METRIC_LABEL_SELECTOR` quando o Prometheus usa outro nome de label; use string vazia apenas se esses exporters realmente não carregarem labels de scrape.
 - Gráficos só são gerados quando há amostras reais; caso contrário, o runner cria um `.txt` explicando a ausência de dados.
 - A estimativa é uma redução relativa de atividade por pod-seconds, não uma cobrança real de provedor de nuvem. O relatório chama essa seção de “Atividade relativa de recursos”.
 
@@ -140,10 +141,10 @@ Evite essa opção em namespaces compartilhados.
 
 ## Códigos de saída
 
-- `0`: experimento válido ou `partial` aceito explicitamente com `--allow-partial`.
-- `1`: experimento `failed`, `partial` sem `--allow-partial`, ou falha de restauração de contexto após `--patch-proxy-context` sem `--allow-restore-failure`.
+- `0`: experimento válido, `partial` aceito explicitamente com `--allow-partial`, ou patch de contexto incompleto aceito explicitamente com `--allow-unscoped-context`.
+- `1`: experimento `failed`, `partial` sem `--allow-partial`, patch de contexto solicitado mas inefetivo sem `--allow-unscoped-context`, ou falha de restauração de contexto após `--patch-proxy-context` sem `--allow-restore-failure`.
 
-Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI. Use `--allow-restore-failure` somente após confirmar limpeza manual do cluster, pois a restauração malsucedida pode deixar deployments com variáveis de ambiente experimentais.
+Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI. Use `--allow-unscoped-context` somente quando aceita que logs/métricas do controller podem não estar correlacionados por labels de experimento. Use `--allow-restore-failure` somente após confirmar limpeza manual do cluster, pois a restauração malsucedida pode deixar deployments com variáveis de ambiente experimentais.
 
 ## Logs por fase
 
@@ -169,4 +170,4 @@ NAMESPACE=media \
 ./tools/experiments/smoke_k8s_experiment.sh
 ```
 
-O script executa um `cold-start` mínimo em namespace dedicado ou controlado e valida se `report.md`, `activation_metrics.csv` e `correctness_metrics.csv` foram gerados com linhas de evidência.
+O script executa um `cold-start` mínimo em namespace dedicado ou controlado e valida se `report.md`, `activation_metrics.csv` e `correctness_metrics.csv` foram gerados. Além da existência dos arquivos, o smoke test exige pelo menos uma amostra de ativação observável e uma linha de correção com worker observado; linhas apenas `not_observable` não são suficientes para aprovar o teste.

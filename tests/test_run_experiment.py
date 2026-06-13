@@ -530,3 +530,102 @@ def test_second_proxy_must_be_correlated_after_second_attempt(tmp_path):
     assert duplicate_rows[0]["scenario_inconclusive"] == "True"
     assert duplicate_rows[0]["controller_rejection_status"] == "rejected"
     assert duplicate_rows[0]["between_proxy_validity_status"] == "inconclusive"
+
+
+def test_missing_metrics_ignores_prometheus_metadata(tmp_path):
+    cfg = config(tmp_path)
+    missing = runner.missing_metrics(
+        cfg,
+        {
+            "_metadata": {"started_at": 1.0, "ended_at": 2.0},
+            "controller_active_streams": {"available": True, "response": {"status": "success"}},
+        },
+        activation_rows=[{
+            "t_controller_received_event": 1.0,
+            "t_worker_create_requested": 1.1,
+            "t_worker_ready": 1.2,
+            "t_ffmpeg_started": 1.3,
+            "t_ffmpeg_first_progress": 1.4,
+            "t_destination_received": 1.5,
+        }],
+        release_rows=[{"total_release_seconds": 2.0}],
+    )
+
+    assert "_metadata" not in missing
+    assert "controller_active_streams" not in missing
+
+
+def test_worker_ffmpeg_promql_is_namespace_scoped_by_default(tmp_path):
+    cfg = config(tmp_path)
+    rendered = runner.render_promql(cfg, "worker_ffmpeg_running$worker_metric_label_selector")
+
+    assert rendered == 'worker_ffmpeg_running{namespace="media"}'
+
+
+def test_worker_ffmpeg_promql_can_be_unscoped_explicitly(tmp_path):
+    cfg = config(tmp_path)
+    cfg.worker_metric_label_selector = ""
+    rendered = runner.render_promql(cfg, "worker_ffmpeg_running$worker_metric_label_selector")
+
+    assert rendered == "worker_ffmpeg_running"
+
+
+def test_duplicate_publisher_nonzero_exit_keeps_process_status_separate(tmp_path):
+    cfg = config(tmp_path, scenario="duplicate-streamkey")
+    result = {"returncode": 1, "publisher_index": 2, "stop_reason": None}
+
+    assert runner.publisher_process_status(result) == "nonzero_exit"
+    assert runner.publisher_status(cfg, result) == "duplicate_publisher_exited"
+
+
+def test_context_patch_incomplete_changes_exit_code_by_default(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    cfg.patch_proxy_context = True
+    cfg.kubectl_path = "/bin/true"
+    cfg.ffmpeg_path = "/bin/true"
+    cfg.output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(runner, "parse_args", lambda argv=None: cfg)
+    monkeypatch.setattr(runner, "execute_experiment", lambda config_arg, dirs: {
+        "status": "partial_context_patch",
+        "context_scope_ok": False,
+        "context_patch_status": "incomplete",
+        "restore_ok": True,
+        "started_at": 1.0,
+        "ended_at": 2.0,
+        "preflight": {"proxy_context_patch": {"controller_scope_effective": False}},
+        "runs": [],
+        "prometheus": {},
+    })
+    monkeypatch.setattr(runner, "build_metrics", lambda config_arg, dirs: {"activation": {}, "resources": [], "cost": [], "missing": []})
+    monkeypatch.setattr(runner, "generate_charts", lambda dirs: {})
+    monkeypatch.setattr(runner, "generate_report", lambda config_arg, dirs, execution, metrics, charts: {})
+
+    assert runner.main([]) == 1
+
+
+def test_context_patch_incomplete_can_be_allowed_explicitly(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    cfg.patch_proxy_context = True
+    cfg.allow_unscoped_context = True
+    cfg.kubectl_path = "/bin/true"
+    cfg.ffmpeg_path = "/bin/true"
+    cfg.output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(runner, "parse_args", lambda argv=None: cfg)
+    monkeypatch.setattr(runner, "execute_experiment", lambda config_arg, dirs: {
+        "status": "partial_context_patch",
+        "context_scope_ok": False,
+        "context_patch_status": "incomplete",
+        "restore_ok": True,
+        "started_at": 1.0,
+        "ended_at": 2.0,
+        "preflight": {"proxy_context_patch": {"controller_scope_effective": False}},
+        "runs": [],
+        "prometheus": {},
+    })
+    monkeypatch.setattr(runner, "build_metrics", lambda config_arg, dirs: {"activation": {}, "resources": [], "cost": [], "missing": []})
+    monkeypatch.setattr(runner, "generate_charts", lambda dirs: {})
+    monkeypatch.setattr(runner, "generate_report", lambda config_arg, dirs, execution, metrics, charts: {})
+
+    assert runner.main([]) == 0

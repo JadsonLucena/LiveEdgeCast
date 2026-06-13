@@ -61,9 +61,9 @@ DEFAULT_PROMQL = {
     "orphan_workers_deleted_total": "orphan_workers_deleted_total$controller_label_selector",
     "worker_recovery_total": "worker_recovery_total$controller_label_selector",
     "worker_recovery_duration_seconds_p95": 'histogram_quantile(0.95, sum by (le) (rate(worker_recovery_duration_seconds_bucket$controller_label_selector[5m])))',
-    "ffmpeg_running": "worker_ffmpeg_running",
-    "ffmpeg_progress_age": "worker_ffmpeg_progress_age_seconds",
-    "ffmpeg_out_time_seconds": "worker_ffmpeg_out_time_seconds",
+    "ffmpeg_running": "worker_ffmpeg_running$worker_metric_label_selector",
+    "ffmpeg_progress_age": "worker_ffmpeg_progress_age_seconds$worker_metric_label_selector",
+    "ffmpeg_out_time_seconds": "worker_ffmpeg_out_time_seconds$worker_metric_label_selector",
     "proxy_rtmp_active_streams": "proxy_rtmp_active_streams$controller_label_selector",
     "proxy_rtmp_active_publishers": "proxy_rtmp_active_publishers$controller_label_selector",
     "proxy_rtmp_active_clients": "proxy_rtmp_active_clients$controller_label_selector",
@@ -107,6 +107,8 @@ class RunnerConfig:
     allow_partial: bool = False
     allow_worker_cleanup: bool = False
     allow_restore_failure: bool = False
+    allow_unscoped_context: bool = False
+    worker_metric_label_selector: str | None = 'namespace="$namespace"'
 
     @property
     def report_root(self) -> Path:
@@ -199,6 +201,8 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--allow-partial", action="store_true", help="Return exit code 0 for partial experiments. By default partial runs fail automation.")
     parser.add_argument("--allow-worker-cleanup", action="store_true", help="Allow cold-start precondition to delete existing worker pods. Without this flag, existing workers make the cold-start run invalid.")
     parser.add_argument("--allow-restore-failure", action="store_true", help="Return exit code 0 even if opt-in deployment context restoration fails. Use only after manual cluster cleanup.")
+    parser.add_argument("--allow-unscoped-context", action="store_true", help="Return exit code 0 when --patch-proxy-context was requested but proxy/controller context patching was not fully effective.")
+    parser.add_argument("--worker-metric-label-selector", default=os.getenv("LIVEEDGECAST_WORKER_METRIC_LABEL_SELECTOR", 'namespace="$namespace"'), help="Prometheus labels used to scope worker FFmpeg exporter metrics. Use an empty string only if those metrics do not carry scrape labels.")
     args = parser.parse_args(argv)
 
     keys = load_stream_keys(args.stream_keys, args.stream_keys_file)
@@ -249,6 +253,8 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         allow_partial=args.allow_partial,
         allow_worker_cleanup=args.allow_worker_cleanup,
         allow_restore_failure=args.allow_restore_failure,
+        allow_unscoped_context=args.allow_unscoped_context,
+        worker_metric_label_selector=args.worker_metric_label_selector,
     )
 
 
@@ -474,17 +480,27 @@ def start_publisher(
     return ManagedPublisher(config, stream_key, command, process, stdout_path, stderr_path, started_at, repetition, publisher_index)
 
 
-def publisher_status(config: RunnerConfig, result: dict[str, Any]) -> str:
+def publisher_process_status(result: dict[str, Any]) -> str:
+    """Classify the FFmpeg process outcome without architectural interpretation."""
     rc = result.get("returncode")
     stop_reason = str(result.get("stop_reason") or "")
     if rc == 0:
         return "success"
     if stop_reason.startswith("expected_"):
         return "expected_stopped"
-    if config.scenario == "duplicate-streamkey" and int(result.get("publisher_index") or 0) > 1 and rc is not None:
-        return "duplicate_publisher_exited"
+    if stop_reason.endswith("_sigkill"):
+        return "killed_by_runner"
     if rc is None:
         return "running_or_unknown"
+    return "nonzero_exit"
+
+
+def publisher_status(config: RunnerConfig, result: dict[str, Any]) -> str:
+    process_status = publisher_process_status(result)
+    if process_status in {"success", "expected_stopped", "running_or_unknown"}:
+        return process_status
+    if config.scenario == "duplicate-streamkey" and int(result.get("publisher_index") or 0) > 1:
+        return "duplicate_publisher_exited"
     return "unexpected_failed"
 
 
@@ -516,6 +532,7 @@ def wait_or_stop_publishers(
 def record_publisher_results(config: RunnerConfig, dirs: dict[str, Path], publishers: list[ManagedPublisher]) -> list[dict[str, Any]]:
     results = [publisher.result() for publisher in publishers]
     for result in results:
+        result["publisher_process_status"] = publisher_process_status(result)
         result["publisher_status"] = publisher_status(config, result)
         append_jsonl(dirs["raw"] / "publishers.jsonl", {"event": "publisher_finished", **result})
     return results
@@ -569,7 +586,11 @@ def collect_logs(config: RunnerConfig, dirs: dict[str, Path], phase: str | None 
         path = log_dir / f"{name}.log"
         path.write_text((out.get("stdout") or "") + ("\n# STDERR\n" + out.get("stderr", "") if out.get("stderr") else ""), encoding="utf-8")
         event_count = extract_structured_events(path, dirs["raw"] / f"{name}_events.jsonl", component=name, collection_phase=phase or "final")
-        results[name] = {"returncode": out["returncode"], "path": str(path), "structured_events": event_count}
+        previous_out = run_cmd([config.kubectl_path, "logs", "-n", config.namespace, "-l", selector, "--all-containers=true", "--tail=-1", "--previous"], timeout=120)
+        previous_path = log_dir / f"{name}.previous.log"
+        previous_path.write_text((previous_out.get("stdout") or "") + ("\n# STDERR\n" + previous_out.get("stderr", "") if previous_out.get("stderr") else ""), encoding="utf-8")
+        previous_count = extract_structured_events(previous_path, dirs["raw"] / f"{name}_events.jsonl", component=name, collection_phase=f"{phase or 'final'}-previous")
+        results[name] = {"returncode": out["returncode"], "path": str(path), "structured_events": event_count, "previous_returncode": previous_out["returncode"], "previous_path": str(previous_path), "previous_structured_events": previous_count}
     # Merge publisher logs for convenience.
     publisher_log = log_dir / "publishers.log"
     with publisher_log.open("w", encoding="utf-8") as merged:
@@ -834,6 +855,28 @@ def prometheus_controller_label_selector(config: RunnerConfig) -> str:
     )
 
 
+def prometheus_worker_metric_label_selector(config: RunnerConfig) -> str:
+    """Return the selector used to scope worker-exporter FFmpeg metrics.
+
+    The worker exporter does not emit Kubernetes namespace labels itself; in
+    production these usually arrive from Prometheus scrape metadata. The selector
+    is configurable because label names differ across Prometheus installations.
+    """
+    raw = (config.worker_metric_label_selector or "").strip()
+    if not raw:
+        return ""
+    rendered = (
+        raw
+        .replace("$namespace", prom_label_value(config.namespace))
+        .replace("$experiment_id", prom_label_value(config.experiment_id))
+        .replace("$scenario", prom_label_value(config.scenario))
+        .replace("$run_id", prom_label_value(config.run_id))
+    )
+    if rendered.startswith("{") and rendered.endswith("}"):
+        return rendered
+    return "{" + rendered + "}"
+
+
 def prom_label_value(value: str) -> str:
     return str(value).replace('\\', '\\\\').replace('"', '\\"')
 
@@ -847,6 +890,7 @@ def render_promql(config: RunnerConfig, query: str, controller_label_selector: s
         .replace("$scenario", prom_label_value(config.scenario))
         .replace("$run_id", prom_label_value(config.run_id))
         .replace("$controller_label_selector", selector)
+        .replace("$worker_metric_label_selector", prometheus_worker_metric_label_selector(config))
     )
 
 
@@ -1024,6 +1068,7 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
             target_stream = stream_keys[0]
             pod = select_pod_by_selector(config, "app=worker", stream_key=target_stream) or select_pod_by_selector(config, "app=worker")
             if pod:
+                collect_logs(config, dirs, phase=f"r{repetition}-before-worker-delete")
                 deleted = delete_pod(config, pod)
                 injected.append({"type": "worker-failure", "stream_key": target_stream, "pod": pod, "timestamp": now_epoch(), "result": deleted})
             else:
@@ -1032,6 +1077,7 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
             time.sleep(min(config.kill_after_seconds, max(1, config.duration_seconds - 1)))
             pod = select_pod_by_selector(config, "app=proxy")
             if pod:
+                collect_logs(config, dirs, phase=f"r{repetition}-before-proxy-delete")
                 deleted = delete_pod(config, pod)
                 injected.append({"type": "proxy-failure", "stream_key": stream_keys[0] if stream_keys else None, "pod": pod, "timestamp": now_epoch(), "result": deleted})
             else:
@@ -1163,6 +1209,13 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
     experiment_started_at = now_epoch()
     run_summaries: list[dict[str, Any]] = []
     status = "valid"
+    context_scope_ok = True
+    context_patch_status = "not_requested"
+    if config.patch_proxy_context:
+        context_scope_ok = bool(patch_result.get("all_patched"))
+        context_patch_status = "effective" if context_scope_ok else "incomplete"
+        if not context_scope_ok:
+            status = "partial_context_patch"
     logs: dict[str, Any] = {}
     controller_after: dict[str, Any] = {}
     prometheus: dict[str, Any] = {}
@@ -1210,6 +1263,8 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
         status = "failed_restore" if status == "valid" else f"{status}_restore_failed"
     return {
         "status": status,
+        "context_scope_ok": context_scope_ok,
+        "context_patch_status": context_patch_status,
         "restore_ok": restore_ok,
         "setup_started_at": setup_started_at,
         "started_at": experiment_started_at,
@@ -1226,7 +1281,11 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
 
 
 def summarize_prometheus_availability(results: dict[str, Any]) -> dict[str, Any]:
-    return {name: {"available": bool(value.get("available")), "status": (value.get("response") or {}).get("status"), "error": value.get("error") or value.get("reason")} for name, value in results.items()}
+    return {
+        name: {"available": bool(value.get("available")), "status": (value.get("response") or {}).get("status"), "error": value.get("error") or value.get("reason")}
+        for name, value in results.items()
+        if not str(name).startswith("_") and isinstance(value, dict)
+    }
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -1788,6 +1847,7 @@ def build_duplicate_streamkey_rows(
             accepted_events = [e for e in scoped_events_after_second_attempt if is_controller_acceptance_event(e)]
             proxy_validity = scenario_proxy_validity_for_total(config, controller_events, window, stream, len(windows), second_attempt_started_at=second_attempt_started_at)
             duplicate_statuses = [row.get("publisher_status") for row in duplicate_pubs]
+            duplicate_process_statuses = [row.get("publisher_process_status") or publisher_process_status(row) for row in duplicate_pubs]
             rejected = attempted and bool(denial_events)
             unexpectedly_accepted = attempted and not rejected and any(status == "success" for status in duplicate_statuses)
             if not attempted:
@@ -1820,6 +1880,7 @@ def build_duplicate_streamkey_rows(
                 "duplicate_streamkey_unexpectedly_accepted": unexpectedly_accepted,
                 "duplicate_publisher_count": len(duplicate_pubs),
                 "duplicate_publisher_statuses": ";".join(str(status) for status in duplicate_statuses if status is not None),
+                "duplicate_publisher_process_statuses": ";".join(str(status) for status in duplicate_process_statuses if status is not None),
                 "controller_denial_events": len(denial_events),
                 "controller_acceptance_events": len(accepted_events),
                 "controller_rejection_status": controller_rejection_status,
@@ -1985,7 +2046,7 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     write_csv(
         dirs["metrics"] / "duplicate_streamkey_metrics.csv",
         duplicate_streamkey_rows,
-        ["run_id", "repetition", "stream_key", "second_publication_attempted", "second_attempt_started_at", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "duplicate_publisher_count", "duplicate_publisher_statuses", "controller_denial_events", "controller_acceptance_events", "controller_rejection_status", "between_proxy_validity_status", "primary_proxy_pod", "secondary_proxy_pod", "second_attempt_proxy_pod", "observed_proxy_sequence", "secondary_proxy_observed", "second_attempt_proxy_correlated", "same_proxy_detected", "scenario_inconclusive", "scenario_inconclusive_reason", "secondary_rtmp_url_configured", "status"],
+        ["run_id", "repetition", "stream_key", "second_publication_attempted", "second_attempt_started_at", "duplicate_streamkey_attempted", "duplicate_streamkey_rejected", "duplicate_streamkey_unexpectedly_accepted", "duplicate_publisher_count", "duplicate_publisher_statuses", "duplicate_publisher_process_statuses", "controller_denial_events", "controller_acceptance_events", "controller_rejection_status", "between_proxy_validity_status", "primary_proxy_pod", "secondary_proxy_pod", "second_attempt_proxy_pod", "observed_proxy_sequence", "secondary_proxy_observed", "second_attempt_proxy_correlated", "same_proxy_detected", "scenario_inconclusive", "scenario_inconclusive_reason", "secondary_rtmp_url_configured", "status"],
     )
 
     correctness_rows = build_correctness_rows(config, dirs, pod_rows, controller_events, publisher_rows)
@@ -2031,6 +2092,8 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
 def missing_metrics(config: RunnerConfig, prom: dict[str, Any], activation_rows: list[dict[str, Any]] | None = None, release_rows: list[dict[str, Any]] | None = None) -> list[str]:
     missing = []
     for name, result in prom.items():
+        if str(name).startswith("_") or not isinstance(result, dict):
+            continue
         if not result.get("available") or (result.get("response") or {}).get("status") != "success":
             missing.append(name)
     activation_rows = activation_rows or []
@@ -2294,6 +2357,7 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
     success_count = len([r for r in publisher_rows if r.get("publisher_status") in {"success", "expected_stopped"}])
     failure_count = len([r for r in publisher_rows if r.get("publisher_status") == "unexpected_failed"])
+    publisher_nonzero_process_count = len([r for r in publisher_rows if (r.get("publisher_process_status") or publisher_process_status(r)) == "nonzero_exit"])
     unavailable = metrics.get("missing", [])
     activation_csv_rows = csv_rows(dirs["metrics"] / "activation_metrics.csv")
     valid_activation_samples = len([row for row in activation_csv_rows if row.get("total_activation_seconds") not in (None, "", "None")])
@@ -2305,6 +2369,7 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
             "publishers": len(publisher_rows),
             "publisher_success_count": success_count,
             "publisher_failure_count": failure_count,
+            "publisher_nonzero_process_count": publisher_nonzero_process_count,
             "valid_activation_samples": valid_activation_samples,
             "invalid_activation_samples": invalid_activation_samples,
             "duplicate_streamkey_rejected": any(str(row.get("duplicate_streamkey_rejected")).lower() == "true" for row in duplicate_rows),
@@ -2314,6 +2379,8 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
             "second_attempt_proxy_correlated": any(str(row.get("second_attempt_proxy_correlated")).lower() == "true" for row in duplicate_rows),
             "between_proxy_claim_valid": any(str(row.get("between_proxy_validity_status")) == "valid_between_proxy_observation" for row in duplicate_rows),
             "restore_ok": execution.get("restore_ok"),
+            "context_scope_ok": execution.get("context_scope_ok"),
+            "context_patch_status": execution.get("context_patch_status"),
             "controller_scope_effective": bool(((execution.get("preflight") or {}).get("proxy_context_patch") or {}).get("controller_scope_effective")),
             "missing_metrics": unavailable,
         },
@@ -2332,7 +2399,7 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
 
 ## Resumo executivo
 
-Experimento `{config.experiment_id}` executado no cenário `{config.scenario}` com {len(config.stream_keys)} streamKey(s), duração nominal de {config.duration_seconds}s e {config.repetitions} repetição(ões). Foram registrados {success_count} publisher(s) com encerramento bem-sucedido e {failure_count} publisher(s) com falha observada. O relatório diferencia métricas reais, inferidas e ausentes; conclusões sobre métricas ausentes não são assumidas.
+Experimento `{config.experiment_id}` executado no cenário `{config.scenario}` com {len(config.stream_keys)} streamKey(s), duração nominal de {config.duration_seconds}s e {config.repetitions} repetição(ões). Foram registrados {success_count} publisher(s) com encerramento bem-sucedido, {failure_count} publisher(s) com falha arquitetural observada e {publisher_nonzero_process_count} publisher(s) com saída de processo não-zero. O relatório diferencia métricas reais, inferidas e ausentes; conclusões sobre métricas ausentes não são assumidas.
 
 Amostras de ativação válidas: {report_json["summary"]["valid_activation_samples"]}. Amostras de ativação sem métrica observável: {report_json["summary"]["invalid_activation_samples"]}.
 
@@ -2348,6 +2415,7 @@ Amostras de ativação válidas: {report_json["summary"]["valid_activation_sampl
 - Patch de contexto em deployments: `{'ativado' if config.patch_proxy_context else 'desativado'}`
 - Restauração de contexto: `{report_json["summary"].get("restore_ok")}`
 - Escopo efetivo de métricas do controller: `{report_json["summary"].get("controller_scope_effective")}`
+- Status do patch de contexto: `{report_json["summary"].get("context_patch_status")}`
 
 ## Métricas principais
 
@@ -2377,7 +2445,7 @@ A verificação de um worker por streamKey e candidatos a órfãos foi salva em 
 
 ## Verificação de streamKey duplicada
 
-{md_table(csv_rows(dirs["metrics"] / "duplicate_streamkey_metrics.csv"), ['run_id','repetition','stream_key','duplicate_streamkey_attempted','duplicate_streamkey_rejected','controller_rejection_status','between_proxy_validity_status','primary_proxy_pod','second_attempt_proxy_pod','secondary_proxy_pod','second_attempt_proxy_correlated','secondary_proxy_observed','scenario_inconclusive','scenario_inconclusive_reason','duplicate_publisher_count','controller_denial_events','status'])}
+{md_table(csv_rows(dirs["metrics"] / "duplicate_streamkey_metrics.csv"), ['run_id','repetition','stream_key','duplicate_streamkey_attempted','duplicate_streamkey_rejected','controller_rejection_status','between_proxy_validity_status','primary_proxy_pod','second_attempt_proxy_pod','secondary_proxy_pod','second_attempt_proxy_correlated','secondary_proxy_observed','scenario_inconclusive','scenario_inconclusive_reason','duplicate_publisher_count','duplicate_publisher_process_statuses','controller_denial_events','status'])}
 
 ## Limitações
 
@@ -2446,11 +2514,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     generate_report(config, dirs, execution, metrics, charts)
     status = str(execution.get("status") or "")
     restore_failed = config.patch_proxy_context and execution.get("restore_ok") is False
+    context_unscoped = config.patch_proxy_context and execution.get("context_scope_ok") is False
     if (
         status == "failed"
         or (status == "failed_restore" and not config.allow_restore_failure)
-        or (status.startswith("partial") and not config.allow_partial)
+        or (
+            status.startswith("partial")
+            and not config.allow_partial
+            and not (status == "partial_context_patch" and config.allow_unscoped_context)
+        )
         or (restore_failed and not config.allow_restore_failure)
+        or (context_unscoped and not config.allow_unscoped_context)
     ):
         exit_code = 1
     print(f"Report generated at: {dirs['root'] / 'report.md'}")
