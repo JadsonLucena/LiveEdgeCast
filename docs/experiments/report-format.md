@@ -1,16 +1,76 @@
 # Formato do relatório experimental
 
-Cada execução cria:
+Cada execução do runner cria uma pasta `reports/<experiment-id>/` com evidências brutas, métricas consolidadas, gráficos e relatórios.
 
 ```text
 reports/<experiment-id>/
   metadata.json
+  execution.json
   raw/
+    streams.jsonl
+    publishers.jsonl
+    controller_events.jsonl
+    proxy_events.jsonl
+    worker_events.jsonl
+    kubernetes_events.jsonl
+    pod_snapshots.jsonl
+    prometheus_range_queries.json
+    proxy_context_patch.json
+    controller_http_before.json
+    controller_http_after.json
   metrics/
+    activation_metrics.csv
+    release_metrics.csv
+    resilience_metrics.csv
+    resource_usage.csv
+    correctness_metrics.csv
+    cost_estimation.csv
   logs/
+    controller.log
+    proxy.log
+    worker.log
+    publishers.log
   charts/
+    *.png ou *.txt
   report.md
   report.json
 ```
 
-Os CSVs em `metrics/` são a base para tabelas e discussão do artigo. Os arquivos em `raw/` preservam evidências brutas para auditoria e reprocessamento.
+## Arquivos principais
+
+- `metadata.json`: parâmetros do experimento, horários de início/fim e diretórios.
+- `execution.json`: resumo das execuções, falhas injetadas, disponibilidade de Prometheus e coleta de logs.
+- `raw/*.jsonl`: evidências brutas para auditoria e reprocessamento.
+- `metrics/*.csv`: dados tabulares usados no relatório e na discussão do artigo.
+- `report.md`: relatório legível com resumo, tabelas, limitações e texto-base para Discussão dos Resultados.
+- `report.json`: versão estruturada do relatório.
+
+## Interpretação dos CSVs
+
+### `activation_metrics.csv`
+
+Contém timestamps e durações por streamKey. O campo `status` informa se os valores foram derivados de logs estruturados ou se não eram observáveis.
+
+### `release_metrics.csv`
+
+Contém tempos entre fim do publisher, recebimento do evento de encerramento e término/deleção do worker.
+
+### `resilience_metrics.csv`
+
+Registra falhas injetadas e, quando possível, tempo de recuperação observado.
+
+### `resource_usage.csv`
+
+Resume séries do Prometheus para CPU, memória e rede, incluindo média, mediana, P50, P95, P99, mínimo, máximo e intervalo de confiança.
+
+### `correctness_metrics.csv`
+
+Resume indícios de um worker por streamKey, duplicidade, handovers, eventos stale ignorados e candidatos a órfãos.
+
+### `cost_estimation.csv`
+
+Calcula uma estimativa relativa por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada.
+
+## Gráficos
+
+O runner só gera gráficos com dados reais. Quando as amostras necessárias não existem, ele grava um arquivo `.txt` na pasta `charts/` explicando a limitação. Isso evita gráficos placeholder que poderiam ser confundidos com evidência experimental.

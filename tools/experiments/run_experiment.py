@@ -306,8 +306,17 @@ class ManagedPublisher:
         }
 
 
+
 def redact_command(command: Sequence[str]) -> list[str]:
-    return ["rtmp://..." if part.startswith(("rtmp://", "rtmps://")) else part for part in command]
+    redacted: list[str] = []
+    for part in command:
+        if part.startswith(("rtmp://", "rtmps://")):
+            scheme = part.split("://", 1)[0]
+            redacted.append(f"{scheme}://...")
+        else:
+            redacted.append(part)
+    return redacted
+
 
 
 def ffmpeg_command(config: RunnerConfig, stream_key: str) -> list[str]:
@@ -403,6 +412,7 @@ def collect_kubernetes(config: RunnerConfig, dirs: dict[str, Path], phase: str) 
     return evidence
 
 
+
 def collect_logs(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
     results: dict[str, Any] = {}
     if not shutil.which(config.kubectl_path) and not Path(config.kubectl_path).exists():
@@ -412,7 +422,8 @@ def collect_logs(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
         out = run_cmd([config.kubectl_path, "logs", "-n", config.namespace, "-l", selector, "--all-containers=true", "--tail=-1"], timeout=120)
         path = dirs["logs"] / f"{name}.log"
         path.write_text((out.get("stdout") or "") + ("\n# STDERR\n" + out.get("stderr", "") if out.get("stderr") else ""), encoding="utf-8")
-        results[name] = {"returncode": out["returncode"], "path": str(path)}
+        event_count = extract_structured_events(path, dirs["raw"] / f"{name}_events.jsonl", component=name)
+        results[name] = {"returncode": out["returncode"], "path": str(path), "structured_events": event_count}
     # Merge publisher logs for convenience.
     publisher_log = dirs["logs"] / "publishers.log"
     with publisher_log.open("w", encoding="utf-8") as merged:
@@ -421,6 +432,112 @@ def collect_logs(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
             merged.write(path.read_text(encoding="utf-8", errors="replace"))
     results["publishers"] = {"path": str(publisher_log)}
     return results
+
+
+
+def parse_event_timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def parse_json_event_line(line: str) -> dict[str, Any] | None:
+    start = line.find("{")
+    if start < 0:
+        return None
+    try:
+        payload = json.loads(line[start:].strip())
+    except json.JSONDecodeError:
+        return None
+    message = payload.get("message")
+    if isinstance(message, str) and message.strip().startswith("{"):
+        try:
+            nested = json.loads(message)
+        except json.JSONDecodeError:
+            nested = None
+        if isinstance(nested, dict) and nested.get("event_type"):
+            merged = dict(payload)
+            for key, value in nested.items():
+                if key not in merged or merged.get(key) in (None, "log", "unknown", "default"):
+                    merged[key] = value
+            payload = merged
+    payload.setdefault("timestamp_epoch", parse_event_timestamp(payload.get("timestamp")))
+    return payload
+
+
+def extract_structured_events(log_path: Path, output_path: Path, component: str) -> int:
+    count = 0
+    if not log_path.exists():
+        return 0
+    with output_path.open("w", encoding="utf-8") as out:
+        for line_number, line in enumerate(log_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+            event = parse_json_event_line(line)
+            if not event:
+                continue
+            event["component"] = component
+            event["source_log"] = str(log_path)
+            event["source_line"] = line_number
+            out.write(json.dumps(event, sort_keys=True, default=str) + "\n")
+            count += 1
+    return count
+
+
+def controller_get(config: RunnerConfig, path: str) -> dict[str, Any]:
+    if not config.controller_url:
+        return {"available": False, "reason": "controller_url_not_configured", "path": path}
+    url = f"{config.controller_url}{path}"
+    try:
+        with urlopen(Request(url, headers={"User-Agent": "liveedgecast-experiment/1"}), timeout=10) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            status = getattr(response, "status", None)
+        return {"available": True, "path": path, "status": status, "body": body}
+    except Exception as exc:
+        return {"available": False, "path": path, "error": {"type": type(exc).__name__, "message": str(exc)}}
+
+
+def collect_controller_http(config: RunnerConfig, dirs: dict[str, Path], phase: str) -> dict[str, Any]:
+    result = {
+        "phase": phase,
+        "timestamp": now_epoch(),
+        "health": controller_get(config, "/health"),
+        "metrics": controller_get(config, "/metrics"),
+    }
+    write_json(dirs["raw"] / f"controller_http_{phase}.json", result)
+    return result
+
+
+def patch_proxy_context(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
+    """Best-effort propagation of experiment context to proxy hook scripts."""
+    if not shutil.which(config.kubectl_path) and not Path(config.kubectl_path).exists():
+        result = {"available": False, "skipped": True, "reason": f"kubectl not found: {config.kubectl_path}"}
+        write_json(dirs["raw"] / "proxy_context_patch.json", result)
+        return result
+    commands = []
+    set_env = [
+        config.kubectl_path, "set", "env", "deployment/proxy",
+        f"EXPERIMENT_ID={config.experiment_id}",
+        f"SCENARIO={config.scenario}",
+        f"RUN_ID={config.run_id}",
+        "-n", config.namespace,
+    ]
+    commands.append(run_cmd(set_env, timeout=60))
+    if commands[-1].get("returncode") == 0:
+        commands.append(run_cmd([config.kubectl_path, "rollout", "status", "deployment/proxy", "-n", config.namespace, "--timeout=120s"], timeout=150))
+    result = {"available": True, "commands": commands, "ok": all(c.get("returncode") == 0 for c in commands)}
+    write_json(dirs["raw"] / "proxy_context_patch.json", result)
+    return result
 
 
 def prometheus_query(config: RunnerConfig, query: str, start: float, end: float, step: int = 5) -> dict[str, Any]:
@@ -507,10 +624,8 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
                 injected.append({"type": "proxy-failure", "pod": pod, "timestamp": now_epoch(), "result": deleted})
             else:
                 injected.append({"type": "proxy-failure", "status": "pod_not_found", "timestamp": now_epoch()})
-        results = wait_or_stop_publishers(config, dirs, publishers, wait=(config.scenario not in {"release"}))
-        if config.scenario == "release":
-            # Release scenario intentionally stops publishers and waits for cleanup observation.
-            results = wait_or_stop_publishers(config, dirs, publishers, wait=False)
+        # Release scenario intentionally stops publishers and waits for cleanup observation.
+        results = wait_or_stop_publishers(config, dirs, publishers, wait=(config.scenario != "release"))
         if config.cooldown_seconds:
             time.sleep(config.cooldown_seconds)
         collect_kubernetes(config, dirs, f"after-r{repetition}")
@@ -539,16 +654,37 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
         return {"repetition": repetition, "started_at": run_started, "ended_at": now_epoch(), "stream_keys": stream_keys, "error": {"type": type(exc).__name__, "message": str(exc)}, "injected_failures": injected}
 
 
+
+
+def build_pilot_levels(max_n: int, step_size: int) -> list[int]:
+    if max_n <= 0:
+        return []
+    if max_n == 1:
+        return [1]
+    levels = [1]
+    current = step_size
+    while current < max_n:
+        if current not in levels:
+            levels.append(current)
+        current += step_size
+    if max_n not in levels:
+        levels.append(max_n)
+    return levels
+
+
 def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
     if config.dry_run:
         return {"dry_run": True, "would_run": config.scenario, "stream_keys": config.stream_keys}
     if not shutil.which(config.ffmpeg_path) and not Path(config.ffmpeg_path).exists():
         raise RuntimeError(f"ffmpeg not found: {config.ffmpeg_path}")
     start = now_epoch()
+    preflight = {
+        "proxy_context_patch": patch_proxy_context(config, dirs),
+        "controller_before": collect_controller_http(config, dirs, "before"),
+    }
     run_summaries: list[dict[str, Any]] = []
     if config.scenario == "pilot-capacity":
-        max_n = len(config.stream_keys)
-        for level in range(1, max_n + 1, config.pilot_step_size):
+        for level in build_pilot_levels(len(config.stream_keys), config.pilot_step_size):
             keys = config.stream_keys[:level]
             summary = execute_single_run(config, dirs, level, keys)
             summary["pilot_concurrency"] = level
@@ -562,7 +698,17 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
     end = now_epoch()
     prometheus = collect_prometheus(config, dirs, start, end)
     logs = collect_logs(config, dirs)
-    return {"started_at": start, "ended_at": end, "runs": run_summaries, "prometheus": summarize_prometheus_availability(prometheus), "logs": logs}
+    controller_after = collect_controller_http(config, dirs, "after")
+    return {
+        "started_at": start,
+        "ended_at": end,
+        "preflight": preflight,
+        "runs": run_summaries,
+        "prometheus": summarize_prometheus_availability(prometheus),
+        "logs": logs,
+        "controller_after": controller_after,
+    }
+
 
 
 def summarize_prometheus_availability(results: dict[str, Any]) -> dict[str, Any]:
@@ -596,7 +742,7 @@ def extract_pod_rows(dirs: dict[str, Path], stream_keys: list[str]) -> list[dict
             continue
         stream = annotations.get("liveedgecast.io/stream")
         if stream_keys and stream and stream not in stream_keys:
-            pass
+            continue
         rows.append({
             "snapshot_phase": record.get("phase"),
             "snapshot_at": record.get("snapshot_at"),
@@ -670,51 +816,124 @@ def percentile(sorted_values: Sequence[float], pct: float) -> float | None:
     return sorted_values[f] * (c - k) + sorted_values[c] * (k - f)
 
 
+
+def lifecycle_field_from_event(event: dict[str, Any]) -> str | None:
+    if event.get("event_type") == "stream_lifecycle_timestamp_observed":
+        message = str(event.get("message") or "")
+        match = re.search(r"\b(t_[A-Za-z0-9_]+) observed\b", message)
+        if match:
+            return match.group(1)
+    direct = {
+        "publish_received": "t_controller_received_event",
+        "stream_ended_received": "t_controller_received_end",
+        "worker_deleted": "t_worker_terminated",
+        "destination_received": "t_destination_received",
+    }
+    return direct.get(str(event.get("event_type")))
+
+
+def latest_event_time(events: list[dict[str, Any]], event_type: str, stream: str) -> float | None:
+    values = [e.get("timestamp_epoch") for e in events if e.get("event_type") == event_type and e.get("stream") == stream and isinstance(e.get("timestamp_epoch"), (int, float))]
+    return max(values) if values else None
+
+
+def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    events = read_jsonl(dirs["raw"] / "controller_events.jsonl")
+    grouped: dict[str, dict[str, Any]] = {key: {"stream_key": key} for key in config.stream_keys}
+    for event in events:
+        stream = event.get("stream")
+        if not stream or stream not in grouped:
+            continue
+        field = lifecycle_field_from_event(event)
+        if not field:
+            continue
+        ts = event.get("timestamp_epoch")
+        if not isinstance(ts, (int, float)):
+            continue
+        # Keep the earliest observation for start phases and latest for terminal phases.
+        if field in grouped[stream]:
+            if field in {"t_worker_terminated", "t_controller_received_end", "t_destination_received"}:
+                grouped[stream][field] = max(grouped[stream][field], ts)
+            else:
+                grouped[stream][field] = min(grouped[stream][field], ts)
+        else:
+            grouped[stream][field] = ts
+    for row in publisher_rows:
+        key = row.get("stream_key")
+        if key in grouped:
+            grouped[key].setdefault("t_publish_start_client", row.get("started_at"))
+            grouped[key].setdefault("t_publish_end_client", row.get("ended_at"))
+    activation_rows: list[dict[str, Any]] = []
+    release_rows: list[dict[str, Any]] = []
+    for key in config.stream_keys:
+        entry = grouped.get(key, {"stream_key": key})
+        activation = {
+            "stream_key": key,
+            "t_publish_start_client": entry.get("t_publish_start_client"),
+            "t_publish_start_proxy": entry.get("t_publish_start_proxy"),
+            "t_controller_received_event": entry.get("t_controller_received_event"),
+            "t_worker_create_requested": entry.get("t_worker_create_requested"),
+            "t_worker_pod_created": entry.get("t_worker_pod_created"),
+            "t_worker_scheduled": entry.get("t_worker_scheduled"),
+            "t_worker_container_started": entry.get("t_worker_container_started"),
+            "t_worker_ready": entry.get("t_worker_ready"),
+            "t_ffmpeg_started": entry.get("t_ffmpeg_started"),
+            "t_ffmpeg_first_progress": entry.get("t_ffmpeg_first_progress"),
+        }
+        activation["event_detection_seconds"] = delta(activation.get("t_publish_start_proxy"), activation.get("t_controller_received_event"))
+        activation["worker_create_seconds"] = delta(activation.get("t_worker_create_requested"), activation.get("t_worker_pod_created"))
+        activation["worker_scheduling_seconds"] = delta(activation.get("t_worker_pod_created"), activation.get("t_worker_scheduled"))
+        activation["worker_ready_seconds"] = delta(activation.get("t_worker_create_requested"), activation.get("t_worker_ready"))
+        activation["ffmpeg_start_seconds"] = delta(activation.get("t_worker_ready"), activation.get("t_ffmpeg_started"))
+        activation["ffmpeg_first_progress_seconds"] = delta(activation.get("t_ffmpeg_started"), activation.get("t_ffmpeg_first_progress"))
+        total_start = activation.get("t_publish_start_client") or activation.get("t_publish_start_proxy") or activation.get("t_controller_received_event")
+        activation["total_activation_seconds"] = delta(total_start, activation.get("t_ffmpeg_first_progress"))
+        observed = sum(1 for field in ("t_controller_received_event", "t_worker_create_requested", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress") if activation.get(field) is not None)
+        activation["status"] = "derived_from_controller_structured_logs" if observed else "not_observable"
+        activation_rows.append(activation)
+        release = {
+            "stream_key": key,
+            "release_detection_seconds": delta(entry.get("t_publish_end_client"), entry.get("t_controller_received_end")),
+            "worker_delete_seconds": delta(entry.get("t_controller_received_end"), entry.get("t_worker_terminated")),
+            "total_release_seconds": delta(entry.get("t_publish_end_client"), entry.get("t_worker_terminated")),
+            "status": "derived_from_controller_structured_logs" if entry.get("t_controller_received_end") or entry.get("t_worker_terminated") else "not_observable",
+        }
+        release_rows.append(release)
+    return activation_rows, release_rows, grouped
+
+
+def delta(start: Any, end: Any) -> float | None:
+    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+        return None
+    value = float(end) - float(start)
+    if value < 0:
+        return None
+    return value
+
+
 def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
     prom = json.loads((dirs["raw"] / "prometheus_range_queries.json").read_text(encoding="utf-8")) if (dirs["raw"] / "prometheus_range_queries.json").exists() else {}
     pod_rows = extract_pod_rows(dirs, config.stream_keys)
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
+    controller_events = read_jsonl(dirs["raw"] / "controller_events.jsonl")
 
-    # Activation metrics: real lifecycle values come from Prometheus histograms when available.
-    activation_rows: list[dict[str, Any]] = []
-    lifecycle_values: dict[str, list[float]] = {}
-    for name in ("stream_lifecycle_phase_seconds_p50", "stream_lifecycle_phase_seconds_p95", "stream_lifecycle_phase_seconds_p99"):
-        lifecycle_values[name] = prom_values(prom.get(name, {}))
-    # Per-stream activation approximated only by local publisher duration availability; unavailable fields stay null.
-    for row in publisher_rows:
-        activation_rows.append({
-            "stream_key": row.get("stream_key"),
-            "t_publish_start_client": row.get("started_at"),
-            "t_publish_start_proxy": None,
-            "t_controller_received_event": None,
-            "t_worker_create_requested": None,
-            "t_worker_pod_created": None,
-            "t_worker_scheduled": None,
-            "t_worker_container_started": None,
-            "t_worker_ready": None,
-            "t_ffmpeg_started": None,
-            "t_ffmpeg_first_progress": None,
-            "event_detection_seconds": None,
-            "worker_create_seconds": None,
-            "worker_scheduling_seconds": None,
-            "worker_ready_seconds": None,
-            "ffmpeg_start_seconds": None,
-            "ffmpeg_first_progress_seconds": None,
-            "total_activation_seconds": None,
-            "status": "not_observable_per_stream_without_controller_lifecycle_export",
-        })
-    write_csv(dirs["metrics"] / "activation_metrics.csv", activation_rows, [
+    activation_rows, release_rows, lifecycle_by_stream = build_lifecycle_rows(config, dirs, publisher_rows)
+    activation_fields = [
         "stream_key", "t_publish_start_client", "t_publish_start_proxy", "t_controller_received_event", "t_worker_create_requested", "t_worker_pod_created", "t_worker_scheduled", "t_worker_container_started", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress", "event_detection_seconds", "worker_create_seconds", "worker_scheduling_seconds", "worker_ready_seconds", "ffmpeg_start_seconds", "ffmpeg_first_progress_seconds", "total_activation_seconds", "status"
-    ])
-
-    release_rows = [{"stream_key": row.get("stream_key"), "release_detection_seconds": None, "worker_delete_seconds": None, "total_release_seconds": None, "status": "not_observable_per_stream_without_controller_lifecycle_export"} for row in publisher_rows]
+    ]
+    write_csv(dirs["metrics"] / "activation_metrics.csv", activation_rows, activation_fields)
     write_csv(dirs["metrics"] / "release_metrics.csv", release_rows, ["stream_key", "release_detection_seconds", "worker_delete_seconds", "total_release_seconds", "status"])
 
     resilience_rows = []
     for run in read_jsonl(dirs["raw"] / "streams.jsonl"):
         if run.get("event") == "run_finished":
             for injected in run.get("injected_failures") or []:
-                resilience_rows.append({"type": injected.get("type"), "pod": injected.get("pod"), "timestamp": injected.get("timestamp"), "recovery_seconds": None, "status": injected.get("status") or ("injected" if injected.get("pod") else "not_injected")})
+                injected_ts = injected.get("timestamp")
+                recovery_end = None
+                if injected.get("type") == "worker-failure":
+                    candidates = [e.get("timestamp_epoch") for e in controller_events if e.get("event_type") in {"worker_deleted", "stream_lifecycle_timestamp_observed"} and isinstance(e.get("timestamp_epoch"), (int, float)) and (not injected_ts or e.get("timestamp_epoch") >= injected_ts)]
+                    recovery_end = min(candidates) if candidates else None
+                resilience_rows.append({"type": injected.get("type"), "pod": injected.get("pod"), "timestamp": injected_ts, "recovery_seconds": delta(injected_ts, recovery_end), "status": injected.get("status") or ("injected" if injected.get("pod") else "not_injected")})
     write_csv(dirs["metrics"] / "resilience_metrics.csv", resilience_rows, ["type", "pod", "timestamp", "recovery_seconds", "status"])
 
     resource_rows = []
@@ -733,67 +952,167 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
             else:
                 orphan_candidates += 1
     correctness_rows = []
+    handover_accepted = sum(1 for e in controller_events if e.get("event_type") == "handover_accepted")
+    handover_denied = sum(1 for e in controller_events if e.get("event_type") == "handover_denied")
+    stale_ignored = sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored")
     for key in config.stream_keys:
         worker_count = len(workers_by_stream.get(key, set()))
-        correctness_rows.append({"stream_key": key, "worker_count_observed": worker_count, "one_worker_per_stream": worker_count <= 1, "duplicate_worker_detected": worker_count > 1})
-    correctness_rows.append({"stream_key": "__orphans__", "worker_count_observed": orphan_candidates, "one_worker_per_stream": None, "duplicate_worker_detected": None})
-    write_csv(dirs["metrics"] / "correctness_metrics.csv", correctness_rows, ["stream_key", "worker_count_observed", "one_worker_per_stream", "duplicate_worker_detected"])
+        correctness_rows.append({"stream_key": key, "worker_count_observed": worker_count, "one_worker_per_stream": worker_count <= 1, "duplicate_worker_detected": worker_count > 1, "handover_accepted": handover_accepted, "handover_denied": handover_denied, "stale_events_ignored": stale_ignored})
+    correctness_rows.append({"stream_key": "__orphans__", "worker_count_observed": orphan_candidates, "one_worker_per_stream": None, "duplicate_worker_detected": None, "handover_accepted": handover_accepted, "handover_denied": handover_denied, "stale_events_ignored": stale_ignored})
+    write_csv(dirs["metrics"] / "correctness_metrics.csv", correctness_rows, ["stream_key", "worker_count_observed", "one_worker_per_stream", "duplicate_worker_detected", "handover_accepted", "handover_denied", "stale_events_ignored"])
 
     workers_active_values = prom_values(prom.get("workers_active", {}))
     proxies_active_values = prom_values(prom.get("proxies_active", {}))
-    duration = max(0.0, (config.report_root / "metadata.json").stat().st_mtime - (config.report_root / "metadata.json").stat().st_mtime)  # overwritten below from metadata in summary
     metadata = json.loads((config.report_root / "metadata.json").read_text(encoding="utf-8")) if (config.report_root / "metadata.json").exists() else {}
     duration = max(0.0, (metadata.get("ended_at") or 0) - (metadata.get("started_at") or 0))
-    worker_pod_seconds = (statistics.mean(workers_active_values) if workers_active_values else 0) * duration
-    proxy_pod_seconds = (statistics.mean(proxies_active_values) if proxies_active_values else 0) * duration
+    observed_worker_count = statistics.mean(workers_active_values) if workers_active_values else None
+    observed_proxy_count = statistics.mean(proxies_active_values) if proxies_active_values else None
+    worker_pod_seconds = (observed_worker_count or 0) * duration
+    proxy_pod_seconds = (observed_proxy_count or 0) * duration
     controller_pod_seconds = duration
     always_on_worker_pod_seconds = max(1, len(config.stream_keys)) * duration
-    economy_relative = None if always_on_worker_pod_seconds <= 0 else 1 - (worker_pod_seconds / always_on_worker_pod_seconds)
-    cost_rows = [{"metric": "worker_pod_seconds", "value": worker_pod_seconds}, {"metric": "proxy_pod_seconds", "value": proxy_pod_seconds}, {"metric": "controller_pod_seconds", "value": controller_pod_seconds}, {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds}, {"metric": "relative_savings_vs_always_on_workers", "value": economy_relative}]
-    write_csv(dirs["metrics"] / "cost_estimation.csv", cost_rows, ["metric", "value"])
+    economy_relative = None if (not workers_active_values or always_on_worker_pod_seconds <= 0) else 1 - (worker_pod_seconds / always_on_worker_pod_seconds)
+    cost_rows = [
+        {"metric": "worker_pod_seconds", "value": worker_pod_seconds, "source": "prometheus_workers_active_mean" if workers_active_values else "no_prometheus_samples"},
+        {"metric": "proxy_pod_seconds", "value": proxy_pod_seconds, "source": "prometheus_proxies_active_mean" if proxies_active_values else "no_prometheus_samples"},
+        {"metric": "controller_pod_seconds", "value": controller_pod_seconds, "source": "experiment_duration"},
+        {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds, "source": "len_stream_keys_times_duration"},
+        {"metric": "relative_savings_vs_always_on_workers", "value": economy_relative, "source": "derived_estimate" if workers_active_values else "not_supported_without_prometheus"},
+    ]
+    write_csv(dirs["metrics"] / "cost_estimation.csv", cost_rows, ["metric", "value", "source"])
 
-    return {"activation": {k: stats(v) for k, v in lifecycle_values.items()}, "resources": resource_rows, "correctness": correctness_rows, "cost": cost_rows, "missing": missing_metrics(config, prom)}
+    lifecycle_values = {name: prom_values(prom.get(name, {})) for name in ("stream_lifecycle_phase_seconds_p50", "stream_lifecycle_phase_seconds_p95", "stream_lifecycle_phase_seconds_p99")}
+    activation_stats = {k: stats(v) for k, v in lifecycle_values.items()}
+    activation_stats["total_activation_seconds_per_stream"] = stats([r["total_activation_seconds"] for r in activation_rows if r.get("total_activation_seconds") is not None])
+    activation_stats["event_detection_seconds_per_stream"] = stats([r["event_detection_seconds"] for r in activation_rows if r.get("event_detection_seconds") is not None])
+    activation_stats["worker_ready_seconds_per_stream"] = stats([r["worker_ready_seconds"] for r in activation_rows if r.get("worker_ready_seconds") is not None])
+    return {"activation": activation_stats, "resources": resource_rows, "correctness": correctness_rows, "cost": cost_rows, "missing": missing_metrics(config, prom, activation_rows, release_rows)}
 
 
-def missing_metrics(config: RunnerConfig, prom: dict[str, Any]) -> list[str]:
+def missing_metrics(config: RunnerConfig, prom: dict[str, Any], activation_rows: list[dict[str, Any]] | None = None, release_rows: list[dict[str, Any]] | None = None) -> list[str]:
     missing = []
     for name, result in prom.items():
         if not result.get("available") or (result.get("response") or {}).get("status") != "success":
             missing.append(name)
-    # Per-stream lifecycle is not exposed as an endpoint in current implementation.
-    missing.extend([
-        "per_stream_t_publish_start_proxy",
-        "per_stream_t_controller_received_event",
-        "per_stream_t_worker_ready",
-        "per_stream_t_ffmpeg_first_progress",
-        "t_destination_received",
-    ])
+    activation_rows = activation_rows or []
+    release_rows = release_rows or []
+    required_activation = ["t_controller_received_event", "t_worker_create_requested", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress"]
+    for field in required_activation:
+        if not any(row.get(field) is not None for row in activation_rows):
+            missing.append(f"per_stream_{field}")
+    if not any(row.get("total_release_seconds") is not None for row in release_rows):
+        missing.append("per_stream_total_release_seconds")
+    missing.append("t_destination_received")
     return sorted(set(missing))
 
 
+
+
+def csv_float_column(path: Path, column: str) -> list[float]:
+    if not path.exists():
+        return []
+    values: list[float] = []
+    with path.open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            raw = row.get(column)
+            try:
+                if raw not in (None, "", "None"):
+                    values.append(float(raw))
+            except ValueError:
+                continue
+    return values
+
+
+def csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def write_chart_limitation(path: Path, reason: str) -> str:
+    txt = path.with_suffix(".txt")
+    txt.write_text(reason + "\n", encoding="utf-8")
+    return str(txt)
+
+
 def generate_charts(dirs: dict[str, Path]) -> dict[str, str]:
-    chart_paths = {
-        "activation_boxplot": dirs["charts"] / "activation_boxplot.png",
-        "activation_p95_by_concurrency": dirs["charts"] / "activation_p95_by_concurrency.png",
-        "resource_usage_cpu": dirs["charts"] / "resource_usage_cpu.png",
-        "resource_usage_memory": dirs["charts"] / "resource_usage_memory.png",
-        "network_usage_proxy": dirs["charts"] / "network_usage_proxy.png",
-        "workers_over_time": dirs["charts"] / "workers_over_time.png",
-        "recovery_time": dirs["charts"] / "recovery_time.png",
-    }
+    paths: dict[str, str] = {}
     try:
         import matplotlib.pyplot as plt  # type: ignore
-        for name, path in chart_paths.items():
+    except Exception:
+        for name in ("activation_boxplot", "activation_p95_by_concurrency", "resource_usage_cpu", "resource_usage_memory", "network_usage_proxy", "workers_over_time", "recovery_time"):
+            paths[name] = write_chart_limitation(dirs["charts"] / f"{name}.png", "Matplotlib unavailable; chart not generated.")
+        return paths
+
+    activation_values = csv_float_column(dirs["metrics"] / "activation_metrics.csv", "total_activation_seconds")
+    path = dirs["charts"] / "activation_boxplot.png"
+    if activation_values:
+        plt.figure()
+        plt.boxplot(activation_values)
+        plt.ylabel("seconds")
+        plt.title("Total activation time")
+        plt.savefig(path, bbox_inches="tight")
+        plt.close()
+        paths["activation_boxplot"] = str(path)
+    else:
+        paths["activation_boxplot"] = write_chart_limitation(path, "No total_activation_seconds samples available.")
+
+    # P95 by current run/concurrency is only meaningful when activation samples exist.
+    path = dirs["charts"] / "activation_p95_by_concurrency.png"
+    if activation_values:
+        plt.figure()
+        plt.bar(["current"], [percentile(sorted(activation_values), 95) or 0])
+        plt.ylabel("seconds")
+        plt.title("Activation P95")
+        plt.savefig(path, bbox_inches="tight")
+        plt.close()
+        paths["activation_p95_by_concurrency"] = str(path)
+    else:
+        paths["activation_p95_by_concurrency"] = write_chart_limitation(path, "No activation samples available for P95 chart.")
+
+    resource = csv_rows(dirs["metrics"] / "resource_usage.csv")
+    for chart_name, metric in [("resource_usage_cpu", "pod_cpu_rate"), ("resource_usage_memory", "pod_memory_working_set"), ("network_usage_proxy", "proxy_network_receive_bps")]:
+        path = dirs["charts"] / f"{chart_name}.png"
+        rows = [r for r in resource if r.get("metric") == metric and r.get("samples") not in (None, "", "0")]
+        if rows:
             plt.figure()
-            plt.text(0.5, 0.5, f"{name}\nDados completos dependem do Prometheus", ha="center", va="center")
-            plt.axis("off")
+            plt.bar([r.get("component", metric) for r in rows], [float(r.get("mean") or 0) for r in rows])
+            plt.ylabel("mean")
+            plt.title(chart_name)
             plt.savefig(path, bbox_inches="tight")
             plt.close()
-    except Exception:
-        for path in chart_paths.values():
-            path.write_text("Chart not generated because matplotlib is unavailable or data is missing.\n", encoding="utf-8")
-    return {name: str(path) for name, path in chart_paths.items()}
+            paths[chart_name] = str(path)
+        else:
+            paths[chart_name] = write_chart_limitation(path, f"No Prometheus samples available for {metric}.")
 
+    path = dirs["charts"] / "workers_over_time.png"
+    prom = json.loads((dirs["raw"] / "prometheus_range_queries.json").read_text(encoding="utf-8")) if (dirs["raw"] / "prometheus_range_queries.json").exists() else {}
+    worker_values = prom_values(prom.get("workers_active", {}))
+    if worker_values:
+        plt.figure()
+        plt.plot(list(range(1, len(worker_values) + 1)), worker_values, marker="o")
+        plt.ylabel("workers")
+        plt.title("Workers active over time")
+        plt.savefig(path, bbox_inches="tight")
+        plt.close()
+        paths["workers_over_time"] = str(path)
+    else:
+        paths["workers_over_time"] = write_chart_limitation(path, "No Prometheus workers_active samples available.")
+
+    path = dirs["charts"] / "recovery_time.png"
+    recovery_values = csv_float_column(dirs["metrics"] / "resilience_metrics.csv", "recovery_seconds")
+    if recovery_values:
+        plt.figure()
+        plt.plot(list(range(1, len(recovery_values) + 1)), recovery_values, marker="o")
+        plt.ylabel("seconds")
+        plt.title("Recovery time")
+        plt.savefig(path, bbox_inches="tight")
+        plt.close()
+        paths["recovery_time"] = str(path)
+    else:
+        paths["recovery_time"] = write_chart_limitation(path, "No recovery_seconds samples available.")
+    return paths
 
 def md_table(rows: list[dict[str, Any]], columns: list[str]) -> str:
     if not rows:
@@ -862,7 +1181,7 @@ Experimento `{config.experiment_id}` executado no cenário `{config.scenario}` c
 
 ## Custo relativo
 
-{md_table(cost_rows, ['metric','value'])}
+{md_table(cost_rows, ['metric','value','source'])}
 
 ## Resiliência
 
@@ -986,12 +1305,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     metrics = build_metrics(config, dirs)
     charts = generate_charts(dirs)
     generate_report(config, dirs, execution, metrics, charts)
-    # Keep docs synced when script is executed from repository checkout.
-    repo_root = Path(__file__).resolve().parents[2]
-    try:
-        write_docs(repo_root)
-    except Exception:
-        pass
     print(f"Report generated at: {dirs['root'] / 'report.md'}")
     return exit_code
 
