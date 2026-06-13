@@ -898,3 +898,70 @@ def test_report_json_exposes_evidence_validity_summary(tmp_path):
     assert summary["observable_activation_samples"] == 1
     assert summary["worker_observed_samples"] == 1
     assert summary["controller_events_observed"] is True
+
+
+def test_prometheus_coverage_detects_missing_run_evidence(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "run-a", "repetition": 1, "timestamp": 1.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "run-a", "repetition": 1, "ended_at": 2.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "run-b", "repetition": 1, "timestamp": 10.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "run-b", "repetition": 1, "ended_at": 20.0, "stream_keys": ["key1"]})
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run-a.json",
+        {"_metadata": {"run_id": "run-a", "started_at": 1.0, "ended_at": 2.0}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[1.0, "1"]]}]}}}},
+    )
+
+    coverage = runner.prometheus_run_coverage(cfg, dirs)
+
+    assert coverage["complete"] is False
+    assert coverage["expected_run_ids"] == ["run-a", "run-b"]
+    assert coverage["observed_run_ids"] == ["run-a"]
+    assert coverage["missing_run_ids"] == ["run-b"]
+
+
+def test_prometheus_metric_coverage_records_per_run_gaps(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    for run_id in ["run-a", "run-b"]:
+        runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": run_id, "repetition": 1, "timestamp": 1.0, "stream_keys": ["key1"]})
+        runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": run_id, "repetition": 1, "ended_at": 2.0, "stream_keys": ["key1"]})
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run-a.json",
+        {"_metadata": {"run_id": "run-a"}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[1.0, "1"]]}]}}}},
+    )
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run-b.json",
+        {"_metadata": {"run_id": "run-b"}, "workers_active": {"available": False, "reason": "missing"}},
+    )
+
+    rows = runner.prometheus_metric_coverage_rows(cfg, dirs)
+    worker_rows = [row for row in rows if row["metric"] == "workers_active"]
+
+    assert len(worker_rows) == 2
+    assert [row["run_id"] for row in worker_rows] == ["run-a", "run-b"]
+    assert worker_rows[0]["available"] is True
+    assert worker_rows[0]["sample_count"] == 1
+    assert worker_rows[1]["available"] is False
+    assert "workers_active" in runner.incomplete_prometheus_metric_names(rows)
+
+
+def test_report_json_persists_final_automation_verdict(tmp_path):
+    cfg = config(tmp_path, scenario="duplicate-streamkey")
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.write_json(dirs["root"] / "metadata.json", {"scenario": "duplicate-streamkey", "experiment_id": "exp"})
+    runner.write_csv(dirs["metrics"] / "activation_metrics.csv", [], ["total_activation_seconds"])
+    runner.write_csv(dirs["metrics"] / "correctness_metrics.csv", [], ["worker_observed_for_stream"])
+    runner.write_csv(dirs["metrics"] / "duplicate_streamkey_metrics.csv", [{"scenario_inconclusive": "True"}], ["scenario_inconclusive"])
+    runner.write_csv(dirs["metrics"] / "resilience_metrics.csv", [], ["run_id"])
+    (dirs["raw"] / "publishers.jsonl").write_text("", encoding="utf-8")
+    (dirs["raw"] / "controller_events.jsonl").write_text("", encoding="utf-8")
+    metrics = {"activation": {}, "resources": [], "cost": [], "missing": [], "duplicate_streamkey": [{"scenario_inconclusive": True}]}
+    execution = {"status": "valid", "restore_ok": True, "context_scope_ok": True, "preflight": {"proxy_context_patch": {}}}
+    verdict = runner.automation_verdict(cfg, execution, metrics)
+
+    report = runner.generate_report(cfg, dirs, execution=execution, metrics=metrics, charts={}, verdict=verdict)
+
+    assert report["summary"]["automation_status"] == "failed"
+    assert report["summary"]["automation_exit_code"] == 1
+    assert "scenario_hypothesis_inconclusive" in report["summary"]["automation_failure_reasons"]

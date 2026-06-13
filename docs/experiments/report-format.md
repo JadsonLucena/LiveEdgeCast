@@ -27,6 +27,7 @@ reports/<experiment-id>/
     resource_usage.csv
     correctness_metrics.csv
     duplicate_streamkey_metrics.csv
+    prometheus_metric_coverage.csv
     resource_activity.csv
     cost_estimation.csv  # alias compatível; contém a mesma estimativa de atividade relativa
   logs/
@@ -81,6 +82,11 @@ Resume indícios de correção por `run_id + repetition + streamKey`. O arquivo 
 
 Registra explicitamente se houve tentativa de publicar uma `streamKey` duplicada, se o controller observou rejeição por conflito/handover negado e se houve aceitação inesperada. O arquivo também separa `duplicate_publisher_statuses` de `duplicate_publisher_process_statuses`; a primeira coluna é interpretação arquitetural, enquanto a segunda descreve o processo FFmpeg, como `nonzero_exit`, `success` ou `expected_stopped`. A coluna `duplicate_publisher_nonzero_without_controller_rejection=true` indica que o segundo publisher terminou com erro de processo sem rejeição observada do controller; por padrão isso invalida/parcializa a hipótese automatizada porque pode representar erro de RTMP/FFmpeg, e não proteção arquitetural. Esse arquivo deve ser usado na discussão sobre prevenção de duplicidade ou roubo de sessão.
 
+
+### `prometheus_metric_coverage.csv`
+
+Arquivo de cobertura por `run_id` e métrica Prometheus. Cada linha informa se a métrica estava disponível, quantas amostras foram retornadas e o erro/razão quando ausente. Em execuções com `--resume`, use esse arquivo para verificar se a agregação comparou janelas com cobertura equivalente.
+
 ### `resource_activity.csv` e `cost_estimation.csv`
 
 Calculam uma estimativa relativa de atividade por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada. Esses arquivos não representam cobrança financeira real de provedor de nuvem. O arquivo `resource_activity.csv` é o artefato primário; `cost_estimation.csv` é gerado apenas como alias legado do plano original e contém uma linha de aviso de depreciação. O relatório usa linguagem mais conservadora de “atividade relativa de recursos”. A referência `always_on_worker_pod_seconds_reference` é consciente das janelas de execução: soma `streamKeys_ativas_na_janela * duração_da_janela` para cada `run_id + repetition`, em vez de usar uma única duração global.
@@ -116,11 +122,14 @@ Quando `--patch-proxy-context` é usado, `report.json.summary.restore_ok=false` 
 
 O campo `report.json.summary` inclui marcadores para auditoria metodológica:
 
-- `prometheus_resume_safe`: há evidência Prometheus por `run_id`, adequada para agregação com `--resume`;
+- `prometheus_resume_safe`: todas as janelas `run_id + repetition` possuem arquivo Prometheus correspondente;
+- `prometheus_missing_run_ids`: `run_id`s esperados pelas janelas, mas sem evidência Prometheus;
+- `prometheus_incomplete_metrics`: métricas ausentes em pelo menos um `run_id`;
 - `prometheus_samples_observed`: pelo menos uma série Prometheus retornou amostras;
 - `resource_baseline_window_aware`: a referência de atividade relativa usa janelas `run_id + repetition`;
-- `observable_activation_samples`: quantidade de linhas com ativação observável;
+- `observable_activation_samples`: quantidade de linhas com `total_activation_seconds` finito;
 - `worker_observed_samples`: quantidade de linhas de correção com worker observado;
-- `controller_events_observed`: há eventos estruturados do controller disponíveis.
+- `controller_events_observed`: há eventos estruturados do controller disponíveis;
+- `automation_status`, `automation_exit_code` e `automation_failure_reasons`: veredito final usado pela automação/CI.
 
 Esses marcadores devem ser arquivados junto com o relatório antes de usar os dados na discussão final do artigo.

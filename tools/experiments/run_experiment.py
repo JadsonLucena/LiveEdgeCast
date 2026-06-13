@@ -1085,6 +1085,118 @@ def load_prometheus_evidence(dirs: dict[str, Path]) -> dict[str, Any]:
     return {}
 
 
+def prometheus_result_run_id(result: dict[str, Any], fallback: str | None = None) -> str | None:
+    metadata = result.get("_metadata") or {}
+    run_id = metadata.get("run_id") or fallback
+    return str(run_id) if run_id else None
+
+
+def load_prometheus_results_by_run(dirs: dict[str, Path]) -> dict[str, dict[str, Any]]:
+    """Load per-run Prometheus evidence keyed by run_id.
+
+    The legacy raw/prometheus_range_queries.json is intentionally ignored when
+    per-run files exist because it represents only the latest collection and is
+    not resume-safe. If only the legacy file exists, it is exposed under the
+    run_id stored in its metadata, when available.
+    """
+    results: dict[str, dict[str, Any]] = {}
+    for path in prometheus_run_files(dirs):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        run_id = prometheus_result_run_id(payload, fallback=path.stem.replace("prometheus_range_queries.", ""))
+        if run_id:
+            results[run_id] = payload
+    if results:
+        return results
+    legacy = dirs["raw"] / "prometheus_range_queries.json"
+    if legacy.exists():
+        try:
+            payload = json.loads(legacy.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        run_id = prometheus_result_run_id(payload)
+        if run_id:
+            results[run_id] = payload
+    return results
+
+
+def prometheus_metric_sample_count(result: dict[str, Any]) -> int:
+    response = result.get("response") or {}
+    data = response.get("data") or {}
+    count = 0
+    for series in data.get("result") or []:
+        count += len(series.get("values") or [])
+    return count
+
+
+def prometheus_run_coverage(config: RunnerConfig, dirs: dict[str, Path], windows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    windows = windows if windows is not None else load_run_windows(config, dirs)
+    expected_run_ids = sorted({str(window.get("run_id") or config.run_id) for window in windows if window.get("run_id") or config.run_id})
+    results_by_run = load_prometheus_results_by_run(dirs)
+    observed_run_ids = sorted(results_by_run)
+    missing_run_ids = sorted(set(expected_run_ids) - set(observed_run_ids))
+    extra_run_ids = sorted(set(observed_run_ids) - set(expected_run_ids))
+    coverage_by_run = [
+        {
+            "run_id": run_id,
+            "has_prometheus_evidence": run_id in results_by_run,
+            "expected_by_run_windows": run_id in expected_run_ids,
+        }
+        for run_id in sorted(set(expected_run_ids) | set(observed_run_ids))
+    ]
+    return {
+        "expected_run_ids": expected_run_ids,
+        "observed_run_ids": observed_run_ids,
+        "missing_run_ids": missing_run_ids,
+        "extra_run_ids": extra_run_ids,
+        "coverage_by_run": coverage_by_run,
+        "complete": bool(expected_run_ids) and not missing_run_ids,
+    }
+
+
+def prometheus_metric_coverage_rows(config: RunnerConfig, dirs: dict[str, Path], windows: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    windows = windows if windows is not None else load_run_windows(config, dirs)
+    expected_run_ids = sorted({str(window.get("run_id") or config.run_id) for window in windows if window.get("run_id") or config.run_id})
+    results_by_run = load_prometheus_results_by_run(dirs)
+    rows: list[dict[str, Any]] = []
+    for run_id in sorted(set(expected_run_ids) | set(results_by_run)):
+        payload = results_by_run.get(run_id) or {}
+        for metric in DEFAULT_PROMQL:
+            value = payload.get(metric) if isinstance(payload, dict) else None
+            available = bool(isinstance(value, dict) and value.get("available") and (value.get("response") or {}).get("status") == "success")
+            rows.append({
+                "run_id": run_id,
+                "metric": metric,
+                "available": available,
+                "sample_count": prometheus_metric_sample_count(value) if isinstance(value, dict) else 0,
+                "status": ((value.get("response") or {}).get("status") if isinstance(value, dict) else None),
+                "error": ((value.get("error") or value.get("reason")) if isinstance(value, dict) else "prometheus_evidence_missing_for_run"),
+            })
+    return rows
+
+
+def incomplete_prometheus_metric_names(rows: list[dict[str, Any]]) -> list[str]:
+    by_metric: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_metric.setdefault(str(row.get("metric")), []).append(row)
+    incomplete = []
+    for metric, metric_rows in by_metric.items():
+        if metric_rows and any(str(row.get("available")).lower() != "true" and row.get("available") is not True for row in metric_rows):
+            incomplete.append(metric)
+    return sorted(incomplete)
+
+
+def finite_csv_number(raw: Any) -> bool:
+    if raw in (None, "", "None", "null"):
+        return False
+    try:
+        return math.isfinite(float(raw))
+    except (TypeError, ValueError):
+        return False
+
+
 def prometheus_observed_duration(prom: dict[str, Any]) -> float | None:
     metadata = prom.get("_metadata") or {}
     runs = metadata.get("runs") or []
@@ -2198,6 +2310,14 @@ def build_correctness_rows(
 
 def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
     prom = load_prometheus_evidence(dirs)
+    run_windows = load_run_windows(config, dirs)
+    prom_coverage = prometheus_run_coverage(config, dirs, run_windows)
+    prom_metric_rows = prometheus_metric_coverage_rows(config, dirs, run_windows)
+    write_csv(
+        dirs["metrics"] / "prometheus_metric_coverage.csv",
+        prom_metric_rows,
+        ["run_id", "metric", "available", "sample_count", "status", "error"],
+    )
     pod_rows = extract_pod_rows(dirs, config.stream_keys)
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
     controller_events = read_jsonl(dirs["raw"] / "controller_events.jsonl")
@@ -2263,7 +2383,11 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
         query_duration = delta(prom_window.get("started_at"), prom_window.get("ended_at"))
     if query_duration is None:
         query_duration = max(0.0, (metadata.get("ended_at") or 0) - (metadata.get("started_at") or 0))
-    run_duration_sum = sum_run_window_durations(load_run_windows(config, dirs))
+    covered_run_ids = set(prom_coverage.get("observed_run_ids") or [])
+    resource_windows = [window for window in run_windows if str(window.get("run_id") or config.run_id) in covered_run_ids]
+    if not resource_windows:
+        resource_windows = run_windows
+    run_duration_sum = sum_run_window_durations(resource_windows)
     reference_duration = run_duration_sum if run_duration_sum > 0 else query_duration
     worker_pod_seconds, worker_cost_source = prom_time_integral(prom.get("workers_active", {}), fallback_duration=query_duration)
     proxy_pod_seconds, proxy_cost_source = prom_time_integral(prom.get("proxies_active", {}), fallback_duration=query_duration)
@@ -2271,8 +2395,10 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     if controller_pod_seconds is None:
         controller_pod_seconds = query_duration
         controller_cost_source = "prometheus_query_window_assumes_single_controller"
-    # Reference assumes one always-on worker capacity unit per active streamKey in each observed run window.
-    always_on_worker_pod_seconds, always_on_source = always_on_worker_pod_seconds_reference(load_run_windows(config, dirs), config.stream_keys, reference_duration)
+    # Reference assumes one always-on worker capacity unit per active streamKey in each covered run window.
+    # When resumed Prometheus evidence is incomplete, this intentionally matches the denominator
+    # to the Prometheus-covered windows and exposes the missing runs in prometheus_metric_coverage.csv.
+    always_on_worker_pod_seconds, always_on_source = always_on_worker_pod_seconds_reference(resource_windows, config.stream_keys, reference_duration)
     economy_relative = None if (worker_pod_seconds is None or always_on_worker_pod_seconds <= 0) else 1 - (worker_pod_seconds / always_on_worker_pod_seconds)
     cost_rows = [
         {"metric": "worker_pod_seconds", "value": worker_pod_seconds, "source": worker_cost_source},
@@ -2290,7 +2416,16 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     activation_stats["total_activation_seconds_per_stream"] = stats([r["total_activation_seconds"] for r in activation_rows if r.get("total_activation_seconds") is not None])
     activation_stats["event_detection_seconds_per_stream"] = stats([r["event_detection_seconds"] for r in activation_rows if r.get("event_detection_seconds") is not None])
     activation_stats["worker_ready_seconds_per_stream"] = stats([r["worker_ready_seconds"] for r in activation_rows if r.get("worker_ready_seconds") is not None])
-    return {"activation": activation_stats, "resources": resource_rows, "correctness": correctness_rows, "duplicate_streamkey": duplicate_streamkey_rows, "cost": cost_rows, "missing": missing_metrics(config, prom, activation_rows, release_rows)}
+    return {
+        "activation": activation_stats,
+        "resources": resource_rows,
+        "correctness": correctness_rows,
+        "duplicate_streamkey": duplicate_streamkey_rows,
+        "cost": cost_rows,
+        "prometheus_coverage": prom_coverage,
+        "prometheus_metric_coverage": prom_metric_rows,
+        "missing": missing_metrics(config, prom, activation_rows, release_rows),
+    }
 
 
 def missing_metrics(config: RunnerConfig, prom: dict[str, Any], activation_rows: list[dict[str, Any]] | None = None, release_rows: list[dict[str, Any]] | None = None) -> list[str]:
@@ -2560,7 +2695,41 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
     return rows
 
 
-def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict[str, Any], metrics: dict[str, Any], charts: dict[str, str]) -> dict[str, Any]:
+def automation_verdict(config: RunnerConfig, execution: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+    duplicate_rows = metrics.get("duplicate_streamkey") or []
+    hypothesis_inconclusive = config.scenario in {"handover", "duplicate-streamkey"} and any(bool(row.get("scenario_inconclusive")) for row in duplicate_rows)
+    duplicate_process_invalid = config.scenario == "duplicate-streamkey" and any(bool(row.get("duplicate_publisher_nonzero_without_controller_rejection")) for row in duplicate_rows)
+    status = str(execution.get("status") or "")
+    restore_failed = config.patch_proxy_context and execution.get("restore_ok") is False
+    context_unscoped = config.patch_proxy_context and execution.get("context_scope_ok") is False
+    reasons: list[str] = []
+    if execution.get("error"):
+        reasons.append("top_level_execution_error")
+    if status == "failed":
+        reasons.append("experiment_status_failed")
+    if status == "failed_restore" and not config.allow_restore_failure:
+        reasons.append("context_restore_failed")
+    if status.startswith("partial") and not config.allow_partial and not (status == "partial_context_patch" and config.allow_unscoped_context):
+        reasons.append(f"experiment_status_{status}")
+    if restore_failed and not config.allow_restore_failure:
+        reasons.append("context_restore_failed")
+    if context_unscoped and not config.allow_unscoped_context:
+        reasons.append("context_scope_not_effective")
+    if hypothesis_inconclusive and not config.allow_inconclusive:
+        reasons.append("scenario_hypothesis_inconclusive")
+    if duplicate_process_invalid and not config.allow_inconclusive:
+        reasons.append("duplicate_publisher_nonzero_without_controller_rejection")
+    # Preserve order while removing duplicates.
+    deduped_reasons = list(dict.fromkeys(reasons))
+    exit_code = 1 if deduped_reasons else 0
+    return {
+        "automation_status": "failed" if exit_code else "passed",
+        "automation_exit_code": exit_code,
+        "automation_failure_reasons": deduped_reasons,
+    }
+
+
+def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict[str, Any], metrics: dict[str, Any], charts: dict[str, str], verdict: dict[str, Any] | None = None) -> dict[str, Any]:
     metadata = json.loads((dirs["root"] / "metadata.json").read_text(encoding="utf-8"))
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
     success_count = len([r for r in publisher_rows if r.get("publisher_status") in {"success", "expected_stopped"}])
@@ -2568,7 +2737,7 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
     publisher_nonzero_process_count = len([r for r in publisher_rows if (r.get("publisher_process_status") or publisher_process_status(r)) == "nonzero_exit"])
     unavailable = metrics.get("missing", [])
     activation_csv_rows = csv_rows(dirs["metrics"] / "activation_metrics.csv")
-    valid_activation_samples = len([row for row in activation_csv_rows if row.get("total_activation_seconds") not in (None, "", "None")])
+    valid_activation_samples = len([row for row in activation_csv_rows if finite_csv_number(row.get("total_activation_seconds"))])
     invalid_activation_samples = max(0, len(activation_csv_rows) - valid_activation_samples)
     duplicate_rows = csv_rows(dirs["metrics"] / "duplicate_streamkey_metrics.csv")
     correctness_rows = csv_rows(dirs["metrics"] / "correctness_metrics.csv")
@@ -2576,7 +2745,11 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
     controller_events_observed = bool(read_jsonl(dirs["raw"] / "controller_events.jsonl"))
     prometheus_files = [path.name for path in prometheus_run_files(dirs)]
     prom = load_prometheus_evidence(dirs)
+    prom_coverage = metrics.get("prometheus_coverage") or prometheus_run_coverage(config, dirs)
+    prom_metric_coverage = metrics.get("prometheus_metric_coverage") or prometheus_metric_coverage_rows(config, dirs)
+    incomplete_prom_metrics = incomplete_prometheus_metric_names(prom_metric_coverage)
     prometheus_samples_observed = any(prom_values(value) for name, value in prom.items() if not str(name).startswith("_") and isinstance(value, dict))
+    verdict = verdict or automation_verdict(config, execution, metrics)
     report_json = {
         "metadata": metadata,
         "summary": {
@@ -2597,13 +2770,22 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
             "context_scope_ok": execution.get("context_scope_ok"),
             "context_patch_status": execution.get("context_patch_status"),
             "controller_scope_effective": bool(((execution.get("preflight") or {}).get("proxy_context_patch") or {}).get("controller_scope_effective")),
-            "prometheus_resume_safe": bool(prometheus_files),
+            "prometheus_resume_safe": bool(prom_coverage.get("complete")),
             "prometheus_evidence_files": prometheus_files,
+            "prometheus_expected_run_ids": prom_coverage.get("expected_run_ids") or [],
+            "prometheus_observed_run_ids": prom_coverage.get("observed_run_ids") or [],
+            "prometheus_missing_run_ids": prom_coverage.get("missing_run_ids") or [],
+            "prometheus_extra_run_ids": prom_coverage.get("extra_run_ids") or [],
+            "prometheus_coverage_by_run": prom_coverage.get("coverage_by_run") or [],
+            "prometheus_incomplete_metrics": incomplete_prom_metrics,
             "prometheus_samples_observed": prometheus_samples_observed,
             "resource_baseline_window_aware": True,
             "observable_activation_samples": valid_activation_samples,
             "worker_observed_samples": worker_observed_samples,
             "controller_events_observed": controller_events_observed,
+            "automation_status": verdict.get("automation_status"),
+            "automation_exit_code": verdict.get("automation_exit_code"),
+            "automation_failure_reasons": verdict.get("automation_failure_reasons") or [],
             "missing_metrics": unavailable,
         },
         "metrics": metrics,
@@ -2645,7 +2827,13 @@ Amostras de ativação válidas: {report_json["summary"]["valid_activation_sampl
 
 ## Validação das evidências
 
-{md_table([report_json["summary"]], ['prometheus_resume_safe','prometheus_samples_observed','resource_baseline_window_aware','observable_activation_samples','worker_observed_samples','controller_events_observed','scenario_inconclusive','context_scope_ok','restore_ok'])}
+{md_table([report_json["summary"]], ['automation_status','automation_exit_code','automation_failure_reasons','prometheus_resume_safe','prometheus_samples_observed','resource_baseline_window_aware','observable_activation_samples','worker_observed_samples','controller_events_observed','scenario_inconclusive','context_scope_ok','restore_ok'])}
+
+### Cobertura Prometheus por execução
+
+{md_table(report_json["summary"].get("prometheus_coverage_by_run") or [], ['run_id','has_prometheus_evidence','expected_by_run_windows'])}
+
+Métricas Prometheus com cobertura incompleta por execução: {', '.join(report_json["summary"].get("prometheus_incomplete_metrics") or []) if report_json["summary"].get("prometheus_incomplete_metrics") else 'nenhuma detectada'}.
 
 ## Resultado por streamKey
 
@@ -2737,27 +2925,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_json(dirs["root"] / "execution.json", execution)
     metrics = build_metrics(config, dirs)
     charts = generate_charts(dirs)
-    generate_report(config, dirs, execution, metrics, charts)
-    duplicate_rows = metrics.get("duplicate_streamkey") or []
-    hypothesis_inconclusive = config.scenario in {"handover", "duplicate-streamkey"} and any(bool(row.get("scenario_inconclusive")) for row in duplicate_rows)
-    duplicate_process_invalid = config.scenario == "duplicate-streamkey" and any(bool(row.get("duplicate_publisher_nonzero_without_controller_rejection")) for row in duplicate_rows)
-    status = str(execution.get("status") or "")
-    restore_failed = config.patch_proxy_context and execution.get("restore_ok") is False
-    context_unscoped = config.patch_proxy_context and execution.get("context_scope_ok") is False
-    if (
-        status == "failed"
-        or (status == "failed_restore" and not config.allow_restore_failure)
-        or (
-            status.startswith("partial")
-            and not config.allow_partial
-            and not (status == "partial_context_patch" and config.allow_unscoped_context)
-        )
-        or (restore_failed and not config.allow_restore_failure)
-        or (context_unscoped and not config.allow_unscoped_context)
-        or (hypothesis_inconclusive and not config.allow_inconclusive)
-        or (duplicate_process_invalid and not config.allow_inconclusive)
-    ):
-        exit_code = 1
+    verdict = automation_verdict(config, execution, metrics)
+    try:
+        generate_report(config, dirs, execution, metrics, charts, verdict=verdict)
+    except TypeError as exc:
+        # Backward compatibility for tests or external callers that monkeypatch
+        # generate_report with the pre-verdict 5-argument signature.
+        if "verdict" not in str(exc) and "positional" not in str(exc) and "keyword" not in str(exc):
+            raise
+        generate_report(config, dirs, execution, metrics, charts)
+    exit_code = max(exit_code, int(verdict.get("automation_exit_code") or 0))
     print(f"Report generated at: {dirs['root'] / 'report.md'}")
     return exit_code
 

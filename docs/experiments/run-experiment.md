@@ -123,7 +123,7 @@ O runner não altera a documentação do repositório durante a execução. Todo
 - Para evitar contaminação em métricas de cAdvisor/kube-state-metrics, execute apenas um experimento por namespace ou use namespaces isolados por execução.
 - Cenários `handover` e `duplicate-streamkey` são marcados como inconclusivos quando a segunda publicação não é observada em outro proxy após o timestamp da segunda tentativa. A rejeição do controller e a validade entre proxies são reportadas separadamente. Por padrão, uma hipótese inconclusiva nesses cenários retorna código de saída `1`; use `--allow-inconclusive` apenas quando deseja preservar o relatório sem tratar a execução como evidência conclusiva.
 - No cenário `duplicate-streamkey`, saída não-zero do segundo publisher sem rejeição observada pelo controller também torna a amostra inválida/inconclusiva para automação. O processo FFmpeg e a rejeição arquitetural são avaliados separadamente.
-- `--resume` agrega evidências no mesmo diretório; use um `run_id` único para cada retomada e interprete o relatório como agregado, não como apenas a execução mais recente. Evidências Prometheus são salvas por `run_id` em `raw/prometheus_range_queries.<run-id>.json`, evitando sobrescrever séries de retomadas anteriores. O arquivo legado `raw/prometheus_range_queries.json` representa apenas a coleta mais recente para compatibilidade.
+- `--resume` agrega evidências no mesmo diretório; use um `run_id` único para cada retomada e interprete o relatório como agregado, não como apenas a execução mais recente. Evidências Prometheus são salvas por `run_id` em `raw/prometheus_range_queries.<run-id>.json`, evitando sobrescrever séries de retomadas anteriores. O arquivo legado `raw/prometheus_range_queries.json` representa apenas a coleta mais recente para compatibilidade. `report.json.summary.prometheus_resume_safe` só fica `true` quando todo `run_id` observado nas janelas de execução possui evidência Prometheus correspondente; lacunas aparecem em `prometheus_missing_run_ids` e em `metrics/prometheus_metric_coverage.csv`.
 
 ## Segurança de diretórios e limpeza
 
@@ -171,7 +171,7 @@ NAMESPACE=media \
 ./tools/experiments/smoke_k8s_experiment.sh
 ```
 
-O script executa um `cold-start` mínimo em namespace dedicado ou controlado e valida se `report.md`, `activation_metrics.csv` e `correctness_metrics.csv` foram gerados. Além da existência dos arquivos, o smoke test exige pelo menos uma amostra de ativação observável e uma linha de correção com worker observado; linhas apenas `not_observable` não são suficientes para aprovar o teste.
+O script executa um `cold-start` mínimo em namespace dedicado ou controlado e valida se `report.md`, `activation_metrics.csv` e `correctness_metrics.csv` foram gerados. Além da existência dos arquivos, o smoke test exige pelo menos uma amostra com `total_activation_seconds` finito e uma linha de correção com worker observado; linhas parciais ou apenas `not_observable` não são suficientes para aprovar o teste.
 
 ## Checklist de validação pré-artigo
 
@@ -182,6 +182,9 @@ Antes de coletar dados finais para o artigo, execute o smoke test e arquive inte
 - `worker_observed_samples > 0`;
 - `prometheus_samples_observed=true`, quando a análise de recursos/atividade relativa for usada;
 - `prometheus_resume_safe=true`, quando `--resume` for usado;
-- `resource_baseline_window_aware=true`.
+- `prometheus_missing_run_ids=[]`;
+- `prometheus_incomplete_metrics=[]` ou apenas métricas que não sustentam a hipótese avaliada;
+- `resource_baseline_window_aware=true`;
+- `automation_status=passed` e `automation_exit_code=0`.
 
 Se qualquer item necessário estiver ausente, trate o relatório como evidência exploratória ou qualitativa, não como resultado final da avaliação.
