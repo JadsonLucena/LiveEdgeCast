@@ -132,6 +132,12 @@ def now_iso() -> str:
 def safe_id(value: str, field: str) -> str:
     if not value or not SAFE_ID_RE.match(value):
         raise argparse.ArgumentTypeError(f"{field} must use only letters, numbers, '_', '.', '-' ")
+    # The id is later used as a single path component. Dots are allowed inside
+    # normal identifiers, but the special path components below would escape or
+    # alias the intended output directory. Keep this guard here so callers cannot
+    # accidentally make --overwrite delete an unintended directory.
+    if value in {".", ".."} or Path(value).name != value:
+        raise argparse.ArgumentTypeError(f"{field} must be a single safe path component, not {value!r}")
     return value
 
 
@@ -298,6 +304,14 @@ def existing_run_keys(root: Path) -> set[tuple[str, int]]:
     return keys
 
 
+def path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def prepare_report_root(config: RunnerConfig) -> Path:
     """Prepare report directory safely.
 
@@ -308,6 +322,9 @@ def prepare_report_root(config: RunnerConfig) -> Path:
     when the requested run_id/repetition keys are not already present.
     """
     root = config.report_root
+    output_root = config.output_dir if config.output_dir.name == config.experiment_id else config.output_dir / config.experiment_id
+    if root.resolve() != output_root.resolve() or not path_is_relative_to(root, config.output_dir):
+        raise RuntimeError(f"unsafe report directory resolved outside output directory: {root}")
     if root.exists() and any(root.iterdir()):
         if config.overwrite:
             shutil.rmtree(root)
@@ -1165,16 +1182,28 @@ def prometheus_metric_coverage_rows(config: RunnerConfig, dirs: dict[str, Path],
         payload = results_by_run.get(run_id) or {}
         for metric in DEFAULT_PROMQL:
             value = payload.get(metric) if isinstance(payload, dict) else None
-            available = bool(isinstance(value, dict) and value.get("available") and (value.get("response") or {}).get("status") == "success")
+            sample_count = prometheus_metric_sample_count(value) if isinstance(value, dict) else 0
+            query_success = bool(isinstance(value, dict) and value.get("available") and (value.get("response") or {}).get("status") == "success")
+            samples_observed = sample_count > 0
+            available_for_analysis = query_success and samples_observed
             rows.append({
                 "run_id": run_id,
                 "metric": metric,
-                "available": available,
-                "sample_count": prometheus_metric_sample_count(value) if isinstance(value, dict) else 0,
+                # Backward-compatible field: true only when the metric produced usable samples.
+                "available": available_for_analysis,
+                "query_success": query_success,
+                "samples_observed": samples_observed,
+                "available_for_analysis": available_for_analysis,
+                "sample_count": sample_count,
                 "status": ((value.get("response") or {}).get("status") if isinstance(value, dict) else None),
                 "error": ((value.get("error") or value.get("reason")) if isinstance(value, dict) else "prometheus_evidence_missing_for_run"),
             })
     return rows
+
+
+def coverage_value_true(row: dict[str, Any], field: str) -> bool:
+    value = row.get(field)
+    return value is True or str(value).lower() == "true"
 
 
 def incomplete_prometheus_metric_names(rows: list[dict[str, Any]]) -> list[str]:
@@ -1183,9 +1212,22 @@ def incomplete_prometheus_metric_names(rows: list[dict[str, Any]]) -> list[str]:
         by_metric.setdefault(str(row.get("metric")), []).append(row)
     incomplete = []
     for metric, metric_rows in by_metric.items():
-        if metric_rows and any(str(row.get("available")).lower() != "true" and row.get("available") is not True for row in metric_rows):
+        if metric_rows and any(not coverage_value_true(row, "available_for_analysis") for row in metric_rows):
             incomplete.append(metric)
     return sorted(incomplete)
+
+
+def prometheus_metric_runs_with_samples(rows: list[dict[str, Any]], metric: str) -> set[str]:
+    return {str(row.get("run_id")) for row in rows if row.get("metric") == metric and coverage_value_true(row, "available_for_analysis")}
+
+
+def prometheus_required_metrics_ready(rows: list[dict[str, Any]], required_metrics: set[str], expected_run_ids: set[str]) -> bool:
+    if not expected_run_ids:
+        return False
+    for metric in required_metrics:
+        if prometheus_metric_runs_with_samples(rows, metric) & expected_run_ids != expected_run_ids:
+            return False
+    return True
 
 
 def finite_csv_number(raw: Any) -> bool:
@@ -2316,7 +2358,7 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     write_csv(
         dirs["metrics"] / "prometheus_metric_coverage.csv",
         prom_metric_rows,
-        ["run_id", "metric", "available", "sample_count", "status", "error"],
+        ["run_id", "metric", "available", "query_success", "samples_observed", "available_for_analysis", "sample_count", "status", "error"],
     )
     pod_rows = extract_pod_rows(dirs, config.stream_keys)
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
@@ -2383,29 +2425,48 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
         query_duration = delta(prom_window.get("started_at"), prom_window.get("ended_at"))
     if query_duration is None:
         query_duration = max(0.0, (metadata.get("ended_at") or 0) - (metadata.get("started_at") or 0))
-    covered_run_ids = set(prom_coverage.get("observed_run_ids") or [])
-    resource_windows = [window for window in run_windows if str(window.get("run_id") or config.run_id) in covered_run_ids]
-    if not resource_windows:
-        resource_windows = run_windows
+    expected_run_ids = set(prom_coverage.get("expected_run_ids") or [])
+    evidence_file_run_ids = set(prom_coverage.get("observed_run_ids") or [])
+    required_resource_metrics = {"workers_active"}
+    worker_sample_run_ids = prometheus_metric_runs_with_samples(prom_metric_rows, "workers_active")
+    worker_samples_complete = bool(expected_run_ids) and (worker_sample_run_ids & expected_run_ids == expected_run_ids)
+
+    # Resource activity is valid only for run windows whose required worker pod-count
+    # series actually produced samples. A Prometheus file with an empty successful
+    # query is not enough evidence for the worker activity reduction claim.
+    resource_run_ids = expected_run_ids & worker_sample_run_ids
+    if not resource_run_ids and not expected_run_ids:
+        resource_run_ids = evidence_file_run_ids & worker_sample_run_ids
+    resource_windows = [window for window in run_windows if str(window.get("run_id") or config.run_id) in resource_run_ids]
     run_duration_sum = sum_run_window_durations(resource_windows)
     reference_duration = run_duration_sum if run_duration_sum > 0 else query_duration
+
     worker_pod_seconds, worker_cost_source = prom_time_integral(prom.get("workers_active", {}), fallback_duration=query_duration)
     proxy_pod_seconds, proxy_cost_source = prom_time_integral(prom.get("proxies_active", {}), fallback_duration=query_duration)
     controller_pod_seconds, controller_cost_source = prom_time_integral(prom.get("controllers_active", {}), fallback_duration=query_duration)
     if controller_pod_seconds is None:
         controller_pod_seconds = query_duration
         controller_cost_source = "prometheus_query_window_assumes_single_controller"
-    # Reference assumes one always-on worker capacity unit per active streamKey in each covered run window.
-    # When resumed Prometheus evidence is incomplete, this intentionally matches the denominator
-    # to the Prometheus-covered windows and exposes the missing runs in prometheus_metric_coverage.csv.
+    if not worker_samples_complete:
+        worker_cost_source = "insufficient_prometheus_worker_samples"
+
+    # Reference assumes one always-on worker capacity unit per active streamKey in each
+    # covered run window. When Prometheus worker samples are incomplete, the relative
+    # reduction is intentionally not computed instead of comparing a partial numerator
+    # with a broader denominator.
     always_on_worker_pod_seconds, always_on_source = always_on_worker_pod_seconds_reference(resource_windows, config.stream_keys, reference_duration)
-    economy_relative = None if (worker_pod_seconds is None or always_on_worker_pod_seconds <= 0) else 1 - (worker_pod_seconds / always_on_worker_pod_seconds)
+    if not worker_samples_complete:
+        economy_relative = None
+        economy_source = "insufficient_prometheus_worker_samples"
+    else:
+        economy_relative = None if (worker_pod_seconds is None or always_on_worker_pod_seconds <= 0) else 1 - (worker_pod_seconds / always_on_worker_pod_seconds)
+        economy_source = "resource_activity_time_integral_estimate" if worker_pod_seconds is not None else "not_supported_without_prometheus"
     cost_rows = [
         {"metric": "worker_pod_seconds", "value": worker_pod_seconds, "source": worker_cost_source},
         {"metric": "proxy_pod_seconds", "value": proxy_pod_seconds, "source": proxy_cost_source},
         {"metric": "controller_pod_seconds", "value": controller_pod_seconds, "source": controller_cost_source},
         {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds, "source": always_on_source},
-        {"metric": "relative_worker_activity_reduction_vs_always_on", "value": economy_relative, "source": "resource_activity_time_integral_estimate" if worker_pod_seconds is not None else "not_supported_without_prometheus"},
+        {"metric": "relative_worker_activity_reduction_vs_always_on", "value": economy_relative, "source": economy_source},
     ]
     legacy_cost_rows = cost_rows + [{"metric": "deprecated_alias_notice", "value": "", "source": "cost_estimation.csv is a legacy alias; use resource_activity.csv for resource pod-second activity, not financial cost"}]
     write_csv(dirs["metrics"] / "cost_estimation.csv", legacy_cost_rows, ["metric", "value", "source"])
@@ -2433,7 +2494,10 @@ def missing_metrics(config: RunnerConfig, prom: dict[str, Any], activation_rows:
     for name, result in prom.items():
         if str(name).startswith("_") or not isinstance(result, dict):
             continue
-        if not result.get("available") or (result.get("response") or {}).get("status") != "success":
+        response = result.get("response") or {}
+        data = response.get("data")
+        explicit_result = isinstance(data, dict) and "result" in data
+        if (not result.get("available") or response.get("status") != "success" or (explicit_result and prometheus_metric_sample_count(result) == 0)):
             missing.append(name)
     activation_rows = activation_rows or []
     release_rows = release_rows or []
@@ -2749,6 +2813,10 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
     prom_metric_coverage = metrics.get("prometheus_metric_coverage") or prometheus_metric_coverage_rows(config, dirs)
     incomplete_prom_metrics = incomplete_prometheus_metric_names(prom_metric_coverage)
     prometheus_samples_observed = any(prom_values(value) for name, value in prom.items() if not str(name).startswith("_") and isinstance(value, dict))
+    expected_prom_run_ids = set(prom_coverage.get("expected_run_ids") or [])
+    required_prometheus_metrics_for_analysis = {"workers_active", "proxies_active", "pod_cpu_rate"}
+    prometheus_evidence_files_complete = bool(prom_coverage.get("complete"))
+    prometheus_analysis_ready = prometheus_evidence_files_complete and prometheus_required_metrics_ready(prom_metric_coverage, required_prometheus_metrics_for_analysis, expected_prom_run_ids)
     verdict = verdict or automation_verdict(config, execution, metrics)
     report_json = {
         "metadata": metadata,
@@ -2770,7 +2838,9 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
             "context_scope_ok": execution.get("context_scope_ok"),
             "context_patch_status": execution.get("context_patch_status"),
             "controller_scope_effective": bool(((execution.get("preflight") or {}).get("proxy_context_patch") or {}).get("controller_scope_effective")),
-            "prometheus_resume_safe": bool(prom_coverage.get("complete")),
+            "prometheus_resume_safe": prometheus_analysis_ready,
+            "prometheus_evidence_files_complete": prometheus_evidence_files_complete,
+            "prometheus_analysis_ready": prometheus_analysis_ready,
             "prometheus_evidence_files": prometheus_files,
             "prometheus_expected_run_ids": prom_coverage.get("expected_run_ids") or [],
             "prometheus_observed_run_ids": prom_coverage.get("observed_run_ids") or [],

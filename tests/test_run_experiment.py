@@ -892,7 +892,9 @@ def test_report_json_exposes_evidence_validity_summary(tmp_path):
     )
 
     summary = report["summary"]
-    assert summary["prometheus_resume_safe"] is True
+    assert summary["prometheus_evidence_files_complete"] is True
+    assert summary["prometheus_resume_safe"] is False
+    assert summary["prometheus_analysis_ready"] is False
     assert summary["prometheus_samples_observed"] is True
     assert summary["resource_baseline_window_aware"] is True
     assert summary["observable_activation_samples"] == 1
@@ -965,3 +967,55 @@ def test_report_json_persists_final_automation_verdict(tmp_path):
     assert report["summary"]["automation_status"] == "failed"
     assert report["summary"]["automation_exit_code"] == 1
     assert "scenario_hypothesis_inconclusive" in report["summary"]["automation_failure_reasons"]
+
+
+def test_safe_id_rejects_path_dot_components():
+    import argparse
+
+    for value in [".", ".."]:
+        try:
+            runner.safe_id(value, "experiment_id")
+        except argparse.ArgumentTypeError:
+            pass
+        else:
+            raise AssertionError(f"expected unsafe id to be rejected: {value}")
+
+
+def test_prometheus_success_without_samples_is_not_available_for_analysis(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "run-a", "repetition": 1, "timestamp": 1.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "run-a", "repetition": 1, "ended_at": 2.0, "stream_keys": ["key1"]})
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run-a.json",
+        {"_metadata": {"run_id": "run-a"}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": []}}}},
+    )
+
+    rows = runner.prometheus_metric_coverage_rows(cfg, dirs)
+    worker = [row for row in rows if row["metric"] == "workers_active"][0]
+
+    assert worker["query_success"] is True
+    assert worker["samples_observed"] is False
+    assert worker["available_for_analysis"] is False
+    assert worker["available"] is False
+    assert "workers_active" in runner.incomplete_prometheus_metric_names(rows)
+
+
+def test_resource_activity_reduction_requires_worker_samples(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.write_json(dirs["root"] / "metadata.json", {"started_at": 1.0, "ended_at": 2.0})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "run-a", "repetition": 1, "timestamp": 1.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "run-a", "repetition": 1, "ended_at": 2.0, "stream_keys": ["key1"]})
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run-a.json",
+        {"_metadata": {"run_id": "run-a", "started_at": 1.0, "ended_at": 2.0}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": []}}}},
+    )
+
+    metrics = runner.build_metrics(cfg, dirs)
+    relative = next(row for row in metrics["cost"] if row["metric"] == "relative_worker_activity_reduction_vs_always_on")
+    worker = next(row for row in metrics["cost"] if row["metric"] == "worker_pod_seconds")
+
+    assert relative["value"] is None
+    assert relative["source"] == "insufficient_prometheus_worker_samples"
+    assert worker["source"] == "insufficient_prometheus_worker_samples"
