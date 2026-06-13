@@ -59,7 +59,7 @@ python tools/experiments/run_experiment.py \
 
 ## Cenários suportados
 
-- `cold-start`: mede ativação sob demanda a partir de zero workers.
+- `cold-start`: mede ativação sob demanda a partir de zero workers. Antes de iniciar cada repetição, o runner verifica pods `app=worker`, remove resíduos ativos no namespace do experimento e falha a repetição se não conseguir confirmar zero workers.
 - `concurrency`: inicia múltiplas transmissões simultâneas.
 - `release`: encerra publishers e observa liberação de workers/estado.
 - `worker-failure`: injeta falha de worker e observa recuperação.
@@ -84,7 +84,7 @@ O runner também coleta logs estruturados e gera:
 - `raw/proxy_events.jsonl`
 - `raw/worker_events.jsonl`
 
-Esses eventos são usados para derivar métricas per-stream de ativação, release, handover e correção arquitetural quando os logs contêm timestamps suficientes.
+Esses eventos são usados para derivar métricas per-stream de ativação, release, handover e correção arquitetural quando os logs contêm timestamps suficientes. As métricas de ativação e release são consolidadas por `repetition` + `streamKey`, preservando amostras independentes quando `--repetitions` é maior que 1.
 
 ## Saída
 

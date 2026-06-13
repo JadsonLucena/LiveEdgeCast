@@ -98,3 +98,76 @@ def test_build_metrics_derives_activation_from_controller_events(tmp_path):
 def test_build_pilot_levels_includes_expected_steps_and_max():
     assert runner.build_pilot_levels(20, 5) == [1, 5, 10, 15, 20]
     assert runner.build_pilot_levels(18, 5) == [1, 5, 10, 15, 18]
+
+
+def test_build_metrics_keeps_repetitions_as_independent_samples(tmp_path):
+    cfg = config(tmp_path)
+    cfg.repetitions = 2
+    dirs = runner.ensure_layout(cfg.report_root)
+    stream_records = [
+        {"event": "run_started", "repetition": 1, "timestamp": 90.0, "stream_keys": ["key1"]},
+        {"event": "run_finished", "repetition": 1, "ended_at": 150.0, "stream_keys": ["key1"]},
+        {"event": "run_started", "repetition": 2, "timestamp": 190.0, "stream_keys": ["key1"]},
+        {"event": "run_finished", "repetition": 2, "ended_at": 250.0, "stream_keys": ["key1"]},
+    ]
+    (dirs["raw"] / "streams.jsonl").write_text("".join(json.dumps(e) + "\n" for e in stream_records))
+    publisher_records = [
+        {"event": "publisher_finished", "repetition": 1, "publisher_index": 1, "stream_key": "key1", "started_at": 100.0, "ended_at": 140.0, "returncode": 0},
+        {"event": "publisher_finished", "repetition": 2, "publisher_index": 1, "stream_key": "key1", "started_at": 200.0, "ended_at": 240.0, "returncode": 0},
+    ]
+    (dirs["raw"] / "publishers.jsonl").write_text("".join(json.dumps(e) + "\n" for e in publisher_records))
+    events = []
+    for base in (100.0, 200.0):
+        events.extend([
+            {"timestamp_epoch": base + 1, "event_type": "stream_lifecycle_timestamp_observed", "stream": "key1", "message": "t_publish_start_proxy observed from proxy_hook"},
+            {"timestamp_epoch": base + 2, "event_type": "stream_lifecycle_timestamp_observed", "stream": "key1", "message": "t_controller_received_event observed from controller"},
+            {"timestamp_epoch": base + 3, "event_type": "stream_lifecycle_timestamp_observed", "stream": "key1", "message": "t_worker_create_requested observed from controller"},
+            {"timestamp_epoch": base + 4, "event_type": "stream_lifecycle_timestamp_observed", "stream": "key1", "message": "t_worker_pod_created observed from pod_watch"},
+            {"timestamp_epoch": base + 5, "event_type": "stream_lifecycle_timestamp_observed", "stream": "key1", "message": "t_worker_ready observed from pod_watch"},
+            {"timestamp_epoch": base + 6, "event_type": "stream_lifecycle_timestamp_observed", "stream": "key1", "message": "t_ffmpeg_started observed from worker"},
+            {"timestamp_epoch": base + 7, "event_type": "stream_lifecycle_timestamp_observed", "stream": "key1", "message": "t_ffmpeg_first_progress observed from worker"},
+        ])
+    (dirs["raw"] / "controller_events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    metrics = runner.build_metrics(cfg, dirs)
+
+    rows = list(__import__("csv").DictReader((dirs["metrics"] / "activation_metrics.csv").open()))
+    assert [row["repetition"] for row in rows] == ["1", "2"]
+    assert [float(row["total_activation_seconds"]) for row in rows] == [7.0, 7.0]
+    assert metrics["activation"]["total_activation_seconds_per_stream"]["samples"] == 2
+
+
+def test_cold_start_precondition_deletes_existing_workers(monkeypatch, tmp_path):
+    cfg = config(tmp_path, scenario="cold-start")
+    cfg.kubectl_path = "/bin/true"
+    dirs = runner.ensure_layout(cfg.report_root)
+    calls = iter([
+        (["worker-old"], {"returncode": 0}),
+        ([], {"returncode": 0}),
+    ])
+    deleted = []
+    monkeypatch.setattr(runner, "list_worker_pods", lambda cfg_arg: next(calls))
+    monkeypatch.setattr(runner, "delete_pod", lambda cfg_arg, pod: deleted.append(pod) or {"returncode": 0})
+
+    result = runner.ensure_zero_workers_for_cold_start(cfg, dirs, repetition=1, timeout_seconds=1)
+
+    assert result["status"] == "ok"
+    assert deleted == ["worker-old"]
+    events = runner.read_jsonl(dirs["raw"] / "streams.jsonl")
+    assert events[-1]["event"] == "cold_start_precondition"
+
+
+def test_cold_start_precondition_fails_when_workers_remain(monkeypatch, tmp_path):
+    cfg = config(tmp_path, scenario="cold-start")
+    cfg.kubectl_path = "/bin/true"
+    dirs = runner.ensure_layout(cfg.report_root)
+    monkeypatch.setattr(runner, "list_worker_pods", lambda cfg_arg: (["worker-stuck"], {"returncode": 0}))
+    monkeypatch.setattr(runner, "delete_pod", lambda cfg_arg, pod: {"returncode": 0})
+    monkeypatch.setattr(runner.time, "sleep", lambda seconds: None)
+
+    try:
+        runner.ensure_zero_workers_for_cold_start(cfg, dirs, repetition=1, timeout_seconds=0)
+    except RuntimeError as exc:
+        assert "worker pods still active" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")

@@ -268,7 +268,17 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> 
 
 
 class ManagedPublisher:
-    def __init__(self, stream_key: str, command: list[str], process: subprocess.Popen, stdout_path: Path, stderr_path: Path, started_at: float):
+    def __init__(
+        self,
+        stream_key: str,
+        command: list[str],
+        process: subprocess.Popen,
+        stdout_path: Path,
+        stderr_path: Path,
+        started_at: float,
+        repetition: int,
+        publisher_index: int,
+    ):
         self.stream_key = stream_key
         self.command = command
         self.process = process
@@ -276,6 +286,8 @@ class ManagedPublisher:
         self.stderr_path = stderr_path
         self.started_at = started_at
         self.ended_at: float | None = None
+        self.repetition = repetition
+        self.publisher_index = publisher_index
 
     def stop(self, grace_seconds: float = 5) -> None:
         if self.process.poll() is None:
@@ -296,6 +308,8 @@ class ManagedPublisher:
     def result(self) -> dict[str, Any]:
         return {
             "stream_key": self.stream_key,
+            "repetition": self.repetition,
+            "publisher_index": self.publisher_index,
             "pid": self.process.pid,
             "returncode": self.process.poll(),
             "started_at": self.started_at,
@@ -340,7 +354,14 @@ def ffmpeg_command(config: RunnerConfig, stream_key: str) -> list[str]:
     return command
 
 
-def start_publisher(config: RunnerConfig, dirs: dict[str, Path], stream_key: str, suffix: str = "") -> ManagedPublisher:
+def start_publisher(
+    config: RunnerConfig,
+    dirs: dict[str, Path],
+    stream_key: str,
+    repetition: int,
+    publisher_index: int,
+    suffix: str = "",
+) -> ManagedPublisher:
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{stream_key}{suffix}")
     stdout_path = dirs["logs"] / f"publisher-{safe_name}.stdout.log"
     stderr_path = dirs["logs"] / f"publisher-{safe_name}.stderr.log"
@@ -351,11 +372,13 @@ def start_publisher(config: RunnerConfig, dirs: dict[str, Path], stream_key: str
     append_jsonl(dirs["raw"] / "publishers.jsonl", {
         "event": "publisher_started",
         "stream_key": stream_key,
+        "repetition": repetition,
+        "publisher_index": publisher_index,
         "pid": process.pid,
         "timestamp": started_at,
         "command": redact_command(command),
     })
-    return ManagedPublisher(stream_key, command, process, stdout_path, stderr_path, started_at)
+    return ManagedPublisher(stream_key, command, process, stdout_path, stderr_path, started_at, repetition, publisher_index)
 
 
 def wait_or_stop_publishers(config: RunnerConfig, dirs: dict[str, Path], publishers: list[ManagedPublisher], wait: bool = True) -> list[dict[str, Any]]:
@@ -578,6 +601,78 @@ def delete_pod(config: RunnerConfig, pod: str) -> dict[str, Any]:
     return run_cmd([config.kubectl_path, "delete", "pod", pod, "-n", config.namespace, "--grace-period=0", "--force"], timeout=60)
 
 
+def list_worker_pods(config: RunnerConfig) -> tuple[list[str], dict[str, Any]]:
+    result = kubectl_json(config, ["get", "pods", "-n", config.namespace, "-l", "app=worker", "-o", "json"], timeout=60)
+    pods: list[str] = []
+    for item in (result.get("json") or {}).get("items", []):
+        metadata = item.get("metadata") or {}
+        status = item.get("status") or {}
+        name = metadata.get("name")
+        phase = status.get("phase")
+        deletion_timestamp = metadata.get("deletionTimestamp")
+        if name and not deletion_timestamp and phase in {"Pending", "Running", "Unknown"}:
+            pods.append(name)
+    return pods, result
+
+
+def ensure_zero_workers_for_cold_start(config: RunnerConfig, dirs: dict[str, Path], repetition: int, timeout_seconds: int = 90) -> dict[str, Any]:
+    """Ensure a true worker scale-to-zero precondition before a cold-start run.
+
+    This function deliberately fails the run if Kubernetes cannot be queried, because
+    otherwise the experiment could report warm-start data as cold-start data. Existing
+    worker pods in the experiment namespace are deleted and the function waits until
+    no active worker pods remain.
+    """
+    if not shutil.which(config.kubectl_path) and not Path(config.kubectl_path).exists():
+        result = {
+            "event": "cold_start_precondition_failed",
+            "repetition": repetition,
+            "timestamp": now_epoch(),
+            "reason": f"kubectl not found: {config.kubectl_path}",
+        }
+        append_jsonl(dirs["raw"] / "streams.jsonl", result)
+        raise RuntimeError(result["reason"])
+
+    initial_pods, list_result = list_worker_pods(config)
+    if list_result.get("returncode") != 0:
+        result = {
+            "event": "cold_start_precondition_failed",
+            "repetition": repetition,
+            "timestamp": now_epoch(),
+            "reason": "unable_to_list_worker_pods",
+            "kubectl": list_result,
+        }
+        append_jsonl(dirs["raw"] / "streams.jsonl", result)
+        raise RuntimeError(f"Unable to verify cold-start precondition: {list_result.get('stderr') or list_result.get('error')}")
+
+    actions: list[dict[str, Any]] = []
+    for pod in initial_pods:
+        actions.append({"pod": pod, "delete": delete_pod(config, pod)})
+
+    deadline = now_epoch() + timeout_seconds
+    remaining = initial_pods
+    while now_epoch() < deadline:
+        remaining, _ = list_worker_pods(config)
+        if not remaining:
+            break
+        time.sleep(2)
+
+    result = {
+        "event": "cold_start_precondition",
+        "repetition": repetition,
+        "timestamp": now_epoch(),
+        "initial_worker_pods": initial_pods,
+        "delete_actions": actions,
+        "remaining_worker_pods": remaining,
+        "status": "ok" if not remaining else "failed",
+    }
+    append_jsonl(dirs["raw"] / "streams.jsonl", result)
+    write_json(dirs["raw"] / f"cold_start_precondition_r{repetition}.json", result)
+    if remaining:
+        raise RuntimeError(f"Cold-start precondition failed: worker pods still active: {', '.join(remaining)}")
+    return result
+
+
 def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: int, stream_keys: list[str]) -> dict[str, Any]:
     run_started = now_epoch()
     append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "repetition": repetition, "timestamp": run_started, "stream_keys": stream_keys})
@@ -588,23 +683,26 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
         if config.warmup_seconds:
             time.sleep(config.warmup_seconds)
         collect_kubernetes(config, dirs, f"before-r{repetition}")
+        if config.scenario == "cold-start":
+            ensure_zero_workers_for_cold_start(config, dirs, repetition)
+            collect_kubernetes(config, dirs, f"after-zero-workers-r{repetition}")
         if config.scenario == "duplicate-streamkey":
             key = stream_keys[0]
-            publishers.append(start_publisher(config, dirs, key, suffix="-primary"))
+            publishers.append(start_publisher(config, dirs, key, repetition, 1, suffix="-primary"))
             time.sleep(config.duplicate_attempt_delay_seconds)
-            publishers.append(start_publisher(config, dirs, key, suffix="-duplicate"))
+            publishers.append(start_publisher(config, dirs, key, repetition, 2, suffix="-duplicate"))
         elif config.scenario == "handover":
             key = stream_keys[0]
-            first = start_publisher(config, dirs, key, suffix="-handover-a")
+            first = start_publisher(config, dirs, key, repetition, 1, suffix="-handover-a")
             publishers.append(first)
             time.sleep(min(config.reconnect_delay_seconds, config.duration_seconds))
             first.stop()
             append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "handover_primary_stopped", "stream_key": key, "timestamp": now_epoch()})
             time.sleep(config.reconnect_delay_seconds)
-            publishers.append(start_publisher(config, dirs, key, suffix="-handover-b"))
+            publishers.append(start_publisher(config, dirs, key, repetition, 2, suffix="-handover-b"))
         else:
             for index, key in enumerate(stream_keys):
-                publishers.append(start_publisher(config, dirs, key))
+                publishers.append(start_publisher(config, dirs, key, repetition, index + 1))
                 if index < len(stream_keys) - 1 and config.startup_interval_seconds:
                     time.sleep(config.startup_interval_seconds)
         if config.scenario == "worker-failure" or config.kill_worker:
@@ -837,12 +935,54 @@ def latest_event_time(events: list[dict[str, Any]], event_type: str, stream: str
     return max(values) if values else None
 
 
-def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+def load_run_windows(config: RunnerConfig, dirs: dict[str, Path]) -> list[dict[str, Any]]:
+    windows: dict[int, dict[str, Any]] = {}
+    for record in read_jsonl(dirs["raw"] / "streams.jsonl"):
+        repetition = record.get("repetition")
+        if not isinstance(repetition, int):
+            continue
+        current = windows.setdefault(repetition, {"repetition": repetition, "stream_keys": list(config.stream_keys)})
+        if record.get("event") == "run_started":
+            current["started_at"] = record.get("timestamp")
+            current["stream_keys"] = record.get("stream_keys") or current["stream_keys"]
+        elif record.get("event") == "run_finished":
+            current["ended_at"] = record.get("ended_at") or record.get("timestamp")
+            current["stream_keys"] = record.get("stream_keys") or current["stream_keys"]
+    if windows:
+        return [windows[key] for key in sorted(windows)]
+    return [
+        {"repetition": rep, "started_at": None, "ended_at": None, "stream_keys": list(config.stream_keys)}
+        for rep in range(1, config.repetitions + 1)
+    ]
+
+
+def event_in_window(event: dict[str, Any], window: dict[str, Any], total_windows: int) -> bool:
+    ts = event.get("timestamp_epoch")
+    start = window.get("started_at")
+    end = window.get("ended_at")
+    if not isinstance(ts, (int, float)):
+        # If there is only one run and no event timestamp, keep the event visible.
+        return total_windows == 1
+    if isinstance(start, (int, float)) and ts < start:
+        return False
+    if isinstance(end, (int, float)) and ts > end:
+        return False
+    return True
+
+
+def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[tuple[int, str], dict[str, Any]]]:
     events = read_jsonl(dirs["raw"] / "controller_events.jsonl")
-    grouped: dict[str, dict[str, Any]] = {key: {"stream_key": key} for key in config.stream_keys}
+    run_windows = load_run_windows(config, dirs)
+    grouped: dict[tuple[int, str], dict[str, Any]] = {}
+
+    for window in run_windows:
+        repetition = int(window.get("repetition") or 1)
+        for key in (window.get("stream_keys") or config.stream_keys):
+            grouped[(repetition, key)] = {"repetition": repetition, "stream_key": key}
+
     for event in events:
         stream = event.get("stream")
-        if not stream or stream not in grouped:
+        if not stream or stream not in config.stream_keys:
             continue
         field = lifecycle_field_from_event(event)
         if not field:
@@ -850,24 +990,41 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
         ts = event.get("timestamp_epoch")
         if not isinstance(ts, (int, float)):
             continue
-        # Keep the earliest observation for start phases and latest for terminal phases.
-        if field in grouped[stream]:
-            if field in {"t_worker_terminated", "t_controller_received_end", "t_destination_received"}:
-                grouped[stream][field] = max(grouped[stream][field], ts)
+        matching_windows = [w for w in run_windows if stream in (w.get("stream_keys") or config.stream_keys) and event_in_window(event, w, len(run_windows))]
+        # Without usable run windows, only a single repetition can be safely inferred.
+        if not matching_windows and len(run_windows) == 1:
+            matching_windows = run_windows
+        for window in matching_windows:
+            repetition = int(window.get("repetition") or 1)
+            entry = grouped.setdefault((repetition, stream), {"repetition": repetition, "stream_key": stream})
+            if field in entry:
+                if field in {"t_worker_terminated", "t_controller_received_end", "t_destination_received"}:
+                    entry[field] = max(entry[field], ts)
+                else:
+                    entry[field] = min(entry[field], ts)
             else:
-                grouped[stream][field] = min(grouped[stream][field], ts)
-        else:
-            grouped[stream][field] = ts
+                entry[field] = ts
+
     for row in publisher_rows:
         key = row.get("stream_key")
-        if key in grouped:
-            grouped[key].setdefault("t_publish_start_client", row.get("started_at"))
-            grouped[key].setdefault("t_publish_end_client", row.get("ended_at"))
+        repetition = int(row.get("repetition") or 1)
+        if key in config.stream_keys:
+            entry = grouped.setdefault((repetition, key), {"repetition": repetition, "stream_key": key})
+            current_start = entry.get("t_publish_start_client")
+            candidate_start = row.get("started_at")
+            if isinstance(candidate_start, (int, float)) and (current_start is None or candidate_start < current_start):
+                entry["t_publish_start_client"] = candidate_start
+            current_end = entry.get("t_publish_end_client")
+            candidate_end = row.get("ended_at")
+            if isinstance(candidate_end, (int, float)) and (current_end is None or candidate_end > current_end):
+                entry["t_publish_end_client"] = candidate_end
+
     activation_rows: list[dict[str, Any]] = []
     release_rows: list[dict[str, Any]] = []
-    for key in config.stream_keys:
-        entry = grouped.get(key, {"stream_key": key})
+    for repetition, key in sorted(grouped):
+        entry = grouped[(repetition, key)]
         activation = {
+            "repetition": repetition,
             "stream_key": key,
             "t_publish_start_client": entry.get("t_publish_start_client"),
             "t_publish_start_proxy": entry.get("t_publish_start_proxy"),
@@ -892,6 +1049,7 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
         activation["status"] = "derived_from_controller_structured_logs" if observed else "not_observable"
         activation_rows.append(activation)
         release = {
+            "repetition": repetition,
             "stream_key": key,
             "release_detection_seconds": delta(entry.get("t_publish_end_client"), entry.get("t_controller_received_end")),
             "worker_delete_seconds": delta(entry.get("t_controller_received_end"), entry.get("t_worker_terminated")),
@@ -900,7 +1058,6 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
         }
         release_rows.append(release)
     return activation_rows, release_rows, grouped
-
 
 def delta(start: Any, end: Any) -> float | None:
     if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
@@ -919,10 +1076,10 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
 
     activation_rows, release_rows, lifecycle_by_stream = build_lifecycle_rows(config, dirs, publisher_rows)
     activation_fields = [
-        "stream_key", "t_publish_start_client", "t_publish_start_proxy", "t_controller_received_event", "t_worker_create_requested", "t_worker_pod_created", "t_worker_scheduled", "t_worker_container_started", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress", "event_detection_seconds", "worker_create_seconds", "worker_scheduling_seconds", "worker_ready_seconds", "ffmpeg_start_seconds", "ffmpeg_first_progress_seconds", "total_activation_seconds", "status"
+        "repetition", "stream_key", "t_publish_start_client", "t_publish_start_proxy", "t_controller_received_event", "t_worker_create_requested", "t_worker_pod_created", "t_worker_scheduled", "t_worker_container_started", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress", "event_detection_seconds", "worker_create_seconds", "worker_scheduling_seconds", "worker_ready_seconds", "ffmpeg_start_seconds", "ffmpeg_first_progress_seconds", "total_activation_seconds", "status"
     ]
     write_csv(dirs["metrics"] / "activation_metrics.csv", activation_rows, activation_fields)
-    write_csv(dirs["metrics"] / "release_metrics.csv", release_rows, ["stream_key", "release_detection_seconds", "worker_delete_seconds", "total_release_seconds", "status"])
+    write_csv(dirs["metrics"] / "release_metrics.csv", release_rows, ["repetition", "stream_key", "release_detection_seconds", "worker_delete_seconds", "total_release_seconds", "status"])
 
     resilience_rows = []
     for run in read_jsonl(dirs["raw"] / "streams.jsonl"):
