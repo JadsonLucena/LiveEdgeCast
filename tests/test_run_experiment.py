@@ -1105,3 +1105,80 @@ def test_incomplete_prometheus_metrics_ignore_extra_run_files(tmp_path):
     assert stale_rows
     assert all(row["expected_by_run_windows"] is False for row in stale_rows)
     assert "workers_active" not in runner.incomplete_prometheus_metric_names(rows)
+
+
+def test_prometheus_metric_coverage_csv_includes_expected_flag(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.write_json(dirs["root"] / "metadata.json", {"started_at": 1.0, "ended_at": 2.0})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "expected", "repetition": 1, "timestamp": 1.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "expected", "repetition": 1, "ended_at": 2.0, "stream_keys": ["key1"]})
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run.expected.json",
+        {"_metadata": {"run_id": "expected"}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[1.0, "1"]]}]}}}},
+    )
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run.stale.json",
+        {"_metadata": {"run_id": "stale"}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": []}}}},
+    )
+
+    runner.build_metrics(cfg, dirs)
+    coverage_rows = runner.csv_rows(dirs["metrics"] / "prometheus_metric_coverage.csv")
+
+    assert "expected_by_run_windows" in coverage_rows[0]
+    stale_rows = [row for row in coverage_rows if row["run_id"] == "stale"]
+    assert stale_rows
+    assert all(row["expected_by_run_windows"].lower() == "false" for row in stale_rows)
+
+
+def test_report_markdown_exposes_prometheus_analysis_readiness(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.write_json(dirs["root"] / "metadata.json", {"scenario": "cold-start", "experiment_id": "exp"})
+    runner.write_csv(dirs["metrics"] / "activation_metrics.csv", [{"total_activation_seconds": "1.5"}], ["total_activation_seconds"])
+    runner.write_csv(dirs["metrics"] / "correctness_metrics.csv", [{"worker_observed_for_stream": "True"}], ["worker_observed_for_stream"])
+    runner.write_csv(dirs["metrics"] / "duplicate_streamkey_metrics.csv", [], ["scenario_inconclusive"])
+    runner.write_csv(dirs["metrics"] / "resilience_metrics.csv", [], ["run_id"])
+    (dirs["raw"] / "publishers.jsonl").write_text("", encoding="utf-8")
+    (dirs["raw"] / "controller_events.jsonl").write_text("", encoding="utf-8")
+
+    runner.generate_report(
+        cfg,
+        dirs,
+        execution={"restore_ok": True, "context_scope_ok": True, "context_patch_status": "not_requested", "preflight": {"proxy_context_patch": {}}},
+        metrics={"activation": {}, "resources": [], "cost": [], "missing": []},
+        charts={},
+    )
+
+    report_md = (dirs["root"] / "report.md").read_text(encoding="utf-8")
+    assert "prometheus_evidence_files_complete" in report_md
+    assert "prometheus_analysis_ready" in report_md
+
+
+def test_prometheus_samples_observed_ignores_extra_stale_runs(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.write_json(dirs["root"] / "metadata.json", {"scenario": "cold-start", "experiment_id": "exp"})
+    runner.write_csv(dirs["metrics"] / "activation_metrics.csv", [], ["total_activation_seconds"])
+    runner.write_csv(dirs["metrics"] / "correctness_metrics.csv", [], ["worker_observed_for_stream"])
+    runner.write_csv(dirs["metrics"] / "duplicate_streamkey_metrics.csv", [], ["scenario_inconclusive"])
+    runner.write_csv(dirs["metrics"] / "resilience_metrics.csv", [], ["run_id"])
+    (dirs["raw"] / "publishers.jsonl").write_text("", encoding="utf-8")
+    (dirs["raw"] / "controller_events.jsonl").write_text("", encoding="utf-8")
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "expected", "repetition": 1, "timestamp": 1.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "expected", "repetition": 1, "ended_at": 2.0, "stream_keys": ["key1"]})
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run.stale.json",
+        {"_metadata": {"run_id": "stale"}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[1.0, "1"]]}]}}}},
+    )
+
+    report = runner.generate_report(
+        cfg,
+        dirs,
+        execution={"restore_ok": True, "context_scope_ok": True, "context_patch_status": "not_requested", "preflight": {"proxy_context_patch": {}}},
+        metrics={"activation": {}, "resources": [], "cost": [], "missing": []},
+        charts={},
+    )
+
+    assert report["summary"]["prometheus_samples_observed"] is False
+    assert report["summary"]["prometheus_extra_run_ids"] == ["stale"]

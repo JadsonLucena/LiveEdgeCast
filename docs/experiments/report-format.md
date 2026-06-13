@@ -85,7 +85,7 @@ Registra explicitamente se houve tentativa de publicar uma `streamKey` duplicada
 
 ### `prometheus_metric_coverage.csv`
 
-Arquivo de cobertura por `run_id` e métrica Prometheus. Cada linha separa `query_success` de `samples_observed`: uma query Prometheus pode retornar `success` com resultado vazio e, nesse caso, `available_for_analysis=false`. Em execuções com `--resume`, use esse arquivo para verificar se a agregação comparou janelas com cobertura equivalente e amostras suficientes.
+Arquivo de cobertura por `run_id` e métrica Prometheus. Cada linha separa `query_success` de `samples_observed`: uma query Prometheus pode retornar `success` com resultado vazio e, nesse caso, `available_for_analysis=false`. A coluna `expected_by_run_windows` indica se aquele `run_id` pertence às janelas de execução esperadas ou se veio de evidência extra/stale preservada em `raw/`. Em execuções com `--resume`, use esse arquivo para verificar se a agregação comparou janelas com cobertura equivalente e amostras suficientes.
 
 ### `resource_activity.csv` e `cost_estimation.csv`
 

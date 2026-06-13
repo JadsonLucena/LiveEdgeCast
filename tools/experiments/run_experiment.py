@@ -2400,7 +2400,7 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     write_csv(
         dirs["metrics"] / "prometheus_metric_coverage.csv",
         prom_metric_rows,
-        ["run_id", "metric", "available", "query_success", "samples_observed", "available_for_analysis", "sample_count", "status", "error"],
+        ["run_id", "metric", "expected_by_run_windows", "available", "query_success", "samples_observed", "available_for_analysis", "sample_count", "status", "error"],
     )
     pod_rows = extract_pod_rows(dirs, config.stream_keys)
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
@@ -2864,12 +2864,24 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
     worker_observed_samples = len([row for row in correctness_rows if str(row.get("worker_observed_for_stream")).lower() == "true"])
     controller_events_observed = bool(read_jsonl(dirs["raw"] / "controller_events.jsonl"))
     prometheus_files = [path.name for path in prometheus_run_files(dirs)]
-    prom = load_prometheus_evidence(dirs)
     prom_coverage = metrics.get("prometheus_coverage") or prometheus_run_coverage(config, dirs)
     prom_metric_coverage = metrics.get("prometheus_metric_coverage") or prometheus_metric_coverage_rows(config, dirs)
     incomplete_prom_metrics = incomplete_prometheus_metric_names(prom_metric_coverage)
-    prometheus_samples_observed = any(prom_values(value) for name, value in prom.items() if not str(name).startswith("_") and isinstance(value, dict))
     expected_prom_run_ids = set(prom_coverage.get("expected_run_ids") or [])
+    prom_results_by_run = load_prometheus_results_by_run(dirs)
+    if expected_prom_run_ids:
+        prom_for_sample_summary = merge_prometheus_results([
+            prom_results_by_run[run_id]
+            for run_id in sorted(expected_prom_run_ids)
+            if run_id in prom_results_by_run
+        ])
+    else:
+        prom_for_sample_summary = load_prometheus_evidence(dirs)
+    prometheus_samples_observed = any(
+        prom_values(value)
+        for name, value in prom_for_sample_summary.items()
+        if not str(name).startswith("_") and isinstance(value, dict)
+    )
     prometheus_evidence_files_complete = bool(prom_coverage.get("complete"))
     prometheus_analysis_ready = prometheus_evidence_files_complete and prometheus_required_metrics_ready(prom_metric_coverage, REQUIRED_PROMETHEUS_METRICS_FOR_ANALYSIS, expected_prom_run_ids)
     verdict = verdict or automation_verdict(config, execution, metrics)
@@ -2952,7 +2964,7 @@ Amostras de ativação válidas: {report_json["summary"]["valid_activation_sampl
 
 ## Validação das evidências
 
-{md_table([report_json["summary"]], ['automation_status','automation_exit_code','automation_failure_reasons','prometheus_resume_safe','prometheus_samples_observed','resource_baseline_window_aware','observable_activation_samples','worker_observed_samples','controller_events_observed','scenario_inconclusive','context_scope_ok','restore_ok'])}
+{md_table([report_json["summary"]], ['automation_status','automation_exit_code','automation_failure_reasons','prometheus_resume_safe','prometheus_evidence_files_complete','prometheus_analysis_ready','prometheus_samples_observed','resource_baseline_window_aware','observable_activation_samples','worker_observed_samples','controller_events_observed','scenario_inconclusive','context_scope_ok','restore_ok'])}
 
 ### Cobertura Prometheus por execução
 
