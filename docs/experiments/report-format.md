@@ -26,10 +26,16 @@ reports/<experiment-id>/
     correctness_metrics.csv
     cost_estimation.csv
   logs/
-    controller.log
-    proxy.log
-    worker.log
-    publishers.log
+    final-before-restore/
+      controller.log
+      proxy.log
+      worker.log
+      publishers.log
+    r<repetition>-after-run/
+      controller.log
+      proxy.log
+      worker.log
+      publishers.log
   charts/
     *.png ou *.txt
   report.md
@@ -65,7 +71,7 @@ Resume séries do Prometheus para CPU, memória e rede, incluindo média, median
 
 ### `correctness_metrics.csv`
 
-Resume indícios de um worker por streamKey, duplicidade, handovers, eventos stale ignorados e candidatos a órfãos.
+Resume indícios de um worker por streamKey por repetição, duplicidade simultânea dentro da janela da repetição, handovers, eventos stale ignorados e candidatos a órfãos. Substituições históricas de worker entre repetições não são tratadas como duplicidade.
 
 ### `cost_estimation.csv`
 
@@ -74,3 +80,9 @@ Calcula uma estimativa relativa por pod-seconds. A coluna `source` indica se o v
 ## Gráficos
 
 O runner só gera gráficos com dados reais. Quando as amostras necessárias não existem, ele grava um arquivo `.txt` na pasta `charts/` explicando a limitação. Isso evita gráficos placeholder que poderiam ser confundidos com evidência experimental.
+
+## Integridade do relatório
+
+O runner não mistura execuções por padrão. Se o diretório de saída já existir, a execução falha, exceto quando `--overwrite` ou `--resume` for informado. Essa regra evita que evidências antigas contaminem métricas novas.
+
+Os resultados por streamKey no `report.md` são calculados por `repetition + streamKey`, usando as janelas de execução registradas em `raw/streams.jsonl`.

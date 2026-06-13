@@ -101,6 +101,10 @@ class RunnerConfig:
     baseline: str | None
     release_after_seconds: int
     patch_proxy_context: bool
+    overwrite: bool = False
+    resume: bool = False
+    allow_partial: bool = False
+    allow_worker_cleanup: bool = False
 
     @property
     def report_root(self) -> Path:
@@ -187,6 +191,10 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--baseline", choices=("always-on", "polling", "event-driven"), default=None)
     parser.add_argument("--release-after-seconds", type=non_negative_int, default=20, help="How long release scenario waits before stopping publishers.")
     parser.add_argument("--patch-proxy-context", action="store_true", help="Opt-in: temporarily patch proxy/controller deployments with experiment context and restore afterwards.")
+    parser.add_argument("--overwrite", action="store_true", help="Delete an existing report directory before running. Mutually exclusive with --resume.")
+    parser.add_argument("--resume", action="store_true", help="Allow appending raw evidence into an existing report directory. Mutually exclusive with --overwrite.")
+    parser.add_argument("--allow-partial", action="store_true", help="Return exit code 0 for partial experiments. By default partial runs fail automation.")
+    parser.add_argument("--allow-worker-cleanup", action="store_true", help="Allow cold-start precondition to delete existing worker pods. Without this flag, existing workers make the cold-start run invalid.")
     args = parser.parse_args(argv)
 
     keys = load_stream_keys(args.stream_keys, args.stream_keys_file)
@@ -198,6 +206,8 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         parser.error(f"--source-file not found: {args.source_file}")
     if args.saturation_error_rate > 1:
         parser.error("--saturation-error-rate must be between 0 and 1")
+    if args.overwrite and args.resume:
+        parser.error("--overwrite and --resume are mutually exclusive")
     return RunnerConfig(
         stream_keys=keys,
         scenario=args.scenario,
@@ -229,6 +239,10 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         baseline=args.baseline,
         release_after_seconds=args.release_after_seconds,
         patch_proxy_context=args.patch_proxy_context,
+        overwrite=args.overwrite,
+        resume=args.resume,
+        allow_partial=args.allow_partial,
+        allow_worker_cleanup=args.allow_worker_cleanup,
     )
 
 
@@ -243,6 +257,26 @@ def load_stream_keys(inline: str | None, file_path: Path | None) -> list[str]:
     if invalid:
         raise argparse.ArgumentTypeError(f"invalid streamKey(s): {', '.join(invalid[:5])}")
     return keys
+
+
+def prepare_report_root(config: RunnerConfig) -> Path:
+    """Prepare report directory safely.
+
+    By default experiments refuse to reuse a non-empty report directory, because
+    JSONL raw evidence is append-only and mixing two executions would invalidate
+    the resulting metrics. Use --overwrite to delete the existing directory or
+    --resume when intentional continuation is desired.
+    """
+    root = config.report_root
+    if root.exists() and any(root.iterdir()):
+        if config.overwrite:
+            shutil.rmtree(root)
+        elif not config.resume:
+            raise RuntimeError(
+                f"report directory already exists and is not empty: {root}. "
+                "Use --overwrite to replace it or --resume to append intentionally."
+            )
+    return root
 
 
 def ensure_layout(root: Path) -> dict[str, Path]:
@@ -278,6 +312,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> 
 class ManagedPublisher:
     def __init__(
         self,
+        config: RunnerConfig,
         stream_key: str,
         command: list[str],
         process: subprocess.Popen,
@@ -287,6 +322,9 @@ class ManagedPublisher:
         repetition: int,
         publisher_index: int,
     ):
+        self.experiment_id = config.experiment_id
+        self.scenario = config.scenario
+        self.run_id = config.run_id
         self.stream_key = stream_key
         self.command = command
         self.process = process
@@ -296,8 +334,10 @@ class ManagedPublisher:
         self.ended_at: float | None = None
         self.repetition = repetition
         self.publisher_index = publisher_index
+        self.stop_reason: str | None = None
 
-    def stop(self, grace_seconds: float = 5) -> None:
+    def stop(self, grace_seconds: float = 5, reason: str = "stopped_by_runner") -> None:
+        self.stop_reason = self.stop_reason or reason
         if self.process.poll() is None:
             try:
                 os.killpg(self.process.pid, signal.SIGTERM)
@@ -306,6 +346,7 @@ class ManagedPublisher:
             try:
                 self.process.wait(timeout=grace_seconds)
             except subprocess.TimeoutExpired:
+                self.stop_reason = f"{reason}_sigkill"
                 try:
                     os.killpg(self.process.pid, signal.SIGKILL)
                 except Exception:
@@ -315,11 +356,15 @@ class ManagedPublisher:
 
     def result(self) -> dict[str, Any]:
         return {
+            "experiment_id": self.experiment_id,
+            "scenario": self.scenario,
+            "run_id": self.run_id,
             "stream_key": self.stream_key,
             "repetition": self.repetition,
             "publisher_index": self.publisher_index,
             "pid": self.process.pid,
             "returncode": self.process.poll(),
+            "stop_reason": self.stop_reason,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "stdout": str(self.stdout_path),
@@ -371,14 +416,17 @@ def start_publisher(
     suffix: str = "",
 ) -> ManagedPublisher:
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{stream_key}{suffix}")
-    stdout_path = dirs["logs"] / f"publisher-{safe_name}.stdout.log"
-    stderr_path = dirs["logs"] / f"publisher-{safe_name}.stderr.log"
+    stdout_path = dirs["logs"] / f"publisher-{config.experiment_id}-r{repetition:03d}-i{publisher_index:02d}-{safe_name}.stdout.log"
+    stderr_path = dirs["logs"] / f"publisher-{config.experiment_id}-r{repetition:03d}-i{publisher_index:02d}-{safe_name}.stderr.log"
     command = ffmpeg_command(config, stream_key)
     started_at = now_epoch()
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
     append_jsonl(dirs["raw"] / "publishers.jsonl", {
         "event": "publisher_started",
+        "experiment_id": config.experiment_id,
+        "scenario": config.scenario,
+        "run_id": config.run_id,
         "stream_key": stream_key,
         "repetition": repetition,
         "publisher_index": publisher_index,
@@ -386,10 +434,30 @@ def start_publisher(
         "timestamp": started_at,
         "command": redact_command(command),
     })
-    return ManagedPublisher(stream_key, command, process, stdout_path, stderr_path, started_at, repetition, publisher_index)
+    return ManagedPublisher(config, stream_key, command, process, stdout_path, stderr_path, started_at, repetition, publisher_index)
 
 
-def wait_or_stop_publishers(config: RunnerConfig, dirs: dict[str, Path], publishers: list[ManagedPublisher], wait: bool = True) -> list[dict[str, Any]]:
+def publisher_status(config: RunnerConfig, result: dict[str, Any]) -> str:
+    rc = result.get("returncode")
+    stop_reason = str(result.get("stop_reason") or "")
+    if rc == 0:
+        return "success"
+    if stop_reason.startswith("expected_"):
+        return "expected_stopped"
+    if config.scenario == "duplicate-streamkey" and int(result.get("publisher_index") or 0) > 1 and rc is not None:
+        return "expected_conflict_or_stopped"
+    if rc is None:
+        return "running_or_unknown"
+    return "unexpected_failed"
+
+
+def wait_or_stop_publishers(
+    config: RunnerConfig,
+    dirs: dict[str, Path],
+    publishers: list[ManagedPublisher],
+    wait: bool = True,
+    stop_reason: str = "expected_stop",
+) -> list[dict[str, Any]]:
     deadline = now_epoch() + config.duration_seconds + config.cooldown_seconds + 30
     if wait:
         for publisher in publishers:
@@ -397,13 +465,17 @@ def wait_or_stop_publishers(config: RunnerConfig, dirs: dict[str, Path], publish
             try:
                 publisher.process.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
-                publisher.stop()
+                publisher.stop(reason="timeout_after_nominal_duration")
             publisher.ended_at = publisher.ended_at or now_epoch()
     else:
         for publisher in publishers:
-            publisher.stop()
+            if publisher.process.poll() is None:
+                publisher.stop(reason=stop_reason)
+            else:
+                publisher.ended_at = publisher.ended_at or now_epoch()
     results = [publisher.result() for publisher in publishers]
     for result in results:
+        result["publisher_status"] = publisher_status(config, result)
         append_jsonl(dirs["raw"] / "publishers.jsonl", {"event": "publisher_finished", **result})
     return results
 
@@ -444,19 +516,21 @@ def collect_kubernetes(config: RunnerConfig, dirs: dict[str, Path], phase: str) 
 
 
 
-def collect_logs(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
+def collect_logs(config: RunnerConfig, dirs: dict[str, Path], phase: str | None = None) -> dict[str, Any]:
     results: dict[str, Any] = {}
     if not shutil.which(config.kubectl_path) and not Path(config.kubectl_path).exists():
         return {"available": False, "error": f"kubectl not found: {config.kubectl_path}"}
+    log_dir = dirs["logs"] / phase if phase else dirs["logs"]
+    log_dir.mkdir(parents=True, exist_ok=True)
     selectors = {"controller": "app=controller", "proxy": "app=proxy", "worker": "app=worker"}
     for name, selector in selectors.items():
         out = run_cmd([config.kubectl_path, "logs", "-n", config.namespace, "-l", selector, "--all-containers=true", "--tail=-1"], timeout=120)
-        path = dirs["logs"] / f"{name}.log"
+        path = log_dir / f"{name}.log"
         path.write_text((out.get("stdout") or "") + ("\n# STDERR\n" + out.get("stderr", "") if out.get("stderr") else ""), encoding="utf-8")
-        event_count = extract_structured_events(path, dirs["raw"] / f"{name}_events.jsonl", component=name)
+        event_count = extract_structured_events(path, dirs["raw"] / f"{name}_events.jsonl", component=name, collection_phase=phase or "final")
         results[name] = {"returncode": out["returncode"], "path": str(path), "structured_events": event_count}
     # Merge publisher logs for convenience.
-    publisher_log = dirs["logs"] / "publishers.log"
+    publisher_log = log_dir / "publishers.log"
     with publisher_log.open("w", encoding="utf-8") as merged:
         for path in sorted(dirs["logs"].glob("publisher-*.stderr.log")):
             merged.write(f"\n===== {path.name} =====\n")
@@ -508,11 +582,23 @@ def parse_json_event_line(line: str) -> dict[str, Any] | None:
     return payload
 
 
-def extract_structured_events(log_path: Path, output_path: Path, component: str) -> int:
+def event_dedupe_key(event: dict[str, Any]) -> str:
+    payload = {
+        key: event.get(key)
+        for key in ("component", "event_type", "timestamp", "timestamp_epoch", "stream", "generation", "message", "worker_pod", "proxy_pod")
+    }
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def extract_structured_events(log_path: Path, output_path: Path, component: str, collection_phase: str = "final") -> int:
     count = 0
     if not log_path.exists():
         return 0
-    with output_path.open("w", encoding="utf-8") as out:
+    seen = set()
+    if output_path.exists():
+        for existing in read_jsonl(output_path):
+            seen.add(event_dedupe_key(existing))
+    with output_path.open("a", encoding="utf-8") as out:
         for line_number, line in enumerate(log_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
             event = parse_json_event_line(line)
             if not event:
@@ -520,6 +606,11 @@ def extract_structured_events(log_path: Path, output_path: Path, component: str)
             event["component"] = component
             event["source_log"] = str(log_path)
             event["source_line"] = line_number
+            event["collection_phase"] = collection_phase
+            key = event_dedupe_key(event)
+            if key in seen:
+                continue
+            seen.add(key)
             out.write(json.dumps(event, sort_keys=True, default=str) + "\n")
             count += 1
     return count
@@ -729,8 +820,8 @@ def ensure_zero_workers_for_cold_start(config: RunnerConfig, dirs: dict[str, Pat
 
     This function deliberately fails the run if Kubernetes cannot be queried, because
     otherwise the experiment could report warm-start data as cold-start data. Existing
-    worker pods in the experiment namespace are deleted and the function waits until
-    no active worker pods remain.
+    worker pods in the experiment namespace are only deleted when
+    --allow-worker-cleanup is enabled; otherwise active workers make the run invalid.
     """
     if not shutil.which(config.kubectl_path) and not Path(config.kubectl_path).exists():
         result = {
@@ -753,6 +844,21 @@ def ensure_zero_workers_for_cold_start(config: RunnerConfig, dirs: dict[str, Pat
         }
         append_jsonl(dirs["raw"] / "streams.jsonl", result)
         raise RuntimeError(f"Unable to verify cold-start precondition: {list_result.get('stderr') or list_result.get('error')}")
+
+    if initial_pods and not config.allow_worker_cleanup:
+        result = {
+            "event": "cold_start_precondition_failed",
+            "repetition": repetition,
+            "timestamp": now_epoch(),
+            "reason": "active_worker_pods_present_and_cleanup_not_allowed",
+            "active_worker_pods": initial_pods,
+        }
+        append_jsonl(dirs["raw"] / "streams.jsonl", result)
+        write_json(dirs["raw"] / f"cold_start_precondition_r{repetition}.json", result)
+        raise RuntimeError(
+            "Cold-start precondition failed: active worker pods present. "
+            "Rerun in an isolated namespace or pass --allow-worker-cleanup."
+        )
 
     actions: list[dict[str, Any]] = []
     for pod in initial_pods:
@@ -784,7 +890,7 @@ def ensure_zero_workers_for_cold_start(config: RunnerConfig, dirs: dict[str, Pat
 
 def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: int, stream_keys: list[str]) -> dict[str, Any]:
     run_started = now_epoch()
-    append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "repetition": repetition, "timestamp": run_started, "stream_keys": stream_keys})
+    append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "experiment_id": config.experiment_id, "scenario": config.scenario, "run_id": config.run_id, "repetition": repetition, "timestamp": run_started, "stream_keys": stream_keys})
     publishers: list[ManagedPublisher] = []
     failures: list[dict[str, Any]] = []
     injected: list[dict[str, Any]] = []
@@ -805,8 +911,8 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
             first = start_publisher(config, dirs, key, repetition, 1, suffix="-handover-a")
             publishers.append(first)
             time.sleep(min(config.reconnect_delay_seconds, config.duration_seconds))
-            first.stop()
-            append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "handover_primary_stopped", "stream_key": key, "timestamp": now_epoch()})
+            first.stop(reason="expected_handover_primary_stop")
+            append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "handover_primary_stopped", "experiment_id": config.experiment_id, "scenario": config.scenario, "run_id": config.run_id, "repetition": repetition, "stream_key": key, "timestamp": now_epoch()})
             time.sleep(config.reconnect_delay_seconds)
             publishers.append(start_publisher(config, dirs, key, repetition, 2, suffix="-handover-b"))
         else:
@@ -816,6 +922,8 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
                     time.sleep(config.startup_interval_seconds)
         if config.scenario == "release":
             time.sleep(min(config.release_after_seconds, config.duration_seconds))
+            # Capture worker/controller evidence while the stream is still expected to be active.
+            collect_logs(config, dirs, phase=f"r{repetition}-before-release")
         if config.scenario == "worker-failure" or config.kill_worker:
             time.sleep(min(config.kill_after_seconds, max(1, config.duration_seconds - 1)))
             target_stream = stream_keys[0]
@@ -834,11 +942,17 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
             else:
                 injected.append({"type": "proxy-failure", "stream_key": stream_keys[0] if stream_keys else None, "status": "pod_not_found", "timestamp": now_epoch()})
         # Release scenario intentionally stops publishers and waits for cleanup observation.
-        results = wait_or_stop_publishers(config, dirs, publishers, wait=(config.scenario != "release"))
+        results = wait_or_stop_publishers(
+            config,
+            dirs,
+            publishers,
+            wait=(config.scenario != "release"),
+            stop_reason="expected_release_stop" if config.scenario == "release" else "expected_stop",
+        )
         if config.cooldown_seconds:
             time.sleep(config.cooldown_seconds)
         collect_kubernetes(config, dirs, f"after-r{repetition}")
-        failures = [r for r in results if r.get("returncode") not in (0, None)]
+        failures = [r for r in results if r.get("publisher_status") == "unexpected_failed"]
         run_ended = now_epoch()
         run_summary = {
             "repetition": repetition,
@@ -851,18 +965,22 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
             "error_rate": len(failures) / len(results) if results else 1.0,
             "injected_failures": injected,
         }
-        append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", **run_summary})
+        append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "experiment_id": config.experiment_id, "scenario": config.scenario, "run_id": config.run_id, **run_summary})
+        collect_logs(config, dirs, phase=f"r{repetition}-after-run")
         return run_summary
     except KeyboardInterrupt:
         for publisher in publishers:
-            publisher.stop()
+            publisher.stop(reason="interrupted_by_user")
         raise
     except Exception as exc:
         for publisher in publishers:
-            publisher.stop()
+            publisher.stop(reason="unexpected_run_exception")
         run_ended = now_epoch()
         failure_summary = {
             "event": "run_failed",
+            "experiment_id": config.experiment_id,
+            "scenario": config.scenario,
+            "run_id": config.run_id,
             "repetition": repetition,
             "started_at": run_started,
             "ended_at": run_ended,
@@ -903,19 +1021,33 @@ def activation_p95_for_repetition(config: RunnerConfig, dirs: dict[str, Path], r
     return percentile(values, 95) if values else None
 
 
+def experiment_query_window(dirs: dict[str, Path], fallback_start: float, fallback_end: float) -> tuple[float, float]:
+    records = read_jsonl(dirs["raw"] / "streams.jsonl")
+    starts = [r.get("timestamp") for r in records if r.get("event") == "run_started" and isinstance(r.get("timestamp"), (int, float))]
+    ends = [r.get("ended_at") for r in records if r.get("event") in {"run_finished", "run_failed"} and isinstance(r.get("ended_at"), (int, float))]
+    return (min(starts) if starts else fallback_start, max(ends) if ends else fallback_end)
+
+
 def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
     if config.dry_run:
         return {"dry_run": True, "would_run": config.scenario, "stream_keys": config.stream_keys, "status": "valid"}
     if not shutil.which(config.ffmpeg_path) and not Path(config.ffmpeg_path).exists():
         raise RuntimeError(f"ffmpeg not found: {config.ffmpeg_path}")
-    start = now_epoch()
+
+    setup_started_at = now_epoch()
     patch_result = patch_proxy_context(config, dirs)
     preflight = {
         "proxy_context_patch": patch_result,
         "controller_before": collect_controller_http(config, dirs, "before"),
     }
+    experiment_started_at = now_epoch()
     run_summaries: list[dict[str, Any]] = []
     status = "valid"
+    logs: dict[str, Any] = {}
+    controller_after: dict[str, Any] = {}
+    prometheus: dict[str, Any] = {}
+    restore_result: dict[str, Any] = {}
+
     try:
         if config.scenario == "pilot-capacity":
             for level in build_pilot_levels(len(config.stream_keys), config.pilot_step_size):
@@ -927,7 +1059,7 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
                 if summary.get("error_rate", 0) >= config.saturation_error_rate:
                     saturation_reasons.append("publisher_error_rate")
                 # Best-effort latency criterion: collect logs after each level and evaluate observed P95.
-                collect_logs(config, dirs)
+                collect_logs(config, dirs, phase=f"pilot-level-{level}")
                 observed_p95 = activation_p95_for_repetition(config, dirs, repetition=level)
                 summary["activation_p95_seconds"] = observed_p95
                 if observed_p95 is not None and observed_p95 >= config.saturation_p95_seconds:
@@ -942,16 +1074,23 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
                 run_summaries.append(execute_single_run(config, dirs, repetition, config.stream_keys))
         if any(run.get("error") for run in run_summaries):
             status = "failed" if config.scenario == "cold-start" else "partial"
+
+        experiment_ended_at = now_epoch()
+        query_start, query_end = experiment_query_window(dirs, experiment_started_at, experiment_ended_at)
+        prometheus = collect_prometheus(config, dirs, query_start, query_end)
+        # Collect logs and controller state before restoring patched deployments; restore may roll pods.
+        logs = collect_logs(config, dirs, phase="final-before-restore")
+        controller_after = collect_controller_http(config, dirs, "after")
     finally:
         restore_result = restore_context_keys(config, dirs, patch_result)
-    end = now_epoch()
-    prometheus = collect_prometheus(config, dirs, start, end)
-    logs = collect_logs(config, dirs)
-    controller_after = collect_controller_http(config, dirs, "after")
+
+    ended_at = now_epoch()
     return {
         "status": status,
-        "started_at": start,
-        "ended_at": end,
+        "setup_started_at": setup_started_at,
+        "started_at": experiment_started_at,
+        "ended_at": ended_at,
+        "prometheus_window": {"started_at": experiment_query_window(dirs, experiment_started_at, ended_at)[0], "ended_at": experiment_query_window(dirs, experiment_started_at, ended_at)[1]},
         "preflight": preflight,
         "runs": run_summaries,
         "prometheus": summarize_prometheus_availability(prometheus),
@@ -1202,7 +1341,7 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
     for window in run_windows:
         repetition = int(window.get("repetition") or 1)
         for key in (window.get("stream_keys") or config.stream_keys):
-            grouped[(repetition, key)] = {"repetition": repetition, "stream_key": key}
+            grouped[(repetition, key)] = {"repetition": repetition, "stream_key": key, "concurrency": len(window.get("stream_keys") or config.stream_keys)}
 
     for event in events:
         stream = event.get("stream")
@@ -1220,7 +1359,7 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
             matching_windows = run_windows
         for window in matching_windows:
             repetition = int(window.get("repetition") or 1)
-            entry = grouped.setdefault((repetition, stream), {"repetition": repetition, "stream_key": stream})
+            entry = grouped.setdefault((repetition, stream), {"repetition": repetition, "stream_key": stream, "concurrency": len(window.get("stream_keys") or config.stream_keys)})
             if field in entry:
                 if field in {"t_worker_terminated", "t_controller_received_end", "t_destination_received"}:
                     entry[field] = max(entry[field], ts)
@@ -1233,7 +1372,7 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
         key = row.get("stream_key")
         repetition = int(row.get("repetition") or 1)
         if key in config.stream_keys:
-            entry = grouped.setdefault((repetition, key), {"repetition": repetition, "stream_key": key})
+            entry = grouped.setdefault((repetition, key), {"repetition": repetition, "stream_key": key, "concurrency": None})
             current_start = entry.get("t_publish_start_client")
             candidate_start = row.get("started_at")
             if isinstance(candidate_start, (int, float)) and (current_start is None or candidate_start < current_start):
@@ -1250,6 +1389,7 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
         activation = {
             "repetition": repetition,
             "stream_key": key,
+            "concurrency": entry.get("concurrency"),
             "t_publish_start_client": entry.get("t_publish_start_client"),
             "t_publish_start_proxy": entry.get("t_publish_start_proxy"),
             "t_controller_received_event": entry.get("t_controller_received_event"),
@@ -1292,6 +1432,80 @@ def delta(start: Any, end: Any) -> float | None:
     return value
 
 
+def repetition_for_timestamp(windows: list[dict[str, Any]], timestamp: Any) -> int | None:
+    if not isinstance(timestamp, (int, float)):
+        return int(windows[0]["repetition"]) if len(windows) == 1 else None
+    for window in windows:
+        if event_in_window({"timestamp_epoch": timestamp}, window, len(windows)):
+            return int(window.get("repetition") or 1)
+    return None
+
+
+def build_correctness_rows(
+    config: RunnerConfig,
+    dirs: dict[str, Path],
+    pod_rows: list[dict[str, Any]],
+    controller_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    windows = load_run_windows(config, dirs)
+    # Track worker pods by snapshot to detect simultaneous duplication, not historical replacement across repetitions.
+    snapshot_workers: dict[tuple[int, Any, str], set[str]] = {}
+    max_workers_by_stream: dict[tuple[int, str], int] = {}
+    duplicate_by_stream: dict[tuple[int, str], bool] = {}
+    orphan_by_rep: dict[int, set[str]] = {int(w.get("repetition") or 1): set() for w in windows}
+
+    for row in pod_rows:
+        rep = repetition_for_timestamp(windows, row.get("snapshot_at"))
+        if rep is None or row.get("component") != "worker":
+            continue
+        stream = row.get("stream_key")
+        pod = row.get("pod")
+        snapshot_at = row.get("snapshot_at")
+        phase = row.get("phase")
+        if phase not in {"Running", "Pending"}:
+            continue
+        if stream:
+            key = (rep, snapshot_at, stream)
+            bucket = snapshot_workers.setdefault(key, set())
+            if pod:
+                bucket.add(str(pod))
+            count = len(bucket)
+            max_key = (rep, stream)
+            max_workers_by_stream[max_key] = max(max_workers_by_stream.get(max_key, 0), count)
+            if count > 1:
+                duplicate_by_stream[max_key] = True
+        elif pod:
+            orphan_by_rep.setdefault(rep, set()).add(str(pod))
+
+    rows: list[dict[str, Any]] = []
+    for window in windows:
+        rep = int(window.get("repetition") or 1)
+        stream_keys = window.get("stream_keys") or config.stream_keys
+        for key in stream_keys:
+            max_count = max_workers_by_stream.get((rep, key), 0)
+            rows.append({
+                "repetition": rep,
+                "stream_key": key,
+                "max_worker_count_observed": max_count,
+                "one_worker_per_stream": max_count <= 1,
+                "duplicate_worker_detected": bool(duplicate_by_stream.get((rep, key), False)),
+                "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_in_window(e, window, len(windows))),
+                "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_in_window(e, window, len(windows))),
+                "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_in_window(e, window, len(windows))),
+            })
+        rows.append({
+            "repetition": rep,
+            "stream_key": "__orphans__",
+            "max_worker_count_observed": len(orphan_by_rep.get(rep, set())),
+            "one_worker_per_stream": None,
+            "duplicate_worker_detected": None,
+            "handover_accepted": sum(1 for e in controller_events if e.get("event_type") == "handover_accepted" and event_in_window(e, window, len(windows))),
+            "handover_denied": sum(1 for e in controller_events if e.get("event_type") == "handover_denied" and event_in_window(e, window, len(windows))),
+            "stale_events_ignored": sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored" and event_in_window(e, window, len(windows))),
+        })
+    return rows
+
+
 def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
     prom = json.loads((dirs["raw"] / "prometheus_range_queries.json").read_text(encoding="utf-8")) if (dirs["raw"] / "prometheus_range_queries.json").exists() else {}
     pod_rows = extract_pod_rows(dirs, config.stream_keys)
@@ -1300,7 +1514,7 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
 
     activation_rows, release_rows, lifecycle_by_stream = build_lifecycle_rows(config, dirs, publisher_rows)
     activation_fields = [
-        "repetition", "stream_key", "t_publish_start_client", "t_publish_start_proxy", "t_controller_received_event", "t_worker_create_requested", "t_worker_pod_created", "t_worker_scheduled", "t_worker_container_started", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress", "event_detection_seconds", "worker_create_seconds", "worker_scheduling_seconds", "worker_ready_seconds", "ffmpeg_start_seconds", "ffmpeg_first_progress_seconds", "total_activation_seconds", "status"
+        "repetition", "stream_key", "concurrency", "t_publish_start_client", "t_publish_start_proxy", "t_controller_received_event", "t_worker_create_requested", "t_worker_pod_created", "t_worker_scheduled", "t_worker_container_started", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress", "event_detection_seconds", "worker_create_seconds", "worker_scheduling_seconds", "worker_ready_seconds", "ffmpeg_start_seconds", "ffmpeg_first_progress_seconds", "total_activation_seconds", "status"
     ]
     write_csv(dirs["metrics"] / "activation_metrics.csv", activation_rows, activation_fields)
     write_csv(dirs["metrics"] / "release_metrics.csv", release_rows, ["repetition", "stream_key", "release_detection_seconds", "worker_delete_seconds", "total_release_seconds", "status"])
@@ -1334,24 +1548,13 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
             resource_rows.append({"metric": metric_name, "component": component, **stats(values)})
     write_csv(dirs["metrics"] / "resource_usage.csv", resource_rows, ["metric", "component", "samples", "mean", "median", "stddev", "p50", "p95", "p99", "min", "max", "ci95_low", "ci95_high"])
 
-    workers_by_stream = {}
-    orphan_candidates = 0
-    for row in pod_rows:
-        if row.get("component") == "worker":
-            stream = row.get("stream_key")
-            if stream:
-                workers_by_stream.setdefault(stream, set()).add(row.get("pod"))
-            else:
-                orphan_candidates += 1
-    correctness_rows = []
-    handover_accepted = sum(1 for e in controller_events if e.get("event_type") == "handover_accepted")
-    handover_denied = sum(1 for e in controller_events if e.get("event_type") == "handover_denied")
-    stale_ignored = sum(1 for e in controller_events if e.get("event_type") == "stale_event_ignored")
-    for key in config.stream_keys:
-        worker_count = len(workers_by_stream.get(key, set()))
-        correctness_rows.append({"stream_key": key, "worker_count_observed": worker_count, "one_worker_per_stream": worker_count <= 1, "duplicate_worker_detected": worker_count > 1, "handover_accepted": handover_accepted, "handover_denied": handover_denied, "stale_events_ignored": stale_ignored})
-    correctness_rows.append({"stream_key": "__orphans__", "worker_count_observed": orphan_candidates, "one_worker_per_stream": None, "duplicate_worker_detected": None, "handover_accepted": handover_accepted, "handover_denied": handover_denied, "stale_events_ignored": stale_ignored})
-    write_csv(dirs["metrics"] / "correctness_metrics.csv", correctness_rows, ["stream_key", "worker_count_observed", "one_worker_per_stream", "duplicate_worker_detected", "handover_accepted", "handover_denied", "stale_events_ignored"])
+    correctness_rows = build_correctness_rows(config, dirs, pod_rows, controller_events)
+    write_csv(
+        dirs["metrics"] / "correctness_metrics.csv",
+        correctness_rows,
+        ["repetition", "stream_key", "max_worker_count_observed", "one_worker_per_stream", "duplicate_worker_detected", "handover_accepted", "handover_denied", "stale_events_ignored"],
+    )
+
 
     metadata = json.loads((config.report_root / "metadata.json").read_text(encoding="utf-8")) if (config.report_root / "metadata.json").exists() else {}
     duration = max(0.0, (metadata.get("ended_at") or 0) - (metadata.get("started_at") or 0))
@@ -1447,18 +1650,42 @@ def generate_charts(dirs: dict[str, Path]) -> dict[str, str]:
     else:
         paths["activation_boxplot"] = write_chart_limitation(path, "No total_activation_seconds samples available.")
 
-    # P95 by current run/concurrency is only meaningful when activation samples exist.
     path = dirs["charts"] / "activation_p95_by_concurrency.png"
-    if activation_values:
+    activation_rows = csv_rows(dirs["metrics"] / "activation_metrics.csv")
+    grouped_by_concurrency: dict[str, list[float]] = {}
+    for row in activation_rows:
+        # The runner records pilot capacity levels as repetition ids. For ordinary runs,
+        # concurrency is not known per row, so the by-concurrency chart is intentionally not generated.
+        conc = row.get("concurrency")
+        if conc:
+            try:
+                grouped_by_concurrency.setdefault(conc, []).append(float(row.get("total_activation_seconds") or "nan"))
+            except ValueError:
+                pass
+    if grouped_by_concurrency:
+        labels = sorted(grouped_by_concurrency, key=lambda value: int(value) if str(value).isdigit() else str(value))
+        values = [percentile(sorted([v for v in grouped_by_concurrency[label] if math.isfinite(v)]), 95) or 0 for label in labels]
         plt.figure()
-        plt.bar(["current"], [percentile(sorted(activation_values), 95) or 0])
+        plt.bar(labels, values)
         plt.ylabel("seconds")
-        plt.title("Activation P95")
+        plt.xlabel("concurrency")
+        plt.title("Activation P95 by concurrency")
         plt.savefig(path, bbox_inches="tight")
         plt.close()
         paths["activation_p95_by_concurrency"] = str(path)
     else:
-        paths["activation_p95_by_concurrency"] = write_chart_limitation(path, "No activation samples available for P95 chart.")
+        paths["activation_p95_by_concurrency"] = write_chart_limitation(path, "No per-concurrency activation samples available; use pilot-capacity with concurrency metadata.")
+    current_path = dirs["charts"] / "activation_p95_current_run.png"
+    if activation_values:
+        plt.figure()
+        plt.bar(["current"], [percentile(sorted(activation_values), 95) or 0])
+        plt.ylabel("seconds")
+        plt.title("Activation P95 for current run")
+        plt.savefig(current_path, bbox_inches="tight")
+        plt.close()
+        paths["activation_p95_current_run"] = str(current_path)
+    else:
+        paths["activation_p95_current_run"] = write_chart_limitation(current_path, "No activation samples available for current-run P95 chart.")
 
     resource = csv_rows(dirs["metrics"] / "resource_usage.csv")
     for chart_name, metric in [("resource_usage_cpu", "pod_cpu_rate"), ("resource_usage_memory", "pod_memory_working_set"), ("network_usage_proxy", "proxy_network_receive_bps")]:
@@ -1524,30 +1751,41 @@ def format_cell(value: Any) -> str:
 def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> list[dict[str, Any]]:
     activation = csv_rows(dirs["metrics"] / "activation_metrics.csv")
     release = csv_rows(dirs["metrics"] / "release_metrics.csv")
-    correctness = {row.get("stream_key"): row for row in csv_rows(dirs["metrics"] / "correctness_metrics.csv")}
+    correctness = {(str(row.get("repetition")), row.get("stream_key")): row for row in csv_rows(dirs["metrics"] / "correctness_metrics.csv")}
     publishers = [row for row in read_jsonl(dirs["raw"] / "publishers.jsonl") if row.get("event") == "publisher_finished"]
     pods = extract_pod_rows(dirs, config.stream_keys)
-    pod_by_stream: dict[str, dict[str, Any]] = {}
+    windows = load_run_windows(config, dirs)
+    pod_by_stream: dict[tuple[str, str], dict[str, Any]] = {}
     for row in pods:
         stream = row.get("stream_key")
-        if stream and row.get("component") == "worker":
-            pod_by_stream[stream] = row
+        rep = repetition_for_timestamp(windows, row.get("snapshot_at"))
+        if stream and rep is not None and row.get("component") == "worker":
+            # Keep the latest observed worker in that repetition only.
+            key = (str(rep), stream)
+            existing = pod_by_stream.get(key)
+            if existing is None or float(row.get("snapshot_at") or 0) >= float(existing.get("snapshot_at") or 0):
+                pod_by_stream[key] = row
     release_by_key = {(str(row.get("repetition")), row.get("stream_key")): row for row in release}
-    publisher_by_key = {(str(row.get("repetition")), row.get("stream_key")): row for row in publishers}
+    publisher_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in publishers:
+        key = (str(row.get("repetition")), row.get("stream_key"))
+        # Prefer the first publisher for primary stream result rows.
+        if key not in publisher_by_key or int(row.get("publisher_index") or 0) < int(publisher_by_key[key].get("publisher_index") or 9999):
+            publisher_by_key[key] = row
     rows: list[dict[str, Any]] = []
     for row in activation:
         key = row.get("stream_key")
         rep = str(row.get("repetition"))
         rel = release_by_key.get((rep, key), {})
         pub = publisher_by_key.get((rep, key), {})
-        corr = correctness.get(key, {})
-        pod = pod_by_stream.get(key, {})
+        corr = correctness.get((rep, key), {})
+        pod = pod_by_stream.get((rep, key), {})
         rows.append({
             "repetition": rep,
             "streamKey": key,
             "worker": pod.get("pod") or "não observado",
             "proxy_owner": pod.get("proxy_pod") or "não observado",
-            "publisher_status": "success" if pub.get("returncode") == 0 else ("running_or_unknown" if pub.get("returncode") is None else "failed"),
+            "publisher_status": pub.get("publisher_status") or publisher_status(config, pub) if pub else "não observado",
             "activation_seconds": row.get("total_activation_seconds") or "não observável",
             "release_seconds": rel.get("total_release_seconds") or "não observável",
             "duplicate_worker": corr.get("duplicate_worker_detected"),
@@ -1565,8 +1803,8 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
 def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict[str, Any], metrics: dict[str, Any], charts: dict[str, str]) -> dict[str, Any]:
     metadata = json.loads((dirs["root"] / "metadata.json").read_text(encoding="utf-8"))
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
-    success_count = len([r for r in publisher_rows if r.get("returncode") == 0])
-    failure_count = len([r for r in publisher_rows if r.get("returncode") not in (0, None)])
+    success_count = len([r for r in publisher_rows if r.get("publisher_status") in {"success", "expected_stopped", "expected_conflict_or_stopped"}])
+    failure_count = len([r for r in publisher_rows if r.get("publisher_status") == "unexpected_failed"])
     unavailable = metrics.get("missing", [])
     report_json = {
         "metadata": metadata,
@@ -1665,7 +1903,8 @@ def discussion_text(config: RunnerConfig, report_json: dict[str, Any]) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     config = parse_args(argv)
-    dirs = ensure_layout(config.report_root)
+    report_root = prepare_report_root(config)
+    dirs = ensure_layout(report_root)
     metadata = {**asdict(config), "output_dir": str(config.output_dir), "report_root": str(config.report_root), "started_at": now_epoch(), "started_at_iso": now_iso()}
     write_json(dirs["root"] / "metadata.json", metadata)
     if config.dry_run:
@@ -1686,7 +1925,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     metrics = build_metrics(config, dirs)
     charts = generate_charts(dirs)
     generate_report(config, dirs, execution, metrics, charts)
-    if execution.get("status") == "failed":
+    if execution.get("status") == "failed" or (execution.get("status") == "partial" and not config.allow_partial):
         exit_code = 1
     print(f"Report generated at: {dirs['root'] / 'report.md'}")
     return exit_code

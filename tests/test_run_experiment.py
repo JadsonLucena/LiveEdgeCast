@@ -142,6 +142,7 @@ def test_build_metrics_keeps_repetitions_as_independent_samples(tmp_path):
 def test_cold_start_precondition_deletes_existing_workers(monkeypatch, tmp_path):
     cfg = config(tmp_path, scenario="cold-start")
     cfg.kubectl_path = "/bin/true"
+    cfg.allow_worker_cleanup = True
     dirs = runner.ensure_layout(cfg.report_root)
     calls = iter([
         (["worker-old"], {"returncode": 0}),
@@ -162,6 +163,7 @@ def test_cold_start_precondition_deletes_existing_workers(monkeypatch, tmp_path)
 def test_cold_start_precondition_fails_when_workers_remain(monkeypatch, tmp_path):
     cfg = config(tmp_path, scenario="cold-start")
     cfg.kubectl_path = "/bin/true"
+    cfg.allow_worker_cleanup = True
     dirs = runner.ensure_layout(cfg.report_root)
     monkeypatch.setattr(runner, "list_worker_pods", lambda cfg_arg: (["worker-stuck"], {"returncode": 0}))
     monkeypatch.setattr(runner, "delete_pod", lambda cfg_arg, pod: {"returncode": 0})
@@ -171,5 +173,20 @@ def test_cold_start_precondition_fails_when_workers_remain(monkeypatch, tmp_path
         runner.ensure_zero_workers_for_cold_start(cfg, dirs, repetition=1, timeout_seconds=0)
     except RuntimeError as exc:
         assert "worker pods still active" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_cold_start_precondition_requires_cleanup_flag(monkeypatch, tmp_path):
+    cfg = config(tmp_path, scenario="cold-start")
+    cfg.kubectl_path = "/bin/true"
+    cfg.allow_worker_cleanup = False
+    dirs = runner.ensure_layout(cfg.report_root)
+    monkeypatch.setattr(runner, "list_worker_pods", lambda cfg_arg: (["worker-old"], {"returncode": 0}))
+
+    try:
+        runner.ensure_zero_workers_for_cold_start(cfg, dirs, repetition=1, timeout_seconds=0)
+    except RuntimeError as exc:
+        assert "allow-worker-cleanup" in str(exc)
     else:
         raise AssertionError("expected RuntimeError")

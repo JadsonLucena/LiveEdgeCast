@@ -118,3 +118,37 @@ O runner não altera a documentação do repositório durante a execução. Todo
 - Repetições com erro geram evento `run_failed`, fechando a janela temporal da repetição para evitar contaminação de métricas posteriores.
 - O cenário `release` aguarda `--release-after-seconds` antes de encerrar publishers, permitindo que a stream fique ativa antes da medição de limpeza.
 - Para evitar contaminação em métricas de cAdvisor/kube-state-metrics, execute apenas um experimento por namespace ou use namespaces isolados por execução.
+
+## Segurança de diretórios e limpeza
+
+Por padrão, o runner recusa executar quando `reports/<experiment-id>/` já existe e contém arquivos, pois os arquivos JSONL são evidência bruta append-only. Use uma das opções abaixo de forma explícita:
+
+- `--overwrite`: apaga o diretório anterior antes de executar.
+- `--resume`: permite continuar e anexar evidências ao diretório existente.
+
+O cenário `cold-start` também é conservador por padrão. Se houver workers ativos, o experimento falha em vez de apagar pods automaticamente. Para permitir a limpeza de workers residuais em um namespace dedicado ao experimento, use:
+
+```bash
+--allow-worker-cleanup
+```
+
+Evite essa opção em namespaces compartilhados.
+
+## Códigos de saída
+
+- `0`: experimento válido ou `partial` aceito explicitamente com `--allow-partial`.
+- `1`: experimento `failed` ou `partial` sem `--allow-partial`.
+
+Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI.
+
+## Logs por fase
+
+Além dos logs finais, o runner pode gravar subpastas em `logs/`, por exemplo:
+
+```text
+logs/r1-before-release/
+logs/r1-after-run/
+logs/final-before-restore/
+```
+
+Quando `--patch-proxy-context` é usado, os logs finais são coletados antes da restauração dos deployments para reduzir o risco de perder logs por rollout.

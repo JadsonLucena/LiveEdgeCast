@@ -1,0 +1,5 @@
+pytest
+requests
+prometheus-client
+kubernetes
+matplotlib
