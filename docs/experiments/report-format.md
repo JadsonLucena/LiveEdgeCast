@@ -14,7 +14,9 @@ reports/<experiment-id>/
     worker_events.jsonl
     kubernetes_events.jsonl
     pod_snapshots.jsonl
-    prometheus_range_queries.json
+    prometheus_range_queries.json              # última coleta, compatibilidade
+    prometheus_range_queries.<run-id>.json     # coleta Prometheus por run_id, segura para --resume
+    prometheus_range_queries.index.json        # índice das coletas Prometheus
     proxy_context_patch.json
     controller_http_before.json
     controller_http_after.json
@@ -81,7 +83,7 @@ Registra explicitamente se houve tentativa de publicar uma `streamKey` duplicada
 
 ### `resource_activity.csv` e `cost_estimation.csv`
 
-Calculam uma estimativa relativa de atividade por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada. Esses arquivos não representam cobrança financeira real de provedor de nuvem. O arquivo `resource_activity.csv` é o artefato primário; `cost_estimation.csv` é gerado apenas como alias legado do plano original e contém uma linha de aviso de depreciação. O relatório usa linguagem mais conservadora de “atividade relativa de recursos”.
+Calculam uma estimativa relativa de atividade por pod-seconds. A coluna `source` indica se o valor veio do Prometheus, da duração do experimento ou de uma estimativa derivada. Esses arquivos não representam cobrança financeira real de provedor de nuvem. O arquivo `resource_activity.csv` é o artefato primário; `cost_estimation.csv` é gerado apenas como alias legado do plano original e contém uma linha de aviso de depreciação. O relatório usa linguagem mais conservadora de “atividade relativa de recursos”. A referência `always_on_worker_pod_seconds_reference` é consciente das janelas de execução: soma `streamKeys_ativas_na_janela * duração_da_janela` para cada `run_id + repetition`, em vez de usar uma única duração global.
 
 ## Gráficos
 
@@ -89,7 +91,7 @@ O runner só gera gráficos com dados reais. Quando as amostras necessárias nã
 
 ## Integridade do relatório
 
-O runner não mistura execuções por padrão. Se o diretório de saída já existir, a execução falha, exceto quando `--overwrite` ou `--resume` for informado. Essa regra evita que evidências antigas contaminem métricas novas.
+O runner não mistura execuções por padrão. Se o diretório de saída já existir, a execução falha, exceto quando `--overwrite` ou `--resume` for informado. Essa regra evita que evidências antigas contaminem métricas novas. Em modo `--resume`, as séries Prometheus são preservadas em arquivos por `run_id`; o agregador lê `raw/prometheus_range_queries.<run-id>.json` e evita depender do arquivo legado `raw/prometheus_range_queries.json`, que contém apenas a coleta mais recente.
 
 Os resultados por streamKey no `report.md` são calculados por `run_id + repetition + streamKey`, usando as janelas de execução registradas em `raw/streams.jsonl`. O uso de `--resume` deve ser acompanhado de um `--run-id` novo; o runner agora recusa retomar quando encontra colisão de `run_id + repetition` já existente no diretório.
 
@@ -108,3 +110,17 @@ Quando `--patch-proxy-context` é usado, `report.json.summary.restore_ok=false` 
 `report.json.summary.context_scope_ok=false` indica que o patch de contexto foi solicitado, mas não ficou totalmente efetivo. Por padrão, isso também faz o comando retornar código diferente de zero, pois a correlação por experimento pode estar incompleta. `report.json.summary.controller_scope_effective=true` indica que o escopo de labels do controller foi efetivamente aplicado nas consultas Prometheus. Quando esse campo é falso, as métricas do controller são consultadas sem labels de experimento para evitar falsos negativos.
 
 `report.json.summary.scenario_inconclusive=true` em `handover` ou `duplicate-streamkey` indica que a hipótese entre proxies não foi sustentada automaticamente, mesmo que a execução técnica tenha terminado. Por padrão isso retorna código diferente de zero, salvo `--allow-inconclusive`. `report.json.summary.duplicate_publisher_nonzero_without_controller_rejection=true` indica erro de processo do segundo publisher sem rejeição observada pelo controller e também deve ser tratado como evidência inválida/inconclusiva para a hipótese de proteção contra duplicidade.
+
+
+## Checklist de validade em `report.json`
+
+O campo `report.json.summary` inclui marcadores para auditoria metodológica:
+
+- `prometheus_resume_safe`: há evidência Prometheus por `run_id`, adequada para agregação com `--resume`;
+- `prometheus_samples_observed`: pelo menos uma série Prometheus retornou amostras;
+- `resource_baseline_window_aware`: a referência de atividade relativa usa janelas `run_id + repetition`;
+- `observable_activation_samples`: quantidade de linhas com ativação observável;
+- `worker_observed_samples`: quantidade de linhas de correção com worker observado;
+- `controller_events_observed`: há eventos estruturados do controller disponíveis.
+
+Esses marcadores devem ser arquivados junto com o relatório antes de usar os dados na discussão final do artigo.

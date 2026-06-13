@@ -113,7 +113,7 @@ O runner não altera a documentação do repositório durante a execução. Todo
 - Métricas per-stream dependem de logs estruturados do controller/worker.
 - Métricas FFmpeg exportadas pelos workers são escopadas por padrão com `namespace="$namespace"`. Ajuste `--worker-metric-label-selector` ou `LIVEEDGECAST_WORKER_METRIC_LABEL_SELECTOR` quando o Prometheus usa outro nome de label; use string vazia apenas se esses exporters realmente não carregarem labels de scrape.
 - Gráficos só são gerados quando há amostras reais; caso contrário, o runner cria um `.txt` explicando a ausência de dados.
-- A estimativa é uma redução relativa de atividade por pod-seconds, não uma cobrança real de provedor de nuvem. O relatório chama essa seção de “Atividade relativa de recursos”.
+- A estimativa é uma redução relativa de atividade por pod-seconds, não uma cobrança real de provedor de nuvem. O relatório chama essa seção de “Atividade relativa de recursos”. A referência `always_on_worker_pod_seconds_reference` é calculada somando cada janela `run_id + repetition`, usando a quantidade de streamKeys ativa naquela janela; isso evita distorções em `pilot-capacity` e `--resume`.
 
 ## Validade do experimento
 
@@ -123,7 +123,7 @@ O runner não altera a documentação do repositório durante a execução. Todo
 - Para evitar contaminação em métricas de cAdvisor/kube-state-metrics, execute apenas um experimento por namespace ou use namespaces isolados por execução.
 - Cenários `handover` e `duplicate-streamkey` são marcados como inconclusivos quando a segunda publicação não é observada em outro proxy após o timestamp da segunda tentativa. A rejeição do controller e a validade entre proxies são reportadas separadamente. Por padrão, uma hipótese inconclusiva nesses cenários retorna código de saída `1`; use `--allow-inconclusive` apenas quando deseja preservar o relatório sem tratar a execução como evidência conclusiva.
 - No cenário `duplicate-streamkey`, saída não-zero do segundo publisher sem rejeição observada pelo controller também torna a amostra inválida/inconclusiva para automação. O processo FFmpeg e a rejeição arquitetural são avaliados separadamente.
-- `--resume` agrega evidências no mesmo diretório; use um `run_id` único para cada retomada e interprete o relatório como agregado, não como apenas a execução mais recente.
+- `--resume` agrega evidências no mesmo diretório; use um `run_id` único para cada retomada e interprete o relatório como agregado, não como apenas a execução mais recente. Evidências Prometheus são salvas por `run_id` em `raw/prometheus_range_queries.<run-id>.json`, evitando sobrescrever séries de retomadas anteriores. O arquivo legado `raw/prometheus_range_queries.json` representa apenas a coleta mais recente para compatibilidade.
 
 ## Segurança de diretórios e limpeza
 
@@ -172,3 +172,16 @@ NAMESPACE=media \
 ```
 
 O script executa um `cold-start` mínimo em namespace dedicado ou controlado e valida se `report.md`, `activation_metrics.csv` e `correctness_metrics.csv` foram gerados. Além da existência dos arquivos, o smoke test exige pelo menos uma amostra de ativação observável e uma linha de correção com worker observado; linhas apenas `not_observable` não são suficientes para aprovar o teste.
+
+## Checklist de validação pré-artigo
+
+Antes de coletar dados finais para o artigo, execute o smoke test e arquive integralmente o diretório `reports/<experiment-id>/`. A coleta deve ser considerada válida para análise quantitativa apenas quando `report.json.summary` indicar:
+
+- `controller_events_observed=true`;
+- `observable_activation_samples > 0`;
+- `worker_observed_samples > 0`;
+- `prometheus_samples_observed=true`, quando a análise de recursos/atividade relativa for usada;
+- `prometheus_resume_safe=true`, quando `--resume` for usado;
+- `resource_baseline_window_aware=true`.
+
+Se qualquer item necessário estiver ausente, trate o relatório como evidência exploratória ou qualitativa, não como resultado final da avaliação.

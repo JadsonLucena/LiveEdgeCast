@@ -806,3 +806,95 @@ def test_duplicate_publisher_nonzero_without_rejection_changes_exit_code(monkeyp
     monkeypatch.setattr(runner, "generate_report", lambda config_arg, dirs, execution, metrics, charts: {})
 
     assert runner.main([]) == 1
+
+
+def test_collect_prometheus_writes_per_run_files_and_loads_resume_safe_evidence(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    cfg.prometheus_url = "http://prometheus.example"
+    dirs = runner.ensure_layout(cfg.report_root)
+
+    def fake_prometheus_query(config_arg, query, start, end, step=5, controller_label_selector=None):
+        value = "1" if config_arg.run_id == "run" else "2"
+        return {
+            "available": True,
+            "query": query,
+            "rendered_query": query,
+            "response": {"status": "success", "data": {"result": [{"metric": {"pod": "worker-a"}, "values": [[start, value], [end, value]]}]}},
+        }
+
+    monkeypatch.setattr(runner, "prometheus_query", fake_prometheus_query)
+
+    runner.collect_prometheus(cfg, dirs, start=10.0, end=20.0)
+    cfg.run_id = "run2"
+    runner.collect_prometheus(cfg, dirs, start=100.0, end=110.0)
+
+    assert (dirs["raw"] / "prometheus_range_queries.run.json").exists()
+    assert (dirs["raw"] / "prometheus_range_queries.run2.json").exists()
+    assert not any(path.name == "prometheus_range_queries.index.json" for path in runner.prometheus_run_files(dirs))
+
+    merged = runner.load_prometheus_evidence(dirs)
+    assert [run["run_id"] for run in merged["_metadata"]["runs"]] == ["run", "run2"]
+    assert runner.prom_values(merged["workers_active"]) == [1.0, 1.0, 2.0, 2.0]
+
+
+def test_always_on_worker_reference_is_window_and_stream_count_aware(tmp_path):
+    windows = [
+        {"started_at": 0.0, "ended_at": 10.0, "stream_keys": ["a"]},
+        {"started_at": 20.0, "ended_at": 30.0, "stream_keys": ["a", "b", "c"]},
+    ]
+
+    value, source = runner.always_on_worker_pod_seconds_reference(windows, ["fallback"], fallback_duration=999.0)
+
+    assert value == 40.0
+    assert source == "sum_per_run_window_stream_count_times_duration"
+
+
+def test_concurrency_chart_is_not_generated_when_activation_samples_are_missing(tmp_path):
+    cfg = config(tmp_path, scenario="concurrency")
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.write_json(dirs["root"] / "metadata.json", {"scenario": "concurrency"})
+    runner.write_csv(
+        dirs["metrics"] / "activation_metrics.csv",
+        [{"concurrency": "5", "total_activation_seconds": ""}, {"concurrency": "10", "total_activation_seconds": "None"}],
+        ["concurrency", "total_activation_seconds"],
+    )
+    runner.write_csv(dirs["metrics"] / "resource_usage.csv", [], ["metric", "component", "samples"])
+    runner.write_csv(dirs["metrics"] / "resilience_metrics.csv", [], ["recovery_seconds"])
+
+    charts = runner.generate_charts(dirs)
+
+    assert charts["activation_p95_by_concurrency"].endswith("activation_p95_by_concurrency.txt")
+    assert (dirs["charts"] / "activation_p95_by_concurrency.txt").exists()
+    assert "finite observed activation samples" in (dirs["charts"] / "activation_p95_by_concurrency.txt").read_text()
+
+
+def test_report_json_exposes_evidence_validity_summary(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.write_json(dirs["root"] / "metadata.json", {"scenario": "cold-start", "experiment_id": "exp"})
+    runner.write_csv(dirs["metrics"] / "activation_metrics.csv", [{"total_activation_seconds": "1.5"}], ["total_activation_seconds"])
+    runner.write_csv(dirs["metrics"] / "correctness_metrics.csv", [{"worker_observed_for_stream": "True"}], ["worker_observed_for_stream"])
+    runner.write_csv(dirs["metrics"] / "duplicate_streamkey_metrics.csv", [], ["scenario_inconclusive"])
+    runner.write_csv(dirs["metrics"] / "resilience_metrics.csv", [], ["run_id"])
+    (dirs["raw"] / "publishers.jsonl").write_text("", encoding="utf-8")
+    (dirs["raw"] / "controller_events.jsonl").write_text('{"event_type":"publish_received"}\n', encoding="utf-8")
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run.json",
+        {"_metadata": {"run_id": "run", "started_at": 1.0, "ended_at": 2.0}, "workers_active": {"available": True, "response": {"status": "success", "data": {"result": [{"metric": {}, "values": [[1.0, "1"]]}]}}}},
+    )
+
+    report = runner.generate_report(
+        cfg,
+        dirs,
+        execution={"restore_ok": True, "context_scope_ok": True, "context_patch_status": "not_requested", "preflight": {"proxy_context_patch": {}}},
+        metrics={"activation": {}, "resources": [], "cost": [], "missing": []},
+        charts={},
+    )
+
+    summary = report["summary"]
+    assert summary["prometheus_resume_safe"] is True
+    assert summary["prometheus_samples_observed"] is True
+    assert summary["resource_baseline_window_aware"] is True
+    assert summary["observable_activation_samples"] == 1
+    assert summary["worker_observed_samples"] == 1
+    assert summary["controller_events_observed"] is True

@@ -984,19 +984,119 @@ def prometheus_query(config: RunnerConfig, query: str, start: float, end: float,
         return {"available": False, "query": query, "rendered_query": locals().get("rendered_query", query), "error": {"type": type(exc).__name__, "message": str(exc)}}
 
 
+def prometheus_result_path(config: RunnerConfig, dirs: dict[str, Path]) -> Path:
+    return dirs["raw"] / f"prometheus_range_queries.{config.run_id}.json"
+
+
+def prometheus_run_files(dirs: dict[str, Path]) -> list[Path]:
+    excluded = {"prometheus_range_queries.json", "prometheus_range_queries.index.json"}
+    return sorted(path for path in dirs["raw"].glob("prometheus_range_queries.*.json") if path.name not in excluded)
+
+
+def update_prometheus_index(config: RunnerConfig, dirs: dict[str, Path], path: Path, start: float, end: float) -> None:
+    index_path = dirs["raw"] / "prometheus_range_queries.index.json"
+    payload: dict[str, Any] = {"schema": "prometheus-range-query-index/v1", "runs": []}
+    if index_path.exists():
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            payload = {"schema": "prometheus-range-query-index/v1", "runs": []}
+    runs = [run for run in payload.get("runs") or [] if run.get("run_id") != config.run_id]
+    runs.append({
+        "run_id": config.run_id,
+        "path": path.name,
+        "started_at": start,
+        "ended_at": end,
+        "scenario": config.scenario,
+        "experiment_id": config.experiment_id,
+    })
+    payload["runs"] = sorted(runs, key=lambda run: str(run.get("run_id") or ""))
+    write_json(index_path, payload)
+
+
 def collect_prometheus(config: RunnerConfig, dirs: dict[str, Path], start: float, end: float, controller_label_selector: str | None = None) -> dict[str, Any]:
     results = {
         "_metadata": {
+            "schema": "prometheus-range-query-result/v1",
+            "run_id": config.run_id,
             "started_at": start,
             "ended_at": end,
             "controller_label_selector": controller_label_selector or "",
             "controller_scope_effective": bool(controller_label_selector),
+            "resume_safe": True,
         }
     }
     for name, query in DEFAULT_PROMQL.items():
         results[name] = prometheus_query(config, query, start, end, controller_label_selector=controller_label_selector)
+    per_run_path = prometheus_result_path(config, dirs)
+    write_json(per_run_path, results)
+    update_prometheus_index(config, dirs, per_run_path, start, end)
+    # Compatibility artifact for tools that still expect the latest run at the legacy path.
+    # Aggregation in this runner reads per-run files first so resume does not lose prior evidence.
     write_json(dirs["raw"] / "prometheus_range_queries.json", results)
     return results
+
+
+def merge_prometheus_results(results_by_run: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {"_metadata": {"schema": "prometheus-range-query-merged/v1", "runs": []}}
+    for result in results_by_run:
+        metadata = result.get("_metadata") or {}
+        merged["_metadata"]["runs"].append(metadata)
+        for name, value in result.items():
+            if str(name).startswith("_") or not isinstance(value, dict):
+                continue
+            target = merged.setdefault(name, {"available": False, "response": {"status": "success", "data": {"result": []}}, "sources": []})
+            target["available"] = bool(target.get("available")) or bool(value.get("available"))
+            if value.get("query"):
+                target.setdefault("query", value.get("query"))
+            if value.get("rendered_query"):
+                target.setdefault("rendered_query", value.get("rendered_query"))
+            if value.get("error") and not target.get("error"):
+                target["error"] = value.get("error")
+            if value.get("reason") and not target.get("reason"):
+                target["reason"] = value.get("reason")
+            target.setdefault("sources", []).append(metadata.get("run_id"))
+            response = value.get("response") or {}
+            data = response.get("data") or {}
+            series = data.get("result") or []
+            target_response = target.setdefault("response", {"status": response.get("status") or "success", "data": {"result": []}})
+            target_data = target_response.setdefault("data", {"result": []})
+            target_data.setdefault("result", []).extend(series)
+            if response.get("status") and target_response.get("status") != "success":
+                target_response["status"] = response.get("status")
+    return merged
+
+
+def load_prometheus_evidence(dirs: dict[str, Path]) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    for path in prometheus_run_files(dirs):
+        try:
+            results.append(json.loads(path.read_text(encoding="utf-8")))
+        except json.JSONDecodeError:
+            continue
+    if results:
+        return merge_prometheus_results(results)
+    legacy = dirs["raw"] / "prometheus_range_queries.json"
+    if legacy.exists():
+        try:
+            return json.loads(legacy.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def prometheus_observed_duration(prom: dict[str, Any]) -> float | None:
+    metadata = prom.get("_metadata") or {}
+    runs = metadata.get("runs") or []
+    total = 0.0
+    for run in runs:
+        duration = delta(run.get("started_at"), run.get("ended_at"))
+        if duration is not None and duration > 0:
+            total += duration
+    if total > 0:
+        return total
+    duration = delta(metadata.get("started_at"), metadata.get("ended_at"))
+    return duration if duration is not None and duration > 0 else None
 
 
 def select_pod_by_selector(config: RunnerConfig, selector: str, stream_key: str | None = None) -> str | None:
@@ -1254,10 +1354,12 @@ def activation_p95_for_repetition(config: RunnerConfig, dirs: dict[str, Path], r
     return percentile(values, 95) if values else None
 
 
-def experiment_query_window(dirs: dict[str, Path], fallback_start: float, fallback_end: float) -> tuple[float, float]:
+def experiment_query_window(dirs: dict[str, Path], fallback_start: float, fallback_end: float, run_id: str | None = None) -> tuple[float, float]:
     records = read_jsonl(dirs["raw"] / "streams.jsonl")
+    if run_id is not None:
+        records = [r for r in records if str(r.get("run_id") or "") == run_id]
     starts = [r.get("timestamp") for r in records if r.get("event") == "run_started" and isinstance(r.get("timestamp"), (int, float))]
-    ends = [r.get("ended_at") for r in records if r.get("event") in {"run_finished", "run_failed"} and isinstance(r.get("ended_at"), (int, float))]
+    ends = [r.get("ended_at") for r in records if r.get("event") in {"run_finished", "run_failed", "run_interrupted"} and isinstance(r.get("ended_at"), (int, float))]
     return (min(starts) if starts else fallback_start, max(ends) if ends else fallback_end)
 
 
@@ -1268,6 +1370,22 @@ def sum_run_window_durations(windows: list[dict[str, Any]]) -> float:
         if duration is not None:
             total += duration
     return total
+
+
+def always_on_worker_pod_seconds_reference(windows: list[dict[str, Any]], fallback_stream_keys: list[str], fallback_duration: float) -> tuple[float, str]:
+    total = 0.0
+    saw_window = False
+    for window in windows:
+        duration = delta(window.get("started_at"), window.get("ended_at"))
+        if duration is None or duration <= 0:
+            continue
+        stream_keys = window.get("stream_keys") or fallback_stream_keys
+        stream_count = len(stream_keys) if isinstance(stream_keys, list) else len(fallback_stream_keys)
+        total += max(1, stream_count) * duration
+        saw_window = True
+    if saw_window:
+        return total, "sum_per_run_window_stream_count_times_duration"
+    return max(1, len(fallback_stream_keys)) * fallback_duration, "fallback_len_stream_keys_times_query_window"
 
 
 def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
@@ -1325,7 +1443,7 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
             status = "failed" if config.scenario == "cold-start" else "partial"
 
         experiment_ended_at = now_epoch()
-        query_start, query_end = experiment_query_window(dirs, experiment_started_at, experiment_ended_at)
+        query_start, query_end = experiment_query_window(dirs, experiment_started_at, experiment_ended_at, run_id=config.run_id)
         prometheus = collect_prometheus(config, dirs, query_start, query_end, controller_label_selector=patch_result.get("effective_metric_scope") or "")
         # Collect logs and controller state before restoring patched deployments; restore may roll pods.
         logs = collect_logs(config, dirs, phase="final-before-restore")
@@ -1345,7 +1463,7 @@ def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str,
         "setup_started_at": setup_started_at,
         "started_at": experiment_started_at,
         "ended_at": ended_at,
-        "prometheus_window": {"started_at": experiment_query_window(dirs, experiment_started_at, ended_at)[0], "ended_at": experiment_query_window(dirs, experiment_started_at, ended_at)[1]},
+        "prometheus_window": {"started_at": experiment_query_window(dirs, experiment_started_at, ended_at, run_id=config.run_id)[0], "ended_at": experiment_query_window(dirs, experiment_started_at, ended_at, run_id=config.run_id)[1], "run_id": config.run_id},
         "preflight": preflight,
         "runs": run_summaries,
         "prometheus": summarize_prometheus_availability(prometheus),
@@ -2079,7 +2197,7 @@ def build_correctness_rows(
 
 
 def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
-    prom = json.loads((dirs["raw"] / "prometheus_range_queries.json").read_text(encoding="utf-8")) if (dirs["raw"] / "prometheus_range_queries.json").exists() else {}
+    prom = load_prometheus_evidence(dirs)
     pod_rows = extract_pod_rows(dirs, config.stream_keys)
     publisher_rows = [r for r in read_jsonl(dirs["raw"] / "publishers.jsonl") if r.get("event") == "publisher_finished"]
     controller_events = read_jsonl(dirs["raw"] / "controller_events.jsonl")
@@ -2140,7 +2258,9 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     metadata = json.loads((config.report_root / "metadata.json").read_text(encoding="utf-8")) if (config.report_root / "metadata.json").exists() else {}
     execution = json.loads((config.report_root / "execution.json").read_text(encoding="utf-8")) if (config.report_root / "execution.json").exists() else {}
     prom_window = execution.get("prometheus_window") or {}
-    query_duration = delta(prom_window.get("started_at"), prom_window.get("ended_at"))
+    query_duration = prometheus_observed_duration(prom)
+    if query_duration is None:
+        query_duration = delta(prom_window.get("started_at"), prom_window.get("ended_at"))
     if query_duration is None:
         query_duration = max(0.0, (metadata.get("ended_at") or 0) - (metadata.get("started_at") or 0))
     run_duration_sum = sum_run_window_durations(load_run_windows(config, dirs))
@@ -2151,14 +2271,14 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     if controller_pod_seconds is None:
         controller_pod_seconds = query_duration
         controller_cost_source = "prometheus_query_window_assumes_single_controller"
-    # Reference assumes one always-on worker capacity unit per streamKey for the observed run windows.
-    always_on_worker_pod_seconds = max(1, len(config.stream_keys)) * reference_duration
+    # Reference assumes one always-on worker capacity unit per active streamKey in each observed run window.
+    always_on_worker_pod_seconds, always_on_source = always_on_worker_pod_seconds_reference(load_run_windows(config, dirs), config.stream_keys, reference_duration)
     economy_relative = None if (worker_pod_seconds is None or always_on_worker_pod_seconds <= 0) else 1 - (worker_pod_seconds / always_on_worker_pod_seconds)
     cost_rows = [
         {"metric": "worker_pod_seconds", "value": worker_pod_seconds, "source": worker_cost_source},
         {"metric": "proxy_pod_seconds", "value": proxy_pod_seconds, "source": proxy_cost_source},
         {"metric": "controller_pod_seconds", "value": controller_pod_seconds, "source": controller_cost_source},
-        {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds, "source": "len_stream_keys_times_observed_run_window_reference"},
+        {"metric": "always_on_worker_pod_seconds_reference", "value": always_on_worker_pod_seconds, "source": always_on_source},
         {"metric": "relative_worker_activity_reduction_vs_always_on", "value": economy_relative, "source": "resource_activity_time_integral_estimate" if worker_pod_seconds is not None else "not_supported_without_prometheus"},
     ]
     legacy_cost_rows = cost_rows + [{"metric": "deprecated_alias_notice", "value": "", "source": "cost_estimation.csv is a legacy alias; use resource_activity.csv for resource pod-second activity, not financial cost"}]
@@ -2230,7 +2350,7 @@ def generate_charts(dirs: dict[str, Path]) -> dict[str, str]:
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except Exception:
-        for name in ("activation_boxplot", "activation_p95_by_concurrency", "resource_usage_cpu", "resource_usage_memory", "network_usage_proxy", "workers_over_time", "recovery_time"):
+        for name in ("activation_boxplot", "activation_p95_by_concurrency", "activation_p95_observed_dataset", "resource_usage_cpu", "resource_usage_memory", "network_usage_proxy", "workers_over_time", "recovery_time"):
             paths[name] = write_chart_limitation(dirs["charts"] / f"{name}.png", "Matplotlib unavailable; chart not generated.")
         return paths
 
@@ -2254,14 +2374,18 @@ def generate_charts(dirs: dict[str, Path]) -> dict[str, str]:
         # The runner records pilot capacity levels as repetition ids. For ordinary runs,
         # concurrency is not known per row, so the by-concurrency chart is intentionally not generated.
         conc = row.get("concurrency")
-        if conc:
-            try:
-                grouped_by_concurrency.setdefault(conc, []).append(float(row.get("total_activation_seconds") or "nan"))
-            except ValueError:
-                pass
+        if not conc:
+            continue
+        try:
+            value = float(row.get("total_activation_seconds") or "nan")
+        except ValueError:
+            continue
+        if math.isfinite(value):
+            grouped_by_concurrency.setdefault(conc, []).append(value)
+    grouped_by_concurrency = {label: values for label, values in grouped_by_concurrency.items() if values}
     if scenario in {"concurrency", "pilot-capacity"} and grouped_by_concurrency:
         labels = sorted(grouped_by_concurrency, key=lambda value: int(value) if str(value).isdigit() else str(value))
-        values = [percentile(sorted([v for v in grouped_by_concurrency[label] if math.isfinite(v)]), 95) or 0 for label in labels]
+        values = [percentile(sorted(grouped_by_concurrency[label]), 95) for label in labels]
         plt.figure()
         plt.bar(labels, values)
         plt.ylabel("seconds")
@@ -2271,18 +2395,18 @@ def generate_charts(dirs: dict[str, Path]) -> dict[str, str]:
         plt.close()
         paths["activation_p95_by_concurrency"] = str(path)
     else:
-        paths["activation_p95_by_concurrency"] = write_chart_limitation(path, "Per-concurrency chart is generated only for concurrency or pilot-capacity scenarios with observed samples.")
-    current_path = dirs["charts"] / "activation_p95_current_run.png"
+        paths["activation_p95_by_concurrency"] = write_chart_limitation(path, "Per-concurrency chart is generated only for concurrency or pilot-capacity scenarios with finite observed activation samples.")
+    observed_path = dirs["charts"] / "activation_p95_observed_dataset.png"
     if activation_values:
         plt.figure()
-        plt.bar(["current"], [percentile(sorted(activation_values), 95) or 0])
+        plt.bar(["observed dataset"], [percentile(sorted(activation_values), 95) or 0])
         plt.ylabel("seconds")
-        plt.title("Activation P95 for current run")
-        plt.savefig(current_path, bbox_inches="tight")
+        plt.title("Activation P95 for observed dataset")
+        plt.savefig(observed_path, bbox_inches="tight")
         plt.close()
-        paths["activation_p95_current_run"] = str(current_path)
+        paths["activation_p95_observed_dataset"] = str(observed_path)
     else:
-        paths["activation_p95_current_run"] = write_chart_limitation(current_path, "No activation samples available for current-run P95 chart.")
+        paths["activation_p95_observed_dataset"] = write_chart_limitation(observed_path, "No activation samples available for observed-dataset P95 chart.")
 
     resource = csv_rows(dirs["metrics"] / "resource_usage.csv")
     for chart_name, metric in [("resource_usage_cpu", "pod_cpu_rate"), ("resource_usage_memory", "pod_memory_working_set"), ("network_usage_proxy", "proxy_network_receive_bps")]:
@@ -2300,7 +2424,7 @@ def generate_charts(dirs: dict[str, Path]) -> dict[str, str]:
             paths[chart_name] = write_chart_limitation(path, f"No Prometheus samples available for {metric}.")
 
     path = dirs["charts"] / "workers_over_time.png"
-    prom = json.loads((dirs["raw"] / "prometheus_range_queries.json").read_text(encoding="utf-8")) if (dirs["raw"] / "prometheus_range_queries.json").exists() else {}
+    prom = load_prometheus_evidence(dirs)
     worker_values = prom_values(prom.get("workers_active", {}))
     if worker_values:
         plt.figure()
@@ -2447,6 +2571,12 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
     valid_activation_samples = len([row for row in activation_csv_rows if row.get("total_activation_seconds") not in (None, "", "None")])
     invalid_activation_samples = max(0, len(activation_csv_rows) - valid_activation_samples)
     duplicate_rows = csv_rows(dirs["metrics"] / "duplicate_streamkey_metrics.csv")
+    correctness_rows = csv_rows(dirs["metrics"] / "correctness_metrics.csv")
+    worker_observed_samples = len([row for row in correctness_rows if str(row.get("worker_observed_for_stream")).lower() == "true"])
+    controller_events_observed = bool(read_jsonl(dirs["raw"] / "controller_events.jsonl"))
+    prometheus_files = [path.name for path in prometheus_run_files(dirs)]
+    prom = load_prometheus_evidence(dirs)
+    prometheus_samples_observed = any(prom_values(value) for name, value in prom.items() if not str(name).startswith("_") and isinstance(value, dict))
     report_json = {
         "metadata": metadata,
         "summary": {
@@ -2467,6 +2597,13 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
             "context_scope_ok": execution.get("context_scope_ok"),
             "context_patch_status": execution.get("context_patch_status"),
             "controller_scope_effective": bool(((execution.get("preflight") or {}).get("proxy_context_patch") or {}).get("controller_scope_effective")),
+            "prometheus_resume_safe": bool(prometheus_files),
+            "prometheus_evidence_files": prometheus_files,
+            "prometheus_samples_observed": prometheus_samples_observed,
+            "resource_baseline_window_aware": True,
+            "observable_activation_samples": valid_activation_samples,
+            "worker_observed_samples": worker_observed_samples,
+            "controller_events_observed": controller_events_observed,
             "missing_metrics": unavailable,
         },
         "metrics": metrics,
@@ -2505,6 +2642,10 @@ Amostras de ativação válidas: {report_json["summary"]["valid_activation_sampl
 ## Métricas principais
 
 {md_table(main_metric_rows, ['metric','samples','mean','median','stddev','p50','p95','p99','min','max','ci95_low','ci95_high'])}
+
+## Validação das evidências
+
+{md_table([report_json["summary"]], ['prometheus_resume_safe','prometheus_samples_observed','resource_baseline_window_aware','observable_activation_samples','worker_observed_samples','controller_events_observed','scenario_inconclusive','context_scope_ok','restore_ok'])}
 
 ## Resultado por streamKey
 
