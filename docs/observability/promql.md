@@ -1023,3 +1023,151 @@ declaradas, aproximadas ou dependentes de coletor não implementado.
   alvo.
 - Observabilidade: `proxy_rtmp_stats_up == 1` para proxies ativos e
   `worker_pod_lifecycle_watch_up == 1` durante execução do controller.
+
+
+## Consultas usadas pelo runner unificado
+
+### controller_active_streams
+
+```promql
+controller_active_streams
+```
+
+### controller_active_allocations
+
+```promql
+controller_active_allocations
+```
+
+### worker_pods_available
+
+```promql
+worker_pods_available
+```
+
+### workers_active
+
+```promql
+count(kube_pod_info{namespace="$namespace", pod=~"worker-.*"})
+```
+
+### proxies_active
+
+```promql
+count(kube_pod_info{namespace="$namespace", pod=~"proxy-.*"})
+```
+
+### pod_cpu_rate
+
+```promql
+sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="", pod=~"(worker|proxy|controller).*"}[1m]))
+```
+
+### pod_memory_working_set
+
+```promql
+sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="", pod=~"(worker|proxy|controller).*"})
+```
+
+### proxy_network_receive_bps
+
+```promql
+sum by (pod) (rate(container_network_receive_bytes_total{namespace="$namespace", pod=~"proxy-.*"}[1m]))
+```
+
+### proxy_network_transmit_bps
+
+```promql
+sum by (pod) (rate(container_network_transmit_bytes_total{namespace="$namespace", pod=~"proxy-.*"}[1m]))
+```
+
+### stream_lifecycle_phase_seconds_p50
+
+```promql
+histogram_quantile(0.50, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket[5m])))
+```
+
+### stream_lifecycle_phase_seconds_p95
+
+```promql
+histogram_quantile(0.95, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket[5m])))
+```
+
+### stream_lifecycle_phase_seconds_p99
+
+```promql
+histogram_quantile(0.99, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket[5m])))
+```
+
+### handover_attempts_total
+
+```promql
+handover_attempts_total
+```
+
+### handover_success_total
+
+```promql
+handover_success_total
+```
+
+### handover_conflict_total
+
+```promql
+handover_conflict_total
+```
+
+### orphan_workers_deleted_total
+
+```promql
+orphan_workers_deleted_total
+```
+
+### worker_recovery_total
+
+```promql
+worker_recovery_total
+```
+
+### worker_recovery_duration_seconds_p95
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(worker_recovery_duration_seconds_bucket[5m])))
+```
+
+### ffmpeg_running
+
+```promql
+worker_ffmpeg_running
+```
+
+### ffmpeg_progress_age
+
+```promql
+worker_ffmpeg_progress_age_seconds
+```
+
+### ffmpeg_out_time_seconds
+
+```promql
+worker_ffmpeg_out_time_seconds
+```
+
+### proxy_rtmp_active_streams
+
+```promql
+proxy_rtmp_active_streams
+```
+
+### proxy_rtmp_active_publishers
+
+```promql
+proxy_rtmp_active_publishers
+```
+
+### proxy_rtmp_active_clients
+
+```promql
+proxy_rtmp_active_clients
+```
+
