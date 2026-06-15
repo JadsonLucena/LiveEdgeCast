@@ -1690,15 +1690,22 @@ def register_or_refresh_stream(
     proxy_pod: str,
     session_id: Optional[str] = None,
     publish_start_ts: Optional[float] = None,
+    force_new_generation: bool = False,
 ) -> Optional[str]:
-    """Creates or refreshes canonical stream ownership on proxy.
+    """Create or refresh canonical stream ownership on a proxy.
 
     Must be called while holding allocation_lock. Returns the stale worker Pod
     that should be deleted *after* the lock is released when a new RTMP session
     replaces an older session for the same stream key.
+
+    Optional lifecycle fields are preserved when omitted. A partial callback or
+    same-owner refresh must not erase session/publish metadata that was already
+    observed for the active stream.
     """
     current = stream_registry.get(stream)
     current_session = current.get("session_id") if current else None
+    previous_owner = current.get("proxy_pod") if current else None
+    owner_changed = bool(current and previous_owner != proxy_pod)
     # A provided session_id is authoritative. If a current stream exists with a
     # different or missing session_id, treat it as a new RTMP session unless an
     # explicit legacy compatibility flag opts into reuse.
@@ -1728,7 +1735,7 @@ def register_or_refresh_stream(
             status=LOG_STATUS_SUCCESS,
             message=f"new RTMP session replaced previous session_id='{current_session or '<legacy/missing>'}'",
         )
-    if stream not in stream_generation or stream not in stream_registry or session_changed:
+    if stream not in stream_generation or stream not in stream_registry or session_changed or force_new_generation:
         previous_generations = stream_lifecycle_timestamps.get(stream, {})
         previous_lifecycle_generation = max(previous_generations) if previous_generations else 0
         previous_high_water_generation = generation_to_int(stream_generation_high_water.get(stream)) or 0
@@ -1746,21 +1753,40 @@ def register_or_refresh_stream(
         ),
     )
     prune_stream_generation_high_water_locked()
-    registry_entry = {
-        "proxy_pod": proxy_pod,
-    }
+    registry_entry = dict(current or {})
+    registry_entry["proxy_pod"] = proxy_pod
     if session_id:
         registry_entry["session_id"] = session_id
+    # If session_id is omitted, keep the active session_id instead of degrading a
+    # session-scoped stream to legacy state during a retry or rolling upgrade.
     if publish_start_ts is not None:
         registry_entry["publish_start_ts"] = str(publish_start_ts)
     stream_registry[stream] = registry_entry
     stream_to_proxy[stream] = proxy_pod
     proxy_health_failures[proxy_pod] = 0
+
+    if owner_changed and force_new_generation:
+        log_controller_event(
+            "handover_accepted",
+            stream=stream,
+            generation=stream_generation.get(stream),
+            proxy_pod=proxy_pod,
+            status=LOG_STATUS_ACCEPTED,
+            message=f"stream owner changed from '{previous_owner}' to '{proxy_pod}'",
+        )
+        handover_success_total.inc()
+        stream_proxy_handover_counter.inc()
+
     return old_worker_to_delete
 
 
 def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
-    """Evaluates stream ownership handover under allocation_lock."""
+    """Evaluate whether a stream may be owned by candidate_proxy_pod.
+
+    This function is intentionally decision-only: it must not mutate stream
+    registry/session state or create/delete Kubernetes Pods. The caller performs
+    the final registration with the full session/generation context.
+    """
     with allocation_lock:
         return _try_handover_stream_owner_locked(stream, candidate_proxy_pod)
 
@@ -1768,20 +1794,21 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
 def _try_handover_stream_owner_locked(stream: str, candidate_proxy_pod: str) -> bool:
     """
     Ownership rule with safe handover. Must be called while holding allocation_lock.
-    - idempotent: if already owned by candidate_proxy_pod, just refresh
-    - handover allowed if previous owner is ineligible by any criterion:
-      proxy unhealthy/dead
+    - no owner: candidate may register the stream
+    - idempotent: current owner may refresh the stream
+    - handover allowed only if previous owner is unhealthy/dead
+
+    The function is side-effect-light: it records denial evidence but does not
+    mutate canonical ownership or perform Kubernetes I/O. This avoids losing
+    session context or creating replacement workers while holding allocation_lock.
     """
     handover_attempts_total.inc()
     current = stream_registry.get(stream)
     if not current:
-        register_or_refresh_stream(stream, candidate_proxy_pod)
-        handover_success_total.inc()
         return True
 
     current_owner = current.get("proxy_pod")
     if current_owner == candidate_proxy_pod:
-        register_or_refresh_stream(stream, candidate_proxy_pod)
         return True
 
     owner_unhealthy = proxy_health_failures.get(current_owner, 0) >= PROXY_HEALTHCHECK_MAX_FAILURES
@@ -1790,116 +1817,9 @@ def _try_handover_stream_owner_locked(stream: str, candidate_proxy_pod: str) -> 
 
     if owner_unhealthy:
         logger.info(
-            f"[Handover] Stream '{stream}' ownership moved from '{current_owner}' "
+            f"[Handover] Stream '{stream}' ownership may move from '{current_owner}' "
             f"to '{candidate_proxy_pod}' (owner_unhealthy={owner_unhealthy})"
         )
-        previous_generation_present = stream in stream_generation
-        previous_generation = stream_generation.get(stream)
-        previous_registry = dict(current)
-        previous_proxy_present = stream in stream_to_proxy
-        previous_proxy = stream_to_proxy.get(stream)
-        previous_candidate_failures_present = candidate_proxy_pod in proxy_health_failures
-        previous_candidate_failures = proxy_health_failures.get(candidate_proxy_pod)
-        worker_state_snapshot = {
-            "stream_to_worker": dict(stream_to_worker),
-            "worker_to_stream": dict(worker_to_stream),
-            "worker_ready_since": dict(worker_ready_since),
-            "worker_create_started_at": dict(worker_create_started_at),
-            "worker_pod_uid_by_name": dict(worker_pod_uid_by_name),
-            "worker_health_failures": dict(worker_health_failures),
-        }
-
-        try:
-            stream_generation[stream] = stream_generation.get(stream, 1) + 1
-            register_or_refresh_stream(stream, candidate_proxy_pod)
-            # PROXY_DNS é env de Pod; para atualizar em reconexão/handover, recria o worker.
-            proxy_dns = resolve_proxy_address(candidate_proxy_pod)
-            if stream in stream_to_worker:
-                replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
-        except Exception:
-            created_workers_to_delete = []
-            current_worker = stream_to_worker.get(stream)
-            previous_worker = worker_state_snapshot["stream_to_worker"].get(stream)
-            if current_worker and current_worker != previous_worker:
-                created_workers_to_delete.append(current_worker)
-            for worker_name in worker_create_started_at:
-                if worker_name not in worker_state_snapshot["worker_create_started_at"]:
-                    created_workers_to_delete.append(worker_name)
-            created_workers_to_delete = list(dict.fromkeys(created_workers_to_delete))
-
-            if previous_generation_present:
-                stream_generation[stream] = previous_generation
-            else:
-                stream_generation.pop(stream, None)
-            stream_registry[stream] = previous_registry
-            if previous_proxy_present:
-                stream_to_proxy[stream] = previous_proxy
-            else:
-                stream_to_proxy.pop(stream, None)
-            if previous_candidate_failures_present:
-                proxy_health_failures[candidate_proxy_pod] = previous_candidate_failures
-            else:
-                proxy_health_failures.pop(candidate_proxy_pod, None)
-            stream_to_worker.clear()
-            stream_to_worker.update(worker_state_snapshot["stream_to_worker"])
-            worker_to_stream.clear()
-            worker_to_stream.update(worker_state_snapshot["worker_to_stream"])
-            worker_ready_since.clear()
-            worker_ready_since.update(worker_state_snapshot["worker_ready_since"])
-            worker_create_started_at.clear()
-            worker_create_started_at.update(worker_state_snapshot["worker_create_started_at"])
-            worker_pod_uid_by_name.clear()
-            worker_pod_uid_by_name.update(worker_state_snapshot["worker_pod_uid_by_name"])
-            worker_health_failures.clear()
-            worker_health_failures.update(worker_state_snapshot["worker_health_failures"])
-            for created_worker_to_delete in created_workers_to_delete:
-                try:
-                    core.delete_namespaced_pod(name=created_worker_to_delete, namespace=NAMESPACE, grace_period_seconds=0)
-                    record_worker_delete_metric("success", "rollback")
-                    log_controller_event(
-                        "worker_deleted",
-                        stream=stream,
-                        proxy_pod=candidate_proxy_pod,
-                        worker_pod=created_worker_to_delete,
-                        status=LOG_STATUS_DELETED,
-                    )
-                except ApiException as cleanup_error:
-                    record_kubernetes_api_error("delete", "pod", cleanup_error)
-                    record_worker_delete_metric("warning", "delete_failed")
-                    log_controller_event(
-                        "worker_deleted",
-                        stream=stream,
-                        proxy_pod=candidate_proxy_pod,
-                        worker_pod=created_worker_to_delete,
-                        status=LOG_STATUS_DELETE_FAILED,
-                        level=logging.WARNING,
-                    )
-                    logger.warning(
-                        f"[Handover] Failed deleting rolled-back worker pod {created_worker_to_delete}: {cleanup_error}"
-                    )
-                except Exception as cleanup_error:
-                    record_worker_delete_metric("warning", "delete_failed")
-                    log_controller_event(
-                        "worker_deleted",
-                        stream=stream,
-                        proxy_pod=candidate_proxy_pod,
-                        worker_pod=created_worker_to_delete,
-                        status=LOG_STATUS_DELETE_FAILED,
-                        level=logging.WARNING,
-                    )
-                    logger.warning(
-                        f"[Handover] Failed deleting rolled-back worker pod {created_worker_to_delete}: {cleanup_error}"
-                    )
-            raise
-
-        log_controller_event(
-            "handover_accepted",
-            stream=stream,
-            proxy_pod=candidate_proxy_pod,
-            status=LOG_STATUS_ACCEPTED,
-        )
-        handover_success_total.inc()
-        stream_proxy_handover_counter.inc()
         return True
 
     handover_conflict_total.inc()
@@ -3012,22 +2932,40 @@ def allocate_worker(
     metric_status = "error"
     metric_reason = "exception"
     try:
+        stale_worker_from_registration: Optional[str] = None
+        registration_proxy_for_cleanup: Optional[str] = None
         with allocation_lock:
             if proxy_pod and not ownership_already_verified:
-                if not try_handover_stream_owner(stream, proxy_pod):
+                current_before = dict(stream_registry.get(stream) or {})
+                current_owner_before = current_before.get("proxy_pod")
+                if not _try_handover_stream_owner_locked(stream, proxy_pod):
                     owner = stream_registry.get(stream, {}).get("proxy_pod")
-                    persist_state_locked()
                     metric_reason = "owner_conflict"
                     raise HTTPException(
                         status_code=409,
                         detail=f"stream '{stream}' owned by proxy '{owner}'"
                     )
+                force_new_generation = bool(current_owner_before and current_owner_before != proxy_pod)
+                stale_worker_from_registration = register_or_refresh_stream(
+                    stream,
+                    proxy_pod,
+                    force_new_generation=force_new_generation,
+                )
+                registration_proxy_for_cleanup = proxy_pod
                 persist_state_locked()
 
             existing_worker = stream_to_worker.get(stream)
             owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
             generation_snapshot = stream_generation.get(stream)
             session_snapshot = (stream_registry.get(stream) or {}).get("session_id")
+
+        if stale_worker_from_registration:
+            delete_worker_pod_best_effort(
+                stale_worker_from_registration,
+                stream,
+                registration_proxy_for_cleanup or owner_proxy,
+                "session_replaced_during_allocate",
+            )
 
         if not owner_proxy:
             metric_reason = "missing_proxy_owner"
@@ -3282,10 +3220,11 @@ def register_stream(
     try:
         stale_worker_to_delete = None
         with allocation_lock:
-            current = stream_registry.get(stream)
-            was_replay = current and current.get("proxy_pod") == proxy_pod and (not session_id or current.get("session_id") == session_id)
+            current = dict(stream_registry.get(stream) or {})
+            current_owner = current.get("proxy_pod")
+            was_replay = current and current_owner == proxy_pod and (not session_id or current.get("session_id") == session_id)
 
-            if not try_handover_stream_owner(stream, proxy_pod):
+            if not _try_handover_stream_owner_locked(stream, proxy_pod):
                 current_owner = stream_registry.get(stream, {}).get("proxy_pod")
                 metric_reason = "owner_conflict"
                 raise HTTPException(
@@ -3293,7 +3232,14 @@ def register_stream(
                     detail=f"stream '{stream}' already owned by proxy '{current_owner}'"
                 )
 
-            stale_worker_to_delete = register_or_refresh_stream(stream, proxy_pod, session_id=session_id, publish_start_ts=publish_start_ts)
+            force_new_generation = bool(current_owner and current_owner != proxy_pod)
+            stale_worker_to_delete = register_or_refresh_stream(
+                stream,
+                proxy_pod,
+                session_id=session_id,
+                publish_start_ts=publish_start_ts,
+                force_new_generation=force_new_generation,
+            )
             persist_state_locked()
 
             if was_replay:

@@ -1227,199 +1227,111 @@ def test_release_worker_delete_event_includes_proxy_context():
     assert delete_event['status'] == 'deleted'
 
 
-def test_handover_accepted_emitted_after_worker_replacement_succeeds():
+def test_handover_decision_does_not_replace_worker_or_mutate_registry():
     reset_state()
-    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
-    main.stream_to_proxy['live'] = 'proxy-old'
-    main.stream_to_worker['live'] = 'worker-old'
-    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
-
-    with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
-         patch.object(main, 'replace_worker_pod_for_stream_locked', return_value='worker-new') as replace_worker:
-        result, events = capture_controller_events(
-            lambda: main.try_handover_stream_owner('live', 'proxy-new')
-        )
-
-    assert result is True
-    replace_worker.assert_called_once_with(stream='live', proxy_dns='10.0.0.2')
-    accepted_event = next(event for event in events if event['event_type'] == 'handover_accepted')
-    assert accepted_event['stream'] == 'live'
-    assert accepted_event['proxy_pod'] == 'proxy-new'
-    assert accepted_event['status'] == 'accepted'
-
-
-def test_handover_accepted_not_emitted_when_worker_replacement_fails():
-    reset_state()
-    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
-    main.stream_to_proxy['live'] = 'proxy-old'
-    main.stream_to_worker['live'] = 'worker-old'
-    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
-
-    handler = JsonCaptureHandler()
-    main.logger.addHandler(handler)
-    try:
-        with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
-             patch.object(main, 'replace_worker_pod_for_stream_locked', side_effect=RuntimeError('replace failed')):
-            with pytest.raises(RuntimeError, match='replace failed'):
-                main.try_handover_stream_owner('live', 'proxy-new')
-    finally:
-        main.logger.removeHandler(handler)
-
-    assert 'handover_accepted' not in [event['event_type'] for event in handler.events]
-    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-old'}
-    assert main.stream_to_proxy['live'] == 'proxy-old'
-    assert main.stream_to_worker['live'] == 'worker-old'
-    assert 'proxy-new' not in main.proxy_health_failures
-
-
-def test_handover_rollback_deletes_new_worker_after_partial_replacement_failure():
-    reset_state()
-    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-old', 'session_id': 'session-old'}
     main.stream_to_proxy['live'] = 'proxy-old'
     main.stream_generation['live'] = 1
     main.stream_to_worker['live'] = 'worker-old'
-    main.worker_to_stream['worker-old'] = 'live'
     main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
 
-    def partial_replacement(stream, proxy_dns):
-        main.stream_to_worker[stream] = 'worker-new'
-        main.worker_to_stream.pop('worker-old', None)
-        main.worker_to_stream['worker-new'] = stream
-        raise RuntimeError('delete old failed')
-
-    handler = JsonCaptureHandler()
-    main.logger.addHandler(handler)
-    try:
-        with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
-             patch.object(main, 'replace_worker_pod_for_stream_locked', side_effect=partial_replacement), \
-             patch.object(main.core, 'delete_namespaced_pod') as delete_pod:
-            with pytest.raises(RuntimeError, match='delete old failed'):
-                main.try_handover_stream_owner('live', 'proxy-new')
-    finally:
-        main.logger.removeHandler(handler)
-
-    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-old'}
-    assert main.stream_to_proxy['live'] == 'proxy-old'
-    assert main.stream_generation['live'] == 1
-    assert main.stream_to_worker['live'] == 'worker-old'
-    assert main.worker_to_stream['worker-old'] == 'live'
-    assert 'worker-new' not in main.worker_to_stream
-    delete_pod.assert_called_once_with(name='worker-new', namespace=main.NAMESPACE, grace_period_seconds=0)
-    cleanup_event = next(event for event in handler.events if event['event_type'] == 'worker_deleted')
-    assert cleanup_event['stream'] == 'live'
-    assert cleanup_event['proxy_pod'] == 'proxy-new'
-    assert cleanup_event['worker_pod'] == 'worker-new'
-    assert cleanup_event['status'] == 'deleted'
-
-
-def test_handover_rollback_keeps_original_error_after_non_api_delete_failure():
-    reset_state()
-    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
-    main.stream_to_proxy['live'] = 'proxy-old'
-    main.stream_generation['live'] = 1
-    main.stream_to_worker['live'] = 'worker-old'
-    main.worker_to_stream['worker-old'] = 'live'
-    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
-    delete_labels = {'status': 'warning', 'reason': 'delete_failed'}
-    delete_before = counter_value(main.workers_deleted_total, **delete_labels)
-
-    def partial_replacement(stream, proxy_dns):
-        main.stream_to_worker[stream] = 'worker-new'
-        main.worker_create_started_at['worker-extra'] = 123.0
-        raise RuntimeError('original handover failure')
-
-    handler = JsonCaptureHandler()
-    main.logger.addHandler(handler)
-    try:
-        with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
-             patch.object(main, 'replace_worker_pod_for_stream_locked', side_effect=partial_replacement), \
-             patch.object(main.core, 'delete_namespaced_pod', side_effect=[RuntimeError('transport timeout'), None]) as delete_pod:
-            with pytest.raises(RuntimeError, match='original handover failure'):
-                main.try_handover_stream_owner('live', 'proxy-new')
-    finally:
-        main.logger.removeHandler(handler)
-
-    assert delete_pod.call_count == 2
-    assert [call.kwargs['name'] for call in delete_pod.call_args_list] == ['worker-new', 'worker-extra']
-    assert counter_value(main.workers_deleted_total, **delete_labels) == delete_before + 1
-    cleanup_events = [event for event in handler.events if event['event_type'] == 'worker_deleted']
-    assert [(event['worker_pod'], event['status']) for event in cleanup_events] == [
-        ('worker-new', 'delete_failed'),
-        ('worker-extra', 'deleted'),
-    ]
-
-
-def test_handover_rollback_deletes_worker_from_create_timestamp_delta():
-    reset_state()
-    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
-    main.stream_to_proxy['live'] = 'proxy-old'
-    main.stream_generation['live'] = 1
-    main.stream_to_worker['live'] = 'worker-old'
-    main.worker_to_stream['worker-old'] = 'live'
-    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
-
-    def create_then_fail(stream, proxy_dns):
-        main.worker_create_started_at['worker-new'] = 123.0
-        raise RuntimeError('post create failed')
-
-    handler = JsonCaptureHandler()
-    main.logger.addHandler(handler)
-    try:
-        with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
-             patch.object(main, 'create_worker_pod_for_stream', side_effect=create_then_fail), \
-             patch.object(main.core, 'delete_namespaced_pod') as delete_pod:
-            with pytest.raises(RuntimeError, match='post create failed'):
-                main.try_handover_stream_owner('live', 'proxy-new')
-    finally:
-        main.logger.removeHandler(handler)
-
-    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-old'}
-    assert main.stream_to_proxy['live'] == 'proxy-old'
-    assert main.stream_generation['live'] == 1
-    assert main.stream_to_worker['live'] == 'worker-old'
-    assert 'worker-new' not in main.worker_create_started_at
-    delete_pod.assert_called_once_with(name='worker-new', namespace=main.NAMESPACE, grace_period_seconds=0)
-    cleanup_event = next(event for event in handler.events if event['event_type'] == 'worker_deleted')
-    assert cleanup_event['worker_pod'] == 'worker-new'
-    assert cleanup_event['status'] == 'deleted'
-
-
-def test_handover_accepted_with_real_worker_replacement_updates_worker_state():
-    reset_state()
-    main.stream_registry['live'] = {'proxy_pod': 'proxy-old'}
-    main.stream_to_proxy['live'] = 'proxy-old'
-    main.stream_generation['live'] = 1
-    main.stream_to_worker['live'] = 'worker-old'
-    main.worker_to_stream['worker-old'] = 'live'
-    main.worker_ready_since['worker-old'] = 111.0
-    main.worker_create_started_at['worker-old'] = 222.0
-    main.worker_pod_uid_by_name['worker-old'] = 'uid-old'
-    main.worker_health_failures['uid-old'] = 2
-    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
-
-    with patch.object(main, 'resolve_proxy_address', return_value='10.0.0.2'), \
-         patch.object(main, 'create_worker_pod_for_stream', return_value='worker-new'), \
+    with patch.object(main, 'replace_worker_pod_for_stream_locked') as replace_worker, \
+         patch.object(main, 'create_worker_pod_for_stream') as create_worker, \
          patch.object(main.core, 'delete_namespaced_pod') as delete_pod:
         result, events = capture_controller_events(
             lambda: main.try_handover_stream_owner('live', 'proxy-new')
         )
 
     assert result is True
-    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-new'}
+    replace_worker.assert_not_called()
+    create_worker.assert_not_called()
+    delete_pod.assert_not_called()
+    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-old', 'session_id': 'session-old'}
+    assert main.stream_to_proxy['live'] == 'proxy-old'
+    assert main.stream_generation['live'] == 1
+    assert main.stream_to_worker['live'] == 'worker-old'
+    assert 'handover_accepted' not in [event['event_type'] for event in events]
+
+
+def test_register_stream_commits_handover_with_session_and_preserves_context():
+    reset_state()
+    main.stream_registry['live'] = {
+        'proxy_pod': 'proxy-old',
+        'session_id': 'session-old',
+        'publish_start_ts': '100.0',
+    }
+    main.stream_to_proxy['live'] = 'proxy-old'
+    main.stream_generation['live'] = 1
+    main.stream_to_worker['live'] = 'worker-old'
+    main.proxy_health_failures['proxy-old'] = main.PROXY_HEALTHCHECK_MAX_FAILURES
+
+    with patch.object(main, 'persist_state_locked', return_value=None):
+        result, events = capture_controller_events(
+            lambda: main.register_stream(
+                stream='live',
+                proxy_pod='proxy-new',
+                session_id='session-new',
+                publish_start_ts=200.0,
+            )
+        )
+
+    assert result['status'] == 'registered'
+    assert result['generation'] == 2
+    assert main.stream_registry['live'] == {
+        'proxy_pod': 'proxy-new',
+        'session_id': 'session-new',
+        'publish_start_ts': '200.0',
+    }
     assert main.stream_to_proxy['live'] == 'proxy-new'
     assert main.stream_generation['live'] == 2
-    assert main.stream_to_worker['live'] == 'worker-new'
-    assert main.worker_to_stream['worker-new'] == 'live'
-    assert 'worker-old' not in main.worker_to_stream
-    assert 'worker-old' not in main.worker_ready_since
-    assert 'worker-old' not in main.worker_create_started_at
-    assert 'uid-old' not in main.worker_health_failures
-    delete_pod.assert_called_once_with(name='worker-old', namespace=main.NAMESPACE, grace_period_seconds=0)
     accepted_event = next(event for event in events if event['event_type'] == 'handover_accepted')
     assert accepted_event['stream'] == 'live'
     assert accepted_event['proxy_pod'] == 'proxy-new'
     assert accepted_event['generation'] == 2
-    assert accepted_event['status'] == 'accepted'
+
+
+def test_register_refresh_without_session_preserves_existing_session_context():
+    reset_state()
+    main.stream_registry['live'] = {
+        'proxy_pod': 'proxy-1',
+        'session_id': 'session-a',
+        'publish_start_ts': '123.0',
+    }
+    main.stream_to_proxy['live'] = 'proxy-1'
+    main.stream_generation['live'] = 7
+
+    with main.allocation_lock:
+        stale_worker = main.register_or_refresh_stream('live', 'proxy-1')
+
+    assert stale_worker is None
+    assert main.stream_generation['live'] == 7
+    assert main.stream_registry['live'] == {
+        'proxy_pod': 'proxy-1',
+        'session_id': 'session-a',
+        'publish_start_ts': '123.0',
+    }
+
+
+def test_register_stream_denies_handover_when_owner_healthy_without_mutation():
+    reset_state()
+    main.stream_registry['live'] = {'proxy_pod': 'proxy-old', 'session_id': 'session-old'}
+    main.stream_to_proxy['live'] = 'proxy-old'
+    main.stream_generation['live'] = 1
+    main.proxy_health_failures['proxy-old'] = 0
+
+    with patch.object(main, 'get_proxy_health_status', return_value='healthy'), \
+         patch.object(main, 'persist_state_locked', return_value=None):
+        with pytest.raises(main.HTTPException):
+            main.register_stream(
+                stream='live',
+                proxy_pod='proxy-new',
+                session_id='session-new',
+                publish_start_ts=200.0,
+            )
+
+    assert main.stream_registry['live'] == {'proxy_pod': 'proxy-old', 'session_id': 'session-old'}
+    assert main.stream_to_proxy['live'] == 'proxy-old'
+    assert main.stream_generation['live'] == 1
 
 
 def test_allocate_worker_clears_ready_timestamp_for_concurrent_discard():
@@ -1511,7 +1423,7 @@ def test_handover_worker_replacement_clears_old_per_pod_tracking():
     main.worker_pod_uid_by_name['worker-old'] = 'uid-old'
     main.worker_health_failures['uid-old'] = 2
 
-    def create_worker_side_effect(stream, proxy_dns):
+    def create_worker_side_effect(*args, **kwargs):
         main.worker_create_started_at['worker-new'] = 456.0
         return 'worker-new'
 

@@ -1,6 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
+# Bash executes EXIT traps in command-substitution subshells as well. The runner
+# uses command substitutions for timestamps, curl output and parsing helpers;
+# cleanup must run only in the top-level worker process or those subshells can
+# delete progress files while FFmpeg is still starting.
+MAIN_BASHPID="${BASHPID:-$$}"
+
 STREAM_KEY="${STREAM_KEY:-}"
 SAFE_STREAM_KEY="$(printf '%s' "$STREAM_KEY" | sed 's/[^a-zA-Z0-9_.:-]/_/g' | cut -c1-160)"
 if [ -z "$SAFE_STREAM_KEY" ]; then
@@ -293,6 +299,9 @@ stop_progress_reader() {
 }
 
 cleanup() {
+  if [ "${BASH_SUBSHELL:-0}" != "0" ] || [ "${BASHPID:-$$}" != "$MAIN_BASHPID" ]; then
+    return 0
+  fi
   stop_progress_reader
   if [ -n "${FFMPEG_PID:-}" ] && kill -0 "$FFMPEG_PID" 2>/dev/null; then
     kill -TERM "$FFMPEG_PID" 2>/dev/null || true
@@ -304,7 +313,7 @@ cleanup() {
     rm -rf "$PROGRESS_NOTIFY_LOCK" "$PROGRESS_LOG_LOCK" "$STARTED_NOTIFY_LOCK" "$STARTED_LOG_LOCK"
   fi
 }
-trap cleanup EXIT
+trap cleanup TERM INT HUP
 
 wait_for_ffmpeg_exit() {
   local pid="$1"
