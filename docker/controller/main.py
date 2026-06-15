@@ -10,6 +10,7 @@ import logging
 import asyncio
 import json
 import copy
+import hashlib
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -636,6 +637,8 @@ PROXY_RTMP_STATS_INTERVAL_SECONDS = get_int_env("PROXY_RTMP_STATS_INTERVAL_SECON
 PROXY_RTMP_STATS_TIMEOUT_SECONDS = get_float_env("PROXY_RTMP_STATS_TIMEOUT_SECONDS", 2.0, min_value=0.1)
 PROXY_RTMP_STATS_MAX_CONCURRENCY = get_int_env("PROXY_RTMP_STATS_MAX_CONCURRENCY", 20, min_value=1)
 WORKER_CONTROLLER_API = os.getenv("WORKER_CONTROLLER_API", "http://controller.media.svc.cluster.local:8000")
+ALLOW_LEGACY_WORKER_REPLAY_WITHOUT_GENERATION = get_bool_env("ALLOW_LEGACY_WORKER_REPLAY_WITHOUT_GENERATION", False)
+ALLOW_LEGACY_WORKER_REPLAY_WITHOUT_SESSION = get_bool_env("ALLOW_LEGACY_WORKER_REPLAY_WITHOUT_SESSION", False)
 proxy_rtmp_stats_observed_pods: Set[str] = set()
 
 pod_cpu_usage_percent = controller_gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',('pod','namespace'))
@@ -688,6 +691,7 @@ worker_replacements_total = controller_counter('worker_replacements_total', 'Tot
 orphan_workers_deleted_total = controller_counter('orphan_workers_deleted_total', 'Total orphan worker pod deletion attempts', ('status', 'reason'))
 kubernetes_api_errors_total = controller_counter('kubernetes_api_errors_total', 'Total Kubernetes API errors observed by the controller', ('operation', 'resource', 'reason'))
 state_persistence_errors_total = controller_counter('state_persistence_errors_total', 'Total persisted-state read/write errors', ('operation', 'reason'))
+state_persistence_duration_seconds = controller_histogram('state_persistence_duration_seconds', 'Duration of persisted-state ConfigMap operations in seconds', ('operation', 'status'))
 state_recovery_total = controller_counter('state_recovery_total', 'Total controller state recovery outcomes', ('status', 'reason'))
 proxy_healthcheck_total = controller_counter('proxy_healthcheck_total', 'Total proxy healthcheck evaluations', ('status', 'reason'))
 worker_healthcheck_total = controller_counter('worker_healthcheck_total', 'Total worker processing readiness probes', ('status', 'reason'))
@@ -1283,11 +1287,14 @@ def persist_state_locked() -> None:
             namespace=NAMESPACE,
             body=body
         )
+        state_persistence_duration_seconds.labels(operation="persist", status="success").observe(time.monotonic() - started_at)
     except ApiException as e:
         if e.status == 404:
             try:
                 core.create_namespaced_config_map(namespace=NAMESPACE, body=body)
+                state_persistence_duration_seconds.labels(operation="persist", status="success").observe(time.monotonic() - started_at)
             except ApiException as create_error:
+                state_persistence_duration_seconds.labels(operation="persist", status="failed").observe(time.monotonic() - started_at)
                 record_kubernetes_api_error("create", "configmap", create_error)
                 state_persistence_errors_total.labels(operation="persist", reason="create_failed").inc()
                 log_controller_event(
@@ -1299,6 +1306,7 @@ def persist_state_locked() -> None:
                 )
                 raise
         else:
+            state_persistence_duration_seconds.labels(operation="persist", status="failed").observe(time.monotonic() - started_at)
             record_kubernetes_api_error("patch", "configmap", e)
             state_persistence_errors_total.labels(operation="persist", reason="patch_failed").inc()
             log_controller_event(
@@ -1391,6 +1399,26 @@ def random_suffix():
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
 
 
+K8S_NAME_FRAGMENT_MAX_LENGTH = 40
+
+
+def k8s_name_fragment(value: str, max_len: int = K8S_NAME_FRAGMENT_MAX_LENGTH) -> str:
+    """Return a DNS-1123-safe, collision-resistant fragment for Kubernetes names.
+
+    Stream keys are publisher-controlled input. They may contain characters that
+    are invalid in Kubernetes object names, so never embed the raw stream key in
+    Pod names. The hash preserves uniqueness when two distinct stream keys
+    normalize to the same visible prefix.
+    """
+    raw = value or "stream"
+    normalized = re.sub(r"[^a-z0-9-]+", "-", raw.lower())
+    normalized = re.sub(r"-+", "-", normalized).strip("-") or "stream"
+    suffix = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    prefix_budget = max(1, max_len - len(suffix) - 1)
+    prefix = normalized[:prefix_budget].strip("-") or "stream"
+    return f"{prefix}-{suffix}"
+
+
 
 
 def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
@@ -1406,7 +1434,7 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
     metric_status = "error"
     metric_reason = "exception"
     try:
-        pod_name = f"worker-{stream.lower().replace('_','-')[:40]}-{random_suffix()}"
+        pod_name = f"worker-{k8s_name_fragment(stream)}-{random_suffix()}"
 
         try:
             deployment = apps.read_namespaced_deployment(name=WORKER_DEPLOYMENT, namespace=NAMESPACE)
@@ -2910,12 +2938,20 @@ def inspect_existing_worker_for_replay(
         return False, f"pod_unusable_phase_{phase.lower()}", True
 
     annotated_generation = generation_to_int(annotations.get("liveedgecast.io/generation"))
-    if expected_generation is not None and annotated_generation is not None and annotated_generation != expected_generation:
-        return False, "generation_mismatch", True
+    if expected_generation is not None:
+        if annotated_generation is None:
+            if not ALLOW_LEGACY_WORKER_REPLAY_WITHOUT_GENERATION:
+                return False, "missing_generation_annotation", True
+        elif annotated_generation != expected_generation:
+            return False, "generation_mismatch", True
 
     annotated_session = annotations.get("liveedgecast.io/session-id")
-    if expected_session_id and annotated_session and annotated_session != expected_session_id:
-        return False, "session_mismatch", True
+    if expected_session_id:
+        if not annotated_session:
+            if not ALLOW_LEGACY_WORKER_REPLAY_WITHOUT_SESSION:
+                return False, "missing_session_annotation", True
+        elif annotated_session != expected_session_id:
+            return False, "session_mismatch", True
 
     return True, "usable", False
 

@@ -2263,3 +2263,85 @@ def test_reused_stream_generation_rejects_delayed_destination_callback():
         main.stream_lifecycle_timestamps['live'][second_generation]['t_destination_received']
         == 23.0
     )
+
+
+def test_k8s_name_fragment_sanitizes_stream_key_and_preserves_uniqueness():
+    unsafe = "../Live Stream:@ç/with spaces+symbols"
+    fragment = main.k8s_name_fragment(unsafe)
+
+    assert fragment == fragment.lower()
+    assert len(fragment) <= main.K8S_NAME_FRAGMENT_MAX_LENGTH
+    assert fragment.strip("-") == fragment
+    assert all(ch.isalnum() or ch == "-" for ch in fragment)
+    assert main.k8s_name_fragment("a/b") != main.k8s_name_fragment("a b")
+
+
+def test_existing_worker_replay_rejects_missing_generation_annotation(monkeypatch):
+    reset_state()
+    monkeypatch.setattr(main, "ALLOW_LEGACY_WORKER_REPLAY_WITHOUT_GENERATION", False)
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(
+            annotations={"liveedgecast.io/session-id": "session-1"},
+            deletion_timestamp=None,
+        ),
+        status=SimpleNamespace(phase="Running"),
+    )
+
+    with patch.object(main.core, "read_namespaced_pod", return_value=pod):
+        usable, reason, should_delete = main.inspect_existing_worker_for_replay(
+            "worker-1",
+            expected_generation=3,
+            expected_session_id="session-1",
+        )
+
+    assert usable is False
+    assert reason == "missing_generation_annotation"
+    assert should_delete is True
+
+
+def test_existing_worker_replay_rejects_missing_session_annotation(monkeypatch):
+    reset_state()
+    monkeypatch.setattr(main, "ALLOW_LEGACY_WORKER_REPLAY_WITHOUT_SESSION", False)
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(
+            annotations={"liveedgecast.io/generation": "3"},
+            deletion_timestamp=None,
+        ),
+        status=SimpleNamespace(phase="Running"),
+    )
+
+    with patch.object(main.core, "read_namespaced_pod", return_value=pod):
+        usable, reason, should_delete = main.inspect_existing_worker_for_replay(
+            "worker-1",
+            expected_generation=3,
+            expected_session_id="session-1",
+        )
+
+    assert usable is False
+    assert reason == "missing_session_annotation"
+    assert should_delete is True
+
+
+def test_existing_worker_replay_accepts_matching_generation_and_session():
+    reset_state()
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(
+            annotations={
+                "liveedgecast.io/generation": "3",
+                "liveedgecast.io/session-id": "session-1",
+            },
+            deletion_timestamp=None,
+        ),
+        status=SimpleNamespace(phase="Running"),
+    )
+
+    with patch.object(main.core, "read_namespaced_pod", return_value=pod):
+        usable, reason, should_delete = main.inspect_existing_worker_for_replay(
+            "worker-1",
+            expected_generation=3,
+            expected_session_id="session-1",
+        )
+
+    assert usable is True
+    assert reason == "usable"
+    assert should_delete is False

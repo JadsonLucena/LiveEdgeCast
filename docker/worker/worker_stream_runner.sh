@@ -41,6 +41,7 @@ FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS="${PROGRESS_NOTIFY_POLL_SECONDS:-0.2}"
 FFMPEG_RW_TIMEOUT_MICROSECONDS="${FFMPEG_RW_TIMEOUT_MICROSECONDS:-30000000}"
 FFMPEG_LOGLEVEL="${FFMPEG_LOGLEVEL:-warning}"
 INPUT_OPEN_TIMEOUT_EXIT_CODE="${INPUT_OPEN_TIMEOUT_EXIT_CODE:-251}"
+DESTINATION_OPEN_FAILED_EXIT_CODE="${DESTINATION_OPEN_FAILED_EXIT_CODE:-252}"
 ALLOW_FFMPEG_EXIT_ZERO_WITH_UNKNOWN_STREAM_STATUS="${ALLOW_FFMPEG_EXIT_ZERO_WITH_UNKNOWN_STREAM_STATUS:-false}"
 
 json_escape() {
@@ -167,6 +168,18 @@ progress_file_has_complete_line() {
     esac
   done < "$PROGRESS_FILE"
   return 1
+}
+
+ffmpeg_attempt_log_has_destination_open_error() {
+  local log_file="$1"
+  [ -f "$log_file" ] || return 1
+  grep -qiE 'Error opening output|Error opening output file|Could not write header|Failed to update header|av_interleaved_write_frame|Broken pipe|Connection refused|Connection reset by peer|Immediate exit requested|Output file.*I/O error' "$log_file"
+}
+
+ffmpeg_attempt_log_has_input_open_error() {
+  local log_file="$1"
+  [ -f "$log_file" ] || return 1
+  grep -qiE 'Error opening input|Error opening input file|Input/output error|Server error: Already publishing|Operation timed out|Connection timed out' "$log_file"
 }
 
 log_ffmpeg_started_once() {
@@ -430,7 +443,15 @@ while true; do
     exit_cleanly_if_stream_inactive
     log_json "ffmpeg_exited_without_progress" "exit_0_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
   else
-    log_json "ffmpeg_input_open_attempt_failed" "exit_${EXIT_CODE}_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
+    if ffmpeg_attempt_log_has_destination_open_error "$ATTEMPT_LOG_FILE"; then
+      log_json "worker_error" "destination_open_failed_exit_${EXIT_CODE}_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
+      tail -n 40 "$ATTEMPT_LOG_FILE" | sed 's/^/[ffmpeg] /' || true
+      exit "$DESTINATION_OPEN_FAILED_EXIT_CODE"
+    elif ffmpeg_attempt_log_has_input_open_error "$ATTEMPT_LOG_FILE"; then
+      log_json "ffmpeg_input_open_attempt_failed" "exit_${EXIT_CODE}_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
+    else
+      log_json "ffmpeg_open_attempt_failed_unclassified" "exit_${EXIT_CODE}_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
+    fi
   fi
   tail -n 20 "$ATTEMPT_LOG_FILE" | sed 's/^/[ffmpeg] /' || true
 
