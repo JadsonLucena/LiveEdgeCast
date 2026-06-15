@@ -342,8 +342,8 @@ def discover_exit_file() -> str:
 
     stream_key = os.environ.get("STREAM_KEY", "")
     if stream_key:
-        return f"/tmp/ffmpeg_{stream_key}.exit"
-    return "/tmp/ffmpeg.exit"
+        return f"/tmp/ffmpeg_{stream_key}.exit_events"
+    return "/tmp/ffmpeg.exit_events"
 
 
 @dataclass

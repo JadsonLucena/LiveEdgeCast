@@ -47,7 +47,7 @@ log_json() {
     "$(json_escape "$event_type")" \
     "$(json_escape "${STREAM_KEY:-}")" \
     "$(json_escape "${STREAM_GENERATION:-}")" \
-    "$(json_escape "${PROXY_POD:-${PROXY_DNS:-}}")" \
+    "$(json_escape "${PROXY_POD:-}")" \
     "$(json_escape "${WORKER_POD:-${HOSTNAME:-unknown-worker}}")" \
     "$(json_escape "${EXPERIMENT_ID:-}")" \
     "$(json_escape "${SCENARIO:-}")" \
@@ -75,6 +75,8 @@ handle_signal() {
 trap 'handle_signal TERM' TERM
 trap 'handle_signal INT' INT
 trap 'handle_signal QUIT' QUIT
+
+KEEP_WORKER_ALIVE_AFTER_RUNNER_EXIT="${KEEP_WORKER_ALIVE_AFTER_RUNNER_EXIT:-false}"
 
 log_json "worker_entrypoint_started" "ok" 0
 
@@ -115,6 +117,14 @@ if [ "$RUNNER_EXIT" -ne 0 ]; then
   wait "$NGINX_PID" "$METRICS_EXPORTER_PID" 2>/dev/null || true
   log_shutdown_once "error"
   exit "$RUNNER_EXIT"
+fi
+
+if [ "${KEEP_WORKER_ALIVE_AFTER_RUNNER_EXIT,,}" != "true" ]; then
+  log_json "runner_completed" "ok" "$(elapsed_ms "$ENTRYPOINT_START_MS")"
+  kill -TERM "$NGINX_PID" "$METRICS_EXPORTER_PID" 2>/dev/null || true
+  wait "$NGINX_PID" "$METRICS_EXPORTER_PID" 2>/dev/null || true
+  log_shutdown_once "completed"
+  exit 0
 fi
 
 set +e

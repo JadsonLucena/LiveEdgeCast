@@ -4,7 +4,8 @@ set -euo pipefail
 STREAM_KEY="${STREAM_KEY:-}"
 PID_FILE="/tmp/ffmpeg_${STREAM_KEY}.pid"
 PROGRESS_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress"
-EXIT_FILE="/tmp/ffmpeg_${STREAM_KEY}.exit"
+EXIT_EVENT_FILE="${FFMPEG_EXIT_FILE:-/tmp/ffmpeg_${STREAM_KEY}.exit_events}"
+LAST_EXIT_FILE="/tmp/ffmpeg_${STREAM_KEY}.last_exit"
 PROGRESS_NOTIFY_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress_notified"
 PROGRESS_NOTIFY_LOCK="/tmp/ffmpeg_${STREAM_KEY}.progress_notify.lock"
 PROGRESS_NOTIFY_ERROR_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress_notify_error_logged"
@@ -36,6 +37,7 @@ FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS="${PROGRESS_NOTIFY_POLL_SECONDS:-0.2}"
 FFMPEG_RW_TIMEOUT_MICROSECONDS="${FFMPEG_RW_TIMEOUT_MICROSECONDS:-30000000}"
 FFMPEG_LOGLEVEL="${FFMPEG_LOGLEVEL:-warning}"
 INPUT_OPEN_TIMEOUT_EXIT_CODE="${INPUT_OPEN_TIMEOUT_EXIT_CODE:-251}"
+ALLOW_FFMPEG_EXIT_ZERO_WITH_UNKNOWN_STREAM_STATUS="${ALLOW_FFMPEG_EXIT_ZERO_WITH_UNKNOWN_STREAM_STATUS:-false}"
 
 json_escape() {
   local value="${1:-}"
@@ -76,7 +78,7 @@ log_json() {
     "$(json_escape "$event_type")" \
     "$(json_escape "${STREAM_KEY:-}")" \
     "$(json_escape "${STREAM_GENERATION:-}")" \
-    "$(json_escape "${PROXY_POD:-${PROXY_DNS:-}}")" \
+    "$(json_escape "${PROXY_POD:-}")" \
     "$(json_escape "${WORKER_POD:-${HOSTNAME:-unknown-worker}}")" \
     "$(json_escape "${EXPERIMENT_ID:-}")" \
     "$(json_escape "${SCENARIO:-}")" \
@@ -97,11 +99,18 @@ notify_controller() {
 
 controller_stream_activity_state() {
   local response rc
+  local curl_args=(
+    -sf
+    --connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}"
+    --max-time "${CONTROLLER_CALLBACK_MAX_TIME_SECONDS:-2}"
+    -G
+    --data-urlencode "stream=${STREAM_KEY}"
+  )
+  if [ -n "${PROXY_POD:-}" ]; then
+    curl_args+=(--data-urlencode "proxy_pod=${PROXY_POD}")
+  fi
   set +e
-  response="$({ curl -sf --connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}" --max-time "${CONTROLLER_CALLBACK_MAX_TIME_SECONDS:-2}" -G \
-    --data-urlencode "stream=${STREAM_KEY}" \
-    --data-urlencode "proxy_pod=${PROXY_POD:-${PROXY_DNS:-}}" \
-    "${CONTROLLER_API}/streams/status"; } 2>/dev/null)"
+  response="$({ curl "${curl_args[@]}" "${CONTROLLER_API}/streams/status"; } 2>/dev/null)"
   rc=$?
   set -e
   if [ "$rc" -ne 0 ] || [ -z "$response" ]; then
@@ -367,8 +376,8 @@ while true; do
 
   EXIT_CODE="$(wait_for_ffmpeg_exit "$FFMPEG_PID")"
   last_exit_code="$EXIT_CODE"
-  echo "$EXIT_CODE" > "/tmp/ffmpeg_${STREAM_KEY}.exit"
-  printf '%s %s\n' "$FFMPEG_RUN_ID" "$EXIT_CODE" >> "$EXIT_FILE"
+  echo "$EXIT_CODE" > "$LAST_EXIT_FILE"
+  printf '%s %s\n' "$FFMPEG_RUN_ID" "$EXIT_CODE" >> "$EXIT_EVENT_FILE"
   cat "$ATTEMPT_LOG_FILE" >> "/tmp/ffmpeg_${STREAM_KEY}.log" 2>/dev/null || true
   rm -f "$PID_FILE"
 
@@ -386,7 +395,22 @@ while true; do
       tail -n 40 "/tmp/ffmpeg_${STREAM_KEY}.log" | sed 's/^/[ffmpeg] /' || true
       exit "$EXIT_CODE"
     fi
-    exit 0
+
+    stream_state="$(controller_stream_activity_state)"
+    if [ "$stream_state" = "inactive" ]; then
+      log_json "ffmpeg_completed_after_stream_end" "ok" "$(elapsed_ms "$RUNNER_START_MS")"
+      exit 0
+    fi
+    if [ "$stream_state" = "active" ]; then
+      log_json "worker_error" "ffmpeg_exit_0_while_stream_still_active" "$(elapsed_ms "$RUNNER_START_MS")"
+      exit "$INPUT_OPEN_TIMEOUT_EXIT_CODE"
+    fi
+    if [ "${ALLOW_FFMPEG_EXIT_ZERO_WITH_UNKNOWN_STREAM_STATUS,,}" = "true" ]; then
+      log_json "ffmpeg_completed_with_unknown_stream_status" "ok_allowed" "$(elapsed_ms "$RUNNER_START_MS")"
+      exit 0
+    fi
+    log_json "worker_error" "ffmpeg_exit_0_while_stream_status_unknown" "$(elapsed_ms "$RUNNER_START_MS")"
+    exit "$INPUT_OPEN_TIMEOUT_EXIT_CODE"
   fi
 
   # No observable input/progress was opened. This is usually a transient race while

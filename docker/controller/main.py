@@ -602,6 +602,11 @@ WORKER_HEALTHCHECK_JITTER_SECONDS = float(os.getenv("WORKER_HEALTHCHECK_JITTER_S
 # Keep this longer than the worker input-open retry window so the controller does not
 # replace a cold-starting worker while FFmpeg is still retrying the proxy input.
 WORKER_READY_HEALTH_DELAY_SECONDS = get_int_env("WORKER_READY_HEALTH_DELAY_SECONDS", 50, min_value=0)
+WORKER_NOT_READY_REPLACE_SECONDS = get_int_env(
+    "WORKER_NOT_READY_REPLACE_SECONDS",
+    max(WORKER_READY_HEALTH_DELAY_SECONDS + (WORKER_HEALTHCHECK_INTERVAL_SECONDS * WORKER_HEALTHCHECK_MAX_FAILURES), 90),
+    min_value=1,
+)
 WORKER_HEALTHCHECK_PORT = get_int_env("WORKER_HEALTHCHECK_PORT", 9113, min_value=1)
 WORKER_HEALTHCHECK_PATH = os.getenv("WORKER_HEALTHCHECK_PATH", "/readyz")
 WORKER_HEALTHCHECK_TIMEOUT_SECONDS = float(os.getenv("WORKER_HEALTHCHECK_TIMEOUT_SECONDS", "2"))
@@ -613,6 +618,7 @@ STREAM_GENERATION_HIGH_WATER_MAX_ENTRIES = get_int_env("STREAM_GENERATION_HIGH_W
 PROXY_READY_HEALTH_DELAY_SECONDS = 3  # Wait after proxy Ready before proxy /health probes.
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
+worker_not_ready_since: Dict[str, float] = {}
 worker_health_failures: Dict[str, int] = {}
 worker_pod_uid_by_name: Dict[str, str] = {}
 proxy_ready_since: Dict[str, float] = {}
@@ -1410,10 +1416,22 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
 
         for c in pod_spec.containers:
             env = list(c.env or [])
-            env = [e for e in env if e.name not in ("STREAM_KEY", "PROXY_DNS", "STREAM_GENERATION", "CONTROLLER_API", "WORKER_POD")]
+            env = [
+                e for e in env
+                if e.name not in (
+                    "STREAM_KEY",
+                    "PROXY_DNS",
+                    "PROXY_POD",
+                    "STREAM_GENERATION",
+                    "CONTROLLER_API",
+                    "WORKER_POD",
+                )
+            ]
             generation_value = str(stream_generation.get(stream, 1))
+            owner_proxy_pod = get_stream_proxy_pod(stream) or ""
             env.append(client.V1EnvVar(name="STREAM_KEY", value=stream))
             env.append(client.V1EnvVar(name="PROXY_DNS", value=proxy_dns))
+            env.append(client.V1EnvVar(name="PROXY_POD", value=owner_proxy_pod))
             env.append(client.V1EnvVar(name="STREAM_GENERATION", value=generation_value))
             env.append(client.V1EnvVar(name="CONTROLLER_API", value=WORKER_CONTROLLER_API))
             env.append(client.V1EnvVar(name="WORKER_POD", value=pod_name))
@@ -1575,13 +1593,14 @@ def register_or_refresh_stream(
     """
     current = stream_registry.get(stream)
     current_session = current.get("session_id") if current else None
-    session_changed = bool(session_id and current_session and current_session != session_id)
+    session_changed = bool(session_id and current and current_session != session_id)
     if session_changed:
         old_worker = stream_to_worker.pop(stream, None)
         if old_worker:
             worker_to_stream.pop(old_worker, None)
             cleanup_worker_lifecycle_tracking_locked(old_worker)
             worker_ready_since.pop(old_worker, None)
+            worker_not_ready_since.pop(old_worker, None)
             worker_create_started_at.pop(old_worker, None)
             old_uid = worker_pod_uid_by_name.pop(old_worker, None)
             if old_uid:
@@ -1609,7 +1628,7 @@ def register_or_refresh_stream(
             stream=stream,
             proxy_pod=proxy_pod,
             status=LOG_STATUS_SUCCESS,
-            message=f"new RTMP session replaced previous session_id='{current_session}'",
+            message=f"new RTMP session replaced previous session_id='{current_session or '<legacy/missing>'}'",
         )
     if stream not in stream_generation or stream not in stream_registry or session_changed:
         previous_generations = stream_lifecycle_timestamps.get(stream, {})
@@ -2381,8 +2400,13 @@ async def collect_infrastructure_metrics():
 
 
 async def monitor_worker_health():
-    """Worker health monitor using worker-specific Ready-to-/health delay before probing."""
-    """Controller-driven worker healthcheck every 3s, with 3 consecutive failures threshold."""
+    """Controller-driven worker lifecycle and FFmpeg readiness monitor.
+
+    Kubernetes Pod Ready now reflects /readyz, which means FFmpeg processing
+    readiness. Therefore NotReady/Failed workers must be evaluated explicitly
+    instead of being skipped, otherwise a failed worker can remain allocated for
+    an active stream forever.
+    """
     while True:
         await asyncio.sleep(WORKER_HEALTHCHECK_INTERVAL_SECONDS)
         to_replace = []
@@ -2417,22 +2441,56 @@ async def monitor_worker_health():
                         worker_health_failures.pop(prev_uid, None)
                         worker_health_failures[current_uid] = 0
                         worker_ready_since.pop(worker_pod, None)
+                        worker_not_ready_since.pop(worker_pod, None)
                         worker_create_started_at.pop(worker_pod, None)
                         cleanup_worker_lifecycle_tracking_locked(worker_pod)
                     if current_uid:
                         worker_pod_uid_by_name[worker_pod] = current_uid
 
+                phase = (getattr(pod.status, "phase", None) or "").strip()
                 ready = any(c.type == "Ready" and c.status == "True" for c in (pod.status.conditions or []))
+                now_monotonic = time.monotonic()
+
+                if phase in {"Failed", "Succeeded"}:
+                    logger.warning(
+                        f"[WorkerHealth] Worker '{worker_pod}' for stream '{stream}' is in terminal pod phase '{phase}'. "
+                        "Scheduling recovery/release evaluation."
+                    )
+                    to_replace.append((stream, worker_pod))
+                    continue
+
+                if phase not in {"Running", "Pending"}:
+                    logger.warning(
+                        f"[WorkerHealth] Worker '{worker_pod}' for stream '{stream}' is in unexpected pod phase '{phase}'. "
+                        "Scheduling recovery/release evaluation."
+                    )
+                    to_replace.append((stream, worker_pod))
+                    continue
+
                 if not ready:
                     with allocation_lock:
+                        first_not_ready_at = worker_create_started_at.get(worker_pod)
+                        if first_not_ready_at is None:
+                            first_not_ready_at = worker_not_ready_since.setdefault(worker_pod, now_monotonic)
                         worker_ready_since.pop(worker_pod, None)
-                        if current_uid:
-                            worker_health_failures.pop(current_uid, None)
+                    not_ready_seconds = max(0.0, now_monotonic - first_not_ready_at)
+                    if not_ready_seconds < WORKER_NOT_READY_REPLACE_SECONDS:
+                        logger.debug(
+                            f"[WorkerHealth] Worker '{worker_pod}' is {phase}/NotReady for stream '{stream}' "
+                            f"for {not_ready_seconds:.1f}s; waiting up to {WORKER_NOT_READY_REPLACE_SECONDS}s before recovery."
+                        )
+                        continue
+                    logger.warning(
+                        f"[WorkerHealth] Worker '{worker_pod}' is {phase}/NotReady for stream '{stream}' "
+                        f"for {not_ready_seconds:.1f}s; scheduling recovery/release evaluation."
+                    )
+                    to_replace.append((stream, worker_pod))
                     continue
 
                 now = time.time()
                 create_started_at = None
                 with allocation_lock:
+                    worker_not_ready_since.pop(worker_pod, None)
                     first_ready_at = worker_ready_since.get(worker_pod)
                     if first_ready_at is None:
                         worker_ready_since[worker_pod] = now
@@ -2443,26 +2501,30 @@ async def monitor_worker_health():
                     if create_started_at is not None:
                         ready_duration_seconds = time.monotonic() - create_started_at
                         worker_ready_duration_seconds.observe(ready_duration_seconds)
-                        worker_ready_total.labels(status=LOG_STATUS_READY, reason="pod_ready").inc()
+                        worker_ready_total.labels(status=LOG_STATUS_READY, reason="processing_ready").inc()
                         ready_duration_ms = round(ready_duration_seconds * 1000, 3)
                     else:
                         worker_ready_total.labels(status=LOG_STATUS_READY, reason="start_time_unknown").inc()
                         ready_duration_ms = None
                     log_controller_event(
-                        "worker_ready_observed",
+                        "worker_processing_ready_observed",
                         stream=stream,
                         proxy_pod=owner_proxy,
                         worker_pod=worker_pod,
                         duration_ms=ready_duration_ms,
                         status=LOG_STATUS_READY,
+                        message="Kubernetes readiness is /readyz, indicating FFmpeg processing readiness",
                     )
-                    logger.debug(f"[WorkerHealth] Worker '{worker_pod}' became Ready. Starting worker delay timer ({WORKER_READY_HEALTH_DELAY_SECONDS}s) before /health probe.")
+                    logger.debug(
+                        f"[WorkerHealth] Worker '{worker_pod}' became processing Ready. "
+                        f"Starting delay timer ({WORKER_READY_HEALTH_DELAY_SECONDS}s) before probing {WORKER_HEALTHCHECK_PATH}."
+                    )
                     continue
 
                 if (now - first_ready_at) < WORKER_READY_HEALTH_DELAY_SECONDS:
                     logger.debug(
-                        f"[WorkerHealth] Waiting worker delay of {WORKER_READY_HEALTH_DELAY_SECONDS}s after Ready for '{worker_pod}' "
-                        f"before probing /health ({now - first_ready_at:.1f}s elapsed)."
+                        f"[WorkerHealth] Waiting worker delay of {WORKER_READY_HEALTH_DELAY_SECONDS}s after processing Ready for '{worker_pod}' "
+                        f"before probing {WORKER_HEALTHCHECK_PATH} ({now - first_ready_at:.1f}s elapsed)."
                     )
                     continue
 
@@ -2576,6 +2638,7 @@ async def monitor_worker_health():
                     current_owner = stream_registry.get(stream, {}).get("proxy_pod")
                     if allocated != worker_pod or current_owner != owner_proxy:
                         worker_create_started_at.pop(new_worker, None)
+                        worker_not_ready_since.pop(new_worker, None)
                         cleanup_worker_lifecycle_tracking_locked(new_worker)
                         discard_new_worker = True
                     else:
@@ -2584,6 +2647,7 @@ async def monitor_worker_health():
                         cleanup_worker_lifecycle_tracking_locked(worker_pod)
                         worker_to_stream[new_worker] = stream
                         worker_ready_since.pop(worker_pod, None)
+                        worker_not_ready_since.pop(worker_pod, None)
                         worker_create_started_at.pop(worker_pod, None)
                         old_uid = worker_pod_uid_by_name.pop(worker_pod, None)
                         if old_uid:
@@ -2948,6 +3012,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 worker_to_stream.pop(worker_name, None)
                 cleanup_worker_lifecycle_tracking_locked(worker_name)
                 worker_ready_since.pop(worker_name, None)
+                worker_not_ready_since.pop(worker_name, None)
                 worker_create_started_at.pop(worker_name, None)
                 old_uid = worker_pod_uid_by_name.pop(worker_name, None)
                 if old_uid:
