@@ -96,10 +96,13 @@ SCENARIO_PROMETHEUS_METRICS_FOR_ANALYSIS = {
 }
 
 # Metrics such as proxy_network_receive_bps/proxy_network_transmit_bps are
-# intentionally collected when available, but are not required for local smoke
-# success because some Kubernetes distributions do not expose container_network_*
-# through cAdvisor. They remain visible in prometheus_metric_coverage.csv as
-# optional evidence.
+# collected when available. They are optional by default because some local
+# Kubernetes distributions do not expose container_network_* through cAdvisor,
+# but --require-network-metrics can promote them to required evidence for final
+# experiments on clusters that support Pod network metrics.
+
+# Small tolerance for distributed timestamp ordering noise between proxy/controller hooks.
+TIMESTAMP_ORDERING_TOLERANCE_SECONDS = 0.050
 
 DEFAULT_PROMQL = {
     # Controller metrics can be scoped by tenant/environment/region when --patch-proxy-context is used.
@@ -110,13 +113,13 @@ DEFAULT_PROMQL = {
     "workers_active": 'count(kube_pod_info{namespace="$namespace", pod=~"worker-.*"})',
     "proxies_active": 'count(kube_pod_info{namespace="$namespace", pod=~"proxy-.*"})',
     "controllers_active": 'count(kube_pod_info{namespace="$namespace", pod=~"controller-.*"})',
-    "pod_cpu_rate": 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", pod=~"(worker|proxy|controller).*"}[1m]))',
-    "pod_memory_working_set": 'sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", pod=~"(worker|proxy|controller).*"})',
-    "proxy_network_receive_bps": 'sum by (pod) (rate(container_network_receive_bytes_total{namespace="$namespace", pod=~"proxy-.*"}[1m]))',
-    "proxy_network_transmit_bps": 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="$namespace", pod=~"proxy-.*"}[1m]))',
-    "stream_lifecycle_phase_seconds_p50": 'histogram_quantile(0.50, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
-    "stream_lifecycle_phase_seconds_p95": 'histogram_quantile(0.95, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
-    "stream_lifecycle_phase_seconds_p99": 'histogram_quantile(0.99, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
+    "pod_cpu_rate": 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))',
+    "pod_memory_working_set": 'sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})',
+    "proxy_network_receive_bps": 'sum by (pod) (rate(container_network_receive_bytes_total{namespace="$namespace", interface!="lo", pod=~"(proxy-lb|proxy|worker|controller)-.*", pod=~"proxy-.*", pod!~"proxy-lb-.*"}[1m]))',
+    "proxy_network_transmit_bps": 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="$namespace", interface!="lo", pod=~"(proxy-lb|proxy|worker|controller)-.*", pod=~"proxy-.*", pod!~"proxy-lb-.*"}[1m]))',
+    "stream_lifecycle_phase_seconds_p50": 'histogram_quantile(0.50, sum by (le, phase) (increase(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
+    "stream_lifecycle_phase_seconds_p95": 'histogram_quantile(0.95, sum by (le, phase) (increase(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
+    "stream_lifecycle_phase_seconds_p99": 'histogram_quantile(0.99, sum by (le, phase) (increase(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
     "handover_attempts_total": "handover_attempts_total$controller_label_selector",
     "handover_success_total": "handover_success_total$controller_label_selector",
     "handover_conflict_total": "handover_conflict_total$controller_label_selector",
@@ -172,6 +175,8 @@ class RunnerConfig:
     allow_unscoped_context: bool = False
     allow_inconclusive: bool = False
     require_prometheus_analysis: bool = False
+    require_network_metrics: bool = False
+    require_destination_received: bool = False
     legacy_output: bool = False
     testsrc_size: str = "1920x1080"
     testsrc_rate: str = "30"
@@ -287,6 +292,8 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--allow-unscoped-context", action="store_true", help="Return exit code 0 when --patch-proxy-context was requested but proxy/controller context patching was not fully effective.")
     parser.add_argument("--allow-inconclusive", action="store_true", help="Return exit code 0 for handover/duplicate-streamkey runs whose between-proxy hypothesis remains inconclusive. By default inconclusive hypothesis tests fail automation.")
     parser.add_argument("--require-prometheus-analysis", action="store_true", help="Return exit code 1 when --prometheus-url is configured but required Prometheus samples for resource/activity analysis are incomplete.")
+    parser.add_argument("--require-network-metrics", action="store_true", help="Promote proxy network RX/TX Prometheus metrics to required evidence. Use this for final experiments on clusters exposing container_network_* metrics.")
+    parser.add_argument("--require-destination-received", action="store_true", help="Require t_destination_received in per-stream activation metrics. Keep disabled unless an instrumented destination receiver is part of the experiment.")
     parser.add_argument("--legacy-output", action="store_true", help="Deprecated compatibility flag. metrics/cost_estimation.csv is generated by default as a legacy alias with a deprecation notice; resource_activity.csv remains the primary artifact.")
     parser.add_argument("--proxy-container", default=os.getenv("LIVEEDGECAST_PROXY_CONTAINER"), help="Container name to patch in deployment/proxy. Required when deployment/proxy has multiple containers.")
     parser.add_argument("--controller-container", default=os.getenv("LIVEEDGECAST_CONTROLLER_CONTAINER"), help="Container name to patch in deployment/controller. Required when deployment/controller has multiple containers.")
@@ -365,6 +372,8 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         allow_unscoped_context=args.allow_unscoped_context,
         allow_inconclusive=args.allow_inconclusive,
         require_prometheus_analysis=args.require_prometheus_analysis,
+        require_network_metrics=args.require_network_metrics,
+        require_destination_received=args.require_destination_received,
         legacy_output=args.legacy_output,
         testsrc_size=args.testsrc_size,
         testsrc_rate=args.testsrc_rate,
@@ -836,6 +845,212 @@ def controller_get(config: RunnerConfig, path: str) -> dict[str, Any]:
         return {"available": False, "path": path, "error": {"type": type(exc).__name__, "message": str(exc)}}
 
 
+def wait_for_controller_health(config: RunnerConfig, timeout_seconds: int = 180, interval_seconds: float = 2.0) -> dict[str, Any]:
+    """Wait until the controller /health endpoint is reachable.
+
+    This is intentionally based on config.controller_url so it also validates that
+    a local kubectl port-forward has recovered after a rollout.
+    """
+    if not config.controller_url:
+        return {"ok": True, "skipped": True, "reason": "controller_url_not_configured"}
+    started_at = now_epoch()
+    deadline = started_at + timeout_seconds
+    attempts: list[dict[str, Any]] = []
+    while now_epoch() <= deadline:
+        result = controller_get(config, "/health")
+        attempts.append({"timestamp": now_epoch(), "result": result})
+        if result.get("available") and int(result.get("status") or 0) == 200:
+            return {
+                "ok": True,
+                "skipped": False,
+                "started_at": started_at,
+                "ended_at": now_epoch(),
+                "timeout_seconds": timeout_seconds,
+                "attempts": attempts[-10:],
+            }
+        time.sleep(interval_seconds)
+    return {
+        "ok": False,
+        "skipped": False,
+        "started_at": started_at,
+        "ended_at": now_epoch(),
+        "timeout_seconds": timeout_seconds,
+        "attempts": attempts[-10:],
+        "reason": "controller_health_timeout",
+    }
+
+
+def prometheus_targets(config: RunnerConfig) -> dict[str, Any]:
+    if not config.prometheus_url:
+        return {"available": False, "reason": "prometheus_url_not_configured"}
+    url = f"{config.prometheus_url}/api/v1/targets"
+    try:
+        with urlopen(Request(url, headers={"User-Agent": "liveedgecast-experiment/1"}), timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return {"available": True, "response": payload}
+    except Exception as exc:
+        return {"available": False, "error": {"type": type(exc).__name__, "message": str(exc)}}
+
+
+def count_healthy_prometheus_targets(payload: dict[str, Any], namespace: str, job: str) -> int:
+    active_targets = ((payload.get("data") or {}).get("activeTargets") or []) if isinstance(payload, dict) else []
+    count = 0
+    for target in active_targets:
+        labels = target.get("labels") or {}
+        if labels.get("namespace") == namespace and labels.get("job") == job and target.get("health") == "up":
+            count += 1
+    return count
+
+
+def wait_for_prometheus_targets(config: RunnerConfig, jobs: Sequence[str] = ("controller", "proxy"), timeout_seconds: int = 180, interval_seconds: float = 5.0) -> dict[str, Any]:
+    """Wait until Prometheus has healthy active targets for the LiveEdgeCast services."""
+    if not config.prometheus_url:
+        return {"ok": True, "skipped": True, "reason": "prometheus_url_not_configured"}
+    started_at = now_epoch()
+    deadline = started_at + timeout_seconds
+    attempts: list[dict[str, Any]] = []
+    while now_epoch() <= deadline:
+        snapshot = prometheus_targets(config)
+        counts: dict[str, int] = {}
+        if snapshot.get("available"):
+            payload = snapshot.get("response") or {}
+            counts = {job: count_healthy_prometheus_targets(payload, config.namespace, job) for job in jobs}
+            if all(counts.get(job, 0) >= 1 for job in jobs):
+                return {
+                    "ok": True,
+                    "skipped": False,
+                    "started_at": started_at,
+                    "ended_at": now_epoch(),
+                    "timeout_seconds": timeout_seconds,
+                    "jobs": list(jobs),
+                    "counts": counts,
+                    "attempts": attempts[-10:],
+                }
+        attempts.append({"timestamp": now_epoch(), "counts": counts, "snapshot": snapshot if not snapshot.get("available") else {"available": True}})
+        time.sleep(interval_seconds)
+    return {
+        "ok": False,
+        "skipped": False,
+        "started_at": started_at,
+        "ended_at": now_epoch(),
+        "timeout_seconds": timeout_seconds,
+        "jobs": list(jobs),
+        "attempts": attempts[-10:],
+        "reason": "prometheus_targets_timeout",
+    }
+
+
+def prometheus_instant_result_count(result: dict[str, Any]) -> int:
+    response = result.get("response") or {}
+    data = response.get("data") or {}
+    return len(data.get("result") or [])
+
+
+def wait_for_scoped_controller_prometheus_samples(config: RunnerConfig, controller_label_selector: str, timeout_seconds: int = 180, interval_seconds: float = 5.0) -> dict[str, Any]:
+    """Wait until the patched controller context has been scraped by Prometheus.
+
+    rollout status and /health only prove that the Pod is up. The scientific run
+    also needs scoped Prometheus samples, otherwise range queries using
+    tenant/environment/region can miss the beginning of the experiment.
+    """
+    if not config.prometheus_url:
+        return {"ok": True, "skipped": True, "reason": "prometheus_url_not_configured"}
+    if not controller_label_selector:
+        return {"ok": True, "skipped": True, "reason": "controller_label_selector_not_configured"}
+    started_at = now_epoch()
+    deadline = started_at + timeout_seconds
+    attempts: list[dict[str, Any]] = []
+    queries = {
+        "controller_active_streams": "controller_active_streams$controller_label_selector",
+        "proxy_rtmp_stats_up": "proxy_rtmp_stats_up$controller_label_selector",
+    }
+    while now_epoch() <= deadline:
+        ts = now_epoch()
+        counts: dict[str, int] = {}
+        query_results: dict[str, Any] = {}
+        for name, query in queries.items():
+            result = prometheus_instant_query(config, query, ts, controller_label_selector=controller_label_selector)
+            counts[name] = prometheus_instant_result_count(result) if result.get("available") else 0
+            query_results[name] = {
+                "available": result.get("available"),
+                "rendered_query": result.get("rendered_query") or result.get("query"),
+                "error": result.get("error"),
+                "count": counts[name],
+            }
+        attempts.append({"timestamp": ts, "counts": counts, "queries": query_results})
+        if all(count >= 1 for count in counts.values()):
+            return {
+                "ok": True,
+                "skipped": False,
+                "started_at": started_at,
+                "ended_at": now_epoch(),
+                "timeout_seconds": timeout_seconds,
+                "controller_label_selector": controller_label_selector,
+                "counts": counts,
+                "attempts": attempts[-10:],
+            }
+        time.sleep(interval_seconds)
+    return {
+        "ok": False,
+        "skipped": False,
+        "started_at": started_at,
+        "ended_at": now_epoch(),
+        "timeout_seconds": timeout_seconds,
+        "controller_label_selector": controller_label_selector,
+        "attempts": attempts[-10:],
+        "reason": "scoped_prometheus_samples_timeout",
+    }
+
+
+def wait_for_deployment_context_stabilization(
+    config: RunnerConfig,
+    dirs: dict[str, Path],
+    phase: str,
+    deployments: Sequence[str],
+    controller_label_selector: str = "",
+) -> dict[str, Any]:
+    """Wait for rollout, controller health, and Prometheus visibility after context changes."""
+    commands: list[dict[str, Any]] = []
+    unique_deployments = list(dict.fromkeys(deployments))
+    for deployment in unique_deployments:
+        commands.append(run_cmd([
+            config.kubectl_path,
+            "rollout",
+            "status",
+            f"deployment/{deployment}",
+            "-n",
+            config.namespace,
+            "--timeout=180s",
+        ], timeout=210))
+
+    controller_health = wait_for_controller_health(config, timeout_seconds=180, interval_seconds=2.0)
+    prometheus_target_health = wait_for_prometheus_targets(config, timeout_seconds=180, interval_seconds=5.0)
+    scoped_prometheus_samples = wait_for_scoped_controller_prometheus_samples(
+        config,
+        controller_label_selector,
+        timeout_seconds=180,
+        interval_seconds=5.0,
+    ) if controller_label_selector else {"ok": True, "skipped": True, "reason": "no_scoped_selector_for_phase"}
+
+    result = {
+        "phase": phase,
+        "timestamp": now_epoch(),
+        "deployments": unique_deployments,
+        "commands": commands,
+        "controller_health": controller_health,
+        "prometheus_targets": prometheus_target_health,
+        "scoped_prometheus_samples": scoped_prometheus_samples,
+    }
+    result["ok"] = (
+        all(command.get("returncode") == 0 for command in commands)
+        and bool(controller_health.get("ok"))
+        and bool(prometheus_target_health.get("ok"))
+        and bool(scoped_prometheus_samples.get("ok"))
+    )
+    write_json(dirs["raw"] / f"deployment_context_stabilization_{phase}.json", result)
+    return result
+
+
 def collect_controller_http(config: RunnerConfig, dirs: dict[str, Path], phase: str) -> dict[str, Any]:
     result = {
         "phase": phase,
@@ -976,11 +1191,19 @@ def restore_context_keys(config: RunnerConfig, dirs: dict[str, Path], patch_resu
         if commands[-1].get("returncode") == 0:
             restored_deployments.append(deployment)
             commands.append(run_cmd([config.kubectl_path, "rollout", "status", f"deployment/{deployment}", "-n", config.namespace, "--timeout=120s"], timeout=150))
+    post_restore_stabilization = wait_for_deployment_context_stabilization(
+        config,
+        dirs,
+        phase="after_restore",
+        deployments=restored_deployments,
+        controller_label_selector="",
+    ) if restored_deployments else {"ok": not patched_deployments, "skipped": True, "reason": "no_restored_deployments"}
     result = {
         "commands": commands,
         "patched_deployments": patched_deployments,
         "restored_deployments": restored_deployments,
-        "ok": all(c.get("returncode") == 0 for c in commands),
+        "post_restore_stabilization": post_restore_stabilization,
+        "ok": all(c.get("returncode") == 0 for c in commands) and bool(post_restore_stabilization.get("ok")),
     }
     write_json(dirs["raw"] / "proxy_context_restore.json", result)
     return result
@@ -1039,16 +1262,27 @@ def patch_proxy_context(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str
             if rollout_result.get("returncode") == 0:
                 effective_deployments.append(deployment)
     effective_metric_scope = prometheus_controller_label_selector(config) if "controller" in effective_deployments else ""
+    post_patch_stabilization = wait_for_deployment_context_stabilization(
+        config,
+        dirs,
+        phase="after_patch",
+        deployments=effective_deployments,
+        controller_label_selector=effective_metric_scope,
+    ) if effective_deployments else {"ok": not patched_deployments, "skipped": True, "reason": "no_effective_deployments"}
+    if effective_metric_scope and not post_patch_stabilization.get("ok"):
+        # Do not scope later Prometheus analysis to labels that have not been observed yet.
+        effective_metric_scope = ""
     result = {
         "available": True,
         "skipped": False,
         "patched": bool(patched_deployments),
-        "all_patched": bool(effective_deployments) and all(c.get("returncode") == 0 for c in commands) and not skipped_deployments,
+        "all_patched": bool(effective_deployments) and all(c.get("returncode") == 0 for c in commands) and not skipped_deployments and bool(post_patch_stabilization.get("ok")),
         "patched_deployments": patched_deployments,
         "effective_deployments": effective_deployments,
         "skipped_deployments": skipped_deployments,
         "commands": commands,
         "previous_env": previous_env,
+        "post_patch_stabilization": post_patch_stabilization,
         "metric_scope": prometheus_controller_label_selector(config),
         "effective_metric_scope": effective_metric_scope,
         "controller_scope_effective": bool(effective_metric_scope),
@@ -2029,9 +2263,23 @@ def load_run_windows(config: RunnerConfig, dirs: dict[str, Path]) -> list[dict[s
     ]
 
 
+def scoped_identity_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"unknown", "none", "null"}:
+        return None
+    return text
+
+
 def event_matches_window_identity(event: dict[str, Any], window: dict[str, Any]) -> bool:
-    event_run_id = event.get("run_id")
-    if event_run_id and window.get("run_id") and str(event_run_id) != str(window.get("run_id")):
+    # Structured logs produced before --patch-proxy-context is enabled can carry
+    # run_id/scenario/experiment_id as "unknown". Treat those values as
+    # unspecified and fall back to the run window timestamp instead of dropping
+    # valid worker lifecycle evidence.
+    event_run_id = scoped_identity_value(event.get("run_id"))
+    window_run_id = scoped_identity_value(window.get("run_id"))
+    if event_run_id and window_run_id and event_run_id != window_run_id:
         return False
     event_rep = event.get("repetition")
     if isinstance(event_rep, int) and isinstance(window.get("repetition"), int) and event_rep != window.get("repetition"):
@@ -2125,7 +2373,8 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
             "t_ffmpeg_first_progress": entry.get("t_ffmpeg_first_progress"),
             "t_destination_received": entry.get("t_destination_received"),
         }
-        activation["event_detection_seconds"] = delta(activation.get("t_publish_start_proxy"), activation.get("t_controller_received_event"))
+        activation["event_detection_seconds"] = delta(activation.get("t_publish_start_proxy"), activation.get("t_controller_received_event"), TIMESTAMP_ORDERING_TOLERANCE_SECONDS)
+        activation["event_detection_status"] = delta_status(activation.get("t_publish_start_proxy"), activation.get("t_controller_received_event"), TIMESTAMP_ORDERING_TOLERANCE_SECONDS)
         activation["worker_create_seconds"] = delta(activation.get("t_worker_create_requested"), activation.get("t_worker_pod_created"))
         activation["worker_scheduling_seconds"] = delta(activation.get("t_worker_pod_created"), activation.get("t_worker_scheduled"))
         activation["worker_ready_seconds"] = delta(activation.get("t_worker_create_requested"), activation.get("t_worker_ready"))
@@ -2148,13 +2397,26 @@ def build_lifecycle_rows(config: RunnerConfig, dirs: dict[str, Path], publisher_
         release_rows.append(release)
     return activation_rows, release_rows, grouped
 
-def delta(start: Any, end: Any) -> float | None:
+def delta(start: Any, end: Any, tolerance_seconds: float = 0.0) -> float | None:
     if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
         return None
     value = float(end) - float(start)
     if value < 0:
+        if abs(value) <= tolerance_seconds:
+            return 0.0
         return None
     return value
+
+
+def delta_status(start: Any, end: Any, tolerance_seconds: float = 0.0) -> str:
+    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+        return "not_observable"
+    value = float(end) - float(start)
+    if value < 0:
+        if abs(value) <= tolerance_seconds:
+            return "clamped_to_zero_clock_skew_or_ordering_noise"
+        return "invalid_negative_delta"
+    return "observed"
 
 
 def window_for_timestamp(windows: list[dict[str, Any]], timestamp: Any, run_id: str | None = None) -> dict[str, Any] | None:
@@ -2174,39 +2436,56 @@ def repetition_for_timestamp(windows: list[dict[str, Any]], timestamp: Any) -> i
     return int(window.get("repetition") or 1) if window else None
 
 
-def worker_overlap_counts_from_controller_events(
+def worker_event_observations_from_controller_events(
     config: RunnerConfig,
     windows: list[dict[str, Any]],
     controller_events: list[dict[str, Any]],
-) -> dict[tuple[str, int, str], int]:
-    """Best-effort overlap detector based on controller worker lifecycle events.
+) -> tuple[dict[tuple[str, int, str], set[str]], dict[tuple[str, int, str], int]]:
+    """Return worker pods observed per stream and max observed overlap.
 
-    Pod snapshots can miss short overlaps. Controller events provide a denser
-    lifecycle signal when available. The result is the maximum simultaneously
-    active worker count observed per run/repetition/stream.
+    Kubernetes snapshots can miss short-lived workers when they are created and
+    deleted between snapshot phases. Controller structured events are denser and
+    carry the streamKey/worker_pod relation. Use them to prove that a worker was
+    observed for a stream, while still estimating duplicate simultaneous workers
+    from create/delete lifecycle events when those are present.
     """
+    observed: dict[tuple[str, int, str], set[str]] = {}
     max_counts: dict[tuple[str, int, str], int] = {}
+    worker_observation_events = {
+        "worker_create_requested",
+        "worker_created",
+        "worker_ready_observed",
+        "ffmpeg_started",
+        "ffmpeg_first_progress",
+        "stream_lifecycle_timestamp_observed",
+    }
     for window in windows:
         run_id = str(window.get("run_id") or config.run_id)
         rep = int(window.get("repetition") or 1)
         for stream in (window.get("stream_keys") or config.stream_keys):
+            key = (run_id, rep, stream)
             timeline: list[tuple[float, int, str]] = []
             for event in controller_events:
-                if event.get("stream") != stream:
+                if not event_stream_matches(event, stream):
                     continue
                 if not event_matches_window_identity(event, window) or not event_in_window(event, window, len(windows)):
                     continue
                 worker_pod = event.get("worker_pod")
                 ts = event.get("timestamp_epoch")
+                event_type = str(event.get("event_type") or "")
+                if worker_pod:
+                    observed.setdefault(key, set()).add(str(worker_pod))
                 if not worker_pod or not isinstance(ts, (int, float)):
                     continue
-                event_type = event.get("event_type")
                 if event_type == "worker_deleted":
                     timeline.append((float(ts), -1, str(worker_pod)))
                 elif event_type == "worker_created":
                     timeline.append((float(ts), 1, str(worker_pod)))
+                elif event_type in worker_observation_events:
+                    # A worker observation without a worker_created event is
+                    # enough to prove existence, but not enough to infer overlap.
+                    max_counts[key] = max(max_counts.get(key, 0), 1)
             active: set[str] = set()
-            max_count = 0
             # Deletions first at the same timestamp avoid false positives when
             # replacement events are emitted with coarse timestamp resolution.
             for _ts, action, worker_pod in sorted(timeline, key=lambda item: (item[0], item[1])):
@@ -2214,11 +2493,8 @@ def worker_overlap_counts_from_controller_events(
                     active.discard(worker_pod)
                 else:
                     active.add(worker_pod)
-                    max_count = max(max_count, len(active))
-            if max_count:
-                max_counts[(run_id, rep, stream)] = max_count
-    return max_counts
-
+                    max_counts[key] = max(max_counts.get(key, 0), len(active))
+    return observed, max_counts
 
 
 
@@ -2432,7 +2708,7 @@ def build_correctness_rows(
     # Track worker pods by snapshot to detect simultaneous duplication, not historical replacement across repetitions or resumed run ids.
     snapshot_workers: dict[tuple[str, int, Any, str], set[str]] = {}
     max_workers_by_stream: dict[tuple[str, int, str], int] = {}
-    event_max_workers_by_stream = worker_overlap_counts_from_controller_events(config, windows, controller_events)
+    event_worker_pods_by_stream, event_max_workers_by_stream = worker_event_observations_from_controller_events(config, windows, controller_events)
     duplicate_by_stream: dict[tuple[str, int, str], bool] = {}
     duplicate_rows = build_duplicate_streamkey_rows(config, dirs, controller_events, publisher_rows)
     duplicate_by_key = {(str(row.get("run_id") or config.run_id), int(row.get("repetition") or 0), row.get("stream_key")): row for row in duplicate_rows}
@@ -2471,7 +2747,8 @@ def build_correctness_rows(
         rep = int(window.get("repetition") or 1)
         stream_keys = window.get("stream_keys") or config.stream_keys
         for key in stream_keys:
-            max_count = max(max_workers_by_stream.get((run_id, rep, key), 0), event_max_workers_by_stream.get((run_id, rep, key), 0))
+            observed_event_workers = event_worker_pods_by_stream.get((run_id, rep, key), set())
+            max_count = max(max_workers_by_stream.get((run_id, rep, key), 0), event_max_workers_by_stream.get((run_id, rep, key), 0), 1 if observed_event_workers else 0)
             duplicate_info = duplicate_by_key.get((run_id, rep, key), {})
             rows.append({
                 "run_id": run_id,
@@ -2552,7 +2829,7 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
 
     activation_rows, release_rows, lifecycle_by_stream = build_lifecycle_rows(config, dirs, publisher_rows)
     activation_fields = [
-        "run_id", "repetition", "stream_key", "concurrency", "t_publish_start_client", "t_publish_start_proxy", "t_controller_received_event", "t_worker_create_requested", "t_worker_pod_created", "t_worker_scheduled", "t_worker_container_started", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress", "t_destination_received", "event_detection_seconds", "worker_create_seconds", "worker_scheduling_seconds", "worker_ready_seconds", "ffmpeg_start_seconds", "ffmpeg_first_progress_seconds", "total_activation_seconds", "status"
+        "run_id", "repetition", "stream_key", "concurrency", "t_publish_start_client", "t_publish_start_proxy", "t_controller_received_event", "t_worker_create_requested", "t_worker_pod_created", "t_worker_scheduled", "t_worker_container_started", "t_worker_ready", "t_ffmpeg_started", "t_ffmpeg_first_progress", "t_destination_received", "event_detection_seconds", "event_detection_status", "worker_create_seconds", "worker_scheduling_seconds", "worker_ready_seconds", "ffmpeg_start_seconds", "ffmpeg_first_progress_seconds", "total_activation_seconds", "status"
     ]
     write_csv(dirs["metrics"] / "activation_metrics.csv", activation_rows, activation_fields)
     write_csv(dirs["metrics"] / "release_metrics.csv", release_rows, ["run_id", "repetition", "stream_key", "release_detection_seconds", "worker_delete_seconds", "total_release_seconds", "status"])
@@ -2695,7 +2972,7 @@ def missing_metrics(config: RunnerConfig, prom: dict[str, Any], activation_rows:
             missing.append(f"per_stream_{field}")
     if not any(row.get("total_release_seconds") is not None for row in release_rows):
         missing.append("per_stream_total_release_seconds")
-    if not any(row.get("t_destination_received") is not None for row in activation_rows):
+    if config.require_destination_received and not any(row.get("t_destination_received") is not None for row in activation_rows):
         missing.append("t_destination_received")
     return sorted(set(missing))
 
@@ -2880,7 +3157,7 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
         ts = event.get("timestamp_epoch")
         if not stream or not worker or not isinstance(ts, (int, float)):
             continue
-        window = window_for_timestamp(windows, ts, event.get("run_id"))
+        window = window_for_timestamp(windows, ts, scoped_identity_value(event.get("run_id")))
         if window is None:
             continue
         if not event_matches_window_identity(event, window) or not event_in_window(event, window, len(windows)):
@@ -2920,14 +3197,16 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
                 distinct_workers.append(name)
         initial_pod = history[0] if history else {}
         final_pod = history[-1] if history else {}
+        observed_worker = distinct_workers[0] if distinct_workers else None
+        observed_proxy = final_pod.get("proxy_pod") or initial_pod.get("proxy_pod") or corr.get("primary_proxy_pod")
         rows.append({
             "run_id": run_id,
             "repetition": rep,
             "streamKey": stream_key,
-            "initial_worker": initial_pod.get("pod") or "não observado",
-            "final_worker": final_pod.get("pod") or "não observado",
+            "initial_worker": initial_pod.get("pod") or observed_worker or "não observado",
+            "final_worker": final_pod.get("pod") or observed_worker or "não observado",
             "worker_replacements_count": max(0, len(distinct_workers) - 1),
-            "proxy_owner": final_pod.get("proxy_pod") or "não observado",
+            "proxy_owner": observed_proxy or "não observado",
             "publisher_status": pub.get("publisher_status") or publisher_status(config, pub) if pub else "não observado",
             "activation_seconds": row.get("total_activation_seconds") or "não observável",
             "release_seconds": rel.get("total_release_seconds") or "não observável",
@@ -2956,7 +3235,10 @@ def required_prometheus_metrics_for_analysis(config: RunnerConfig) -> set[str]:
     run must not fail just because handover, recovery, orphan cleanup, or optional
     network metrics did not occur in that scenario.
     """
-    return set(CORE_PROMETHEUS_METRICS_FOR_ANALYSIS) | set(SCENARIO_PROMETHEUS_METRICS_FOR_ANALYSIS.get(config.scenario, set()))
+    required = set(CORE_PROMETHEUS_METRICS_FOR_ANALYSIS) | set(SCENARIO_PROMETHEUS_METRICS_FOR_ANALYSIS.get(config.scenario, set()))
+    if config.require_network_metrics:
+        required.update({"proxy_network_receive_bps", "proxy_network_transmit_bps"})
+    return required
 
 
 def metric_expected_for_analysis(config: RunnerConfig, metric: str) -> bool:
@@ -3100,6 +3382,11 @@ def generate_report(config: RunnerConfig, dirs: dict[str, Path], execution: dict
     resource_rows = metrics.get("resources") or []
     cost_rows = metrics.get("cost") or []
     discussion = discussion_text(config, report_json)
+    destination_received_limitation = (
+        "- `t_destination_received` só pode ser sustentado se houver callback/observação no destino externo.\n"
+        if config.require_destination_received
+        else ""
+    )
     report = f"""# Relatório Experimental LiveEdgeCast
 
 ## Resumo executivo
@@ -3167,8 +3454,7 @@ A verificação de um worker por streamKey e candidatos a órfãos foi salva em 
 
 - Métricas ausentes ou não observáveis nesta execução: {', '.join(unavailable) if unavailable else 'nenhuma limitação automática detectada'}.
 - Tempos per-stream de cold start dependem da exportação de timestamps pelo controller; quando não há endpoint per-stream, o relatório usa apenas histogramas Prometheus agregados.
-- `t_destination_received` só pode ser sustentado se houver callback/observação no destino externo.
-- A seção de atividade relativa de recursos usa pod-seconds e séries de pods ativos; ela não representa custo financeiro real de provedor de nuvem sem CPU/memória request-seconds e modelo de preço.
+{destination_received_limitation}- A seção de atividade relativa de recursos usa pod-seconds e séries de pods ativos; ela não representa custo financeiro real de provedor de nuvem sem CPU/memória request-seconds e modelo de preço.
 - Métricas de cAdvisor/kube-state-metrics são isoladas por namespace; para evitar contaminação, execute cada experimento em namespace dedicado ou use `--patch-proxy-context` para escopo das métricas do controller. O escopo do controller só é aplicado quando o patch do deployment `controller` foi efetivamente concluído.
 - Se a restauração de contexto falhar, o experimento deve ser tratado como inválido até limpeza manual do cluster.
 - A validade estatística depende do número de repetições e da disponibilidade de amostras em Prometheus.

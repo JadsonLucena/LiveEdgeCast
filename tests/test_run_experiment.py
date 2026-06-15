@@ -1251,3 +1251,137 @@ def test_parse_args_accepts_generated_source_controls(tmp_path):
     assert cfg.testsrc_size == "1920x1080"
     assert cfg.testsrc_rate == "30"
     assert cfg.audio_bitrate == "128k"
+
+
+def test_correctness_uses_unknown_run_id_controller_events_as_worker_evidence(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    (dirs["raw"] / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 10.0, "stream_keys": ["key1"]}) + "\n" +
+        json.dumps({"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 20.0, "stream_keys": ["key1"]}) + "\n"
+    )
+    (dirs["raw"] / "publishers.jsonl").write_text(
+        json.dumps({"event": "publisher_finished", "run_id": "run", "repetition": 1, "publisher_index": 1, "stream_key": "key1", "started_at": 11.0, "ended_at": 19.0, "returncode": 0}) + "\n"
+    )
+    events = [
+        {"timestamp_epoch": 12.0, "event_type": "worker_created", "stream": "key1", "worker_pod": "worker-key1-abc", "run_id": "unknown", "scenario": "unknown"},
+        {"timestamp_epoch": 13.0, "event_type": "ffmpeg_first_progress", "stream": "key1", "worker_pod": "worker-key1-abc", "run_id": "unknown", "scenario": "unknown"},
+    ]
+    (dirs["raw"] / "controller_events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    runner.build_metrics(cfg, dirs)
+
+    rows = list(__import__("csv").DictReader((dirs["metrics"] / "correctness_metrics.csv").open()))
+    stream_row = next(row for row in rows if row["stream_key"] == "key1")
+    assert stream_row["worker_observed_for_stream"] == "True"
+    assert stream_row["one_worker_per_stream"] == "True"
+
+
+def test_missing_metrics_does_not_require_destination_by_default(tmp_path):
+    cfg = config(tmp_path)
+    missing = runner.missing_metrics(
+        cfg,
+        {},
+        activation_rows=[{
+            "t_controller_received_event": 1.0,
+            "t_worker_create_requested": 1.1,
+            "t_worker_ready": 1.2,
+            "t_ffmpeg_started": 1.3,
+            "t_ffmpeg_first_progress": 1.4,
+        }],
+        release_rows=[{"total_release_seconds": 2.0}],
+    )
+
+    assert "t_destination_received" not in missing
+
+
+def test_missing_metrics_can_require_destination_when_explicit(tmp_path):
+    cfg = config(tmp_path)
+    cfg.require_destination_received = True
+    missing = runner.missing_metrics(
+        cfg,
+        {},
+        activation_rows=[{
+            "t_controller_received_event": 1.0,
+            "t_worker_create_requested": 1.1,
+            "t_worker_ready": 1.2,
+            "t_ffmpeg_started": 1.3,
+            "t_ffmpeg_first_progress": 1.4,
+        }],
+        release_rows=[{"total_release_seconds": 2.0}],
+    )
+
+    assert "t_destination_received" in missing
+
+
+def test_require_network_metrics_promotes_proxy_network_to_required(tmp_path):
+    cfg = config(tmp_path)
+    assert "proxy_network_receive_bps" not in runner.required_prometheus_metrics_for_analysis(cfg)
+    assert "proxy_network_transmit_bps" not in runner.required_prometheus_metrics_for_analysis(cfg)
+
+    cfg.require_network_metrics = True
+
+    required = runner.required_prometheus_metrics_for_analysis(cfg)
+    assert "proxy_network_receive_bps" in required
+    assert "proxy_network_transmit_bps" in required
+
+
+def test_build_stream_result_rows_uses_unknown_run_id_controller_events_for_worker_columns(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    (dirs["raw"] / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 10.0, "stream_keys": ["key1"]}) + "\n" +
+        json.dumps({"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 30.0, "stream_keys": ["key1"]}) + "\n"
+    )
+    (dirs["raw"] / "publishers.jsonl").write_text(
+        json.dumps({"event": "publisher_finished", "run_id": "run", "repetition": 1, "publisher_index": 1, "stream_key": "key1", "started_at": 11.0, "ended_at": 29.0, "returncode": 0, "publisher_status": "success"}) + "\n"
+    )
+    activation_header = ["run_id", "repetition", "stream_key", "total_activation_seconds", "status"]
+    with (dirs["metrics"] / "activation_metrics.csv").open("w", newline="") as f:
+        import csv
+        writer = csv.DictWriter(f, fieldnames=activation_header)
+        writer.writeheader()
+        writer.writerow({"run_id": "run", "repetition": "1", "stream_key": "key1", "total_activation_seconds": "5.0", "status": "derived_from_controller_structured_logs"})
+    (dirs["metrics"] / "release_metrics.csv").write_text("run_id,repetition,stream_key,total_release_seconds\nrun,1,key1,1.0\n")
+    (dirs["metrics"] / "correctness_metrics.csv").write_text(
+        "run_id,repetition,stream_key,worker_observed_for_stream,duplicate_worker_detected,primary_proxy_pod\n"
+        "run,1,key1,True,False,proxy-a\n"
+    )
+    events = [
+        {"timestamp_epoch": 12.0, "event_type": "worker_created", "stream": "key1", "worker_pod": "worker-key1-abc", "proxy_pod": "proxy-a", "run_id": "unknown"},
+        {"timestamp_epoch": 13.0, "event_type": "worker_ready_observed", "stream": "key1", "worker_pod": "worker-key1-abc", "proxy_pod": "proxy-a", "run_id": "unknown"},
+    ]
+    (dirs["raw"] / "controller_events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    rows = runner.build_stream_result_rows(cfg, dirs)
+
+    row = rows[0]
+    assert row["initial_worker"] == "worker-key1-abc"
+    assert row["final_worker"] == "worker-key1-abc"
+    assert row["proxy_owner"] == "proxy-a"
+
+
+def test_event_detection_small_negative_delta_is_clamped_and_classified(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    (dirs["raw"] / "streams.jsonl").write_text(
+        json.dumps({"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 90.0, "stream_keys": ["key1"]}) + "\n" +
+        json.dumps({"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 200.0, "stream_keys": ["key1"]}) + "\n"
+    )
+    (dirs["raw"] / "publishers.jsonl").write_text(
+        json.dumps({"event":"publisher_finished","run_id":"run","repetition":1,"stream_key":"key1","started_at":100.0,"ended_at":200.0,"returncode":0}) + "\n"
+    )
+    events = [
+        {"timestamp_epoch":101.010,"event_type":"stream_lifecycle_timestamp_observed","stream":"key1","message":"t_publish_start_proxy observed from proxy_hook"},
+        {"timestamp_epoch":101.000,"event_type":"stream_lifecycle_timestamp_observed","stream":"key1","message":"t_controller_received_event observed from controller"},
+        {"timestamp_epoch":102.0,"event_type":"stream_lifecycle_timestamp_observed","stream":"key1","message":"t_worker_create_requested observed from controller"},
+        {"timestamp_epoch":103.0,"event_type":"stream_lifecycle_timestamp_observed","stream":"key1","message":"t_ffmpeg_first_progress observed from worker"},
+    ]
+    (dirs["raw"] / "controller_events.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events))
+
+    runner.build_metrics(cfg, dirs)
+
+    import csv
+    row = list(csv.DictReader((dirs["metrics"] / "activation_metrics.csv").open()))[0]
+    assert row["event_detection_seconds"] == "0.0"
+    assert row["event_detection_status"] == "clamped_to_zero_clock_skew_or_ordering_noise"

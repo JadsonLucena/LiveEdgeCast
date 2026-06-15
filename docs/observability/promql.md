@@ -1043,25 +1043,25 @@ count(kube_pod_info{namespace="$namespace", pod=~"proxy-.*"})
 ### pod_cpu_rate
 
 ```promql
-sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="", pod=~"(worker|proxy|controller).*"}[1m]))
+sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))
 ```
 
 ### pod_memory_working_set
 
 ```promql
-sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="", pod=~"(worker|proxy|controller).*"})
+sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})
 ```
 
 ### proxy_network_receive_bps
 
 ```promql
-sum by (pod) (rate(container_network_receive_bytes_total{namespace="$namespace", pod=~"proxy-.*"}[1m]))
+sum by (pod) (rate(container_network_receive_bytes_total{namespace="$namespace", interface!="lo", pod=~"(proxy-lb|proxy|worker|controller)-.*", pod=~"proxy-.*", pod!~"proxy-lb-.*"}[1m]))
 ```
 
 ### stream_lifecycle_phase_seconds_p95
 
 ```promql
-histogram_quantile(0.95, sum by (le, phase) (rate(stream_lifecycle_phase_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by (le, phase) (increase(stream_lifecycle_phase_seconds_bucket[5m])))
 ```
 
 ### worker_recovery_duration_seconds_p95

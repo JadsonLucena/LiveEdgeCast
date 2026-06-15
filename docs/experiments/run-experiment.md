@@ -126,7 +126,7 @@ O runner não altera a documentação do repositório durante a execução. Todo
 
 ## Limitações esperadas
 
-- `t_destination_received` só é observável se houver callback do destino ou receptor experimental.
+- `t_destination_received` só é observável se houver callback do destino ou receptor experimental. Por padrão, o runner **não** trata essa métrica como obrigatória; use `--require-destination-received` apenas quando a campanha experimental incluir um destino instrumentado.
 - Métricas per-stream dependem de logs estruturados do controller/worker.
 - Métricas FFmpeg exportadas pelos workers são escopadas por padrão com `namespace="$namespace"`. Ajuste `--worker-metric-label-selector` ou `LIVEEDGECAST_WORKER_METRIC_LABEL_SELECTOR` quando o Prometheus usa outro nome de label; use string vazia apenas se esses exporters realmente não carregarem labels de scrape.
 - Gráficos só são gerados quando há amostras reais; caso contrário, o runner cria um `.txt` explicando a ausência de dados.
@@ -162,7 +162,11 @@ Evite essa opção em namespaces compartilhados.
 - `0`: experimento válido, `partial` aceito explicitamente com `--allow-partial`, patch de contexto incompleto aceito explicitamente com `--allow-unscoped-context`, ou hipótese inconclusiva aceita explicitamente com `--allow-inconclusive`.
 - `1`: experimento `failed`, `partial` sem `--allow-partial`, patch de contexto solicitado mas inefetivo sem `--allow-unscoped-context`, falha de restauração de contexto após `--patch-proxy-context` sem `--allow-restore-failure`, cenário `handover`/`duplicate-streamkey` inconclusivo sem `--allow-inconclusive`, ou Prometheus configurado com `--require-prometheus-analysis` sem amostras obrigatórias suficientes.
 
-Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI. Use `--allow-unscoped-context` somente quando aceita que logs/métricas do controller podem não estar correlacionados por labels de experimento. Use `--allow-restore-failure` somente após confirmar limpeza manual do cluster, pois a restauração malsucedida pode deixar deployments com variáveis de ambiente experimentais. Use `--allow-inconclusive` apenas quando a execução será analisada manualmente e não será tratada como evidência conclusiva automática. Para coleta de dados de artigo, use `--require-prometheus-analysis` junto com `--prometheus-url`; assim o comando falha quando os arquivos Prometheus existem, mas as séries obrigatórias do cenário não possuem amostras utilizáveis. A validação é sensível ao cenário: um `cold-start` não falha por ausência de métricas de `handover`, `worker_recovery` ou limpeza de órfãos. Métricas opcionais que dependem do cluster, como `container_network_receive_bytes_total`/`container_network_transmit_bytes_total`, continuam aparecendo em `metrics/prometheus_metric_coverage.csv`, mas não bloqueiam o smoke quando não existem no Prometheus local.
+O script `tools/experiments/smoke_k8s_experiment.sh` passa `--controller-url` automaticamente quando `CONTROLLER_URL` ou `LIVEEDGECAST_CONTROLLER_URL` está definido; por padrão, usa `http://127.0.0.1:8000`. Também aceita `PATCH_PROXY_CONTEXT=true` e `REQUIRE_NETWORK_METRICS=true` para ativar, respectivamente, `--patch-proxy-context` e `--require-network-metrics` sem editar o script.
+
+A métrica `event_detection_seconds_per_stream` usa pequena tolerância para ruído de ordenação/relógio entre proxy e controller. Deltas negativos dentro de 50 ms são registrados como `0.0` e classificados em `event_detection_status` como `clamped_to_zero_clock_skew_or_ordering_noise`; deltas negativos maiores continuam inválidos/não observáveis.
+
+Use `--allow-partial` apenas quando deseja gerar relatório mesmo com falhas parciais sem quebrar automações/CI. Use `--allow-unscoped-context` somente quando aceita que logs/métricas do controller podem não estar correlacionados por labels de experimento. Use `--allow-restore-failure` somente após confirmar limpeza manual do cluster, pois a restauração malsucedida pode deixar deployments com variáveis de ambiente experimentais. Use `--allow-inconclusive` apenas quando a execução será analisada manualmente e não será tratada como evidência conclusiva automática. Para coleta de dados de artigo, use `--require-prometheus-analysis` junto com `--prometheus-url`; assim o comando falha quando os arquivos Prometheus existem, mas as séries obrigatórias do cenário não possuem amostras utilizáveis. A validação é sensível ao cenário: um `cold-start` não falha por ausência de métricas de `handover`, `worker_recovery` ou limpeza de órfãos. Métricas opcionais que dependem do cluster, como `container_network_receive_bytes_total`/`container_network_transmit_bytes_total`, continuam aparecendo em `metrics/prometheus_metric_coverage.csv`, mas não bloqueiam o smoke quando não existem no Prometheus local. Para a campanha final em cluster que exponha rede por Pod, use `--require-network-metrics` para tornar `proxy_network_receive_bps` e `proxy_network_transmit_bps` obrigatórias. Use `--require-destination-received` somente quando houver receptor externo instrumentado; transmissões para YouTube/RTMPS sem callback não devem exigir `t_destination_received`.
 
 `metrics/cost_estimation.csv` é gerado por padrão como alias de compatibilidade com o plano original, sempre com aviso de depreciação. O artefato primário para a discussão do artigo continua sendo `metrics/resource_activity.csv`, pois representa atividade relativa por pod-seconds, não custo financeiro real. `--legacy-output` permanece aceito por compatibilidade, mas não é mais necessário para gerar o alias.
 
@@ -219,3 +223,11 @@ Antes de coletar dados finais para o artigo, execute o smoke test e arquive inte
 - `automation_status=passed` e `automation_exit_code=0`.
 
 Se qualquer item necessário estiver ausente, trate o relatório como evidência exploratória ou qualitativa, não como resultado final da avaliação.
+
+
+### Opções de validação adicionais
+
+- `--require-network-metrics`: torna `proxy_network_receive_bps` e `proxy_network_transmit_bps` obrigatórias. Use em clusters que expõem `container_network_receive_bytes_total` e `container_network_transmit_bytes_total` via cAdvisor/kubelet ou equivalente.
+- `--require-destination-received`: torna `t_destination_received` obrigatório. Não use em campanhas cujo destino é YouTube/RTMPS sem receptor externo instrumentado.
+
+A verificação de correção por stream combina snapshots Kubernetes com eventos estruturados do controller. Isso evita marcar `worker_observed_for_stream=false` quando um worker nasceu e morreu entre snapshots, mas teve eventos como `worker_created`, `ffmpeg_started` ou `ffmpeg_first_progress`.

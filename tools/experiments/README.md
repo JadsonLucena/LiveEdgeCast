@@ -103,3 +103,14 @@ Useful optional parameters:
 - `--target-worker-pod` / `--target_worker_pod`: exact worker pod to delete in `kill_worker`. Defaults to `TARGET_WORKER_POD` when set.
 - `--ffmpeg-path` / `--ffmpeg_path`: FFmpeg executable. Defaults to `ffmpeg` or `FFMPEG`.
 - `--kubectl-path` / `--kubectl_path`: kubectl executable. Defaults to `kubectl` or `KUBECTL`.
+
+## Scientific validation switches
+
+- Use `--require-prometheus-analysis` to fail automation when scenario-required Prometheus series are missing.
+- Use `--require-network-metrics` only in clusters that expose Pod network counters such as `container_network_receive_bytes_total` and `container_network_transmit_bytes_total`; this makes proxy RX/TX mandatory evidence.
+- Use `--require-destination-received` only when an instrumented destination receiver reports `t_destination_received`. It should remain disabled for YouTube/RTMPS targets without callback telemetry.
+
+Correctness metrics combine Kubernetes snapshots with controller structured events, so short-lived workers observed via `worker_created`, `worker_ready_observed`, `ffmpeg_started`, or `ffmpeg_first_progress` are still counted even when they are absent from before/after snapshots. The Markdown stream table uses the same event-derived worker/proxy evidence so `initial_worker`, `final_worker`, and `proxy_owner` remain populated for short-lived workers.
+- `tools/experiments/smoke_k8s_experiment.sh` passes `--controller-url` by default from `CONTROLLER_URL`/`LIVEEDGECAST_CONTROLLER_URL` or `http://127.0.0.1:8000`; set `CONTROLLER_URL=` to skip controller preflight artifacts.
+- `PATCH_PROXY_CONTEXT=true` enables `--patch-proxy-context` in the smoke script. Use this for official multi-run campaigns when controller metrics must be scoped by experiment context.
+- `REQUIRE_NETWORK_METRICS=true` enables `--require-network-metrics` in the smoke script for clusters that expose Pod network counters.

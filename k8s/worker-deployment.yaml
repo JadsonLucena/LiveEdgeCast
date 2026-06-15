@@ -17,7 +17,7 @@ spec:
           imagePullPolicy: Never
           env:
             - name: RTMP_PUSH_BASE_URL
-              value: "rtmp://a.rtmp.youtube.com/live2"
+              value: "rtmp://mediaserver.eadmeeting.com/LiveApp"
           ports:
             - containerPort: 1935
               name: rtmp

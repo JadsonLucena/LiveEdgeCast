@@ -77,7 +77,7 @@ Resume séries do Prometheus para CPU, memória e rede, incluindo média, median
 
 ### `correctness_metrics.csv`
 
-Resume indícios de correção por `run_id + repetition + streamKey`. O arquivo separa `worker_observed_for_stream`, `at_most_one_worker_per_stream` e `one_worker_per_stream`, evitando considerar uma stream sem worker observado como válida. Duplicidade combina snapshots de pods com eventos estruturados do controller para reduzir o risco de perder sobreposições transitórias; substituições históricas entre repetições não são tratadas como duplicidade.
+Resume indícios de correção por `run_id + repetition + streamKey`. O arquivo separa `worker_observed_for_stream`, `at_most_one_worker_per_stream` e `one_worker_per_stream`, evitando considerar uma stream sem worker observado como válida. Duplicidade combina snapshots de pods com eventos estruturados do controller para reduzir o risco de perder sobreposições transitórias; substituições históricas entre repetições não são tratadas como duplicidade. A coluna `worker_observed_for_stream` considera evidências densas de controller events (`worker_created`, `worker_ready_observed`, `ffmpeg_started`, `ffmpeg_first_progress`) para não perder workers curtos que nasceram e morreram entre snapshots Kubernetes.
 
 ### `duplicate_streamkey_metrics.csv`
 
@@ -144,3 +144,13 @@ Esses marcadores devem ser arquivados junto com o relatório antes de usar os da
 ### Evidências Prometheus instantâneas
 
 Além de `raw/prometheus_range_queries.run.<run-id>.json`, o runner salva `raw/prometheus_instant_queries.run.<run-id>.json` e `raw/prometheus_instant_queries.json` com consultas instantâneas no final da janela de observação. Elas complementam a auditoria; as métricas consolidadas usam as range queries.
+
+
+### Métricas opcionais por desenho experimental
+
+`proxy_network_receive_bps` e `proxy_network_transmit_bps` são opcionais por padrão porque nem todo cluster local expõe `container_network_*`. Em experimentos finais que tenham rede por Pod disponível, rode o runner com `--require-network-metrics`. `t_destination_received` não é listado como lacuna obrigatória por padrão; ele só deve ser exigido com `--require-destination-received` quando houver receptor de destino instrumentado.
+
+A tabela `Resultado por streamKey` combina snapshots Kubernetes com eventos estruturados do controller. Quando o worker é criado e removido entre snapshots, `initial_worker`, `final_worker` e `proxy_owner` podem ser preenchidos por eventos como `worker_created`, `worker_ready_observed`, `ffmpeg_started` e `ffmpeg_first_progress`.
+
+`activation_metrics.csv` inclui `event_detection_status` para indicar se `event_detection_seconds` foi observado diretamente, ficou ausente ou foi normalizado para `0.0` por ruído pequeno de ordenação/clock entre proxy e controller.
+

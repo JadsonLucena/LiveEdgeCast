@@ -630,6 +630,8 @@ proxy_rtmp_active_clients = controller_gauge('proxy_rtmp_active_clients', 'Activ
 proxy_rtmp_stream_active = controller_gauge('proxy_rtmp_stream_active', 'Whether each proxy has at least one active RTMP stream', ('proxy_pod',))
 proxy_rtmp_stats_up = controller_gauge('proxy_rtmp_stats_up', 'Whether the last proxy RTMP /stats scrape succeeded', ('proxy_pod',))
 worker_pods_available = controller_gauge('worker_pods_available','Available worker pods for allocation',('namespace',))
+# Initialize labeled gauge so Prometheus sees a series even before any worker is created.
+worker_pods_available.labels(namespace=NAMESPACE).set(0)
 controller_active_streams = controller_gauge('controller_active_streams', 'Active streams currently tracked by the controller')
 controller_active_allocations = controller_gauge('controller_active_allocations', 'Active stream-to-worker allocations currently tracked by the controller')
 stream_proxy_handover_counter = controller_counter('stream_proxy_handover_total','Total proxy handovers accepted by controller')
@@ -2219,11 +2221,44 @@ def recover_state(
         raise
 
 
+def update_worker_pods_available_metric() -> None:
+    """Update the Ready worker Pod gauge from the Kubernetes API.
+
+    This gauge is a small controller-owned readiness/capacity signal. It does
+    not replace cAdvisor/kube-state-metrics for scientific CPU, memory, network,
+    or pod-second analysis.
+    """
+    try:
+        pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker").items
+    except ApiException as e:
+        record_kubernetes_api_error("list", "pod", e)
+        logger.warning(f"[InfrastructureMetrics] Failed to list worker pods: {e}")
+        return
+    except Exception as e:
+        logger.warning(f"[InfrastructureMetrics] Failed to list worker pods: {e}")
+        return
+
+    ready_count = 0
+    for pod in pods:
+        metadata = getattr(pod, "metadata", None)
+        status = getattr(pod, "status", None)
+        if not metadata or getattr(metadata, "deletion_timestamp", None):
+            continue
+        if not status or getattr(status, "phase", None) not in {"Running", "Pending"}:
+            continue
+        conditions = getattr(status, "conditions", None) or []
+        if any(getattr(c, "type", None) == "Ready" and getattr(c, "status", None) == "True" for c in conditions):
+            ready_count += 1
+    worker_pods_available.labels(namespace=NAMESPACE).set(ready_count)
+
+
 async def collect_infrastructure_metrics():
+    # Publish the worker readiness gauge promptly so short smoke tests get a
+    # series even before the first periodic interval completes. The heavy
+    # resource metrics remain sourced from Prometheus/cAdvisor.
     while True:
-        await asyncio.sleep(30)
-        # real CPU/memory/network metrics must be scraped from cAdvisor/kubelet metrics
-        pass
+        update_worker_pods_available_metric()
+        await asyncio.sleep(5)
 
 
 

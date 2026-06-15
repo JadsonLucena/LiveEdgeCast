@@ -47,7 +47,7 @@ O projeto já implementa parte importante da arquitetura **pull-only** (Proxy re
    - Existem mecanismos de handover, mas a política pode ser simplificada para evitar trabalho duplicado: se troca de proxy inevitavelmente derruba consumo, priorizar recriação limpa do worker com estado atualizado.
 
 7. **URL base de ingest do YouTube em variável de ambiente Kubernetes**
-   - Hoje o script usa URL fixa `rtmp://a.rtmp.youtube.com/live2/` no worker.
+   - Hoje o script usa URL fixa `rtmp://mediaserver.eadmeeting.com/LiveApp/` no worker.
 
 8. **Guard rail de unicidade de stream key simultânea**
    - Existem sinais de controle por owner/proxy no registro, mas a garantia precisa ser explícita e transacional (uma única stream ativa por chave em qualquer condição de corrida).
