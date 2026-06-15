@@ -36,10 +36,18 @@ spec:
               memory: "1Gi"
               cpu: "1000m"
           readinessProbe:
-            tcpSocket: { port: 1935 }
-            initialDelaySeconds: 3
-            periodSeconds: 5
-          livenessProbe:
-            tcpSocket: { port: 1935 }
+            httpGet:
+              path: /healthz
+              port: metrics
             initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 20
             periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6

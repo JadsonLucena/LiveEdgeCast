@@ -17,6 +17,42 @@ EXPERIMENT_ID="$(sanitize_context_value "${EXPERIMENT_ID:-unknown}")"
 SCENARIO="$(sanitize_context_value "${SCENARIO:-unknown}")"
 RUN_ID="$(sanitize_context_value "${RUN_ID:-unknown}")"
 
+SESSION_DIR="${LIVEEDGECAST_SESSION_DIR:-/tmp/liveedgecast-sessions}"
+mkdir -p "$SESSION_DIR"
+
+sanitize_file_key() {
+  jq -rn --arg value "${1:-unknown}" '
+    ($value | gsub("[^a-zA-Z0-9_.:-]+"; "_") | .[:160]) as $sanitized
+    | if $sanitized == "" then "unknown" else $sanitized end
+  '
+}
+
+stream_session_file() {
+  printf '%s/%s.session' "$SESSION_DIR" "$(sanitize_file_key "$STREAM_NAME")"
+}
+
+generate_session_id() {
+  local raw hash
+  raw="${PROXY_POD}|${STREAM_NAME}|${PUBLISH_START_TS}|$$|${RANDOM:-0}"
+  if command -v sha256sum >/dev/null 2>&1; then
+    hash="$(printf '%s' "$raw" | sha256sum | awk '{print $1}')"
+  else
+    hash="$(printf '%s' "$raw" | cksum | awk '{print $1}')"
+  fi
+  printf '%s' "$hash"
+}
+
+persist_session() {
+  local file
+  file="$(stream_session_file)"
+  {
+    printf 'session_id=%s\n' "$SESSION_ID"
+    printf 'publish_start_ts=%s\n' "$PUBLISH_START_TS"
+    printf 'proxy_pod=%s\n' "$PROXY_POD"
+  } > "${file}.tmp"
+  mv "${file}.tmp" "$file"
+}
+
 utc_timestamp() {
   local timestamp
   timestamp="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || true)"
@@ -61,6 +97,7 @@ notify_stream_started() {
     --data-urlencode "stream=${STREAM_NAME}" \
     --data-urlencode "proxy_pod=${PROXY_POD}" \
     --data-urlencode "t_publish_start_proxy=${PUBLISH_START_TS}" \
+    --data-urlencode "session_id=${SESSION_ID}" \
     --data-urlencode "experiment_id=${EXPERIMENT_ID}" \
     --data-urlencode "scenario=${SCENARIO}" \
     --data-urlencode "run_id=${RUN_ID}" \
@@ -68,6 +105,8 @@ notify_stream_started() {
 }
 
 PUBLISH_START_TS="$(high_resolution_epoch_seconds)"
+SESSION_ID="${LIVEEDGECAST_SESSION_ID:-$(generate_session_id)}"
+persist_session
 log_event "proxy_publish_started" "received"
 
 if notify_stream_started; then

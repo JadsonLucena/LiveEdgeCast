@@ -17,6 +17,38 @@ EXPERIMENT_ID="$(sanitize_context_value "${EXPERIMENT_ID:-unknown}")"
 SCENARIO="$(sanitize_context_value "${SCENARIO:-unknown}")"
 RUN_ID="$(sanitize_context_value "${RUN_ID:-unknown}")"
 
+SESSION_DIR="${LIVEEDGECAST_SESSION_DIR:-/tmp/liveedgecast-sessions}"
+
+sanitize_file_key() {
+  jq -rn --arg value "${1:-unknown}" '
+    ($value | gsub("[^a-zA-Z0-9_.:-]+"; "_") | .[:160]) as $sanitized
+    | if $sanitized == "" then "unknown" else $sanitized end
+  '
+}
+
+stream_session_file() {
+  printf '%s/%s.session' "$SESSION_DIR" "$(sanitize_file_key "$STREAM_NAME")"
+}
+
+load_session() {
+  local file line key value
+  file="$(stream_session_file)"
+  SESSION_ID=""
+  PUBLISH_START_TS=""
+  if [ -f "$file" ]; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        session_id) SESSION_ID="$value" ;;
+        publish_start_ts) PUBLISH_START_TS="$value" ;;
+      esac
+    done < "$file"
+  fi
+}
+
+cleanup_session() {
+  rm -f "$(stream_session_file)" 2>/dev/null || true
+}
+
 utc_timestamp() {
   local timestamp
   timestamp="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ 2>/dev/null || true)"
@@ -50,16 +82,20 @@ notify_stream_ended() {
     -H "X-LiveEdgeCast-Run-Id: ${RUN_ID}" \
     --data-urlencode "stream=${STREAM_NAME}" \
     --data-urlencode "proxy_pod=${PROXY_POD}" \
+    --data-urlencode "session_id=${SESSION_ID}" \
+    --data-urlencode "t_publish_start_proxy=${PUBLISH_START_TS}" \
     --data-urlencode "experiment_id=${EXPERIMENT_ID}" \
     --data-urlencode "scenario=${SCENARIO}" \
     --data-urlencode "run_id=${RUN_ID}" \
     "${CONTROLLER_API}/streams/ended"
 }
 
+load_session
 log_event "proxy_publish_ended" "received"
 
 if notify_stream_ended; then
   log_event "proxy_publish_done_notified" "success"
+  cleanup_session
 else
   log_event "proxy_publish_done_notify_failed" "failed"
 fi

@@ -18,7 +18,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple
 from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from fastapi.responses import Response
 
@@ -86,10 +86,18 @@ class ProxyRtmpStats:
     active_streams: int
     active_publishers: int
     active_clients: int
+    stream_names: FrozenSet[str] = frozenset()
 
     @property
     def stream_active(self) -> int:
         return 1 if self.active_streams > 0 else 0
+
+    def has_stream(self, stream: str) -> Optional[bool]:
+        if self.stream_names:
+            return stream in self.stream_names
+        if self.active_streams == 0:
+            return False
+        return None
 
 
 @dataclass(frozen=True)
@@ -588,10 +596,12 @@ PROXY_HEALTHCHECK_MAX_FAILURES = 3
 PROXY_HEALTHCHECK_TIMEOUT_SECONDS = 2
 PROXY_HEALTHCHECK_MAX_CONCURRENCY = 20
 PROXY_HEALTHCHECK_JITTER_SECONDS = 1.5
-WORKER_HEALTHCHECK_INTERVAL_SECONDS = 3
-WORKER_HEALTHCHECK_MAX_FAILURES = 3
-WORKER_HEALTHCHECK_JITTER_SECONDS = 1.5
-WORKER_READY_HEALTH_DELAY_SECONDS = 3  # Wait after worker Ready before worker /health probes.
+WORKER_HEALTHCHECK_INTERVAL_SECONDS = get_int_env("WORKER_HEALTHCHECK_INTERVAL_SECONDS", 3, min_value=1)
+WORKER_HEALTHCHECK_MAX_FAILURES = get_int_env("WORKER_HEALTHCHECK_MAX_FAILURES", 3, min_value=1)
+WORKER_HEALTHCHECK_JITTER_SECONDS = float(os.getenv("WORKER_HEALTHCHECK_JITTER_SECONDS", "1.5"))
+# Keep this longer than the worker input-open retry window so the controller does not
+# replace a cold-starting worker while FFmpeg is still retrying the proxy input.
+WORKER_READY_HEALTH_DELAY_SECONDS = get_int_env("WORKER_READY_HEALTH_DELAY_SECONDS", 50, min_value=0)
 WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS = 60
 WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS = get_int_env("WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS", 5, min_value=1)
 CONTROLLER_DESTINATION_CALLBACK_ENABLED = get_bool_env("CONTROLLER_DESTINATION_CALLBACK_ENABLED", False)
@@ -1392,16 +1402,17 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
         pod_spec = copy.deepcopy(template.spec)
         pod_metadata = copy.deepcopy(template.metadata) if template.metadata else client.V1ObjectMeta()
 
-        pod_spec.restart_policy = "Always"
+        pod_spec.restart_policy = os.getenv("WORKER_POD_RESTART_POLICY", "Never")
 
         for c in pod_spec.containers:
             env = list(c.env or [])
-            env = [e for e in env if e.name not in ("STREAM_KEY", "PROXY_DNS", "STREAM_GENERATION", "CONTROLLER_API")]
+            env = [e for e in env if e.name not in ("STREAM_KEY", "PROXY_DNS", "STREAM_GENERATION", "CONTROLLER_API", "WORKER_POD")]
             generation_value = str(stream_generation.get(stream, 1))
             env.append(client.V1EnvVar(name="STREAM_KEY", value=stream))
             env.append(client.V1EnvVar(name="PROXY_DNS", value=proxy_dns))
             env.append(client.V1EnvVar(name="STREAM_GENERATION", value=generation_value))
             env.append(client.V1EnvVar(name="CONTROLLER_API", value=WORKER_CONTROLLER_API))
+            env.append(client.V1EnvVar(name="WORKER_POD", value=pod_name))
             c.env = env
 
         labels = dict(pod_metadata.labels or {})
@@ -1546,11 +1557,22 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
     )
     return new_worker
 
-def register_or_refresh_stream(stream: str, proxy_pod: str):
+def register_or_refresh_stream(
+    stream: str,
+    proxy_pod: str,
+    session_id: Optional[str] = None,
+    publish_start_ts: Optional[float] = None,
+):
+    """Creates or refreshes canonical stream ownership on proxy.
+
+    session_id is optional for backward compatibility, but when provided it lets
+    /streams/ended reject stale publish_done callbacks from earlier RTMP sessions
+    that reused the same stream key.
     """
-    Creates or refreshes canonical stream ownership on proxy.
-    """
-    if stream not in stream_generation or stream not in stream_registry:
+    current = stream_registry.get(stream)
+    current_session = current.get("session_id") if current else None
+    session_changed = bool(session_id and current_session and current_session != session_id)
+    if stream not in stream_generation or stream not in stream_registry or session_changed:
         previous_generations = stream_lifecycle_timestamps.get(stream, {})
         previous_lifecycle_generation = max(previous_generations) if previous_generations else 0
         previous_high_water_generation = generation_to_int(stream_generation_high_water.get(stream)) or 0
@@ -1568,9 +1590,14 @@ def register_or_refresh_stream(stream: str, proxy_pod: str):
         ),
     )
     prune_stream_generation_high_water_locked()
-    stream_registry[stream] = {
+    registry_entry = {
         "proxy_pod": proxy_pod,
     }
+    if session_id:
+        registry_entry["session_id"] = session_id
+    if publish_start_ts is not None:
+        registry_entry["publish_start_ts"] = str(publish_start_ts)
+    stream_registry[stream] = registry_entry
     stream_to_proxy[stream] = proxy_pod
     proxy_health_failures[proxy_pod] = 0
     return None
@@ -1899,6 +1926,12 @@ def _json_has_truthy_key(node: Any, names: Iterable[str]) -> bool:
 def parse_proxy_rtmp_stats_xml(payload: str) -> ProxyRtmpStats:
     root = ET.fromstring(payload)
     streams = [element for element in root.iter() if _xml_local_name(element.tag) == "stream"]
+    stream_names = frozenset(
+        (child.text or "").strip()
+        for stream_element in streams
+        for child in list(stream_element)
+        if _xml_local_name(child.tag) == "name" and (child.text or "").strip()
+    )
     clients = [element for element in root.iter() if _xml_local_name(element.tag) == "client"]
     publishers = [
         client_element
@@ -1910,11 +1943,25 @@ def parse_proxy_rtmp_stats_xml(payload: str) -> ProxyRtmpStats:
         active_streams=len(streams),
         active_publishers=len(publishers),
         active_clients=len(clients),
+        stream_names=stream_names,
     )
 
 
 def parse_proxy_rtmp_stats_json(payload: str) -> ProxyRtmpStats:
     data = json.loads(payload)
+    streams = [stream for stream in _collect_json_values(data, "stream") if isinstance(stream, dict)]
+    stream_names = frozenset(
+        str(stream.get("name") or stream.get("stream") or stream.get("streamName") or "").strip()
+        for stream in streams
+        if str(stream.get("name") or stream.get("stream") or stream.get("streamName") or "").strip()
+    )
+    clients = [client_item for client_item in _collect_json_values(data, "client") if isinstance(client_item, dict)]
+    publishers = [
+        client_item
+        for client_item in clients
+        if _json_has_truthy_key(client_item, ("publishing", "publisher", "is_publisher", "isPublisher"))
+    ]
+
     if isinstance(data, dict):
         direct_streams = data.get("active_streams", data.get("activeStreams"))
         direct_publishers = data.get("active_publishers", data.get("activePublishers"))
@@ -1923,19 +1970,13 @@ def parse_proxy_rtmp_stats_json(payload: str) -> ProxyRtmpStats:
             active_streams = _safe_int(direct_streams)
             active_publishers = _safe_int(direct_publishers)
             active_clients = _safe_int(direct_clients)
-            return ProxyRtmpStats(active_streams, active_publishers, active_clients)
+            return ProxyRtmpStats(active_streams, active_publishers, active_clients, stream_names=stream_names)
 
-    streams = [stream for stream in _collect_json_values(data, "stream") if isinstance(stream, dict)]
-    clients = [client_item for client_item in _collect_json_values(data, "client") if isinstance(client_item, dict)]
-    publishers = [
-        client_item
-        for client_item in clients
-        if _json_has_truthy_key(client_item, ("publishing", "publisher", "is_publisher", "isPublisher"))
-    ]
     return ProxyRtmpStats(
         active_streams=len(streams),
         active_publishers=len(publishers),
         active_clients=len(clients),
+        stream_names=stream_names,
     )
 
 
@@ -1998,6 +2039,32 @@ def scrape_proxy_rtmp_stats(proxy_pod: str, pod_ip: str) -> ProxyRtmpStats:
     response = requests.get(f"http://{pod_ip}:8080/stats", timeout=PROXY_RTMP_STATS_TIMEOUT_SECONDS)
     response.raise_for_status()
     return parse_proxy_rtmp_stats(response.text, response.headers.get("Content-Type", ""))
+
+
+def get_stream_activity_on_proxy(stream: str, proxy_pod: str) -> Optional[bool]:
+    """Return whether a specific stream is active on a proxy.
+
+    True/False is returned when /stats gives enough evidence. None means the
+    proxy could not be scraped or the stats format did not expose stream names
+    while still reporting some active streams. Callers should treat None as
+    inconclusive and avoid destructive replacement decisions.
+    """
+    try:
+        proxy_ip = resolve_proxy_address(proxy_pod)
+        stats = scrape_proxy_rtmp_stats(proxy_pod, proxy_ip)
+        activity = stats.has_stream(stream)
+        logger.debug(
+            "[ProxyRtmpStats] Stream activity check "
+            f"stream='{stream}' proxy_pod='{proxy_pod}' active={activity} "
+            f"active_streams={stats.active_streams} stream_names={sorted(stats.stream_names)}"
+        )
+        return activity
+    except Exception as e:
+        logger.warning(
+            f"[ProxyRtmpStats] Failed checking stream activity for stream '{stream}' "
+            f"on proxy '{proxy_pod}': {e}"
+        )
+        return None
 
 
 async def collect_proxy_rtmp_stats_once() -> None:
@@ -2420,7 +2487,22 @@ async def monitor_worker_health():
                     )
                     continue
 
-                logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for stream '{stream}'. Replacing.")
+                stream_active = get_stream_activity_on_proxy(stream, owner_proxy)
+                if stream_active is False:
+                    logger.info(
+                        f"[WorkerHealth] Worker '{worker_pod}' is unhealthy, but stream '{stream}' "
+                        f"is no longer active on proxy '{owner_proxy}'. Releasing stale allocation instead of replacing."
+                    )
+                    await release_worker(stream=stream)
+                    continue
+                if stream_active is None:
+                    logger.info(
+                        f"[WorkerHealth] Delaying replacement of worker '{worker_pod}' for stream '{stream}' "
+                        f"because proxy stream activity is inconclusive."
+                    )
+                    continue
+
+                logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for active stream '{stream}'. Replacing.")
                 recovery_started_at = time.monotonic()
                 recovery_status = "error"
                 recovery_reason = "exception"
@@ -2899,7 +2981,9 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
 
 def register_stream(
     stream: str = Query(..., description="Stream name"),
-    proxy_pod: str = Query(..., description="Proxy pod name")
+    proxy_pod: str = Query(..., description="Proxy pod name"),
+    session_id: Optional[str] = Query(None, description="RTMP publish session id"),
+    publish_start_ts: Optional[float] = Query(None, description="Proxy-side publish-start epoch seconds"),
 ):
     started_at = time.monotonic()
     metric_status = "error"
@@ -2907,7 +2991,7 @@ def register_stream(
     try:
         with allocation_lock:
             current = stream_registry.get(stream)
-            was_replay = current and current.get("proxy_pod") == proxy_pod
+            was_replay = current and current.get("proxy_pod") == proxy_pod and (not session_id or current.get("session_id") == session_id)
 
             if not try_handover_stream_owner(stream, proxy_pod):
                 current_owner = stream_registry.get(stream, {}).get("proxy_pod")
@@ -2917,6 +3001,7 @@ def register_stream(
                     detail=f"stream '{stream}' already owned by proxy '{current_owner}'"
                 )
 
+            register_or_refresh_stream(stream, proxy_pod, session_id=session_id, publish_start_ts=publish_start_ts)
             persist_state_locked()
 
             if was_replay:
@@ -2959,7 +3044,8 @@ def register_stream(
 def stream_started(
     stream: str = Query(..., description="Stream name"),
     proxy_pod: str = Query(..., description="Proxy pod that received publish"),
-    t_publish_start_proxy: Optional[float] = Query(None, description="Proxy-side publish-start epoch seconds")
+    t_publish_start_proxy: Optional[float] = Query(None, description="Proxy-side publish-start epoch seconds"),
+    session_id: Optional[str] = Query(None, description="RTMP publish session id"),
 ):
     """Single controller entrypoint when proxy publish starts.
     Controller performs register/allocation/start orchestration.
@@ -2976,7 +3062,7 @@ def stream_started(
         status=LOG_STATUS_RECEIVED,
     )
     try:
-        registration = register_stream(stream=stream, proxy_pod=proxy_pod)
+        registration = register_stream(stream=stream, proxy_pod=proxy_pod, session_id=session_id, publish_start_ts=t_publish_start_proxy)
         generation = stream_generation.get(stream)
         if t_publish_start_proxy is not None:
             record_stream_lifecycle_timestamp(
@@ -3116,7 +3202,9 @@ def stream_destination_received(
 @app.post("/streams/ended")
 async def stream_ended(
     stream: str = Query(..., description="Stream name"),
-    proxy_pod: str = Query(None, description="Proxy pod that ended publish")
+    proxy_pod: str = Query(None, description="Proxy pod that ended publish"),
+    session_id: Optional[str] = Query(None, description="RTMP publish session id"),
+    t_publish_start_proxy: Optional[float] = Query(None, description="Proxy-side publish-start epoch seconds echoed from start hook"),
 ):
     """Single controller entrypoint when proxy publish ends.
     Controller performs full cleanup (registry + worker release).
@@ -3136,6 +3224,33 @@ async def stream_ended(
             if proxy_pod:
                 current = stream_registry.get(stream)
                 if current and current.get("proxy_pod") == proxy_pod:
+                    current_session = current.get("session_id")
+                    if session_id and current_session and session_id != current_session:
+                        stale_ended_events_ignored_total.labels(status=LOG_STATUS_IGNORED, reason="session_id_mismatch").inc()
+                        stream_ended_events_total.labels(status=LOG_STATUS_IGNORED, reason="stale_session_mismatch").inc()
+                        logger.info(
+                            f"[StreamsEnded] Ignored stale ended event for stream '{stream}' "
+                            f"from proxy='{proxy_pod}' session='{session_id}' current_session='{current_session}'"
+                        )
+                        log_controller_event(
+                            "stale_event_ignored",
+                            stream=stream,
+                            proxy_pod=proxy_pod,
+                            started_at=started_at,
+                            status=LOG_STATUS_IGNORED,
+                            level=logging.WARNING,
+                            message="stale publish_done ignored due to session_id mismatch",
+                        )
+                        metric_status = "success"
+                        metric_reason = "stale_session_ignored"
+                        return {
+                            "status": "stale_ended_ignored",
+                            "reason": "session_id_mismatch",
+                            "stream": stream,
+                            "proxy_pod": proxy_pod,
+                            "received_session_id": session_id,
+                            "current_session_id": current_session,
+                        }
                     stream_registry.pop(stream, None)
                     stream_to_proxy.pop(stream, None)
                     cleanup_stream_lifecycle_tracking_locked(stream)

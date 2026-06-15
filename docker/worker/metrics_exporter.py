@@ -558,6 +558,32 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         path = urlparse(self.path).path
+
+        if path in ("/healthz", "/livez"):
+            payload = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if path == "/readyz":
+            # Readiness is intentionally stricter than liveness: it reports 200 only
+            # after FFmpeg is running and has produced recent progress. Kubernetes
+            # manifests in this project use /healthz for pod liveness/readiness to
+            # avoid killing cold-starting workers before input is available, while
+            # /readyz remains useful for manual diagnostics.
+            payload_text = self.collector.collect()
+            healthy = any(line == "worker_ffmpeg_health_state 1" for line in payload_text.splitlines())
+            payload = ("ready\n" if healthy else "not_ready\n").encode("utf-8")
+            self.send_response(200 if healthy else 503)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
         if path not in ("/metrics", "/"):
             self.send_response(404)
             self.end_headers()

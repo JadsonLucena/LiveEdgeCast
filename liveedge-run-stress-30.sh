@@ -55,6 +55,7 @@ PORT_FORWARD_RESTART_AFTER_LEVEL="${PORT_FORWARD_RESTART_AFTER_LEVEL:-false}"
 PORT_FORWARD_VERIFY_TIMEOUT_SECONDS="${PORT_FORWARD_VERIFY_TIMEOUT_SECONDS:-90}"
 PORT_FORWARD_VERIFY_INTERVAL_SECONDS="${PORT_FORWARD_VERIFY_INTERVAL_SECONDS:-2}"
 PORT_FORWARD_RESTART_COOLDOWN_SECONDS="${PORT_FORWARD_RESTART_COOLDOWN_SECONDS:-2}"
+UNIQUE_KEYS_PER_REPETITION="${UNIQUE_KEYS_PER_REPETITION:-true}"
 
 mkdir -p "$BASE_OUTPUT_DIR/keys" "$BASE_OUTPUT_DIR/logs"
 CAMPAIGN_LOG="$BASE_OUTPUT_DIR/stress-campaign.log"
@@ -405,32 +406,27 @@ PY
   fi
 }
 
-run_stress_level() {
+run_experiment_once() {
   local stream_count="$1"
-  local repetitions="$2"
+  local repetition_index="$2"
   local duration="$3"
-  local cooldown="$4"
-  local scenario="concurrency"
+  local scenario="$4"
   local timestamp experiment_id report_dir key_file
 
-  if bool_true "$PORT_FORWARD_RESTART_BEFORE_LEVEL"; then
-    manage_port_forward restart
-  elif bool_true "$PORT_FORWARD_WATCHDOG"; then
-    ensure_port_forward_ready
-  fi
-
   timestamp="$(date +%Y%m%d-%H%M%S)"
-  experiment_id="stress-${stream_count}streams-${timestamp}"
+  if bool_true "$UNIQUE_KEYS_PER_REPETITION"; then
+    experiment_id="stress-${stream_count}streams-r${repetition_index}-${timestamp}"
+    key_file="$(make_keys "$stream_count" "stress-${stream_count}streams-r${repetition_index}" "$timestamp")"
+  else
+    experiment_id="stress-${stream_count}streams-${timestamp}"
+    key_file="$(make_keys "$stream_count" "stress-${stream_count}streams" "$timestamp")"
+  fi
   report_dir="$BASE_OUTPUT_DIR/$experiment_id"
-  key_file="$(make_keys "$stream_count" "stress-${stream_count}streams" "$timestamp")"
   mkdir -p "$report_dir"
 
-  log "================================================================================"
-  log "Starting stress level: streams=$stream_count repetitions=$repetitions duration=${duration}s cooldown=${cooldown}s"
   log "Experiment: $experiment_id"
   log "Report dir:  $report_dir"
   log "Keys file:   $key_file"
-  log "================================================================================"
 
   local flags=()
   while IFS= read -r flag; do
@@ -442,8 +438,8 @@ run_stress_level() {
     --scenario "$scenario"
     --stream-keys-file "$key_file"
     --duration-seconds "$duration"
-    --repetitions "$repetitions"
-    --cooldown-seconds "$cooldown"
+    --repetitions 1
+    --cooldown-seconds 0
     --startup-interval-seconds 0
     --prometheus-url "$PROMETHEUS_URL"
     --controller-url "$CONTROLLER_URL"
@@ -451,7 +447,7 @@ run_stress_level() {
     --rtmp-url "$RTMP_URL"
     --output-dir "$report_dir"
     --experiment-id "$experiment_id"
-    --run-id "stress-${stream_count}streams"
+    --run-id "stress-${stream_count}streams-r${repetition_index}"
     --bitrate "$BITRATE"
     --testsrc-size "$TESTSRC_SIZE"
     --testsrc-rate "$TESTSRC_RATE"
@@ -469,7 +465,7 @@ run_stress_level() {
   cat "$report_dir.command.txt" | tee -a "$CAMPAIGN_LOG"
 
   if bool_true "$DRY_RUN"; then
-    log "DRY_RUN=true; not executing level $stream_count."
+    log "DRY_RUN=true; not executing ${stream_count} streams repetition ${repetition_index}."
     return 0
   fi
 
@@ -482,20 +478,127 @@ run_stress_level() {
   end=$(date +%s)
   elapsed=$(( end - start ))
 
-  log "Level ${stream_count} streams finished with rc=$rc elapsed=${elapsed}s"
+  log "Experiment ${experiment_id} finished with rc=$rc elapsed=${elapsed}s"
   summarize_level "$report_dir"
 
-  if bool_true "$PORT_FORWARD_RESTART_AFTER_LEVEL"; then
-    manage_port_forward restart
-  elif bool_true "$PORT_FORWARD_WATCHDOG"; then
-    ensure_port_forward_ready || true
-  fi
-
   if [[ "$rc" -ne 0 ]]; then
-    fail "run_experiment.py failed for ${stream_count} streams with rc=$rc. See $CAMPAIGN_LOG"
+    fail "run_experiment.py failed for ${stream_count} streams repetition ${repetition_index} with rc=$rc. See $CAMPAIGN_LOG"
   fi
 
-  check_elapsed_guard "$stream_count" "$repetitions" "$duration" "$elapsed"
+  check_elapsed_guard "$stream_count" 1 "$duration" "$elapsed"
+}
+
+run_stress_level() {
+  local stream_count="$1"
+  local repetitions="$2"
+  local duration="$3"
+  local cooldown="$4"
+  local scenario="concurrency"
+
+  log "================================================================================"
+  log "Starting stress level: streams=$stream_count repetitions=$repetitions duration=${duration}s cooldown=${cooldown}s unique_keys_per_repetition=${UNIQUE_KEYS_PER_REPETITION}"
+  log "================================================================================"
+
+  if bool_true "$UNIQUE_KEYS_PER_REPETITION"; then
+    local rep
+    for rep in $(seq 1 "$repetitions"); do
+      if bool_true "$PORT_FORWARD_RESTART_BEFORE_LEVEL"; then
+        manage_port_forward restart
+      elif bool_true "$PORT_FORWARD_WATCHDOG"; then
+        ensure_port_forward_ready
+      fi
+
+      run_experiment_once "$stream_count" "$rep" "$duration" "$scenario"
+
+      if bool_true "$PORT_FORWARD_RESTART_AFTER_LEVEL"; then
+        manage_port_forward restart
+      elif bool_true "$PORT_FORWARD_WATCHDOG"; then
+        ensure_port_forward_ready || true
+      fi
+
+      if [[ "$rep" -lt "$repetitions" && "$cooldown" -gt 0 ]]; then
+        log "Cooldown after ${stream_count} streams repetition ${rep}: ${cooldown}s"
+        sleep "$cooldown"
+      fi
+    done
+  else
+    # Legacy behavior: a single run_experiment.py call with reused stream keys across repetitions.
+    # This is kept for backwards compatibility but is not recommended for scientific stress campaigns,
+    # because delayed publish_done callbacks can collide with later repetitions using the same stream key.
+    if bool_true "$PORT_FORWARD_RESTART_BEFORE_LEVEL"; then
+      manage_port_forward restart
+    elif bool_true "$PORT_FORWARD_WATCHDOG"; then
+      ensure_port_forward_ready
+    fi
+
+    local timestamp experiment_id report_dir key_file
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    experiment_id="stress-${stream_count}streams-${timestamp}"
+    report_dir="$BASE_OUTPUT_DIR/$experiment_id"
+    key_file="$(make_keys "$stream_count" "stress-${stream_count}streams" "$timestamp")"
+    mkdir -p "$report_dir"
+
+    log "Experiment: $experiment_id"
+    log "Report dir:  $report_dir"
+    log "Keys file:   $key_file"
+
+    local flags=()
+    while IFS= read -r flag; do
+      [[ -n "$flag" ]] && flags+=("$flag")
+    done < <(build_flags)
+
+    local cmd=(
+      "$PYTHON_BIN" tools/experiments/run_experiment.py
+      --scenario "$scenario"
+      --stream-keys-file "$key_file"
+      --duration-seconds "$duration"
+      --repetitions "$repetitions"
+      --cooldown-seconds "$cooldown"
+      --startup-interval-seconds 0
+      --prometheus-url "$PROMETHEUS_URL"
+      --controller-url "$CONTROLLER_URL"
+      --namespace "$NAMESPACE"
+      --rtmp-url "$RTMP_URL"
+      --output-dir "$report_dir"
+      --experiment-id "$experiment_id"
+      --run-id "stress-${stream_count}streams"
+      --bitrate "$BITRATE"
+      --testsrc-size "$TESTSRC_SIZE"
+      --testsrc-rate "$TESTSRC_RATE"
+      --audio-bitrate "$AUDIO_BITRATE"
+      "${flags[@]}"
+      --overwrite
+    )
+    if [[ -n "$SECONDARY_RTMP_URL" ]]; then
+      cmd+=(--secondary-rtmp-url "$SECONDARY_RTMP_URL")
+    fi
+    printf '%q ' "${cmd[@]}" > "$report_dir.command.txt"
+    echo >> "$report_dir.command.txt"
+    cat "$report_dir.command.txt" | tee -a "$CAMPAIGN_LOG"
+    if bool_true "$DRY_RUN"; then
+      log "DRY_RUN=true; not executing level $stream_count."
+      return 0
+    fi
+    local start end elapsed rc
+    start=$(date +%s)
+    set +e
+    "${cmd[@]}" 2>&1 | tee -a "$CAMPAIGN_LOG"
+    rc=${PIPESTATUS[0]}
+    set -e
+    end=$(date +%s)
+    elapsed=$(( end - start ))
+    log "Level ${stream_count} streams finished with rc=$rc elapsed=${elapsed}s"
+    summarize_level "$report_dir"
+    if bool_true "$PORT_FORWARD_RESTART_AFTER_LEVEL"; then
+      manage_port_forward restart
+    elif bool_true "$PORT_FORWARD_WATCHDOG"; then
+      ensure_port_forward_ready || true
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+      fail "run_experiment.py failed for ${stream_count} streams with rc=$rc. See $CAMPAIGN_LOG"
+    fi
+    check_elapsed_guard "$stream_count" "$repetitions" "$duration" "$elapsed"
+  fi
 
   if [[ "$WAIT_AFTER_LEVEL_SECONDS" -gt 0 ]]; then
     log "Waiting ${WAIT_AFTER_LEVEL_SECONDS}s after level ${stream_count}..."
@@ -529,6 +632,7 @@ port_forward_watchdog=$PORT_FORWARD_WATCHDOG
 port_forward_restart_before_preflight=$PORT_FORWARD_RESTART_BEFORE_PREFLIGHT
 port_forward_restart_before_level=$PORT_FORWARD_RESTART_BEFORE_LEVEL
 port_forward_restart_after_level=$PORT_FORWARD_RESTART_AFTER_LEVEL
+unique_keys_per_repetition=$UNIQUE_KEYS_PER_REPETITION
 EOF_META
 }
 
