@@ -173,13 +173,37 @@ progress_file_has_complete_line() {
 ffmpeg_attempt_log_has_destination_open_error() {
   local log_file="$1"
   [ -f "$log_file" ] || return 1
-  grep -qiE 'Error opening output|Error opening output file|Could not write header|Failed to update header|av_interleaved_write_frame|Broken pipe|Connection refused|Connection reset by peer|Immediate exit requested|Output file.*I/O error' "$log_file"
+
+  # Keep output classification contextual. Generic network errors such as
+  # "Connection refused" can also happen while opening the input proxy RTMP URL,
+  # so they must not be classified as destination errors unless the output URL
+  # appears in the same log line or FFmpeg explicitly reports an output failure.
+  if grep -qiE 'Error opening output|Error opening output file|Could not write header|Failed to update header|av_interleaved_write_frame|Output file.*I/O error' "$log_file"; then
+    return 0
+  fi
+
+  if [ -n "${TARGET_RTMP:-}" ] \
+    && grep -F "$TARGET_RTMP" "$log_file" | grep -qiE 'Connection refused|Connection reset by peer|Broken pipe|I/O error|Immediate exit requested|Operation timed out|Connection timed out'; then
+    return 0
+  fi
+
+  return 1
 }
 
 ffmpeg_attempt_log_has_input_open_error() {
   local log_file="$1"
   [ -f "$log_file" ] || return 1
-  grep -qiE 'Error opening input|Error opening input file|Input/output error|Server error: Already publishing|Operation timed out|Connection timed out' "$log_file"
+
+  if grep -qiE 'Error opening input|Error opening input file|Input/output error|Server error: Already publishing|Operation timed out|Connection timed out' "$log_file"; then
+    return 0
+  fi
+
+  if [ -n "${PROXY_RTMP:-}" ] \
+    && grep -F "$PROXY_RTMP" "$log_file" | grep -qiE 'Connection refused|Connection reset by peer|I/O error|Operation timed out|Connection timed out'; then
+    return 0
+  fi
+
+  return 1
 }
 
 log_ffmpeg_started_once() {

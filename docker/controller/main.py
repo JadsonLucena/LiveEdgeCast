@@ -1421,7 +1421,13 @@ def k8s_name_fragment(value: str, max_len: int = K8S_NAME_FRAGMENT_MAX_LENGTH) -
 
 
 
-def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
+def create_worker_pod_for_stream(
+    stream: str,
+    proxy_dns: str,
+    proxy_pod: Optional[str] = None,
+    generation: Optional[int] = None,
+    session_id: Optional[str] = None,
+) -> str:
     """
     Cria Pod por stream reaproveitando o template do worker Deployment.
 
@@ -1465,9 +1471,9 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
                     "WORKER_POD",
                 )
             ]
-            generation_value = str(stream_generation.get(stream, 1))
-            owner_proxy_pod = get_stream_proxy_pod(stream) or ""
-            session_id_value = str((stream_registry.get(stream) or {}).get("session_id") or "")
+            generation_value = str(generation if generation is not None else stream_generation.get(stream, 1))
+            owner_proxy_pod = str(proxy_pod if proxy_pod is not None else (get_stream_proxy_pod(stream) or ""))
+            session_id_value = str(session_id if session_id is not None else ((stream_registry.get(stream) or {}).get("session_id") or ""))
             env.append(client.V1EnvVar(name="STREAM_KEY", value=stream))
             env.append(client.V1EnvVar(name="PROXY_DNS", value=proxy_dns))
             env.append(client.V1EnvVar(name="PROXY_POD", value=owner_proxy_pod))
@@ -1482,9 +1488,9 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
         annotations = dict(getattr(pod_metadata, "annotations", None) or {})
         annotations.update({
             "liveedgecast.io/stream": stream,
-            "liveedgecast.io/generation": str(stream_generation.get(stream, 1)),
-            "liveedgecast.io/proxy-pod": get_stream_proxy_pod(stream) or "",
-            "liveedgecast.io/session-id": str((stream_registry.get(stream) or {}).get("session_id") or ""),
+            "liveedgecast.io/generation": generation_value,
+            "liveedgecast.io/proxy-pod": owner_proxy_pod,
+            "liveedgecast.io/session-id": session_id_value,
         })
 
         logger.debug(
@@ -1496,8 +1502,8 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
             spec=pod_spec,
         )
 
-        generation = stream_generation.get(stream)
-        proxy_pod = get_stream_proxy_pod(stream)
+        generation = generation_to_int(generation_value) or 1
+        proxy_pod = owner_proxy_pod
         create_request_recorded = record_stream_lifecycle_timestamp(
             stream, generation, "t_worker_create_requested",
             timestamp=time.time(), source="controller", worker_pod=pod_name, proxy_pod=proxy_pod,
@@ -1564,7 +1570,13 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
         return None
 
     try:
-        new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
+        new_worker = create_worker_pod_for_stream(
+            stream=stream,
+            proxy_dns=proxy_dns,
+            proxy_pod=get_stream_proxy_pod(stream) or "",
+            generation=generation_to_int(stream_generation.get(stream)) or 1,
+            session_id=(stream_registry.get(stream) or {}).get("session_id"),
+        )
     except Exception as e:
         worker_replacements_total.labels(status="error", reason="create_failed").inc()
         raise
@@ -2716,7 +2728,13 @@ async def monitor_worker_health():
                 recovery_reason = "exception"
                 try:
                     proxy_dns = resolve_proxy_address(owner_proxy)
-                    new_worker = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_dns)
+                    new_worker = create_worker_pod_for_stream(
+                        stream=stream,
+                        proxy_dns=proxy_dns,
+                        proxy_pod=owner_proxy,
+                        generation=generation_to_int(stream_generation.get(stream)) or 1,
+                        session_id=(stream_registry.get(stream) or {}).get("session_id"),
+                    )
                 except Exception as e:
                     recovery_reason = type(e).__name__
                     worker_recovery_duration_seconds.observe(time.monotonic() - recovery_started_at)
@@ -3060,7 +3078,18 @@ def allocate_worker(
             if stale_worker_to_delete:
                 delete_worker_pod_best_effort(stale_worker_to_delete, stream, owner_proxy, f"stale_idempotent_replay_{replay_reason}")
 
-        pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
+        pod_name = create_worker_pod_for_stream(
+            stream=stream,
+            proxy_dns=proxy_address,
+            proxy_pod=owner_proxy,
+            generation=generation_to_int(generation_snapshot) or 1,
+            session_id=session_snapshot,
+        )
+
+        discard_created_worker: Optional[str] = None
+        discard_reason: Optional[str] = None
+        replay_worker: Optional[str] = None
+        stale_owner_for_log: Optional[str] = None
 
         with allocation_lock:
             current_worker = stream_to_worker.get(stream)
@@ -3074,80 +3103,50 @@ def allocate_worker(
                 )
                 worker_create_started_at.pop(pod_name, None)
                 cleanup_worker_lifecycle_tracking_locked(pod_name)
-                try:
-                    core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
-                    record_worker_delete_metric("success", "concurrent_allocation")
-                    log_controller_event(
-                        "worker_deleted",
-                        stream=stream,
-                        proxy_pod=owner_proxy,
-                        worker_pod=pod_name,
-                        status=LOG_STATUS_DELETED,
-                    )
-                except ApiException as e:
-                    record_kubernetes_api_error("delete", "pod", e)
-                    record_worker_delete_metric("warning", "delete_failed")
-                    log_controller_event(
-                        "worker_deleted",
-                        stream=stream,
-                        proxy_pod=owner_proxy,
-                        worker_pod=pod_name,
-                        status=LOG_STATUS_DELETE_FAILED,
-                        level=logging.WARNING,
-                    )
-                    logger.warning(f"[Allocate] Failed deleting extra worker pod {pod_name}: {e}")
-                metric_status = "success"
-                metric_reason = "concurrent_idempotent_replay"
-                return {
-                    "pod": f"{current_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
-                    "name": current_worker,
-                    "proxy": proxy_address,
-                    "status": "idempotent_replay"
-                }
+                discard_created_worker = pod_name
+                discard_reason = "concurrent_allocation"
+                replay_worker = current_worker
 
-            if current_owner != owner_proxy or current_generation != generation_snapshot:
+            elif current_owner != owner_proxy or current_generation != generation_snapshot:
                 logger.warning(
                     f"[Allocate] Ownership changed while creating worker for stream '{stream}'. "
                     f"expected_owner='{owner_proxy}' current_owner='{current_owner}'. Deleting '{pod_name}'."
                 )
                 worker_create_started_at.pop(pod_name, None)
                 cleanup_worker_lifecycle_tracking_locked(pod_name)
-                try:
-                    core.delete_namespaced_pod(name=pod_name, namespace=NAMESPACE, grace_period_seconds=0)
-                    record_worker_delete_metric("success", "stale_allocation")
-                    log_controller_event(
-                        "worker_deleted",
-                        stream=stream,
-                        proxy_pod=owner_proxy,
-                        worker_pod=pod_name,
-                        status=LOG_STATUS_DELETED,
-                    )
-                except ApiException as e:
-                    record_kubernetes_api_error("delete", "pod", e)
-                    record_worker_delete_metric("warning", "delete_failed")
-                    log_controller_event(
-                        "worker_deleted",
-                        stream=stream,
-                        proxy_pod=owner_proxy,
-                        worker_pod=pod_name,
-                        status=LOG_STATUS_DELETE_FAILED,
-                        level=logging.WARNING,
-                    )
-                    logger.warning(f"[Allocate] Failed deleting stale worker pod {pod_name}: {e}")
-                log_controller_event(
-                    "stale_event_ignored",
-                    stream=stream,
-                    proxy_pod=current_owner,
-                    worker_pod=pod_name,
-                    status=LOG_STATUS_IGNORED,
-                    level=logging.WARNING,
-                )
-                metric_reason = "ownership_changed"
-                raise HTTPException(status_code=409, detail=f"stream '{stream}' ownership changed during allocation")
+                discard_created_worker = pod_name
+                discard_reason = "stale_allocation"
+                stale_owner_for_log = current_owner
 
-            stream_to_worker[stream] = pod_name
-            worker_to_stream[pod_name] = stream
-            persist_state_locked()
+            else:
+                stream_to_worker[stream] = pod_name
+                worker_to_stream[pod_name] = stream
+                persist_state_locked()
+
+        if discard_created_worker:
+            delete_worker_pod_best_effort(discard_created_worker, stream, owner_proxy, discard_reason or "discard_created_worker")
+
+        if replay_worker:
+            metric_status = "success"
+            metric_reason = "concurrent_idempotent_replay"
+            return {
+                "pod": f"{replay_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
+                "name": replay_worker,
+                "proxy": proxy_address,
+                "status": "idempotent_replay"
+            }
+
+        if stale_owner_for_log is not None:
+            log_controller_event(
+                "stale_event_ignored",
+                stream=stream,
+                proxy_pod=stale_owner_for_log,
+                worker_pod=pod_name,
+                status=LOG_STATUS_IGNORED,
+                level=logging.WARNING,
+            )
+            metric_reason = "ownership_changed"
+            raise HTTPException(status_code=409, detail=f"stream '{stream}' ownership changed during allocation")
 
         worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
         logger.info(f"[Allocate] Created dedicated worker pod {pod_name} for stream '{stream}'")
@@ -3538,6 +3537,18 @@ def stream_status(
         }
 
     current_session = current.get("session_id")
+    if session_id and not current_session:
+        return {
+            "status": "session_missing",
+            "stream": stream,
+            "active": None,
+            "reason": "current_stream_has_no_session_id",
+            "requested_session_id": session_id,
+            "session_id": current_session,
+            "proxy_pod": owner_proxy,
+            "worker_pod": worker_pod,
+            "generation": active_generation,
+        }
     if session_id and current_session and session_id != current_session:
         return {
             "status": "session_mismatch",
@@ -3553,7 +3564,19 @@ def stream_status(
 
     if requested_generation is not None:
         current_generation = generation_to_int(active_generation)
-        if current_generation is not None and int(requested_generation) != current_generation:
+        if current_generation is None:
+            return {
+                "status": "generation_missing",
+                "stream": stream,
+                "active": None,
+                "reason": "current_stream_has_no_generation",
+                "requested_generation": int(requested_generation),
+                "generation": active_generation,
+                "session_id": current_session,
+                "proxy_pod": owner_proxy,
+                "worker_pod": worker_pod,
+            }
+        if int(requested_generation) != current_generation:
             return {
                 "status": "generation_mismatch",
                 "stream": stream,
