@@ -611,6 +611,7 @@ WORKER_HEALTHCHECK_PORT = get_int_env("WORKER_HEALTHCHECK_PORT", 9113, min_value
 WORKER_HEALTHCHECK_PATH = os.getenv("WORKER_HEALTHCHECK_PATH", "/readyz")
 WORKER_HEALTHCHECK_TIMEOUT_SECONDS = float(os.getenv("WORKER_HEALTHCHECK_TIMEOUT_SECONDS", "2"))
 ALLOW_LEGACY_ENDED_WITHOUT_SESSION_ID = os.getenv("ALLOW_LEGACY_ENDED_WITHOUT_SESSION_ID", "false").lower() in {"1", "true", "yes", "y"}
+ALLOW_LEGACY_SESSION_REUSE = os.getenv("ALLOW_LEGACY_SESSION_REUSE", "false").lower() in {"1", "true", "yes", "y"}
 WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS = 60
 WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS = get_int_env("WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS", 5, min_value=1)
 CONTROLLER_DESTINATION_CALLBACK_ENABLED = get_bool_env("CONTROLLER_DESTINATION_CALLBACK_ENABLED", False)
@@ -649,9 +650,13 @@ proxy_rtmp_active_publishers = controller_gauge('proxy_rtmp_active_publishers', 
 proxy_rtmp_active_clients = controller_gauge('proxy_rtmp_active_clients', 'Active RTMP clients reported by each proxy /stats endpoint', ('proxy_pod',))
 proxy_rtmp_stream_active = controller_gauge('proxy_rtmp_stream_active', 'Whether each proxy has at least one active RTMP stream', ('proxy_pod',))
 proxy_rtmp_stats_up = controller_gauge('proxy_rtmp_stats_up', 'Whether the last proxy RTMP /stats scrape succeeded', ('proxy_pod',))
-worker_pods_available = controller_gauge('worker_pods_available','Available worker pods for allocation',('namespace',))
-# Initialize labeled gauge so Prometheus sees a series even before any worker is created.
+worker_pods_available = controller_gauge('worker_pods_available','Worker pods with processing readiness (/readyz); kept for backward-compatible dashboards',('namespace',))
+worker_pods_running = controller_gauge('worker_pods_running','Worker pods in Running or Pending phase and not deleting',('namespace',))
+worker_processing_ready = controller_gauge('worker_processing_ready','Worker pods whose Kubernetes Ready condition reflects FFmpeg processing readiness',('namespace',))
+# Initialize labeled gauges so Prometheus sees series even before any worker is created.
 worker_pods_available.labels(namespace=NAMESPACE).set(0)
+worker_pods_running.labels(namespace=NAMESPACE).set(0)
+worker_processing_ready.labels(namespace=NAMESPACE).set(0)
 controller_active_streams = controller_gauge('controller_active_streams', 'Active streams currently tracked by the controller')
 controller_active_allocations = controller_gauge('controller_active_allocations', 'Active stream-to-worker allocations currently tracked by the controller')
 stream_proxy_handover_counter = controller_counter('stream_proxy_handover_total','Total proxy handovers accepted by controller')
@@ -1391,7 +1396,11 @@ def random_suffix():
 def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
     """
     Cria Pod por stream reaproveitando o template do worker Deployment.
-    Apenas STREAM_KEY e PROXY_DNS são injetados dinamicamente.
+
+    STREAM_KEY identifica a publicação original. PROXY_DNS é o endereço usado
+    pelo FFmpeg para consumir o RTMP no proxy. PROXY_POD, SESSION_ID e
+    STREAM_GENERATION são contexto de controle usado para validar lifecycle no
+    controller sem confundir endereço/IP com identidade do Pod proxy.
     """
     started_at = time.monotonic()
     metric_status = "error"
@@ -1422,6 +1431,7 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
                     "STREAM_KEY",
                     "PROXY_DNS",
                     "PROXY_POD",
+                    "SESSION_ID",
                     "STREAM_GENERATION",
                     "CONTROLLER_API",
                     "WORKER_POD",
@@ -1429,9 +1439,11 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
             ]
             generation_value = str(stream_generation.get(stream, 1))
             owner_proxy_pod = get_stream_proxy_pod(stream) or ""
+            session_id_value = str((stream_registry.get(stream) or {}).get("session_id") or "")
             env.append(client.V1EnvVar(name="STREAM_KEY", value=stream))
             env.append(client.V1EnvVar(name="PROXY_DNS", value=proxy_dns))
             env.append(client.V1EnvVar(name="PROXY_POD", value=owner_proxy_pod))
+            env.append(client.V1EnvVar(name="SESSION_ID", value=session_id_value))
             env.append(client.V1EnvVar(name="STREAM_GENERATION", value=generation_value))
             env.append(client.V1EnvVar(name="CONTROLLER_API", value=WORKER_CONTROLLER_API))
             env.append(client.V1EnvVar(name="WORKER_POD", value=pod_name))
@@ -1444,6 +1456,7 @@ def create_worker_pod_for_stream(stream: str, proxy_dns: str) -> str:
             "liveedgecast.io/stream": stream,
             "liveedgecast.io/generation": str(stream_generation.get(stream, 1)),
             "liveedgecast.io/proxy-pod": get_stream_proxy_pod(stream) or "",
+            "liveedgecast.io/session-id": str((stream_registry.get(stream) or {}).get("session_id") or ""),
         })
 
         logger.debug(
@@ -1579,24 +1592,87 @@ def replace_worker_pod_for_stream_locked(stream: str, proxy_dns: str) -> Optiona
     )
     return new_worker
 
+def delete_worker_pod_best_effort(worker_name: str, stream: Optional[str], proxy_pod: Optional[str], reason: str) -> None:
+    """Delete a worker Pod outside allocation_lock and record best-effort evidence."""
+    if not worker_name:
+        return
+    try:
+        core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
+        record_worker_delete_metric("success", reason)
+        log_controller_event(
+            "worker_deleted",
+            stream=stream,
+            proxy_pod=proxy_pod,
+            worker_pod=worker_name,
+            status=LOG_STATUS_DELETED,
+            message=f"deleted worker pod reason={reason}",
+        )
+    except ApiException as e:
+        record_kubernetes_api_error("delete", "pod", e)
+        if e.status == 404:
+            record_worker_delete_metric("success", f"{reason}_already_deleted")
+            log_controller_event(
+                "worker_deleted",
+                stream=stream,
+                proxy_pod=proxy_pod,
+                worker_pod=worker_name,
+                status=LOG_STATUS_ALREADY_DELETED,
+                message=f"worker pod already deleted reason={reason}",
+            )
+        else:
+            record_worker_delete_metric("warning", f"{reason}_delete_failed")
+            log_controller_event(
+                "worker_deleted",
+                stream=stream,
+                proxy_pod=proxy_pod,
+                worker_pod=worker_name,
+                status=LOG_STATUS_DELETE_FAILED,
+                level=logging.WARNING,
+                message=f"failed deleting worker pod reason={reason}",
+            )
+            logger.warning(f"[WorkerDelete] Failed deleting worker '{worker_name}' reason='{reason}': {e}")
+    except Exception as e:
+        record_worker_delete_metric("warning", f"{reason}_delete_failed")
+        log_controller_event(
+            "worker_deleted",
+            stream=stream,
+            proxy_pod=proxy_pod,
+            worker_pod=worker_name,
+            status=LOG_STATUS_DELETE_FAILED,
+            level=logging.WARNING,
+            message=f"failed deleting worker pod reason={reason}",
+        )
+        logger.warning(f"[WorkerDelete] Failed deleting worker '{worker_name}' reason='{reason}': {e}")
+
+
 def register_or_refresh_stream(
     stream: str,
     proxy_pod: str,
     session_id: Optional[str] = None,
     publish_start_ts: Optional[float] = None,
-):
+) -> Optional[str]:
     """Creates or refreshes canonical stream ownership on proxy.
 
-    session_id is optional for backward compatibility, but when provided it lets
-    /streams/ended reject stale publish_done callbacks from earlier RTMP sessions
-    that reused the same stream key.
+    Must be called while holding allocation_lock. Returns the stale worker Pod
+    that should be deleted *after* the lock is released when a new RTMP session
+    replaces an older session for the same stream key.
     """
     current = stream_registry.get(stream)
     current_session = current.get("session_id") if current else None
-    session_changed = bool(session_id and current and current_session != session_id)
+    # A provided session_id is authoritative. If a current stream exists with a
+    # different or missing session_id, treat it as a new RTMP session unless an
+    # explicit legacy compatibility flag opts into reuse.
+    session_changed = bool(
+        session_id
+        and current
+        and current_session != session_id
+        and not (ALLOW_LEGACY_SESSION_REUSE and not current_session)
+    )
+    old_worker_to_delete: Optional[str] = None
     if session_changed:
         old_worker = stream_to_worker.pop(stream, None)
         if old_worker:
+            old_worker_to_delete = old_worker
             worker_to_stream.pop(old_worker, None)
             cleanup_worker_lifecycle_tracking_locked(old_worker)
             worker_ready_since.pop(old_worker, None)
@@ -1605,24 +1681,6 @@ def register_or_refresh_stream(
             old_uid = worker_pod_uid_by_name.pop(old_worker, None)
             if old_uid:
                 worker_health_failures.pop(old_uid, None)
-            try:
-                core.delete_namespaced_pod(name=old_worker, namespace=NAMESPACE, grace_period_seconds=0)
-                record_worker_delete_metric("success", "session_replaced")
-                log_controller_event(
-                    "worker_deleted",
-                    stream=stream,
-                    proxy_pod=current.get("proxy_pod") if current else proxy_pod,
-                    worker_pod=old_worker,
-                    status=LOG_STATUS_DELETED,
-                    message="deleted stale worker after RTMP session changed",
-                )
-            except ApiException as e:
-                record_kubernetes_api_error("delete", "pod", e)
-                if e.status == 404:
-                    record_worker_delete_metric("success", "session_replaced_already_deleted")
-                else:
-                    record_worker_delete_metric("warning", "session_replaced_delete_failed")
-                    logger.warning(f"[Session] Failed deleting stale worker '{old_worker}' for stream '{stream}': {e}")
         log_controller_event(
             "stream_session_replaced",
             stream=stream,
@@ -1658,7 +1716,7 @@ def register_or_refresh_stream(
     stream_registry[stream] = registry_entry
     stream_to_proxy[stream] = proxy_pod
     proxy_health_failures[proxy_pod] = 0
-    return None
+    return old_worker_to_delete
 
 
 def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
@@ -2359,11 +2417,12 @@ def recover_state(
 
 
 def update_worker_pods_available_metric() -> None:
-    """Update the Ready worker Pod gauge from the Kubernetes API.
+    """Update controller-owned worker lifecycle gauges from the Kubernetes API.
 
-    This gauge is a small controller-owned readiness/capacity signal. It does
-    not replace cAdvisor/kube-state-metrics for scientific CPU, memory, network,
-    or pod-second analysis.
+    worker_pods_available is retained for backward compatibility, but with the
+    v4 lifecycle semantics Kubernetes Ready maps to /readyz, i.e. FFmpeg
+    processing readiness. Use worker_pods_running when the question is simply
+    whether worker Pods exist and are not terminal/deleting.
     """
     try:
         pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker").items
@@ -2375,18 +2434,26 @@ def update_worker_pods_available_metric() -> None:
         logger.warning(f"[InfrastructureMetrics] Failed to list worker pods: {e}")
         return
 
-    ready_count = 0
+    running_count = 0
+    processing_ready_count = 0
     for pod in pods:
         metadata = getattr(pod, "metadata", None)
         status = getattr(pod, "status", None)
         if not metadata or getattr(metadata, "deletion_timestamp", None):
             continue
-        if not status or getattr(status, "phase", None) not in {"Running", "Pending"}:
+        if not status:
+            continue
+        phase = getattr(status, "phase", None)
+        if phase in {"Running", "Pending"}:
+            running_count += 1
+        if phase != "Running":
             continue
         conditions = getattr(status, "conditions", None) or []
         if any(getattr(c, "type", None) == "Ready" and getattr(c, "status", None) == "True" for c in conditions):
-            ready_count += 1
-    worker_pods_available.labels(namespace=NAMESPACE).set(ready_count)
+            processing_ready_count += 1
+    worker_pods_running.labels(namespace=NAMESPACE).set(running_count)
+    worker_processing_ready.labels(namespace=NAMESPACE).set(processing_ready_count)
+    worker_pods_available.labels(namespace=NAMESPACE).set(processing_ready_count)
 
 
 async def collect_infrastructure_metrics():
@@ -2810,6 +2877,49 @@ def health():
     return {"status": "ok"}
 
 
+def inspect_existing_worker_for_replay(
+    worker_pod: str,
+    expected_generation: Optional[int],
+    expected_session_id: Optional[str],
+) -> Tuple[bool, str, bool]:
+    """Return (usable, reason, should_delete) for an existing stream->worker mapping."""
+    try:
+        pod = core.read_namespaced_pod(name=worker_pod, namespace=NAMESPACE)
+    except ApiException as e:
+        if e.status == 404:
+            return False, "pod_not_found", False
+        record_kubernetes_api_error("read", "pod", e)
+        logger.warning(f"[Allocate] Could not inspect existing worker '{worker_pod}': {e}")
+        # Preserve idempotency on transient API errors instead of creating duplicates.
+        return True, "inspection_inconclusive", False
+    except Exception as e:
+        logger.warning(f"[Allocate] Could not inspect existing worker '{worker_pod}': {e}")
+        return True, "inspection_inconclusive", False
+
+    metadata = getattr(pod, "metadata", None)
+    status = getattr(pod, "status", None)
+    annotations = dict(getattr(metadata, "annotations", None) or {}) if metadata else {}
+
+    if metadata and getattr(metadata, "deletion_timestamp", None):
+        return False, "pod_deleting", False
+
+    phase = (getattr(status, "phase", None) or "").strip() if status else ""
+    if phase in {"Failed", "Succeeded"}:
+        return False, f"pod_terminal_{phase.lower()}", True
+    if phase and phase not in {"Running", "Pending"}:
+        return False, f"pod_unusable_phase_{phase.lower()}", True
+
+    annotated_generation = generation_to_int(annotations.get("liveedgecast.io/generation"))
+    if expected_generation is not None and annotated_generation is not None and annotated_generation != expected_generation:
+        return False, "generation_mismatch", True
+
+    annotated_session = annotations.get("liveedgecast.io/session-id")
+    if expected_session_id and annotated_session and annotated_session != expected_session_id:
+        return False, "session_mismatch", True
+
+    return True, "usable", False
+
+
 @app.post("/workers/ffmpeg/started")
 def worker_ffmpeg_started(
     stream: str = Query(..., description="Stream name"),
@@ -2863,6 +2973,7 @@ def allocate_worker(
             existing_worker = stream_to_worker.get(stream)
             owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
             generation_snapshot = stream_generation.get(stream)
+            session_snapshot = (stream_registry.get(stream) or {}).get("session_id")
 
         if not owner_proxy:
             metric_reason = "missing_proxy_owner"
@@ -2871,18 +2982,47 @@ def allocate_worker(
         proxy_address = resolve_proxy_address(owner_proxy)
 
         if existing_worker:
-            logger.info(
-                f"[Allocate] Idempotent replay for stream '{stream}' "
-                f"existing worker={existing_worker} proxy={proxy_address}"
+            usable, replay_reason, should_delete_existing = inspect_existing_worker_for_replay(
+                existing_worker,
+                generation_to_int(generation_snapshot),
+                session_snapshot,
             )
-            metric_status = "success"
-            metric_reason = "idempotent_replay"
-            return {
-                "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
-                "name": existing_worker,
-                "proxy": proxy_address,
-                "status": "idempotent_replay"
-            }
+            if usable:
+                logger.info(
+                    f"[Allocate] Idempotent replay for stream '{stream}' "
+                    f"existing worker={existing_worker} proxy={proxy_address} reason={replay_reason}"
+                )
+                metric_status = "success"
+                metric_reason = "idempotent_replay"
+                return {
+                    "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
+                    "name": existing_worker,
+                    "proxy": proxy_address,
+                    "status": "idempotent_replay",
+                    "reason": replay_reason,
+                }
+
+            logger.warning(
+                f"[Allocate] Existing worker '{existing_worker}' for stream '{stream}' is not reusable: {replay_reason}. "
+                "Clearing mapping and creating a fresh worker."
+            )
+            stale_worker_to_delete = existing_worker if should_delete_existing else None
+            with allocation_lock:
+                if stream_to_worker.get(stream) == existing_worker:
+                    stream_to_worker.pop(stream, None)
+                    worker_to_stream.pop(existing_worker, None)
+                    cleanup_worker_lifecycle_tracking_locked(existing_worker)
+                    worker_ready_since.pop(existing_worker, None)
+                    worker_not_ready_since.pop(existing_worker, None)
+                    worker_create_started_at.pop(existing_worker, None)
+                    old_uid = worker_pod_uid_by_name.pop(existing_worker, None)
+                    if old_uid:
+                        worker_health_failures.pop(old_uid, None)
+                    persist_state_locked()
+                else:
+                    stale_worker_to_delete = None
+            if stale_worker_to_delete:
+                delete_worker_pod_best_effort(stale_worker_to_delete, stream, owner_proxy, f"stale_idempotent_replay_{replay_reason}")
 
         pod_name = create_worker_pod_for_stream(stream=stream, proxy_dns=proxy_address)
 
@@ -3105,6 +3245,7 @@ def register_stream(
     metric_status = "error"
     metric_reason = "exception"
     try:
+        stale_worker_to_delete = None
         with allocation_lock:
             current = stream_registry.get(stream)
             was_replay = current and current.get("proxy_pod") == proxy_pod and (not session_id or current.get("session_id") == session_id)
@@ -3117,7 +3258,7 @@ def register_stream(
                     detail=f"stream '{stream}' already owned by proxy '{current_owner}'"
                 )
 
-            register_or_refresh_stream(stream, proxy_pod, session_id=session_id, publish_start_ts=publish_start_ts)
+            stale_worker_to_delete = register_or_refresh_stream(stream, proxy_pod, session_id=session_id, publish_start_ts=publish_start_ts)
             persist_state_locked()
 
             if was_replay:
@@ -3131,6 +3272,7 @@ def register_stream(
                 metric_status = "success"
                 metric_reason = "registered"
 
+            generation = stream_generation.get(stream)
             log_controller_event(
                 "stream_registered",
                 stream=stream,
@@ -3139,14 +3281,19 @@ def register_stream(
                 status=status,
             )
 
-            return {
+            response = {
                 "status": status,
                 "stream": stream,
                 "proxy_pod": proxy_pod,
-                "generation": stream_generation.get(stream),
+                "generation": generation,
                 "healthcheck_interval_seconds": PROXY_HEALTHCHECK_INTERVAL_SECONDS,
                 "max_failed_healthchecks": PROXY_HEALTHCHECK_MAX_FAILURES
             }
+
+        if stale_worker_to_delete:
+            delete_worker_pod_best_effort(stale_worker_to_delete, stream, proxy_pod, "session_replaced")
+
+        return response
     except Exception as e:
         if metric_reason == "exception":
             metric_reason = type(e).__name__
@@ -3319,6 +3466,8 @@ def stream_destination_received(
 def stream_status(
     stream: str = Query(..., description="Stream name"),
     proxy_pod: Optional[str] = Query(None, description="Expected proxy owner"),
+    session_id: Optional[str] = Query(None, description="Expected RTMP session id"),
+    requested_generation: Optional[int] = Query(None, alias="generation", description="Expected stream generation"),
 ):
     """Returns lightweight stream activity information for workers and diagnostics.
 
@@ -3329,7 +3478,7 @@ def stream_status(
         current = dict(stream_registry.get(stream) or {})
         owner_proxy = current.get("proxy_pod")
         worker_pod = stream_to_worker.get(stream)
-        generation = stream_generation.get(stream)
+        active_generation = stream_generation.get(stream)
 
     if not current or not owner_proxy:
         return {
@@ -3348,9 +3497,38 @@ def stream_status(
             "requested_proxy_pod": proxy_pod,
             "owner_proxy_pod": owner_proxy,
             "worker_pod": worker_pod,
-            "generation": generation,
+            "generation": active_generation,
             "session_id": current.get("session_id"),
         }
+
+    current_session = current.get("session_id")
+    if session_id and current_session and session_id != current_session:
+        return {
+            "status": "session_mismatch",
+            "stream": stream,
+            "active": None,
+            "reason": "session_id_mismatch",
+            "requested_session_id": session_id,
+            "session_id": current_session,
+            "proxy_pod": owner_proxy,
+            "worker_pod": worker_pod,
+            "generation": active_generation,
+        }
+
+    if requested_generation is not None:
+        current_generation = generation_to_int(active_generation)
+        if current_generation is not None and int(requested_generation) != current_generation:
+            return {
+                "status": "generation_mismatch",
+                "stream": stream,
+                "active": None,
+                "reason": "stream_generation_mismatch",
+                "requested_generation": int(requested_generation),
+                "generation": current_generation,
+                "session_id": current_session,
+                "proxy_pod": owner_proxy,
+                "worker_pod": worker_pod,
+            }
 
     activity = get_stream_activity_on_proxy(stream, owner_proxy)
     if activity is True:
@@ -3370,7 +3548,7 @@ def stream_status(
         "reason": reason,
         "proxy_pod": owner_proxy,
         "worker_pod": worker_pod,
-        "generation": generation,
+        "generation": active_generation,
         "session_id": current.get("session_id"),
     }
 

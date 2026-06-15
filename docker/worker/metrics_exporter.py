@@ -286,6 +286,11 @@ class ProgressFollower:
         return text[: last_newline + 1], text[last_newline + 1 :]
 
 
+
+def safe_stream_key_for_path(stream_key: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.:-]", "_", stream_key or "")[:160]
+    return safe or "stream"
+
 def discover_progress_path() -> str:
     explicit = os.environ.get("FFMPEG_PROGRESS_FILE")
     if explicit:
@@ -293,7 +298,7 @@ def discover_progress_path() -> str:
 
     stream_key = os.environ.get("STREAM_KEY", "")
     if stream_key:
-        return f"/tmp/ffmpeg_{stream_key}.progress"
+        return f"/tmp/ffmpeg_{safe_stream_key_for_path(stream_key)}.progress"
 
     candidates = []
     for path in glob.glob("/tmp/ffmpeg_*.progress"):
@@ -331,7 +336,7 @@ def discover_pid_file() -> str:
 
     stream_key = os.environ.get("STREAM_KEY", "")
     if stream_key:
-        return f"/tmp/ffmpeg_{stream_key}.pid"
+        return f"/tmp/ffmpeg_{safe_stream_key_for_path(stream_key)}.pid"
     return "/tmp/ffmpeg.pid"
 
 
@@ -342,7 +347,7 @@ def discover_exit_file() -> str:
 
     stream_key = os.environ.get("STREAM_KEY", "")
     if stream_key:
-        return f"/tmp/ffmpeg_{stream_key}.exit_events"
+        return f"/tmp/ffmpeg_{safe_stream_key_for_path(stream_key)}.exit_events"
     return "/tmp/ffmpeg.exit_events"
 
 

@@ -2,20 +2,24 @@
 set -euo pipefail
 
 STREAM_KEY="${STREAM_KEY:-}"
-PID_FILE="/tmp/ffmpeg_${STREAM_KEY}.pid"
-PROGRESS_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress"
-EXIT_EVENT_FILE="${FFMPEG_EXIT_FILE:-/tmp/ffmpeg_${STREAM_KEY}.exit_events}"
-LAST_EXIT_FILE="/tmp/ffmpeg_${STREAM_KEY}.last_exit"
-PROGRESS_NOTIFY_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress_notified"
-PROGRESS_NOTIFY_LOCK="/tmp/ffmpeg_${STREAM_KEY}.progress_notify.lock"
-PROGRESS_NOTIFY_ERROR_FILE="/tmp/ffmpeg_${STREAM_KEY}.progress_notify_error_logged"
-PROGRESS_LOG_FILE="/tmp/ffmpeg_${STREAM_KEY}.first_progress_logged"
-PROGRESS_LOG_LOCK="/tmp/ffmpeg_${STREAM_KEY}.first_progress_log.lock"
-STARTED_NOTIFY_FILE="/tmp/ffmpeg_${STREAM_KEY}.started_notified"
-STARTED_NOTIFY_LOCK="/tmp/ffmpeg_${STREAM_KEY}.started_notify.lock"
-STARTED_NOTIFY_ERROR_FILE="/tmp/ffmpeg_${STREAM_KEY}.started_notify_error_logged"
-STARTED_LOG_FILE="/tmp/ffmpeg_${STREAM_KEY}.started_logged"
-STARTED_LOG_LOCK="/tmp/ffmpeg_${STREAM_KEY}.started_log.lock"
+SAFE_STREAM_KEY="$(printf '%s' "$STREAM_KEY" | sed 's/[^a-zA-Z0-9_.:-]/_/g' | cut -c1-160)"
+if [ -z "$SAFE_STREAM_KEY" ]; then
+  SAFE_STREAM_KEY="stream"
+fi
+PID_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.pid"
+PROGRESS_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.progress"
+EXIT_EVENT_FILE="${FFMPEG_EXIT_FILE:-/tmp/ffmpeg_${SAFE_STREAM_KEY}.exit_events}"
+LAST_EXIT_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.last_exit"
+PROGRESS_NOTIFY_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.progress_notified"
+PROGRESS_NOTIFY_LOCK="/tmp/ffmpeg_${SAFE_STREAM_KEY}.progress_notify.lock"
+PROGRESS_NOTIFY_ERROR_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.progress_notify_error_logged"
+PROGRESS_LOG_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.first_progress_logged"
+PROGRESS_LOG_LOCK="/tmp/ffmpeg_${SAFE_STREAM_KEY}.first_progress_log.lock"
+STARTED_NOTIFY_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.started_notified"
+STARTED_NOTIFY_LOCK="/tmp/ffmpeg_${SAFE_STREAM_KEY}.started_notify.lock"
+STARTED_NOTIFY_ERROR_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.started_notify_error_logged"
+STARTED_LOG_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.started_logged"
+STARTED_LOG_LOCK="/tmp/ffmpeg_${SAFE_STREAM_KEY}.started_log.lock"
 PROGRESS_READER_PID=""
 FFMPEG_PID=""
 CURRENT_ATTEMPT=""
@@ -73,11 +77,12 @@ log_json() {
   local duration_ms="${3:-$(elapsed_ms "$RUNNER_START_MS")}"
   local timestamp
   timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  printf '{"timestamp":"%s","event_type":"%s","stream":"%s","generation":"%s","proxy_pod":"%s","worker_pod":"%s","experiment_id":"%s","scenario":"%s","run_id":"%s","duration_ms":%s,"status":"%s","attempt":"%s","ffmpeg_run_id":"%s"}\n' \
+  printf '{"timestamp":"%s","event_type":"%s","stream":"%s","generation":"%s","session_id":"%s","proxy_pod":"%s","worker_pod":"%s","experiment_id":"%s","scenario":"%s","run_id":"%s","duration_ms":%s,"status":"%s","attempt":"%s","ffmpeg_run_id":"%s"}\n' \
     "$(json_escape "$timestamp")" \
     "$(json_escape "$event_type")" \
     "$(json_escape "${STREAM_KEY:-}")" \
     "$(json_escape "${STREAM_GENERATION:-}")" \
+    "$(json_escape "${SESSION_ID:-}")" \
     "$(json_escape "${PROXY_POD:-}")" \
     "$(json_escape "${WORKER_POD:-${HOSTNAME:-unknown-worker}}")" \
     "$(json_escape "${EXPERIMENT_ID:-}")" \
@@ -108,6 +113,12 @@ controller_stream_activity_state() {
   )
   if [ -n "${PROXY_POD:-}" ]; then
     curl_args+=(--data-urlencode "proxy_pod=${PROXY_POD}")
+  fi
+  if [ -n "${SESSION_ID:-}" ]; then
+    curl_args+=(--data-urlencode "session_id=${SESSION_ID}")
+  fi
+  if [ -n "${STREAM_GENERATION:-}" ]; then
+    curl_args+=(--data-urlencode "generation=${STREAM_GENERATION}")
   fi
   set +e
   response="$({ curl "${curl_args[@]}" "${CONTROLLER_API}/streams/status"; } 2>/dev/null)"
@@ -327,7 +338,7 @@ while true; do
   : > "$PROGRESS_FILE"
   FFMPEG_START_MS="$(current_epoch_ms)"
   FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-attempt_${attempt}-${RANDOM}"
-  ATTEMPT_LOG_FILE="/tmp/ffmpeg_${STREAM_KEY}.attempt_${attempt}.log"
+  ATTEMPT_LOG_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.attempt_${attempt}.log"
   : > "$ATTEMPT_LOG_FILE"
   log_json "ffmpeg_process_spawned" "attempt_${attempt}" "$(elapsed_ms "$FFMPEG_START_MS")"
 
@@ -335,7 +346,7 @@ while true; do
     -loglevel "$FFMPEG_LOGLEVEL" \
     -nostats \
     -rw_timeout "$FFMPEG_RW_TIMEOUT_MICROSECONDS" \
-    -progress "/tmp/ffmpeg_${STREAM_KEY}.progress" \
+    -progress "/tmp/ffmpeg_${SAFE_STREAM_KEY}.progress" \
     -i "$PROXY_RTMP" \
     -c:v copy \
     -c:a copy \
@@ -378,7 +389,7 @@ while true; do
   last_exit_code="$EXIT_CODE"
   echo "$EXIT_CODE" > "$LAST_EXIT_FILE"
   printf '%s %s\n' "$FFMPEG_RUN_ID" "$EXIT_CODE" >> "$EXIT_EVENT_FILE"
-  cat "$ATTEMPT_LOG_FILE" >> "/tmp/ffmpeg_${STREAM_KEY}.log" 2>/dev/null || true
+  cat "$ATTEMPT_LOG_FILE" >> "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" 2>/dev/null || true
   rm -f "$PID_FILE"
 
   if progress_file_has_complete_line; then
@@ -392,7 +403,7 @@ while true; do
   if [ "$input_opened" -eq 1 ]; then
     if [ "$EXIT_CODE" -ne 0 ]; then
       log_json "worker_error" "ffmpeg_exit_${EXIT_CODE}" "$(elapsed_ms "$RUNNER_START_MS")"
-      tail -n 40 "/tmp/ffmpeg_${STREAM_KEY}.log" | sed 's/^/[ffmpeg] /' || true
+      tail -n 40 "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" | sed 's/^/[ffmpeg] /' || true
       exit "$EXIT_CODE"
     fi
 
