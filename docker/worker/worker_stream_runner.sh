@@ -17,6 +17,8 @@ STARTED_LOG_FILE="/tmp/ffmpeg_${STREAM_KEY}.started_logged"
 STARTED_LOG_LOCK="/tmp/ffmpeg_${STREAM_KEY}.started_log.lock"
 PROGRESS_READER_PID=""
 FFMPEG_PID=""
+CURRENT_ATTEMPT=""
+FFMPEG_RUN_ID=""
 RUNNER_START_MS="$(python3 - <<'PYMS'
 import time
 print(time.time_ns() // 1_000_000)
@@ -69,7 +71,7 @@ log_json() {
   local duration_ms="${3:-$(elapsed_ms "$RUNNER_START_MS")}"
   local timestamp
   timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  printf '{"timestamp":"%s","event_type":"%s","stream":"%s","generation":"%s","proxy_pod":"%s","worker_pod":"%s","experiment_id":"%s","scenario":"%s","run_id":"%s","duration_ms":%s,"status":"%s"}\n' \
+  printf '{"timestamp":"%s","event_type":"%s","stream":"%s","generation":"%s","proxy_pod":"%s","worker_pod":"%s","experiment_id":"%s","scenario":"%s","run_id":"%s","duration_ms":%s,"status":"%s","attempt":"%s","ffmpeg_run_id":"%s"}\n' \
     "$(json_escape "$timestamp")" \
     "$(json_escape "$event_type")" \
     "$(json_escape "${STREAM_KEY:-}")" \
@@ -80,7 +82,9 @@ log_json() {
     "$(json_escape "${SCENARIO:-}")" \
     "$(json_escape "${RUN_ID:-}")" \
     "$duration_ms" \
-    "$(json_escape "$status")"
+    "$(json_escape "$status")" \
+    "$(json_escape "${CURRENT_ATTEMPT:-}")" \
+    "$(json_escape "${FFMPEG_RUN_ID:-}")"
 }
 
 notify_controller() {
@@ -89,6 +93,45 @@ notify_controller() {
     --data-urlencode "stream=${STREAM_KEY}" \
     --data-urlencode "worker_pod=${WORKER_POD}" \
     "${CONTROLLER_API}${path}"
+}
+
+controller_stream_activity_state() {
+  local response rc
+  set +e
+  response="$({ curl -sf --connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}" --max-time "${CONTROLLER_CALLBACK_MAX_TIME_SECONDS:-2}" -G \
+    --data-urlencode "stream=${STREAM_KEY}" \
+    --data-urlencode "proxy_pod=${PROXY_POD:-${PROXY_DNS:-}}" \
+    "${CONTROLLER_API}/streams/status"; } 2>/dev/null)"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] || [ -z "$response" ]; then
+    printf 'unknown'
+    return 0
+  fi
+  RESPONSE_JSON="$response" python3 - <<'PYSTATUS' 2>/dev/null || printf 'unknown'
+import json, os
+try:
+    data = json.loads(os.environ.get("RESPONSE_JSON", "{}"))
+except json.JSONDecodeError:
+    print("unknown")
+else:
+    active = data.get("active")
+    if active is True:
+        print("active")
+    elif active is False:
+        print("inactive")
+    else:
+        print("unknown")
+PYSTATUS
+}
+
+exit_cleanly_if_stream_inactive() {
+  local state
+  state="$(controller_stream_activity_state)"
+  if [ "$state" = "inactive" ]; then
+    log_json "worker_shutdown" "stream_already_ended" "$(elapsed_ms "$RUNNER_START_MS")"
+    exit 0
+  fi
 }
 
 progress_file_has_complete_line() {
@@ -261,15 +304,22 @@ input_opened=0
 
 while true; do
   attempt=$((attempt + 1))
+  CURRENT_ATTEMPT="$attempt"
   now_seconds=$(date +%s)
   if [ "$now_seconds" -ge "$input_open_deadline" ]; then
+    exit_cleanly_if_stream_inactive
     log_json "worker_error" "input_open_timeout" "$(elapsed_ms "$RUNNER_START_MS")"
     exit "$INPUT_OPEN_TIMEOUT_EXIT_CODE"
   fi
 
+  exit_cleanly_if_stream_inactive
+
   rm -f "$PROGRESS_FILE"
   : > "$PROGRESS_FILE"
   FFMPEG_START_MS="$(current_epoch_ms)"
+  FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-attempt_${attempt}-${RANDOM}"
+  ATTEMPT_LOG_FILE="/tmp/ffmpeg_${STREAM_KEY}.attempt_${attempt}.log"
+  : > "$ATTEMPT_LOG_FILE"
   log_json "ffmpeg_process_spawned" "attempt_${attempt}" "$(elapsed_ms "$FFMPEG_START_MS")"
 
   ffmpeg \
@@ -282,11 +332,10 @@ while true; do
     -c:a copy \
     -progress "$PROGRESS_FILE" \
     -f flv "$TARGET_RTMP" \
-    >> "/tmp/ffmpeg_${STREAM_KEY}.log" 2>&1 &
+    >> "$ATTEMPT_LOG_FILE" 2>&1 &
 
   FFMPEG_PID=$!
   echo "$FFMPEG_PID" > "$PID_FILE"
-  FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-${FFMPEG_PID}-${RANDOM}"
   start_progress_reader
 
   attempt_deadline=$(( $(date +%s) + FFMPEG_INPUT_ATTEMPT_TIMEOUT_SECONDS ))
@@ -320,6 +369,7 @@ while true; do
   last_exit_code="$EXIT_CODE"
   echo "$EXIT_CODE" > "/tmp/ffmpeg_${STREAM_KEY}.exit"
   printf '%s %s\n' "$FFMPEG_RUN_ID" "$EXIT_CODE" >> "$EXIT_FILE"
+  cat "$ATTEMPT_LOG_FILE" >> "/tmp/ffmpeg_${STREAM_KEY}.log" 2>/dev/null || true
   rm -f "$PID_FILE"
 
   if progress_file_has_complete_line; then
@@ -342,15 +392,16 @@ while true; do
   # No observable input/progress was opened. This is usually a transient race while
   # the proxy accepts publish and the worker cold-starts. Retry until the overall deadline.
   if [ "$EXIT_CODE" -eq 0 ]; then
-    log_json "ffmpeg_exited_without_progress" "exit_0" "$(elapsed_ms "$RUNNER_START_MS")"
-    exit 0
+    exit_cleanly_if_stream_inactive
+    log_json "ffmpeg_exited_without_progress" "exit_0_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
+  else
+    log_json "ffmpeg_input_open_attempt_failed" "exit_${EXIT_CODE}_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
   fi
-
-  log_json "ffmpeg_input_open_attempt_failed" "exit_${EXIT_CODE}_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
-  tail -n 20 "/tmp/ffmpeg_${STREAM_KEY}.log" | sed 's/^/[ffmpeg] /' || true
+  tail -n 20 "$ATTEMPT_LOG_FILE" | sed 's/^/[ffmpeg] /' || true
 
   now_seconds=$(date +%s)
   if [ "$now_seconds" -ge "$input_open_deadline" ]; then
+    exit_cleanly_if_stream_inactive
     log_json "worker_error" "input_open_timeout_last_exit_${last_exit_code}" "$(elapsed_ms "$RUNNER_START_MS")"
     exit "$INPUT_OPEN_TIMEOUT_EXIT_CODE"
   fi

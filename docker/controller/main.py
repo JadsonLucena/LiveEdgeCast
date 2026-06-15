@@ -602,6 +602,10 @@ WORKER_HEALTHCHECK_JITTER_SECONDS = float(os.getenv("WORKER_HEALTHCHECK_JITTER_S
 # Keep this longer than the worker input-open retry window so the controller does not
 # replace a cold-starting worker while FFmpeg is still retrying the proxy input.
 WORKER_READY_HEALTH_DELAY_SECONDS = get_int_env("WORKER_READY_HEALTH_DELAY_SECONDS", 50, min_value=0)
+WORKER_HEALTHCHECK_PORT = get_int_env("WORKER_HEALTHCHECK_PORT", 9113, min_value=1)
+WORKER_HEALTHCHECK_PATH = os.getenv("WORKER_HEALTHCHECK_PATH", "/readyz")
+WORKER_HEALTHCHECK_TIMEOUT_SECONDS = float(os.getenv("WORKER_HEALTHCHECK_TIMEOUT_SECONDS", "2"))
+ALLOW_LEGACY_ENDED_WITHOUT_SESSION_ID = os.getenv("ALLOW_LEGACY_ENDED_WITHOUT_SESSION_ID", "false").lower() in {"1", "true", "yes", "y"}
 WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS = 60
 WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS = get_int_env("WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS", 5, min_value=1)
 CONTROLLER_DESTINATION_CALLBACK_ENABLED = get_bool_env("CONTROLLER_DESTINATION_CALLBACK_ENABLED", False)
@@ -660,7 +664,7 @@ worker_ready_duration_seconds = controller_histogram('worker_ready_duration_seco
 stream_release_duration_seconds = controller_histogram('stream_release_duration_seconds', 'Duration of stream worker release handling in seconds')
 worker_recovery_duration_seconds = controller_histogram('worker_recovery_duration_seconds', 'Duration of unhealthy worker recovery attempts in seconds')
 proxy_healthcheck_duration_seconds = controller_histogram('proxy_healthcheck_duration_seconds', 'Duration of proxy healthcheck evaluation in seconds')
-worker_healthcheck_duration_seconds = controller_histogram('worker_healthcheck_duration_seconds', 'Duration of worker /health probes in seconds')
+worker_healthcheck_duration_seconds = controller_histogram('worker_healthcheck_duration_seconds', 'Duration of worker processing readiness probes in seconds')
 stream_event_to_controller_total = controller_counter('stream_event_to_controller_total', 'Total stream events handled by controller', ('event', 'status', 'reason'))
 stream_registration_total = controller_counter('stream_registration_total', 'Total stream registration attempts', ('status', 'reason'))
 stream_allocation_total = controller_counter('stream_allocation_total', 'Total stream allocation attempts', ('status', 'reason'))
@@ -675,7 +679,7 @@ kubernetes_api_errors_total = controller_counter('kubernetes_api_errors_total', 
 state_persistence_errors_total = controller_counter('state_persistence_errors_total', 'Total persisted-state read/write errors', ('operation', 'reason'))
 state_recovery_total = controller_counter('state_recovery_total', 'Total controller state recovery outcomes', ('status', 'reason'))
 proxy_healthcheck_total = controller_counter('proxy_healthcheck_total', 'Total proxy healthcheck evaluations', ('status', 'reason'))
-worker_healthcheck_total = controller_counter('worker_healthcheck_total', 'Total worker healthcheck probes', ('status', 'reason'))
+worker_healthcheck_total = controller_counter('worker_healthcheck_total', 'Total worker processing readiness probes', ('status', 'reason'))
 proxy_rtmp_stats_scrape_errors_total = controller_counter('proxy_rtmp_stats_scrape_errors_total', 'Total proxy RTMP /stats scrape failures', ('proxy_pod',))
 proxy_rtmp_stats_discovery_errors_total = controller_counter('proxy_rtmp_stats_discovery_errors_total', 'Total failures listing proxy pods for RTMP stats scraping')
 stream_lifecycle_timestamp_observed_total = controller_counter(
@@ -1572,6 +1576,41 @@ def register_or_refresh_stream(
     current = stream_registry.get(stream)
     current_session = current.get("session_id") if current else None
     session_changed = bool(session_id and current_session and current_session != session_id)
+    if session_changed:
+        old_worker = stream_to_worker.pop(stream, None)
+        if old_worker:
+            worker_to_stream.pop(old_worker, None)
+            cleanup_worker_lifecycle_tracking_locked(old_worker)
+            worker_ready_since.pop(old_worker, None)
+            worker_create_started_at.pop(old_worker, None)
+            old_uid = worker_pod_uid_by_name.pop(old_worker, None)
+            if old_uid:
+                worker_health_failures.pop(old_uid, None)
+            try:
+                core.delete_namespaced_pod(name=old_worker, namespace=NAMESPACE, grace_period_seconds=0)
+                record_worker_delete_metric("success", "session_replaced")
+                log_controller_event(
+                    "worker_deleted",
+                    stream=stream,
+                    proxy_pod=current.get("proxy_pod") if current else proxy_pod,
+                    worker_pod=old_worker,
+                    status=LOG_STATUS_DELETED,
+                    message="deleted stale worker after RTMP session changed",
+                )
+            except ApiException as e:
+                record_kubernetes_api_error("delete", "pod", e)
+                if e.status == 404:
+                    record_worker_delete_metric("success", "session_replaced_already_deleted")
+                else:
+                    record_worker_delete_metric("warning", "session_replaced_delete_failed")
+                    logger.warning(f"[Session] Failed deleting stale worker '{old_worker}' for stream '{stream}': {e}")
+        log_controller_event(
+            "stream_session_replaced",
+            stream=stream,
+            proxy_pod=proxy_pod,
+            status=LOG_STATUS_SUCCESS,
+            message=f"new RTMP session replaced previous session_id='{current_session}'",
+        )
     if stream not in stream_generation or stream not in stream_registry or session_changed:
         previous_generations = stream_lifecycle_timestamps.get(stream, {})
         previous_lifecycle_generation = max(previous_generations) if previous_generations else 0
@@ -2199,21 +2238,32 @@ def check_worker_health(
     stream: Optional[str] = None,
     proxy_pod: Optional[str] = None,
 ) -> bool:
+    """Checks worker processing health using the FFmpeg exporter readiness endpoint.
+
+    Kubernetes liveness only proves the container/exporter is alive. For recovery
+    decisions the controller needs a stronger signal: FFmpeg must be running and
+    producing recent progress. The monitor already waits WORKER_READY_HEALTH_DELAY_SECONDS
+    after Pod Ready before calling this function, so /readyz is expected to be stable here.
+    """
     started_at = time.monotonic()
     metric_status = "unhealthy"
     metric_reason = "exception"
+    endpoint_path = WORKER_HEALTHCHECK_PATH if WORKER_HEALTHCHECK_PATH.startswith("/") else f"/{WORKER_HEALTHCHECK_PATH}"
     try:
         target = pod_ip if pod_ip else f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
-        response = requests.get(f"http://{target}:8080/health", timeout=2)
+        response = requests.get(
+            f"http://{target}:{WORKER_HEALTHCHECK_PORT}{endpoint_path}",
+            timeout=WORKER_HEALTHCHECK_TIMEOUT_SECONDS,
+        )
         if response.status_code == 200:
             metric_status = "healthy"
-            metric_reason = "http_200"
+            metric_reason = f"http_200_{endpoint_path.strip('/') or 'root'}"
             return True
         metric_status = "unhealthy"
-        metric_reason = f"http_{response.status_code}"
+        metric_reason = f"http_{response.status_code}_{endpoint_path.strip('/') or 'root'}"
         return False
     except Exception as e:
-        logger.warning(f"Failed to check /health for {pod_name}: {e}")
+        logger.warning(f"Failed to check worker processing readiness for {pod_name}: {e}")
         metric_status = "unhealthy"
         metric_reason = type(e).__name__
         return False
@@ -2229,6 +2279,7 @@ def check_worker_health(
             duration_ms=round(duration_seconds * 1000, 3),
             status=metric_status,
             level=logging.INFO if metric_status == "healthy" else logging.WARNING,
+            message=f"worker processing readiness checked via {endpoint_path} on port {WORKER_HEALTHCHECK_PORT}",
         )
 
 
@@ -3199,6 +3250,65 @@ def stream_destination_received(
         "approximate": timestamp_is_approximate,
     }
 
+@app.get("/streams/status")
+def stream_status(
+    stream: str = Query(..., description="Stream name"),
+    proxy_pod: Optional[str] = Query(None, description="Expected proxy owner"),
+):
+    """Returns lightweight stream activity information for workers and diagnostics.
+
+    active=True/False is returned only when the controller/proxy state is sufficiently
+    conclusive. active=None means the controller could not safely determine activity.
+    """
+    with allocation_lock:
+        current = dict(stream_registry.get(stream) or {})
+        owner_proxy = current.get("proxy_pod")
+        worker_pod = stream_to_worker.get(stream)
+        generation = stream_generation.get(stream)
+
+    if not current or not owner_proxy:
+        return {
+            "status": "not_found",
+            "stream": stream,
+            "active": False,
+            "reason": "stream_not_registered",
+        }
+
+    if proxy_pod and owner_proxy != proxy_pod:
+        return {
+            "status": "owner_mismatch",
+            "stream": stream,
+            "active": None,
+            "reason": "proxy_owner_mismatch",
+            "requested_proxy_pod": proxy_pod,
+            "owner_proxy_pod": owner_proxy,
+            "worker_pod": worker_pod,
+            "generation": generation,
+            "session_id": current.get("session_id"),
+        }
+
+    activity = get_stream_activity_on_proxy(stream, owner_proxy)
+    if activity is True:
+        status = "active"
+        reason = "observed_on_proxy"
+    elif activity is False:
+        status = "ended"
+        reason = "not_observed_on_proxy"
+    else:
+        status = "unknown"
+        reason = "proxy_stats_inconclusive"
+
+    return {
+        "status": status,
+        "stream": stream,
+        "active": activity,
+        "reason": reason,
+        "proxy_pod": owner_proxy,
+        "worker_pod": worker_pod,
+        "generation": generation,
+        "session_id": current.get("session_id"),
+    }
+
 @app.post("/streams/ended")
 async def stream_ended(
     stream: str = Query(..., description="Stream name"),
@@ -3225,6 +3335,31 @@ async def stream_ended(
                 current = stream_registry.get(stream)
                 if current and current.get("proxy_pod") == proxy_pod:
                     current_session = current.get("session_id")
+                    if current_session and not session_id and not ALLOW_LEGACY_ENDED_WITHOUT_SESSION_ID:
+                        stale_ended_events_ignored_total.labels(status=LOG_STATUS_IGNORED, reason="missing_session_id").inc()
+                        stream_ended_events_total.labels(status=LOG_STATUS_IGNORED, reason="missing_session_id_for_session_scoped_stream").inc()
+                        logger.info(
+                            f"[StreamsEnded] Ignored ended event without session_id for session-scoped stream '{stream}' "
+                            f"from proxy='{proxy_pod}' current_session='{current_session}'"
+                        )
+                        log_controller_event(
+                            "stale_event_ignored",
+                            stream=stream,
+                            proxy_pod=proxy_pod,
+                            started_at=started_at,
+                            status=LOG_STATUS_IGNORED,
+                            level=logging.WARNING,
+                            message="publish_done without session_id ignored for session-scoped stream",
+                        )
+                        metric_status = "success"
+                        metric_reason = "missing_session_id_ignored"
+                        return {
+                            "status": "stale_ended_ignored",
+                            "reason": "missing_session_id_for_session_scoped_stream",
+                            "stream": stream,
+                            "proxy_pod": proxy_pod,
+                            "current_session_id": current_session,
+                        }
                     if session_id and current_session and session_id != current_session:
                         stale_ended_events_ignored_total.labels(status=LOG_STATUS_IGNORED, reason="session_id_mismatch").inc()
                         stream_ended_events_total.labels(status=LOG_STATUS_IGNORED, reason="stale_session_mismatch").inc()

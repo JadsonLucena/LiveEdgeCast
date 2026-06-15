@@ -35,9 +35,17 @@ spec:
             limits:
               memory: "1Gi"
               cpu: "1000m"
-          readinessProbe:
+          startupProbe:
             httpGet:
               path: /healthz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /readyz
               port: metrics
             initialDelaySeconds: 5
             periodSeconds: 5

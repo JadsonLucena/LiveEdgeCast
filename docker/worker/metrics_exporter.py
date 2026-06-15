@@ -571,9 +571,8 @@ class MetricsHandler(BaseHTTPRequestHandler):
         if path == "/readyz":
             # Readiness is intentionally stricter than liveness: it reports 200 only
             # after FFmpeg is running and has produced recent progress. Kubernetes
-            # manifests in this project use /healthz for pod liveness/readiness to
-            # avoid killing cold-starting workers before input is available, while
-            # /readyz remains useful for manual diagnostics.
+            # manifests use /healthz for liveness/startup and /readyz for readiness,
+            # so cold-starting workers are not killed while still opening the input.
             payload_text = self.collector.collect()
             healthy = any(line == "worker_ffmpeg_health_state 1" for line in payload_text.splitlines())
             payload = ("ready\n" if healthy else "not_ready\n").encode("utf-8")
