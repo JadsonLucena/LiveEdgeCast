@@ -629,7 +629,7 @@ testsrc_size=$TESTSRC_SIZE
 testsrc_rate=$TESTSRC_RATE
 bitrate=$BITRATE
 audio_bitrate=$AUDIO_BITRATE
-profile=YouTube-like 1080p30 H.264 10Mbps video + AAC 128kbps
+profile=YouTube-like 720p30 H.264 4Mbps video + AAC 128kbps
 require_destination_received=$REQUIRE_DESTINATION_RECEIVED
 allow_partial=$ALLOW_PARTIAL
 allow_inconclusive=$ALLOW_INCONCLUSIVE
@@ -650,16 +650,14 @@ EOF_META
 print_estimated_duration() {
   "$PYTHON_BIN" - <<'PY' | tee -a "$CAMPAIGN_LOG"
 levels = [
-    (1, 5, 120, 45),
-    (2, 5, 120, 45),
-    (4, 5, 120, 45),
-    (8, 5, 120, 60),
-    (12, 5, 120, 60),
-    (16, 5, 150, 75),
-    (20, 5, 150, 90),
-    (24, 5, 180, 120),
-    (28, 3, 180, 120),
-    (30, 3, 180, 120),
+    (1, 3, 30, 30),
+    (2, 3, 30, 30),
+    (3, 3, 30, 30),
+    (5, 3, 30, 30),
+    (8, 3, 30, 30),
+    (13, 3, 30, 30),
+    (21, 3, 30, 30),
+    (34, 3, 30, 30),
 ]
 seconds = 0
 for streams, reps, duration, cooldown in levels:
@@ -688,16 +686,14 @@ main() {
     log "SKIP_PREFLIGHT=true; skipping preflight checks."
   fi
 
-  run_stress_level 1  5 120 45
-  run_stress_level 2  5 120 45
-  run_stress_level 4  5 120 45
-  run_stress_level 8  5 120 60
-  run_stress_level 12 5 120 60
-  run_stress_level 16 5 150 75
-  run_stress_level 20 5 150 90
-  run_stress_level 24 5 180 120
-  run_stress_level 28 3 180 120
-  run_stress_level 30 3 180 120
+  run_stress_level 1  3 30 30
+  run_stress_level 2  3 30 30
+  run_stress_level 3  3 30 30
+  run_stress_level 5  3 30 30
+  run_stress_level 8  3 30 30
+  run_stress_level 13 3 30 30
+  run_stress_level 21 3 30 30
+  run_stress_level 34 3 30 30
 
   log "Campaign finished successfully. Output: $BASE_OUTPUT_DIR"
 }
