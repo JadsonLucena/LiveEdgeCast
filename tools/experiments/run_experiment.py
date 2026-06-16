@@ -240,7 +240,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--testsrc-rate", default=os.getenv("LIVEEDGECAST_TESTSRC_RATE", "30"), help="Synthetic lavfi testsrc frame rate used when --source-file is omitted. Default: 30.")
     parser.add_argument("--audio-bitrate", default=os.getenv("LIVEEDGECAST_AUDIO_BITRATE", "128k"), help="AAC audio bitrate used by generated publishers. Default: 128k.")
     parser.add_argument("--constant-bitrate", action="store_true", help="Enforce constant video bitrate for FFmpeg publishers with minrate=maxrate=bitrate, VBV buffer sizing, and x264 HRD CBR signaling.")
-    parser.add_argument("--tee-rtmp-urls", default=os.getenv("LIVEEDGECAST_TEE_RTMP_URLS"), help="Comma-separated extra RTMP base URLs mirrored by each publisher with ffmpeg -f tee after a single local encode. Example: rtmp://host-a/live,rtmp://host-b/live")
+    parser.add_argument("--tee-rtmp-urls", default=os.getenv("LIVEEDGECAST_TEE_RTMP_URLS"), help="Comma-separated extra RTMP base URLs mirrored by each publisher with ffmpeg -f tee after a single local encode. Provide base URLs only; the generated streamKey is appended automatically. Example: rtmp://host-a/live,rtmp://host-b/live")
     parser.add_argument("--namespace", default=os.getenv("NAMESPACE", "media"))
     parser.add_argument("--prometheus-url", default=os.getenv("PROMETHEUS_URL"))
     parser.add_argument("--controller-url", default=os.getenv("LIVEEDGECAST_CONTROLLER_URL"))

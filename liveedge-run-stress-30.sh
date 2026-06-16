@@ -8,6 +8,8 @@ set -euo pipefail
 # Use MANAGE_PORT_FORWARD=true to enable automatic restart/readiness checks.
 # Set TEE_RTMP_URLS to a comma-separated list of extra RTMP base URLs when the same
 # encoded stream should be mirrored to multiple destinations through ffmpeg -f tee.
+# Do not include stream keys in TEE_RTMP_URLS; this script keeps generating streamKey
+# values automatically and run_experiment.py appends each key to every RTMP base URL.
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
