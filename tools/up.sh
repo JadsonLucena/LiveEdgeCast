@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "🚀 Deploying LiveEdgeCast with KEDA RTMP Serverless Architecture..."
+echo "🚀 Deploying LiveEdgeCast simplified RTMP architecture..."
 
 set -e
 
@@ -37,8 +37,6 @@ check_command() {
 print_step "Checking prerequisites..."
 check_command "docker"
 check_command "kubectl"
-check_command "helm"
-
 if ! kubectl cluster-info >/dev/null 2>&1; then
     print_error "Cannot connect to Kubernetes cluster!"
     kubectl config current-context 2>/dev/null || echo "  No active context found"
@@ -46,33 +44,39 @@ if ! kubectl cluster-info >/dev/null 2>&1; then
 fi
 print_success "kubectl can connect to cluster"
 
-print_step "Checking KEDA installation..."
-if ! kubectl get namespace keda >/dev/null 2>&1; then
-    print_error "KEDA namespace not found. Please install KEDA first:"
-    echo "  helm repo add kedacore https://kedacore.github.io/charts"
-    echo "  helm repo update"
-    echo "  helm install keda kedacore/keda --namespace keda --create-namespace"
-    exit 1
-fi
-
 kubectl apply -f k8s/namespaces.yaml || { print_error "Failed to create namespace"; exit 1; }
 
-kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/media --timeout=30s || {
+kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/media || {
     print_error "Namespace 'media' failed to become active"
     exit 1
 }
-kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/monitoring --timeout=30s || {
-    print_error "Namespace 'keda' failed to become active"
-    exit 1
-}
 
-if ! kubectl get service kube-prometheus-stack-prometheus -n monitoring >/dev/null 2>&1; then
-    print_warning "Prometheus service not found in namespace 'monitoring'. Installing Prometheus stack..."
+if kubectl get apiservice v1beta1.metrics.k8s.io >/dev/null 2>&1; then
+    print_success "Kubernetes Metrics API is available for CPU/memory-based proxy HPA"
+else
+    print_warning "Kubernetes Metrics API (metrics-server) was not found. The proxy HPA will be created, but CPU/memory scaling stays inactive until metrics-server is installed."
+    print_warning "Install metrics-server or enable it in your local cluster before expecting proxy HPA scaling."
+fi
+
+INSTALL_PROMETHEUS="${INSTALL_PROMETHEUS:-false}"
+PROMETHEUS_AVAILABLE=false
+PROMETHEUS_SERVICE="${PROMETHEUS_SERVICE:-kube-prometheus-stack-prometheus}"
+
+if kubectl get service "$PROMETHEUS_SERVICE" -n monitoring >/dev/null 2>&1; then
+    PROMETHEUS_AVAILABLE=true
+    print_success "Prometheus stack already available as service '${PROMETHEUS_SERVICE}' in namespace 'monitoring' for observability/reporting"
+elif DISCOVERED_PROMETHEUS_SERVICE="$(kubectl -n monitoring get svc -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}' 2>/dev/null | grep -E '(^|-)prometheus($|-)' | head -n 1)" && [[ -n "$DISCOVERED_PROMETHEUS_SERVICE" ]]; then
+    PROMETHEUS_SERVICE="$DISCOVERED_PROMETHEUS_SERVICE"
+    PROMETHEUS_AVAILABLE=true
+    print_success "Prometheus stack discovered as service '${PROMETHEUS_SERVICE}' in namespace 'monitoring' for observability/reporting"
+elif [[ "$INSTALL_PROMETHEUS" == "true" || "$INSTALL_PROMETHEUS" == "1" ]]; then
+    check_command "helm"
+    print_warning "Prometheus service not found in namespace 'monitoring'. Installing Prometheus stack for experiment/report observability only (not proxy scaling)..."
     print_step "Installing Prometheus stack..."
-    
+
     helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
     helm repo update >/dev/null 2>&1
-    
+
     helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
         --namespace monitoring --create-namespace \
         --set prometheus-node-exporter.enabled=false \
@@ -81,10 +85,11 @@ if ! kubectl get service kube-prometheus-stack-prometheus -n monitoring >/dev/nu
         print_error "Failed to install Prometheus"
         exit 1
     }
-    
-    print_success "Prometheus installed successfully"
+
+    PROMETHEUS_AVAILABLE=true
+    print_success "Prometheus installed successfully for observability/reporting"
 else
-    print_success "Prometheus stack already available in namespace 'monitoring'"
+    print_warning "Prometheus stack not found and INSTALL_PROMETHEUS=false; continuing without Prometheus observability/reporting."
 fi
 
 print_step "Building LiveEdgeCast proxy image..."
@@ -130,12 +135,11 @@ if [[ $CONTEXT =~ (kind) ]]; then
 elif [[ ! $CONTEXT =~ (docker-desktop|localhost|127\.0\.0\.1) ]]; then
     print_warning "Remote/managed cluster detected: $CONTEXT"
     print_warning "Ensure $PROXY_IMAGE, $WORKER_IMAGE and $CONTROLLER_IMAGE are available in the cluster registry."
-    echo -n "Continue with deployment? (y/n): "
-    read -r continue_deploy
-    if [[ ! $continue_deploy =~ ^[Yy]$ ]]; then
-        print_error "Deployment cancelled. Please push images to cluster registry first."
+    if [[ "${DEPLOY_REMOTE_CLUSTER:-false}" != "true" && "${DEPLOY_REMOTE_CLUSTER:-0}" != "1" ]]; then
+        print_error "Non-interactive safety stop. Set DEPLOY_REMOTE_CLUSTER=true after pushing images to the cluster registry."
         exit 1
     fi
+    print_warning "DEPLOY_REMOTE_CLUSTER=true set; continuing without an interactive prompt."
 fi
 
 print_step "Applying RBAC for Controller..."
@@ -143,8 +147,41 @@ kubectl apply -f k8s/controller-rbac.yaml || { print_error "RBAC setup failed"; 
 print_success "Controller RBAC configured"
 
 print_step "Deploying to Kubernetes..."
-kubectl apply -R -f k8s/ || { print_error "Deployment failed"; exit 1; }
-print_success "Kubernetes manifests applied"
+CORE_MANIFESTS=(
+    k8s/controller-state-configmap.yaml
+    k8s/controller-service.yaml
+    k8s/controller-deployment.yaml
+    k8s/worker-service.yaml
+    k8s/worker-deployment.yaml
+    k8s/proxy-service.yaml
+    k8s/proxy-deployment.yaml
+    k8s/proxy-lb-configmap.yaml
+    k8s/proxy-lb-deployment.yaml
+    k8s/proxy-lb-service.yaml
+    k8s/proxy-hpa.yaml
+)
+CORE_APPLY_ARGS=()
+for manifest in "${CORE_MANIFESTS[@]}"; do
+    CORE_APPLY_ARGS+=(-f "$manifest")
+done
+kubectl apply "${CORE_APPLY_ARGS[@]}" || { print_error "Core deployment failed"; exit 1; }
+print_success "Core Kubernetes manifests applied"
+
+if [[ "$PROMETHEUS_AVAILABLE" == "true" ]] && \
+   kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1 && \
+   kubectl get crd prometheusrules.monitoring.coreos.com >/dev/null 2>&1; then
+    kubectl apply -f k8s/controller-service-monitor.yaml \
+        -f k8s/worker-service-monitor.yaml \
+        -f k8s/proxy-service-monitor.yaml \
+        -f k8s/proxy-observability-rules.yaml \
+        -f k8s/observability/liveedgecast-resource-rules.yaml || {
+        print_error "Observability manifest deployment failed"
+        exit 1
+    }
+    print_success "Prometheus observability manifests applied"
+else
+    print_warning "Skipping Prometheus ServiceMonitor/PrometheusRule manifests; Prometheus Operator CRDs are unavailable or Prometheus is disabled."
+fi
 
 print_step "Waiting for RTMP Controller deployment to be ready..."
 kubectl wait --for=condition=available deployment/controller -n media --timeout=120s || {
@@ -162,20 +199,7 @@ kubectl wait --for=condition=available deployment/proxy -n media --timeout=120s 
 }
 print_success "RTMP Proxy is ready"
 
-print_step "Verifying KEDA ScaledObjects..."
-sleep 5
-
-if kubectl get scaledobject proxy-scaler -n media >/dev/null 2>&1; then
-    print_success "RTMP Proxy ScaledObject is active"
-else
-    print_warning "RTMP Proxy ScaledObject not found"
-fi
-
-if kubectl get scaledobject worker-scaler -n media >/dev/null 2>&1; then
-    print_warning "RTMP Worker ScaledObject found (should be disabled - Controller manages workers)"
-else
-    print_success "RTMP Worker scaling managed by Controller (KEDA disabled as expected)"
-fi
+print_step "Skipping KEDA checks (simplified mode manages workers via controller; proxy uses fixed Deployment replicas)."
 
 print_step "Checking pod status..."
 CONTROLLER_PODS=$(kubectl get pods -l app=controller -n media --no-headers 2>/dev/null | wc -l)
@@ -186,19 +210,10 @@ print_success "RTMP Controller: $CONTROLLER_PODS pod(s) running"
 print_success "RTMP Proxy: $PROXY_PODS pod(s) running"
 
 if [ "$WORKER_PODS" -eq 0 ]; then
-    print_warning "No worker pods running (KEDA serverless - workers will scale on demand)"
+    print_warning "No worker pods running (expected until proxy publish hook asks controller to create one)"
 else
     print_success "RTMP Workers: $WORKER_PODS pod(s) running"
 fi
-
-print_step "Checking KEDA Operator status..."
-kubectl get pods -n keda -l app=keda-operator --no-headers | grep Running >/dev/null || {
-    print_warning "KEDA Operator may not be ready yet"
-}
-
-kubectl get pods -n keda -l app=keda-metrics-apiserver --no-headers | grep Running >/dev/null || {
-    print_warning "KEDA Metrics API Server may not be ready yet"
-}
 
 print_step "Getting NodePort access information..."
 
@@ -218,17 +233,14 @@ echo ""
 print_step "RTMP Proxy Pods:"
 kubectl get pods -l app=proxy -n media
 echo ""
-print_step "RTMP Worker Pods (Serverless):"
+print_step "RTMP Worker Pods (created per stream by controller):"
 kubectl get pods -l app=worker -n media
-echo ""
-print_step "KEDA ScaledObjects:"
-kubectl get scaledobject -n media
 echo ""
 print_step "Services:"
 kubectl get svc -n media
 
 echo ""
-print_success "🎉 LiveEdgeCast RTMP Serverless is ready!"
+print_success "🎉 LiveEdgeCast simplified RTMP pipeline is ready!"
 echo ""
 echo -e "${GREEN}📡 RTMP Streaming (NodePort - External Access):${NC}"
 echo "  📺 From Windows/OBS: rtmp://localhost:31935/live/{your-youtube-key}"
@@ -248,7 +260,6 @@ echo "  📊 Controller status: kubectl logs -l app=controller -n media --tail=5
 echo "  📋 Controller logs: kubectl logs -l app=controller -n media -f"
 echo "  📋 Proxy logs: kubectl logs -l app=proxy -n media -f"
 echo "  📋 Worker logs: kubectl logs -l app=worker -n media -f"
-echo "  🔍 KEDA status: kubectl get scaledobject -n media"
 echo "  📈 Metrics: kubectl top pods -n media"
 echo ""
 echo -e "${YELLOW}🎬 Testing with FFmpeg (NodePort):${NC}"
@@ -266,22 +277,11 @@ echo "  ffmpeg -re -i video1.mp4 -f flv rtmp://localhost:31935/live/key1 &"
 echo "  ffmpeg -re -i video2.mp4 -f flv rtmp://localhost:31935/live/key2 &"
 echo "  ffmpeg -re -i video3.mp4 -f flv rtmp://localhost:31935/live/key3 &"
 echo ""
-echo -e "${YELLOW}💡 Multi-Stream Serverless Architecture v2.0:${NC}"
-echo -e "${YELLOW}   • Controller: Única fonte da verdade para workers (state recovery via métricas)${NC}"
-echo -e "${YELLOW}   • Proxy: Suporte multi-stream via FFmpeg dedicado por publicação${NC}"
-echo -e "${YELLOW}   • Workers: True Serverless (0 replicas) escalados 1:1 pelo Controller${NC}"
-echo -e "${YELLOW}   • Garantia: 1 stream = 1 worker = 1 processo FFmpeg isolado${NC}"
-echo -e "${YELLOW}   • Scripts: Embarcados na imagem Docker (on_publish_start/done.sh)${NC}"
-echo -e "${YELLOW}   • Roteamento: NGINX → FFmpeg → Worker dedicado → YouTube${NC}"
-echo ""
-echo -e "${YELLOW}📊 Auto-Scaling Configuration:${NC}"
-echo -e "${YELLOW}   Proxy Scaling (1-10 replicas via KEDA):${NC}"
-echo -e "${YELLOW}   • Primary: >800 Mbps inbound (80% of 1Gbps per node)${NC}"
-echo -e "${YELLOW}   • Secondary: >50 active connections or >80% CPU${NC}"
-echo -e "${YELLOW}   Worker Scaling (0-100 replicas via Controller):${NC}"
-echo -e "${YELLOW}   • Controller API: /streams/started e /streams/ended orquestram workers${NC}"
-echo -e "${YELLOW}   • Mapeamento bidirecional: stream ↔ worker${NC}"
-echo -e "${YELLOW}   • State recovery: Automático via métricas RTMP ao reiniciar${NC}"
+echo -e "${YELLOW}💡 Simplified Multi-Stream Architecture:${NC}"
+echo -e "${YELLOW}   • Proxy: exec_publish chama /streams/started; exec_publish_done chama /streams/ended${NC}"
+echo -e "${YELLOW}   • Controller: cria/reusa 1 worker por stream e remove no publish_done${NC}"
+echo -e "${YELLOW}   • Workers: execução única de FFmpeg; sem timeout/retry/auto-recovery local${NC}"
+echo -e "${YELLOW}   • Proxy replicas: HPA nativo do Kubernetes por CPU/memória via Metrics API; sem KEDA/ScaledObject/Prometheus para escala${NC}"
 echo ""
 echo -e "${GREEN}🚀 Ready to receive RTMP streams!${NC}"
 echo ""
@@ -306,11 +306,14 @@ fi
 
 echo ""
 echo -e "${BLUE}📊 Monitoring (Optional):${NC}"
-echo "  To access Prometheus UI:"
-echo "    kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090"
-echo "    Then open: http://localhost:9090"
-echo ""
-echo "  Useful Prometheus queries:"
-echo "    - rate(container_network_receive_bytes_total{namespace=\"media\"}[1m])/1000000  # Mbps"
-echo "    - container_memory_usage_bytes{namespace=\"media\",pod=~\"rtmp-.*\"}/1024/1024  # MB"
-echo "    - rate(container_cpu_usage_seconds_total{namespace=\"media\"}[1m])*100  # CPU %"
+if [[ "$PROMETHEUS_AVAILABLE" == "true" ]]; then
+    echo "  To access Prometheus UI:"
+    echo "    kubectl port-forward -n monitoring svc/${PROMETHEUS_SERVICE} 9090:9090"
+    echo "    Then open: http://localhost:9090"
+    echo ""
+    echo "  Useful Prometheus queries for reporting/observability (not proxy scaling):"
+    echo "    - container_memory_working_set_bytes{namespace=\"media\",pod=~\"proxy-.*\"}/1024/1024  # proxy MB"
+    echo "    - rate(container_cpu_usage_seconds_total{namespace=\"media\",pod=~\"proxy-.*\"}[1m])*100  # proxy CPU %"
+else
+    echo "  Prometheus is disabled. Set INSTALL_PROMETHEUS=true before running tools/up.sh if you need report graphs."
+fi

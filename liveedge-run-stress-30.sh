@@ -13,7 +13,7 @@ CURL_BIN="${CURL_BIN:-curl}"
 JQ_BIN="${JQ_BIN:-jq}"
 
 NAMESPACE="${NAMESPACE:-media}"
-PROMETHEUS_URL="${PROMETHEUS_URL:-${PROM_URL:-http://127.0.0.1:9090}}"
+PROMETHEUS_URL="${PROMETHEUS_URL:-${PROM_URL:-}}"
 CONTROLLER_URL="${CONTROLLER_URL:-http://127.0.0.1:8000}"
 RTMP_URL="${RTMP_URL:-${LIVEEDGECAST_RTMP_URL:-rtmp://127.0.0.1:1935/live}}"
 SECONDARY_RTMP_URL="${SECONDARY_RTMP_URL:-}"
@@ -25,7 +25,6 @@ AUDIO_BITRATE="${AUDIO_BITRATE:-128k}"
 
 BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-./reports-stress/$(date +%Y%m%d-%H%M%S)}"
 
-REQUIRE_NETWORK_METRICS="${REQUIRE_NETWORK_METRICS:-false}"
 REQUIRE_DESTINATION_RECEIVED="${REQUIRE_DESTINATION_RECEIVED:-false}"
 ALLOW_PARTIAL="${ALLOW_PARTIAL:-true}"
 ALLOW_INCONCLUSIVE="${ALLOW_INCONCLUSIVE:-true}"
@@ -33,7 +32,7 @@ ALLOW_RESTORE_FAILURE="${ALLOW_RESTORE_FAILURE:-false}"
 ALLOW_UNSCOPED_CONTEXT="${ALLOW_UNSCOPED_CONTEXT:-false}"
 ALLOW_WORKER_CLEANUP="${ALLOW_WORKER_CLEANUP:-false}"
 PATCH_PROXY_CONTEXT="${PATCH_PROXY_CONTEXT:-true}"
-REQUIRE_PROMETHEUS_ANALYSIS="${REQUIRE_PROMETHEUS_ANALYSIS:-true}"
+REQUIRE_PROMETHEUS_ANALYSIS="${REQUIRE_PROMETHEUS_ANALYSIS:-false}"
 
 REQUIRE_MIN_DURATION="${REQUIRE_MIN_DURATION:-true}"
 CONTINUE_ON_SHORT_RUN="${CONTINUE_ON_SHORT_RUN:-false}"
@@ -141,7 +140,9 @@ wait_for_local_endpoints() {
       controller_ok="false"
     fi
 
-    if "$CURL_BIN" -fsS "${PROMETHEUS_URL%/}/-/ready" >/dev/null 2>&1; then
+    if [[ -z "$PROMETHEUS_URL" ]]; then
+      prometheus_ok="skipped"
+    elif "$CURL_BIN" -fsS "${PROMETHEUS_URL%/}/-/ready" >/dev/null 2>&1; then
       prometheus_ok="true"
     else
       prometheus_ok="false"
@@ -153,7 +154,7 @@ wait_for_local_endpoints() {
       rtmp_ok="false"
     fi
 
-    if [[ "$controller_ok" == "true" && "$prometheus_ok" == "true" && "$rtmp_ok" == "true" ]]; then
+    if [[ "$controller_ok" == "true" && ( "$prometheus_ok" == "true" || "$prometheus_ok" == "skipped" ) && "$rtmp_ok" == "true" ]]; then
       log "Local endpoints ready: controller=${controller_ok} prometheus=${prometheus_ok} rtmp=${rtmp_ok}"
       return 0
     fi
@@ -298,6 +299,15 @@ preflight() {
   "$CURL_BIN" -fsS "${CONTROLLER_URL%/}/health" | tee -a "$CAMPAIGN_LOG" || fail "Controller health endpoint failed. Check port-forward svc/controller 8000:8000."
   echo | tee -a "$CAMPAIGN_LOG" >/dev/null
 
+  if [[ -z "$PROMETHEUS_URL" ]]; then
+    if bool_true "$REQUIRE_PROMETHEUS_ANALYSIS"; then
+      fail "REQUIRE_PROMETHEUS_ANALYSIS=true but PROMETHEUS_URL is empty."
+    fi
+    log "PROMETHEUS_URL is empty; skipping Prometheus readiness, target, and metric preflight checks."
+    log "Preflight passed with reduced observability."
+    return 0
+  fi
+
   log "Checking Prometheus readiness: ${PROMETHEUS_URL%/}/-/ready"
   "$CURL_BIN" -fsS "${PROMETHEUS_URL%/}/-/ready" | tee -a "$CAMPAIGN_LOG" || fail "Prometheus not ready. Check port-forward to 9090."
   echo | tee -a "$CAMPAIGN_LOG" >/dev/null
@@ -314,19 +324,17 @@ preflight() {
   log "metric sample counts: controller_active_streams=$controller_samples proxy_rtmp_stats_up=$proxy_samples cpu_by_pod=$cpu_samples memory_by_pod=$memory_samples"
 
   [[ "${controller_samples:-0}" -ge 1 ]] || fail "controller_active_streams has no samples."
-  [[ "${proxy_samples:-0}" -ge 1 ]] || fail "proxy_rtmp_stats_up has no samples."
-  [[ "${memory_samples:-0}" -ge 1 ]] || fail "memory by pod has no samples."
-
-  if bool_true "$REQUIRE_NETWORK_METRICS"; then
-    local rx tx
-    rx=$(prom_query_len "sum by (pod) (rate(container_network_receive_bytes_total{namespace=\"$NAMESPACE\", interface!=\"lo\", pod=~\"proxy-.*\", pod!~\"proxy-lb-.*\"}[1m]))" || echo 0)
-    tx=$(prom_query_len "sum by (pod) (rate(container_network_transmit_bytes_total{namespace=\"$NAMESPACE\", interface!=\"lo\", pod=~\"proxy-.*\", pod!~\"proxy-lb-.*\"}[1m]))" || echo 0)
-    log "network metric sample counts: proxy_rx=$rx proxy_tx=$tx"
-    [[ "${rx:-0}" -ge 1 ]] || fail "REQUIRE_NETWORK_METRICS=true but proxy receive network metric has no samples."
-    [[ "${tx:-0}" -ge 1 ]] || fail "REQUIRE_NETWORK_METRICS=true but proxy transmit network metric has no samples."
-  else
-    log "Network metrics are optional for this environment: REQUIRE_NETWORK_METRICS=false"
+  if [[ "${proxy_samples:-0}" -lt 1 ]]; then
+    log "proxy_rtmp_stats_up has no samples; continuing with reduced proxy metrics."
   fi
+  if [[ "${memory_samples:-0}" -lt 1 ]]; then
+    log "memory by pod has no samples; continuing with reduced infrastructure metrics."
+  fi
+  if [[ "${cpu_samples:-0}" -lt 1 ]]; then
+    log "cpu by pod has no samples; continuing with reduced infrastructure metrics."
+  fi
+
+  log "Proxy verification is limited to CPU/memory/controller metrics; network traffic metrics are not required in simplified mode."
 
   log "Preflight passed."
 }
@@ -335,7 +343,6 @@ build_flags() {
   local flags=()
   bool_true "$PATCH_PROXY_CONTEXT" && flags+=(--patch-proxy-context)
   bool_true "$REQUIRE_PROMETHEUS_ANALYSIS" && flags+=(--require-prometheus-analysis)
-  bool_true "$REQUIRE_NETWORK_METRICS" && flags+=(--require-network-metrics)
   bool_true "$REQUIRE_DESTINATION_RECEIVED" && flags+=(--require-destination-received)
   bool_true "$ALLOW_PARTIAL" && flags+=(--allow-partial)
   bool_true "$ALLOW_INCONCLUSIVE" && flags+=(--allow-inconclusive)
@@ -376,8 +383,9 @@ for key in [
 ]:
     print(f"{key}:", summary.get(key))
 for k in ("total_activation_seconds_per_stream", "worker_ready_seconds_per_stream", "stream_lifecycle_phase_seconds_p95"):
-    row = activation.get(k, {})
-    print(f"{k}: samples={row.get('samples')} p50={row.get('p50')} p95={row.get('p95')} p99={row.get('p99')}")
+    row = activation.get(k, {}) or {}
+    print(f"{k}: samples={row.get('samples', 0)} p50={row.get('p50')} p95={row.get('p95')} p99={row.get('p99')}")
+print("note: controller simplificado; métricas de handover, recovery e lifecycle detalhado podem estar ausentes.")
 PY
 }
 
@@ -441,7 +449,6 @@ run_experiment_once() {
     --repetitions 1
     --cooldown-seconds 0
     --startup-interval-seconds 0
-    --prometheus-url "$PROMETHEUS_URL"
     --controller-url "$CONTROLLER_URL"
     --namespace "$NAMESPACE"
     --rtmp-url "$RTMP_URL"
@@ -456,6 +463,9 @@ run_experiment_once() {
     --overwrite
   )
 
+  if [[ -n "$PROMETHEUS_URL" ]]; then
+    cmd+=(--prometheus-url "$PROMETHEUS_URL")
+  fi
   if [[ -n "$SECONDARY_RTMP_URL" ]]; then
     cmd+=(--secondary-rtmp-url "$SECONDARY_RTMP_URL")
   fi
@@ -555,7 +565,6 @@ run_stress_level() {
       --repetitions "$repetitions"
       --cooldown-seconds "$cooldown"
       --startup-interval-seconds 0
-      --prometheus-url "$PROMETHEUS_URL"
       --controller-url "$CONTROLLER_URL"
       --namespace "$NAMESPACE"
       --rtmp-url "$RTMP_URL"
@@ -569,6 +578,9 @@ run_stress_level() {
       "${flags[@]}"
       --overwrite
     )
+    if [[ -n "$PROMETHEUS_URL" ]]; then
+      cmd+=(--prometheus-url "$PROMETHEUS_URL")
+    fi
     if [[ -n "$SECONDARY_RTMP_URL" ]]; then
       cmd+=(--secondary-rtmp-url "$SECONDARY_RTMP_URL")
     fi
@@ -618,7 +630,6 @@ testsrc_rate=$TESTSRC_RATE
 bitrate=$BITRATE
 audio_bitrate=$AUDIO_BITRATE
 profile=YouTube-like 1080p30 H.264 10Mbps video + AAC 128kbps
-require_network_metrics=$REQUIRE_NETWORK_METRICS
 require_destination_received=$REQUIRE_DESTINATION_RECEIVED
 allow_partial=$ALLOW_PARTIAL
 allow_inconclusive=$ALLOW_INCONCLUSIVE

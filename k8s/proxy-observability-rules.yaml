@@ -8,43 +8,6 @@ spec:
     - name: liveedgecast.proxy.observability
       interval: 15s
       rules:
-        - record: liveedgecast:proxy:network_receive_bytes_per_second
-          expr: |
-            sum by (pod) (
-              rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[1m])
-            )
-        - record: liveedgecast:proxy:network_transmit_bytes_per_second
-          expr: |
-            sum by (pod) (
-              rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[1m])
-            )
-        - record: liveedgecast:component:network_receive_bytes_per_second:rate1m
-          expr: |
-            sum by (component) (
-              label_replace(
-                rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]),
-                "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
-              )
-            )
-        - record: liveedgecast:component:network_transmit_bytes_per_second:rate1m
-          expr: |
-            sum by (component) (
-              label_replace(
-                rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]),
-                "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
-              )
-            )
-        - record: liveedgecast:proxy:inbound_mbps_total
-          expr: |
-            sum(liveedgecast:proxy:network_receive_bytes_per_second) * 8 / (1000*1000)
-        - record: liveedgecast:proxy:outbound_mbps_total
-          expr: |
-            sum(liveedgecast:proxy:network_transmit_bytes_per_second) * 8 / (1000*1000)
-        - record: liveedgecast:proxy:inbound_mbps_avg_per_pod
-          expr: |
-            sum(liveedgecast:proxy:network_receive_bytes_per_second) * 8 / (1000*1000)
-            /
-            clamp_min(count(liveedgecast:proxy:network_receive_bytes_per_second), 1)
         - record: liveedgecast:proxy:cpu_percent
           expr: |
             sum(rate(container_cpu_usage_seconds_total{namespace="media",container!="",container!="POD",pod=~"proxy-.*",pod!~"proxy-lb-.*"}[1m]))

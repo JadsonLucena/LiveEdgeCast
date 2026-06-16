@@ -37,18 +37,11 @@ PYMS
 )"
 FFMPEG_START_MS=""
 
-# Opening an RTMP stream can be transiently racy in a cold-start path:
-# publish event -> controller -> pod scheduling -> container start -> FFmpeg play.
-# Do not fail the worker on the first input-open I/O error.
-FFMPEG_INPUT_OPEN_TIMEOUT_SECONDS="${FFMPEG_INPUT_OPEN_TIMEOUT_SECONDS:-60}"
-FFMPEG_INPUT_ATTEMPT_TIMEOUT_SECONDS="${FFMPEG_INPUT_ATTEMPT_TIMEOUT_SECONDS:-15}"
-FFMPEG_INPUT_RETRY_INTERVAL_SECONDS="${FFMPEG_INPUT_RETRY_INTERVAL_SECONDS:-2}"
+# Simplified worker mode: start FFmpeg once and let it run until it exits or the
+# controller deletes the worker pod on exec_publish_done. No input-open deadline,
+# no per-attempt timeout and no retry/self-recovery loop are used here.
 FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS="${PROGRESS_NOTIFY_POLL_SECONDS:-0.2}"
-FFMPEG_RW_TIMEOUT_MICROSECONDS="${FFMPEG_RW_TIMEOUT_MICROSECONDS:-30000000}"
 FFMPEG_LOGLEVEL="${FFMPEG_LOGLEVEL:-warning}"
-INPUT_OPEN_TIMEOUT_EXIT_CODE="${INPUT_OPEN_TIMEOUT_EXIT_CODE:-251}"
-DESTINATION_OPEN_FAILED_EXIT_CODE="${DESTINATION_OPEN_FAILED_EXIT_CODE:-252}"
-ALLOW_FFMPEG_EXIT_ZERO_WITH_UNKNOWN_STREAM_STATUS="${ALLOW_FFMPEG_EXIT_ZERO_WITH_UNKNOWN_STREAM_STATUS:-false}"
 
 json_escape() {
   local value="${1:-}"
@@ -365,137 +358,47 @@ rm -f "$PROGRESS_FILE" "$PROGRESS_NOTIFY_FILE" "$PROGRESS_NOTIFY_ERROR_FILE" "$P
 rm -rf "$PROGRESS_NOTIFY_LOCK" "$PROGRESS_LOG_LOCK" "$STARTED_NOTIFY_LOCK" "$STARTED_LOG_LOCK"
 : > "$PROGRESS_FILE"
 
-input_open_deadline=$(( $(date +%s) + FFMPEG_INPUT_OPEN_TIMEOUT_SECONDS ))
-attempt=0
-last_exit_code="$INPUT_OPEN_TIMEOUT_EXIT_CODE"
-input_opened=0
+attempt=1
+CURRENT_ATTEMPT="$attempt"
+FFMPEG_START_MS="$(current_epoch_ms)"
+FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-single_attempt-${RANDOM}"
+ATTEMPT_LOG_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.attempt_${attempt}.log"
+: > "$ATTEMPT_LOG_FILE"
+log_json "ffmpeg_process_spawned" "single_attempt_no_timeout" "$(elapsed_ms "$FFMPEG_START_MS")"
 
-while true; do
-  attempt=$((attempt + 1))
-  CURRENT_ATTEMPT="$attempt"
-  now_seconds=$(date +%s)
-  if [ "$now_seconds" -ge "$input_open_deadline" ]; then
-    exit_cleanly_if_stream_terminal
-    log_json "worker_error" "input_open_timeout" "$(elapsed_ms "$RUNNER_START_MS")"
-    exit "$INPUT_OPEN_TIMEOUT_EXIT_CODE"
-  fi
+ffmpeg \
+  -loglevel "$FFMPEG_LOGLEVEL" \
+  -nostats \
+  -progress "/tmp/ffmpeg_${SAFE_STREAM_KEY}.progress" \
+  -i "$PROXY_RTMP" \
+  -c:v copy \
+  -c:a copy \
+  -progress "$PROGRESS_FILE" \
+  -f flv "$TARGET_RTMP" \
+  >> "$ATTEMPT_LOG_FILE" 2>&1 &
 
-  exit_cleanly_if_stream_terminal
+FFMPEG_PID=$!
+echo "$FFMPEG_PID" > "$PID_FILE"
+start_progress_reader
 
-  rm -f "$PROGRESS_FILE"
-  : > "$PROGRESS_FILE"
-  FFMPEG_START_MS="$(current_epoch_ms)"
-  FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-attempt_${attempt}-${RANDOM}"
-  ATTEMPT_LOG_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.attempt_${attempt}.log"
-  : > "$ATTEMPT_LOG_FILE"
-  log_json "ffmpeg_process_spawned" "attempt_${attempt}" "$(elapsed_ms "$FFMPEG_START_MS")"
+EXIT_CODE="$(wait_for_ffmpeg_exit "$FFMPEG_PID")"
+echo "$EXIT_CODE" > "$LAST_EXIT_FILE"
+printf '%s %s\n' "$FFMPEG_RUN_ID" "$EXIT_CODE" >> "$EXIT_EVENT_FILE"
+cat "$ATTEMPT_LOG_FILE" >> "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" 2>/dev/null || true
+rm -f "$PID_FILE"
 
-  ffmpeg \
-    -loglevel "$FFMPEG_LOGLEVEL" \
-    -nostats \
-    -rw_timeout "$FFMPEG_RW_TIMEOUT_MICROSECONDS" \
-    -progress "/tmp/ffmpeg_${SAFE_STREAM_KEY}.progress" \
-    -i "$PROXY_RTMP" \
-    -c:v copy \
-    -c:a copy \
-    -progress "$PROGRESS_FILE" \
-    -f flv "$TARGET_RTMP" \
-    >> "$ATTEMPT_LOG_FILE" 2>&1 &
+if progress_file_has_complete_line; then
+  notify_first_progress_once || true
+fi
+stop_progress_reader
 
-  FFMPEG_PID=$!
-  echo "$FFMPEG_PID" > "$PID_FILE"
-  start_progress_reader
+log_json "ffmpeg_exited" "exit_${EXIT_CODE}_no_retry" "$(elapsed_ms "$FFMPEG_START_MS")"
+if [ "$EXIT_CODE" -ne 0 ]; then
+  log_json "worker_error" "ffmpeg_exit_${EXIT_CODE}_no_self_recovery" "$(elapsed_ms "$RUNNER_START_MS")"
+  tail -n 40 "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" | sed 's/^/[ffmpeg] /' || true
+fi
 
-  attempt_deadline=$(( $(date +%s) + FFMPEG_INPUT_ATTEMPT_TIMEOUT_SECONDS ))
-  input_opened=0
-
-  while true; do
-    if progress_file_has_complete_line; then
-      input_opened=1
-      notify_first_progress_once || true
-      break
-    fi
-
-    if ! kill -0 "$FFMPEG_PID" 2>/dev/null; then
-      break
-    fi
-
-    if [ "$(date +%s)" -ge "$attempt_deadline" ]; then
-      log_json "ffmpeg_input_open_attempt_timeout" "attempt_${attempt}" "$(elapsed_ms "$FFMPEG_START_MS")"
-      kill -TERM "$FFMPEG_PID" 2>/dev/null || true
-      sleep 1
-      if kill -0 "$FFMPEG_PID" 2>/dev/null; then
-        kill -KILL "$FFMPEG_PID" 2>/dev/null || true
-      fi
-      break
-    fi
-
-    sleep "$FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS"
-  done
-
-  EXIT_CODE="$(wait_for_ffmpeg_exit "$FFMPEG_PID")"
-  last_exit_code="$EXIT_CODE"
-  echo "$EXIT_CODE" > "$LAST_EXIT_FILE"
-  printf '%s %s\n' "$FFMPEG_RUN_ID" "$EXIT_CODE" >> "$EXIT_EVENT_FILE"
-  cat "$ATTEMPT_LOG_FILE" >> "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" 2>/dev/null || true
-  rm -f "$PID_FILE"
-
-  if progress_file_has_complete_line; then
-    input_opened=1
-    notify_first_progress_once || true
-  fi
-  stop_progress_reader
-
-  log_json "ffmpeg_exited" "exit_${EXIT_CODE}" "$(elapsed_ms "$FFMPEG_START_MS")"
-
-  if [ "$input_opened" -eq 1 ]; then
-    if [ "$EXIT_CODE" -ne 0 ]; then
-      log_json "worker_error" "ffmpeg_exit_${EXIT_CODE}" "$(elapsed_ms "$RUNNER_START_MS")"
-      tail -n 40 "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" | sed 's/^/[ffmpeg] /' || true
-      exit "$EXIT_CODE"
-    fi
-
-    stream_state="$(controller_stream_activity_state)"
-    if [ "$stream_state" = "ended" ]; then
-      log_json "ffmpeg_completed_after_stream_end" "ok" "$(elapsed_ms "$RUNNER_START_MS")"
-      exit 0
-    fi
-    if [ "$stream_state" = "active" ]; then
-      log_json "worker_error" "ffmpeg_exit_0_while_stream_still_active" "$(elapsed_ms "$RUNNER_START_MS")"
-      exit "$INPUT_OPEN_TIMEOUT_EXIT_CODE"
-    fi
-    if [ "${ALLOW_FFMPEG_EXIT_ZERO_WITH_UNKNOWN_STREAM_STATUS,,}" = "true" ]; then
-      log_json "ffmpeg_completed_with_unknown_stream_status" "ok_allowed" "$(elapsed_ms "$RUNNER_START_MS")"
-      exit 0
-    fi
-    log_json "worker_error" "ffmpeg_exit_0_while_stream_status_unknown" "$(elapsed_ms "$RUNNER_START_MS")"
-    exit "$INPUT_OPEN_TIMEOUT_EXIT_CODE"
-  fi
-
-  # No observable input/progress was opened. This is usually a transient race while
-  # the proxy accepts publish and the worker cold-starts. Retry until the overall deadline.
-  if [ "$EXIT_CODE" -eq 0 ]; then
-    exit_cleanly_if_stream_terminal
-    log_json "ffmpeg_exited_without_progress" "exit_0_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
-  else
-    if ffmpeg_attempt_log_has_destination_open_error "$ATTEMPT_LOG_FILE"; then
-      log_json "worker_error" "destination_open_failed_exit_${EXIT_CODE}_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
-      tail -n 40 "$ATTEMPT_LOG_FILE" | sed 's/^/[ffmpeg] /' || true
-      exit "$DESTINATION_OPEN_FAILED_EXIT_CODE"
-    elif ffmpeg_attempt_log_has_input_open_error "$ATTEMPT_LOG_FILE"; then
-      log_json "ffmpeg_input_open_attempt_failed" "exit_${EXIT_CODE}_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
-    else
-      log_json "ffmpeg_open_attempt_failed_unclassified" "exit_${EXIT_CODE}_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
-    fi
-  fi
-  tail -n 20 "$ATTEMPT_LOG_FILE" | sed 's/^/[ffmpeg] /' || true
-
-  now_seconds=$(date +%s)
-  if [ "$now_seconds" -ge "$input_open_deadline" ]; then
-    exit_cleanly_if_stream_terminal
-    log_json "worker_error" "input_open_timeout_last_exit_${last_exit_code}" "$(elapsed_ms "$RUNNER_START_MS")"
-    exit "$INPUT_OPEN_TIMEOUT_EXIT_CODE"
-  fi
-
-  sleep "$FFMPEG_INPUT_RETRY_INTERVAL_SECONDS"
-done
+# Do not retry or recover locally. restartPolicy=Never on worker pods keeps this
+# as a terminal worker result; the controller will only delete workers when the
+# proxy emits exec_publish_done.
+exit "$EXIT_CODE"

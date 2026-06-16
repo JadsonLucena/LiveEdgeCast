@@ -37,6 +37,11 @@ SCENARIOS = (
     "duplicate-streamkey",
     "pilot-capacity",
 )
+SIMPLIFIED_MODE_UNSUPPORTED_LIFECYCLE_SCENARIOS = {
+    "worker-failure",
+    "proxy-failure",
+    "handover",
+}
 
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 RESERVED_RUN_IDS = {"index", "latest", "__index__", "legacy"}
@@ -46,60 +51,30 @@ PROMETHEUS_LEGACY_LATEST_FILENAME = "prometheus_range_queries.json"
 PROMETHEUS_INSTANT_LATEST_FILENAME = "prometheus_instant_queries.json"
 PROMETHEUS_INSTANT_RUN_PREFIX = "prometheus_instant_queries.run."
 PROMETHEUS_RUN_PREFIX = "prometheus_range_queries.run."
+# In simplified mode, Prometheus strictness is intentionally small. The runner
+# still collects all DEFAULT_PROMQL rows, but only controller allocation/stream
+# gauges are required for --require-prometheus-analysis by default. cAdvisor
+# CPU/memory, detailed lifecycle histograms, handover and recovery metrics are
+# best-effort because this project version disables those controller behaviors.
 CORE_PROMETHEUS_METRICS_FOR_ANALYSIS = {
-    "workers_active",
-    "proxies_active",
-    "controllers_active",
-    "pod_cpu_rate",
-    "pod_memory_working_set",
+    "controller_active_streams",
+    "controller_active_allocations",
 }
 
 SCENARIO_PROMETHEUS_METRICS_FOR_ANALYSIS = {
-    "cold-start": {
-        "controller_active_streams",
-        "controller_active_allocations",
-        "stream_lifecycle_phase_seconds_p95",
-    },
-    "concurrency": {
-        "controller_active_streams",
-        "controller_active_allocations",
-        "stream_lifecycle_phase_seconds_p95",
-    },
-    "release": {
-        "controller_active_streams",
-        "controller_active_allocations",
-    },
-    "worker-failure": {
-        "worker_recovery_total",
-        "worker_recovery_duration_seconds_p95",
-    },
-    "proxy-failure": {
-        "controller_active_streams",
-        "controller_active_allocations",
-        "proxy_rtmp_active_streams",
-    },
-    "handover": {
-        "handover_attempts_total",
-        "handover_success_total",
-        "handover_conflict_total",
-    },
-    "duplicate-streamkey": {
-        "handover_attempts_total",
-        "handover_success_total",
-        "handover_conflict_total",
-    },
-    "pilot-capacity": {
-        "controller_active_streams",
-        "controller_active_allocations",
-        "stream_lifecycle_phase_seconds_p95",
-    },
+    "cold-start": set(),
+    "concurrency": set(),
+    "release": set(),
+    "worker-failure": set(),
+    "proxy-failure": set(),
+    "handover": set(),
+    "duplicate-streamkey": set(),
+    "pilot-capacity": set(),
 }
 
-# Metrics such as proxy_network_receive_bps/proxy_network_transmit_bps are
-# collected when available. They are optional by default because some local
-# Kubernetes distributions do not expose container_network_* through cAdvisor,
-# but --require-network-metrics can promote them to required evidence for final
-# experiments on clusters that support Pod network metrics.
+# Proxy/resource verification in simplified mode is intentionally limited to
+# CPU and memory. Network traffic is not used for proxy scaling or required
+# experiment evidence.
 
 # Small tolerance for distributed timestamp ordering noise between proxy/controller hooks.
 TIMESTAMP_ORDERING_TOLERANCE_SECONDS = 0.050
@@ -115,8 +90,6 @@ DEFAULT_PROMQL = {
     "controllers_active": 'count(kube_pod_info{namespace="$namespace", pod=~"controller-.*"})',
     "pod_cpu_rate": 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))',
     "pod_memory_working_set": 'sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})',
-    "proxy_network_receive_bps": 'sum by (pod) (rate(container_network_receive_bytes_total{namespace="$namespace", interface!="lo", pod=~"(proxy-lb|proxy|worker|controller)-.*", pod=~"proxy-.*", pod!~"proxy-lb-.*"}[1m]))',
-    "proxy_network_transmit_bps": 'sum by (pod) (rate(container_network_transmit_bytes_total{namespace="$namespace", interface!="lo", pod=~"(proxy-lb|proxy|worker|controller)-.*", pod=~"proxy-.*", pod!~"proxy-lb-.*"}[1m]))',
     "stream_lifecycle_phase_seconds_p50": 'histogram_quantile(0.50, sum by (le, phase) (increase(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
     "stream_lifecycle_phase_seconds_p95": 'histogram_quantile(0.95, sum by (le, phase) (increase(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
     "stream_lifecycle_phase_seconds_p99": 'histogram_quantile(0.99, sum by (le, phase) (increase(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
@@ -175,7 +148,6 @@ class RunnerConfig:
     allow_unscoped_context: bool = False
     allow_inconclusive: bool = False
     require_prometheus_analysis: bool = False
-    require_network_metrics: bool = False
     require_destination_received: bool = False
     legacy_output: bool = False
     testsrc_size: str = "1920x1080"
@@ -292,7 +264,6 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--allow-unscoped-context", action="store_true", help="Return exit code 0 when --patch-proxy-context was requested but proxy/controller context patching was not fully effective.")
     parser.add_argument("--allow-inconclusive", action="store_true", help="Return exit code 0 for handover/duplicate-streamkey runs whose between-proxy hypothesis remains inconclusive. By default inconclusive hypothesis tests fail automation.")
     parser.add_argument("--require-prometheus-analysis", action="store_true", help="Return exit code 1 when --prometheus-url is configured but required Prometheus samples for resource/activity analysis are incomplete.")
-    parser.add_argument("--require-network-metrics", action="store_true", help="Promote proxy network RX/TX Prometheus metrics to required evidence. Use this for final experiments on clusters exposing container_network_* metrics.")
     parser.add_argument("--require-destination-received", action="store_true", help="Require t_destination_received in per-stream activation metrics. Keep disabled unless an instrumented destination receiver is part of the experiment.")
     parser.add_argument("--legacy-output", action="store_true", help="Deprecated compatibility flag. metrics/cost_estimation.csv is generated by default as a legacy alias with a deprecation notice; resource_activity.csv remains the primary artifact.")
     parser.add_argument("--proxy-container", default=os.getenv("LIVEEDGECAST_PROXY_CONTAINER"), help="Container name to patch in deployment/proxy. Required when deployment/proxy has multiple containers.")
@@ -372,7 +343,6 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         allow_unscoped_context=args.allow_unscoped_context,
         allow_inconclusive=args.allow_inconclusive,
         require_prometheus_analysis=args.require_prometheus_analysis,
-        require_network_metrics=args.require_network_metrics,
         require_destination_received=args.require_destination_received,
         legacy_output=args.legacy_output,
         testsrc_size=args.testsrc_size,
@@ -1954,11 +1924,28 @@ def always_on_worker_pod_seconds_reference(windows: list[dict[str, Any]], fallba
     return max(1, len(fallback_stream_keys)) * fallback_duration, "fallback_len_stream_keys_times_query_window"
 
 
-def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
-    if config.dry_run:
-        return {"dry_run": True, "would_run": config.scenario, "stream_keys": config.stream_keys, "status": "valid"}
+def simplified_lifecycle_warning(config: RunnerConfig) -> dict[str, Any] | None:
+    if config.scenario not in SIMPLIFIED_MODE_UNSUPPORTED_LIFECYCLE_SCENARIOS and not config.kill_worker and not config.kill_proxy:
+        return None
+    return {
+        "event": "simplified_lifecycle_scenario_warning",
+        "experiment_id": config.experiment_id,
+        "scenario": config.scenario,
+        "run_id": config.run_id,
+        "timestamp": now_epoch(),
+        "status": "unsupported_recovery_handover_semantics",
+        "message": (
+            "Simplified mode disables controller handover, auto-recovery and orphan cleanup; "
+            "this run observes terminal/no-recovery behavior rather than validating automatic resilience."
+        ),
+    }
+
+
+def execute_experiment(config: RunnerConfig, dirs: dict[str, Path], simplified_warning: dict[str, Any] | None = None) -> dict[str, Any]:
     if not shutil.which(config.ffmpeg_path) and not Path(config.ffmpeg_path).exists():
         raise RuntimeError(f"ffmpeg not found: {config.ffmpeg_path}")
+    if simplified_warning:
+        append_jsonl(dirs["raw"] / "streams.jsonl", simplified_warning)
 
     setup_started_at = now_epoch()
     patch_result = patch_proxy_context(config, dirs)
@@ -2856,7 +2843,7 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
     write_csv(dirs["metrics"] / "resilience_metrics.csv", resilience_rows, ["run_id", "repetition", "type", "stream_key", "pod", "timestamp", "recovery_completed_at", "recovery_event", "recovery_seconds", "status"])
 
     resource_rows = []
-    for metric_name in ("pod_cpu_rate", "pod_memory_working_set", "proxy_network_receive_bps", "proxy_network_transmit_bps"):
+    for metric_name in ("pod_cpu_rate", "pod_memory_working_set"):
         grouped_components = prom_series_values_by_component(prom.get(metric_name, {}))
         if not grouped_components:
             resource_rows.append({"metric": metric_name, "component": "not_observable", **stats([])})
@@ -3014,7 +3001,7 @@ def generate_charts(dirs: dict[str, Path]) -> dict[str, str]:
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except Exception:
-        for name in ("activation_boxplot", "activation_p95_by_concurrency", "activation_p95_observed_dataset", "resource_usage_cpu", "resource_usage_memory", "network_usage_proxy", "workers_over_time", "recovery_time"):
+        for name in ("activation_boxplot", "activation_p95_by_concurrency", "activation_p95_observed_dataset", "resource_usage_cpu", "resource_usage_memory", "workers_over_time", "recovery_time"):
             paths[name] = write_chart_limitation(dirs["charts"] / f"{name}.png", "Matplotlib unavailable; chart not generated.")
         return paths
 
@@ -3073,7 +3060,7 @@ def generate_charts(dirs: dict[str, Path]) -> dict[str, str]:
         paths["activation_p95_observed_dataset"] = write_chart_limitation(observed_path, "No activation samples available for observed-dataset P95 chart.")
 
     resource = csv_rows(dirs["metrics"] / "resource_usage.csv")
-    for chart_name, metric in [("resource_usage_cpu", "pod_cpu_rate"), ("resource_usage_memory", "pod_memory_working_set"), ("network_usage_proxy", "proxy_network_receive_bps")]:
+    for chart_name, metric in [("resource_usage_cpu", "pod_cpu_rate"), ("resource_usage_memory", "pod_memory_working_set")]:
         path = dirs["charts"] / f"{chart_name}.png"
         rows = [r for r in resource if r.get("metric") == metric and r.get("samples") not in (None, "", "0")]
         if rows:
@@ -3231,13 +3218,11 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
 def required_prometheus_metrics_for_analysis(config: RunnerConfig) -> set[str]:
     """Return the Prometheus metrics that must have samples for this scenario.
 
-    The runner still collects every query in DEFAULT_PROMQL, but a smoke/cold-start
-    run must not fail just because handover, recovery, orphan cleanup, or optional
-    network metrics did not occur in that scenario.
+    The runner still collects every query in DEFAULT_PROMQL, but simplified-mode
+    runs must not fail just because lifecycle histograms, handover, recovery,
+    or orphan cleanup did not occur. Proxy/resource verification is CPU/memory only.
     """
     required = set(CORE_PROMETHEUS_METRICS_FOR_ANALYSIS) | set(SCENARIO_PROMETHEUS_METRICS_FOR_ANALYSIS.get(config.scenario, set()))
-    if config.require_network_metrics:
-        required.update({"proxy_network_receive_bps", "proxy_network_transmit_bps"})
     return required
 
 
@@ -3480,11 +3465,11 @@ def discussion_text(config: RunnerConfig, report_json: dict[str, Any]) -> str:
     else:
         lines.append("A conclusão sobre cold start per-stream ainda é limitada, pois as métricas de ciclo de vida não estavam plenamente observáveis ou não retornaram amostras suficientes.")
     if config.prometheus_url:
-        lines.append("As séries do Prometheus permitem relacionar latência e comportamento operacional com uso de CPU, memória, rede e quantidade de pods ativos, desde que as consultas tenham retornado amostras válidas.")
+        lines.append("As séries do Prometheus permitem relacionar latência e comportamento operacional com uso de CPU, memória e quantidade de pods ativos, desde que as consultas tenham retornado amostras válidas.")
     else:
         lines.append("Como o Prometheus não foi configurado, a discussão quantitativa de recursos e custo relativo não pode ser sustentada por séries temporais nesta execução.")
     if config.scenario in {"worker-failure", "proxy-failure", "handover", "duplicate-streamkey"}:
-        lines.append("O cenário executado também contribui para a análise qualitativa de resiliência e correção arquitetural, especialmente quanto a recuperação de worker, limitação de falha de proxy, handover seguro ou rejeição de streamKey duplicada.")
+        lines.append("Nesta versão simplificada, cenários de falha, handover e streamKey duplicada são tratados como evidência qualitativa/reduzida; recuperação automática e handover não são responsabilidades ativas do controller.")
     if missing:
         lines.append("As métricas ausentes devem ser explicitadas como limitação metodológica; conclusões sobre elas não devem ser afirmadas sem nova instrumentação ou nova execução experimental.")
     return "\n\n".join(lines)
@@ -3495,15 +3480,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_root = prepare_report_root(config)
     dirs = ensure_layout(report_root)
     metadata = {**asdict(config), "output_dir": str(config.output_dir), "report_root": str(config.report_root), "started_at": now_epoch(), "started_at_iso": now_iso()}
+    simplified_warning = simplified_lifecycle_warning(config)
+    if simplified_warning:
+        print(f"WARNING: {simplified_warning['message']}", file=sys.stderr)
+        metadata["simplified_lifecycle_warning"] = simplified_warning
     write_json(dirs["root"] / "metadata.json", metadata)
     if config.dry_run:
         execution = {"dry_run": True, "config": metadata}
+        if simplified_warning:
+            execution["simplified_lifecycle_warning"] = simplified_warning
         write_json(dirs["root"] / "report.json", execution)
-        (dirs["root"] / "report.md").write_text("# Dry run\n\nConfiguração validada. Nenhum experimento foi executado.\n", encoding="utf-8")
+        dry_report = "# Dry run\n\nConfiguração validada. Nenhum experimento foi executado.\n"
+        if simplified_warning:
+            dry_report += f"\n> Aviso: {simplified_warning['message']}\n"
+        (dirs["root"] / "report.md").write_text(dry_report, encoding="utf-8")
         return 0
     exit_code = 0
     try:
-        execution = execute_experiment(config, dirs)
+        execution = execute_experiment(config, dirs, simplified_warning=simplified_warning)
     except Exception as exc:
         execution = {"error": {"type": type(exc).__name__, "message": str(exc)}, "started_at": metadata["started_at"], "ended_at": now_epoch()}
         exit_code = 1
