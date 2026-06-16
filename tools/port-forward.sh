@@ -22,6 +22,8 @@ PROMETHEUS_SERVICE="${PROMETHEUS_SERVICE:-}"
 DEFAULT_PROMETHEUS_SERVICE="${DEFAULT_PROMETHEUS_SERVICE:-kube-prometheus-stack-prometheus}"
 PROMETHEUS_LOCAL_PORT="${PROMETHEUS_LOCAL_PORT:-9090}"
 PROMETHEUS_REMOTE_PORT="${PROMETHEUS_REMOTE_PORT:-9090}"
+ENABLE_PROMETHEUS_FORWARD="${ENABLE_PROMETHEUS_FORWARD:-auto}"
+PROMETHEUS_FORWARD_ENABLED=false
 
 # Optional helper: forward proxy HTTP/stat endpoint if needed for manual debug.
 ENABLE_PROXY_HTTP_FORWARD="${ENABLE_PROXY_HTTP_FORWARD:-false}"
@@ -54,6 +56,7 @@ Environment overrides:
   CONTROLLER_SERVICE, CONTROLLER_LOCAL_PORT, CONTROLLER_REMOTE_PORT
   PROXY_ENTRY_SERVICE, RTMP_LOCAL_PORT, RTMP_REMOTE_PORT
   PROMETHEUS_SERVICE, DEFAULT_PROMETHEUS_SERVICE, PROMETHEUS_LOCAL_PORT, PROMETHEUS_REMOTE_PORT
+  ENABLE_PROMETHEUS_FORWARD=true|false|auto
   ENABLE_PROXY_HTTP_FORWARD=true
   LIVEEDGECAST_PORT_FORWARD_PID_DIR, LIVEEDGECAST_PORT_FORWARD_LOG_DIR
 USAGE
@@ -138,7 +141,7 @@ resolve_prometheus_service() {
     port="$(prometheus_service_port "$PROMETHEUS_SERVICE" || true)"
     if [[ -z "$port" ]]; then
       print_error "Configured Prometheus service ${MONITORING_NAMESPACE}/svc/${PROMETHEUS_SERVICE} does not expose port 9090/web." >&2
-      exit 1
+      return 1
     fi
     PROMETHEUS_REMOTE_PORT="$port"
     return 0
@@ -162,7 +165,7 @@ resolve_prometheus_service() {
     0)
       print_error "Prometheus service was not found in namespace ${MONITORING_NAMESPACE}." >&2
       kubectl -n "$MONITORING_NAMESPACE" get svc >&2 2>/dev/null || true
-      exit 1
+      return 1
       ;;
     1)
       PROMETHEUS_SERVICE="${candidates[0]%:*}"
@@ -171,7 +174,7 @@ resolve_prometheus_service() {
       ;;
     *)
       print_error "Multiple Prometheus service candidates found: ${candidates[*]}. Set PROMETHEUS_SERVICE explicitly." >&2
-      exit 1
+      return 1
       ;;
   esac
 }
@@ -317,7 +320,29 @@ validate_required_services() {
   print_step "Validating required Services..."
   kubectl -n "$MEDIA_NAMESPACE" get "svc/${CONTROLLER_SERVICE}" >/dev/null
   kubectl -n "$MEDIA_NAMESPACE" get "svc/${PROXY_ENTRY_SERVICE}" >/dev/null
-  resolve_prometheus_service
+
+  case "$ENABLE_PROMETHEUS_FORWARD" in
+    true|TRUE|1|yes|YES|y|Y)
+      resolve_prometheus_service || exit 1
+      PROMETHEUS_FORWARD_ENABLED=true
+      ;;
+    false|FALSE|0|no|NO|n|N)
+      PROMETHEUS_FORWARD_ENABLED=false
+      print_warning "Prometheus port-forward disabled by ENABLE_PROMETHEUS_FORWARD=false."
+      ;;
+    auto|AUTO|"")
+      if resolve_prometheus_service; then
+        PROMETHEUS_FORWARD_ENABLED=true
+      else
+        PROMETHEUS_FORWARD_ENABLED=false
+        print_warning "Prometheus service not found; continuing with controller/RTMP port-forwards only."
+      fi
+      ;;
+    *)
+      print_error "Invalid ENABLE_PROMETHEUS_FORWARD='${ENABLE_PROMETHEUS_FORWARD}'. Use true, false, or auto."
+      exit 1
+      ;;
+  esac
 
   CONTROLLER_REMOTE_PORT="$(service_port "$MEDIA_NAMESPACE" "$CONTROLLER_SERVICE" "$CONTROLLER_REMOTE_PORT" || echo "$CONTROLLER_REMOTE_PORT")"
   RTMP_REMOTE_PORT="$(service_port "$MEDIA_NAMESPACE" "$PROXY_ENTRY_SERVICE" "$RTMP_REMOTE_PORT" || echo "$RTMP_REMOTE_PORT")"
@@ -339,11 +364,15 @@ print_health() {
       cat /tmp/liveedgecast-controller-health.err 2>/dev/null || true
     fi
 
-    if curl -fsS "http://127.0.0.1:${PROMETHEUS_LOCAL_PORT}/-/ready" >/tmp/liveedgecast-prometheus-ready.out 2>/tmp/liveedgecast-prometheus-ready.err; then
-      print_success "prometheus ready: $(cat /tmp/liveedgecast-prometheus-ready.out)"
+    if [[ "$PROMETHEUS_FORWARD_ENABLED" == "true" ]]; then
+      if curl -fsS "http://127.0.0.1:${PROMETHEUS_LOCAL_PORT}/-/ready" >/tmp/liveedgecast-prometheus-ready.out 2>/tmp/liveedgecast-prometheus-ready.err; then
+        print_success "prometheus ready: $(cat /tmp/liveedgecast-prometheus-ready.out)"
+      else
+        print_warning "prometheus readiness check failed on http://127.0.0.1:${PROMETHEUS_LOCAL_PORT}/-/ready"
+        cat /tmp/liveedgecast-prometheus-ready.err 2>/dev/null || true
+      fi
     else
-      print_warning "prometheus readiness check failed on http://127.0.0.1:${PROMETHEUS_LOCAL_PORT}/-/ready"
-      cat /tmp/liveedgecast-prometheus-ready.err 2>/dev/null || true
+      print_warning "prometheus readiness check skipped because Prometheus port-forward is disabled/unavailable."
     fi
   else
     print_warning "curl not found; skipped HTTP health checks."
@@ -371,7 +400,11 @@ start_all() {
   print_step "Starting self-healing port-forward supervisors..."
   start_supervisor "$MEDIA_NAMESPACE" "svc/${CONTROLLER_SERVICE}" "$CONTROLLER_LOCAL_PORT" "$CONTROLLER_REMOTE_PORT" controller
   start_supervisor "$MEDIA_NAMESPACE" "svc/${PROXY_ENTRY_SERVICE}" "$RTMP_LOCAL_PORT" "$RTMP_REMOTE_PORT" rtmp
-  start_supervisor "$MONITORING_NAMESPACE" "svc/${PROMETHEUS_SERVICE}" "$PROMETHEUS_LOCAL_PORT" "$PROMETHEUS_REMOTE_PORT" prometheus
+  if [[ "$PROMETHEUS_FORWARD_ENABLED" == "true" ]]; then
+    start_supervisor "$MONITORING_NAMESPACE" "svc/${PROMETHEUS_SERVICE}" "$PROMETHEUS_LOCAL_PORT" "$PROMETHEUS_REMOTE_PORT" prometheus
+  else
+    print_warning "Skipping Prometheus port-forward."
+  fi
 
   if [[ "$ENABLE_PROXY_HTTP_FORWARD" == "true" ]]; then
     start_supervisor "$MEDIA_NAMESPACE" "svc/${PROXY_HTTP_SERVICE}" "$PROXY_HTTP_LOCAL_PORT" "$PROXY_HTTP_REMOTE_PORT" proxy-http
@@ -383,7 +416,11 @@ start_all() {
   echo "Endpoints:"
   echo "  Controller: http://127.0.0.1:${CONTROLLER_LOCAL_PORT}/health"
   echo "  RTMP:       rtmp://127.0.0.1:${RTMP_LOCAL_PORT}/live"
-  echo "  Prometheus: http://127.0.0.1:${PROMETHEUS_LOCAL_PORT}"
+  if [[ "$PROMETHEUS_FORWARD_ENABLED" == "true" ]]; then
+    echo "  Prometheus: http://127.0.0.1:${PROMETHEUS_LOCAL_PORT}"
+  else
+    echo "  Prometheus: disabled/unavailable (set ENABLE_PROMETHEUS_FORWARD=true to require it)"
+  fi
   echo "Logs: ${LOG_DIR}/liveedgecast-*-port-forward.log"
 }
 

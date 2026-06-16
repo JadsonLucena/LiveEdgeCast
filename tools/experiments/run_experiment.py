@@ -37,6 +37,11 @@ SCENARIOS = (
     "duplicate-streamkey",
     "pilot-capacity",
 )
+SIMPLIFIED_MODE_UNSUPPORTED_LIFECYCLE_SCENARIOS = {
+    "worker-failure",
+    "proxy-failure",
+    "handover",
+}
 
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 RESERVED_RUN_IDS = {"index", "latest", "__index__", "legacy"}
@@ -1920,10 +1925,30 @@ def always_on_worker_pod_seconds_reference(windows: list[dict[str, Any]], fallba
 
 
 def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
+    simplified_warning = None
+    if config.scenario in SIMPLIFIED_MODE_UNSUPPORTED_LIFECYCLE_SCENARIOS or config.kill_worker or config.kill_proxy:
+        simplified_warning = {
+            "event": "simplified_lifecycle_scenario_warning",
+            "experiment_id": config.experiment_id,
+            "scenario": config.scenario,
+            "run_id": config.run_id,
+            "timestamp": now_epoch(),
+            "status": "unsupported_recovery_handover_semantics",
+            "message": (
+                "Simplified mode disables controller handover, auto-recovery and orphan cleanup; "
+                "this run observes terminal/no-recovery behavior rather than validating automatic resilience."
+            ),
+        }
+        print(f"WARNING: {simplified_warning['message']}", file=sys.stderr)
     if config.dry_run:
-        return {"dry_run": True, "would_run": config.scenario, "stream_keys": config.stream_keys, "status": "valid"}
+        result = {"dry_run": True, "would_run": config.scenario, "stream_keys": config.stream_keys, "status": "valid"}
+        if simplified_warning:
+            result["simplified_lifecycle_warning"] = simplified_warning
+        return result
     if not shutil.which(config.ffmpeg_path) and not Path(config.ffmpeg_path).exists():
         raise RuntimeError(f"ffmpeg not found: {config.ffmpeg_path}")
+    if simplified_warning:
+        append_jsonl(dirs["raw"] / "streams.jsonl", simplified_warning)
 
     setup_started_at = now_epoch()
     patch_result = patch_proxy_context(config, dirs)

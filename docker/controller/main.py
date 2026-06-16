@@ -3087,8 +3087,13 @@ def allocate_worker(
 
 async def release_worker(stream: str = Query(..., description="Stream name to release")):
     """
-    Libera worker alocado para uma stream e SEMPRE limpa estado canônico residual.
-    Idempotente: se não houver worker, ainda remove ownership/mapeamentos restantes.
+    Libera worker alocado para uma stream.
+
+    Simplified lifecycle rule: try to delete the worker first, then clean the
+    canonical state only after Kubernetes confirms the Pod is gone (success or
+    404).  Because orphan/recovery loops are disabled in this version, keeping
+    the mapping on delete failure is intentional: a later /streams/ended replay
+    or manual call can retry the delete instead of losing track of a live worker.
     """
     started_at = time.monotonic()
     metric_status = "success"
@@ -3096,72 +3101,79 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
 
     worker_name = None
     owner_proxy = None
-    changed = False
-    response_status = "not_found"
+    residual_state = False
+
+    def cleanup_released_state_locked(expected_worker: Optional[str]) -> bool:
+        """Remove stream state only when the mapping still points at the deleted worker."""
+        changed = False
+        current_worker = stream_to_worker.get(stream)
+        if expected_worker and current_worker and current_worker != expected_worker:
+            logger.warning(
+                f"[Release] Stream '{stream}' remapped from worker '{expected_worker}' "
+                f"to '{current_worker}' before cleanup; preserving current mapping."
+            )
+            return False
+
+        removed_worker = stream_to_worker.pop(stream, None)
+        if removed_worker:
+            changed = True
+            worker_to_stream.pop(removed_worker, None)
+            cleanup_worker_lifecycle_tracking_locked(removed_worker)
+            worker_ready_since.pop(removed_worker, None)
+            worker_not_ready_since.pop(removed_worker, None)
+            worker_create_started_at.pop(removed_worker, None)
+            old_uid = worker_pod_uid_by_name.pop(removed_worker, None)
+            if old_uid:
+                worker_health_failures.pop(old_uid, None)
+
+        if stream_to_proxy.pop(stream, None) is not None:
+            changed = True
+        if stream_registry.pop(stream, None) is not None:
+            changed = True
+        if stream_generation.pop(stream, None) is not None:
+            changed = True
+        if changed:
+            cleanup_stream_lifecycle_tracking_locked(stream)
+            update_controller_state_gauges_locked()
+            persist_state_locked()
+        return changed
 
     try:
         with allocation_lock:
             owner_proxy = stream_registry.get(stream, {}).get("proxy_pod") or stream_to_proxy.get(stream)
-            worker_name = stream_to_worker.pop(stream, None)
-
-            if worker_name:
-                changed = True
-                response_status = "released"
-                worker_to_stream.pop(worker_name, None)
-                cleanup_worker_lifecycle_tracking_locked(worker_name)
-                worker_ready_since.pop(worker_name, None)
-                worker_not_ready_since.pop(worker_name, None)
-                worker_create_started_at.pop(worker_name, None)
-                old_uid = worker_pod_uid_by_name.pop(worker_name, None)
-                if old_uid:
-                    worker_health_failures.pop(old_uid, None)
-
-            if stream_to_proxy.pop(stream, None) is not None:
-                changed = True
-            if stream_registry.pop(stream, None) is not None:
-                changed = True
-            if stream_generation.pop(stream, None) is not None:
-                changed = True
-            if changed:
-                cleanup_stream_lifecycle_tracking_locked(stream)
-                update_controller_state_gauges_locked()
-                persist_state_locked()
+            worker_name = stream_to_worker.get(stream)
+            residual_state = any(
+                mapping in container
+                for mapping, container in (
+                    (stream, stream_to_proxy),
+                    (stream, stream_registry),
+                    (stream, stream_generation),
+                )
+            )
 
         if worker_name:
-            logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
+            logger.info(f"[Release] Deleting worker {worker_name} for stream '{stream}'")
+            delete_status = LOG_STATUS_DELETED
+            response_status = "released"
             try:
                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
                 metric_best_effort("recording worker delete metric", lambda: record_worker_delete_metric("success", "released"))
                 metric_reason = "released"
-                log_controller_event(
-                    "worker_deleted",
-                    stream=stream,
-                    proxy_pod=owner_proxy,
-                    worker_pod=worker_name,
-                    started_at=started_at,
-                    status=LOG_STATUS_DELETED,
-                )
             except ApiException as e:
                 if e.status == 404:
                     metric_status = "success"
                     metric_reason = "pod_already_deleted"
+                    response_status = "pod_already_deleted"
+                    delete_status = LOG_STATUS_ALREADY_DELETED
                     metric_best_effort("recording worker already deleted metric", lambda: record_worker_delete_metric("success", "pod_already_deleted"))
                     logger.info(f"[Release] Worker pod {worker_name} was already deleted")
-                    log_controller_event(
-                        "worker_deleted",
-                        stream=stream,
-                        proxy_pod=owner_proxy,
-                        worker_pod=worker_name,
-                        started_at=started_at,
-                        status=LOG_STATUS_ALREADY_DELETED,
-                    )
                 else:
                     metric_status = "warning"
                     metric_reason = "delete_failed"
                     metric_best_effort("recording Kubernetes delete error metric", lambda: record_kubernetes_api_error("delete", "pod", e))
                     metric_best_effort("recording worker delete failure metric", lambda: record_worker_delete_metric("warning", "delete_failed"))
                     log_controller_event(
-                        "worker_deleted",
+                        "worker_delete_failed",
                         stream=stream,
                         proxy_pod=owner_proxy,
                         worker_pod=worker_name,
@@ -3169,17 +3181,37 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                         status=LOG_STATUS_DELETE_FAILED,
                         level=logging.WARNING,
                     )
-                    logger.warning(f"[Release] Failed deleting worker pod {worker_name}: {e}")
-            return {
-                "status": response_status,
-                "stream": stream,
-                "worker": worker_name
-            }
+                    logger.warning(
+                        f"[Release] Failed deleting worker pod {worker_name}; preserving stream mapping for retry: {e}"
+                    )
+                    return {"status": "delete_failed", "stream": stream, "worker": worker_name}
 
-        if changed:
-            logger.info(f"[Release] Cleaned residual state for stream '{stream}' without active worker")
-            metric_reason = "state_cleaned"
-            return {"status": "state_cleaned", "stream": stream}
+            with allocation_lock:
+                changed = cleanup_released_state_locked(worker_name)
+
+            log_controller_event(
+                "worker_deleted",
+                stream=stream,
+                proxy_pod=owner_proxy,
+                worker_pod=worker_name,
+                started_at=started_at,
+                status=delete_status,
+            )
+            if not changed:
+                metric_status = "warning"
+                metric_reason = "mapping_changed"
+                return {"status": "mapping_changed", "stream": stream, "worker": worker_name}
+
+            logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
+            return {"status": response_status, "stream": stream, "worker": worker_name}
+
+        if residual_state:
+            with allocation_lock:
+                changed = cleanup_released_state_locked(None)
+            if changed:
+                logger.info(f"[Release] Cleaned residual state for stream '{stream}' without active worker")
+                metric_reason = "state_cleaned"
+                return {"status": "state_cleaned", "stream": stream}
 
         logger.info(f"[Release] Idempotent replay: stream '{stream}' not found")
         metric_reason = "not_found"
@@ -3615,9 +3647,15 @@ async def stream_ended(
     )
     try:
         release_result = await release_worker(stream=stream)
-        replay = release_result.get("status") == "not_found"
-        event_status = "not_found" if replay else "ended"
-        event_reason = "no_worker_mapping" if replay else "publish_done_cleanup"
+        release_status = release_result.get("status")
+        replay = release_status == "not_found"
+        cleanup_incomplete = release_status in {"delete_failed", "mapping_changed"}
+        event_status = "not_found" if replay else (release_status if cleanup_incomplete else "ended")
+        event_reason = (
+            "no_worker_mapping"
+            if replay
+            else ("worker_delete_not_confirmed" if cleanup_incomplete else "publish_done_cleanup")
+        )
         metric_best_effort(
             "recording stream ended metric",
             lambda: stream_ended_events_total.labels(status=event_status, reason=event_reason).inc(),
@@ -3631,7 +3669,7 @@ async def stream_ended(
             f"[StreamsEnded] exec_publish_done cleanup for stream '{stream}' "
             f"proxy='{proxy_pod}' release_status='{release_result.get('status')}'"
         )
-        metric_status = "success"
+        metric_status = "warning" if cleanup_incomplete else "success"
         metric_reason = event_status
         return {"status": event_status, "stream": stream, "release": release_result}
     except Exception as e:

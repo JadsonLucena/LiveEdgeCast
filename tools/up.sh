@@ -64,10 +64,15 @@ fi
 
 INSTALL_PROMETHEUS="${INSTALL_PROMETHEUS:-false}"
 PROMETHEUS_AVAILABLE=false
+PROMETHEUS_SERVICE="${PROMETHEUS_SERVICE:-kube-prometheus-stack-prometheus}"
 
-if kubectl get service kube-prometheus-stack-prometheus -n monitoring >/dev/null 2>&1; then
+if kubectl get service "$PROMETHEUS_SERVICE" -n monitoring >/dev/null 2>&1; then
     PROMETHEUS_AVAILABLE=true
-    print_success "Prometheus stack already available in namespace 'monitoring' for observability/reporting"
+    print_success "Prometheus stack already available as service '${PROMETHEUS_SERVICE}' in namespace 'monitoring' for observability/reporting"
+elif DISCOVERED_PROMETHEUS_SERVICE="$(kubectl -n monitoring get svc -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}' 2>/dev/null | grep -E '(^|-)prometheus($|-)' | head -n 1)" && [[ -n "$DISCOVERED_PROMETHEUS_SERVICE" ]]; then
+    PROMETHEUS_SERVICE="$DISCOVERED_PROMETHEUS_SERVICE"
+    PROMETHEUS_AVAILABLE=true
+    print_success "Prometheus stack discovered as service '${PROMETHEUS_SERVICE}' in namespace 'monitoring' for observability/reporting"
 elif [[ "$INSTALL_PROMETHEUS" == "true" || "$INSTALL_PROMETHEUS" == "1" ]]; then
     check_command "helm"
     print_warning "Prometheus service not found in namespace 'monitoring'. Installing Prometheus stack for experiment/report observability only (not proxy scaling)..."
@@ -307,7 +312,7 @@ echo ""
 echo -e "${BLUE}📊 Monitoring (Optional):${NC}"
 if [[ "$PROMETHEUS_AVAILABLE" == "true" ]]; then
     echo "  To access Prometheus UI:"
-    echo "    kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090"
+    echo "    kubectl port-forward -n monitoring svc/${PROMETHEUS_SERVICE} 9090:9090"
     echo "    Then open: http://localhost:9090"
     echo ""
     echo "  Useful Prometheus queries for reporting/observability (not proxy scaling):"
