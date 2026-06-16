@@ -1234,6 +1234,25 @@ def test_ffmpeg_command_generates_1080p30_testsrc_by_default(tmp_path):
     assert command[-1] == "rtmp://example/live/key1"
 
 
+def test_redact_command_redacts_tee_targets_with_embedded_rtmp_urls():
+    command = [
+        "ffmpeg",
+        "-f",
+        "tee",
+        "[f=flv:onfail=ignore]rtmp://user:pass@example/live/key1|"
+        "[f=flv:onfail=ignore]rtmps://mirror/live/key1",
+    ]
+
+    redacted = runner.redact_command(command)
+
+    assert "user:pass@example" not in redacted[-1]
+    assert "mirror/live/key1" not in redacted[-1]
+    assert redacted[-1] == (
+        "[f=flv:onfail=ignore]rtmp://...|"
+        "[f=flv:onfail=ignore]rtmps://..."
+    )
+
+
 def test_ffmpeg_vbv_bufsize_preserves_bitrate_units():
     assert runner.ffmpeg_vbv_bufsize("6500k") == "13000k"
     assert runner.ffmpeg_vbv_bufsize("4M") == "8M"

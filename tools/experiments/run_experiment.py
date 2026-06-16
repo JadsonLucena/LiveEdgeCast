@@ -554,14 +554,13 @@ class ManagedPublisher:
 
 
 
+RTMP_URL_PATTERN = re.compile(r"(rtmps?://)[^\]\[|\s]+")
+
+
 def redact_command(command: Sequence[str]) -> list[str]:
     redacted: list[str] = []
     for part in command:
-        if part.startswith(("rtmp://", "rtmps://")):
-            scheme = part.split("://", 1)[0]
-            redacted.append(f"{scheme}://...")
-        else:
-            redacted.append(part)
+        redacted.append(RTMP_URL_PATTERN.sub(r"\1...", part))
     return redacted
 
 
