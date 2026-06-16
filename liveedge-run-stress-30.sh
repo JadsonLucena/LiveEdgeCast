@@ -25,7 +25,6 @@ AUDIO_BITRATE="${AUDIO_BITRATE:-128k}"
 
 BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-./reports-stress/$(date +%Y%m%d-%H%M%S)}"
 
-REQUIRE_NETWORK_METRICS="${REQUIRE_NETWORK_METRICS:-false}"
 REQUIRE_DESTINATION_RECEIVED="${REQUIRE_DESTINATION_RECEIVED:-false}"
 ALLOW_PARTIAL="${ALLOW_PARTIAL:-true}"
 ALLOW_INCONCLUSIVE="${ALLOW_INCONCLUSIVE:-true}"
@@ -324,16 +323,7 @@ preflight() {
     log "cpu by pod has no samples; continuing with reduced infrastructure metrics."
   fi
 
-  if bool_true "$REQUIRE_NETWORK_METRICS"; then
-    local rx tx
-    rx=$(prom_query_len "sum by (pod) (rate(container_network_receive_bytes_total{namespace=\"$NAMESPACE\", interface!=\"lo\", pod=~\"proxy-.*\", pod!~\"proxy-lb-.*\"}[1m]))" || echo 0)
-    tx=$(prom_query_len "sum by (pod) (rate(container_network_transmit_bytes_total{namespace=\"$NAMESPACE\", interface!=\"lo\", pod=~\"proxy-.*\", pod!~\"proxy-lb-.*\"}[1m]))" || echo 0)
-    log "network metric sample counts: proxy_rx=$rx proxy_tx=$tx"
-    [[ "${rx:-0}" -ge 1 ]] || fail "REQUIRE_NETWORK_METRICS=true but proxy receive network metric has no samples."
-    [[ "${tx:-0}" -ge 1 ]] || fail "REQUIRE_NETWORK_METRICS=true but proxy transmit network metric has no samples."
-  else
-    log "Network metrics are optional for this environment: REQUIRE_NETWORK_METRICS=false"
-  fi
+  log "Proxy verification is limited to CPU/memory/controller metrics; network traffic metrics are not required in simplified mode."
 
   log "Preflight passed."
 }
@@ -342,7 +332,6 @@ build_flags() {
   local flags=()
   bool_true "$PATCH_PROXY_CONTEXT" && flags+=(--patch-proxy-context)
   bool_true "$REQUIRE_PROMETHEUS_ANALYSIS" && flags+=(--require-prometheus-analysis)
-  bool_true "$REQUIRE_NETWORK_METRICS" && flags+=(--require-network-metrics)
   bool_true "$REQUIRE_DESTINATION_RECEIVED" && flags+=(--require-destination-received)
   bool_true "$ALLOW_PARTIAL" && flags+=(--allow-partial)
   bool_true "$ALLOW_INCONCLUSIVE" && flags+=(--allow-inconclusive)
@@ -626,7 +615,6 @@ testsrc_rate=$TESTSRC_RATE
 bitrate=$BITRATE
 audio_bitrate=$AUDIO_BITRATE
 profile=YouTube-like 1080p30 H.264 10Mbps video + AAC 128kbps
-require_network_metrics=$REQUIRE_NETWORK_METRICS
 require_destination_received=$REQUIRE_DESTINATION_RECEIVED
 allow_partial=$ALLOW_PARTIAL
 allow_inconclusive=$ALLOW_INCONCLUSIVE

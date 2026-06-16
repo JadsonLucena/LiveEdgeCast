@@ -264,6 +264,5 @@ echo "    kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheu
 echo "    Then open: http://localhost:9090"
 echo ""
 echo "  Useful Prometheus queries:"
-echo "    - rate(container_network_receive_bytes_total{namespace=\"media\"}[1m])/1000000  # Mbps"
-echo "    - container_memory_usage_bytes{namespace=\"media\",pod=~\"rtmp-.*\"}/1024/1024  # MB"
-echo "    - rate(container_cpu_usage_seconds_total{namespace=\"media\"}[1m])*100  # CPU %"
+echo "    - container_memory_working_set_bytes{namespace=\"media\",pod=~\"proxy-.*\"}/1024/1024  # proxy MB"
+echo "    - rate(container_cpu_usage_seconds_total{namespace=\"media\",pod=~\"proxy-.*\"}[1m])*100  # proxy CPU %"
