@@ -57,8 +57,14 @@ kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/mon
     exit 1
 }
 
+if kubectl get apiservice v1beta1.metrics.k8s.io >/dev/null 2>&1; then
+    print_success "Kubernetes Metrics API is available for CPU/memory-based proxy HPA"
+else
+    print_warning "Kubernetes Metrics API (metrics-server) was not found. The proxy HPA will be created, but CPU/memory scaling stays inactive until metrics-server is installed."
+fi
+
 if ! kubectl get service kube-prometheus-stack-prometheus -n monitoring >/dev/null 2>&1; then
-    print_warning "Prometheus service not found in namespace 'monitoring'. Installing Prometheus stack..."
+    print_warning "Prometheus service not found in namespace 'monitoring'. Installing Prometheus stack for experiment/report observability only (not proxy scaling)..."
     print_step "Installing Prometheus stack..."
     
     helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
@@ -73,9 +79,9 @@ if ! kubectl get service kube-prometheus-stack-prometheus -n monitoring >/dev/nu
         exit 1
     }
     
-    print_success "Prometheus installed successfully"
+    print_success "Prometheus installed successfully for observability/reporting"
 else
-    print_success "Prometheus stack already available in namespace 'monitoring'"
+    print_success "Prometheus stack already available in namespace 'monitoring' for observability/reporting"
 fi
 
 print_step "Building LiveEdgeCast proxy image..."
@@ -234,7 +240,7 @@ echo -e "${YELLOW}💡 Simplified Multi-Stream Architecture:${NC}"
 echo -e "${YELLOW}   • Proxy: exec_publish chama /streams/started; exec_publish_done chama /streams/ended${NC}"
 echo -e "${YELLOW}   • Controller: cria/reusa 1 worker por stream e remove no publish_done${NC}"
 echo -e "${YELLOW}   • Workers: execução única de FFmpeg; sem timeout/retry/auto-recovery local${NC}"
-echo -e "${YELLOW}   • Proxy replicas: geridas diretamente pelo Deployment, sem KEDA/ScaledObject${NC}"
+echo -e "${YELLOW}   • Proxy replicas: HPA nativo do Kubernetes por CPU/memória via Metrics API; sem KEDA/ScaledObject/Prometheus para escala${NC}"
 echo ""
 echo -e "${GREEN}🚀 Ready to receive RTMP streams!${NC}"
 echo ""
@@ -263,6 +269,6 @@ echo "  To access Prometheus UI:"
 echo "    kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090"
 echo "    Then open: http://localhost:9090"
 echo ""
-echo "  Useful Prometheus queries:"
+echo "  Useful Prometheus queries for reporting/observability (not proxy scaling):"
 echo "    - container_memory_working_set_bytes{namespace=\"media\",pod=~\"proxy-.*\"}/1024/1024  # proxy MB"
 echo "    - rate(container_cpu_usage_seconds_total{namespace=\"media\",pod=~\"proxy-.*\"}[1m])*100  # proxy CPU %"

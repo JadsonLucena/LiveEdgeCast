@@ -39,7 +39,9 @@ print_success "No active port-forwards (using NodePort 31935)"
 
 print_step "Deleting Kubernetes resources..."
 
-print_step "Step 1/6: Scaling deployments to 0..."
+print_step "Step 1/6: Deleting autoscalers and scaling deployments to 0..."
+kubectl delete hpa proxy -n media 2>/dev/null && print_success "Proxy HPA deleted" || print_warning "No Proxy HPA found"
+
 if kubectl get deployment worker -n media >/dev/null 2>&1; then
     kubectl scale deployment/worker --replicas=0 -n media
     print_success "Worker scaled to 0"
