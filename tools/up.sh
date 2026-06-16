@@ -50,10 +50,6 @@ kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/med
     print_error "Namespace 'media' failed to become active"
     exit 1
 }
-kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/monitoring || {
-    print_error "Namespace 'monitoring' failed to become active"
-    exit 1
-}
 
 if kubectl get apiservice v1beta1.metrics.k8s.io >/dev/null 2>&1; then
     print_success "Kubernetes Metrics API is available for CPU/memory-based proxy HPA"

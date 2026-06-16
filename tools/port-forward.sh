@@ -135,12 +135,13 @@ list_prometheus_service_candidates() {
 
 resolve_prometheus_service() {
   local svc="" port=""
+  local quiet="${1:-false}"
 
   if [[ -n "$PROMETHEUS_SERVICE" ]]; then
     kubectl -n "$MONITORING_NAMESPACE" get "svc/${PROMETHEUS_SERVICE}" >/dev/null
     port="$(prometheus_service_port "$PROMETHEUS_SERVICE" || true)"
     if [[ -z "$port" ]]; then
-      print_error "Configured Prometheus service ${MONITORING_NAMESPACE}/svc/${PROMETHEUS_SERVICE} does not expose port 9090/web." >&2
+      [[ "$quiet" == "true" ]] || print_error "Configured Prometheus service ${MONITORING_NAMESPACE}/svc/${PROMETHEUS_SERVICE} does not expose port 9090/web." >&2
       return 1
     fi
     PROMETHEUS_REMOTE_PORT="$port"
@@ -163,8 +164,10 @@ resolve_prometheus_service() {
 
   case "${#candidates[@]}" in
     0)
-      print_error "Prometheus service was not found in namespace ${MONITORING_NAMESPACE}." >&2
-      kubectl -n "$MONITORING_NAMESPACE" get svc >&2 2>/dev/null || true
+      if [[ "$quiet" != "true" ]]; then
+        print_error "Prometheus service was not found in namespace ${MONITORING_NAMESPACE}." >&2
+        kubectl -n "$MONITORING_NAMESPACE" get svc >&2 2>/dev/null || true
+      fi
       return 1
       ;;
     1)
@@ -173,7 +176,7 @@ resolve_prometheus_service() {
       print_warning "Using discovered Prometheus service ${MONITORING_NAMESPACE}/svc/${PROMETHEUS_SERVICE}:${PROMETHEUS_REMOTE_PORT}." >&2
       ;;
     *)
-      print_error "Multiple Prometheus service candidates found: ${candidates[*]}. Set PROMETHEUS_SERVICE explicitly." >&2
+      [[ "$quiet" == "true" ]] || print_error "Multiple Prometheus service candidates found: ${candidates[*]}. Set PROMETHEUS_SERVICE explicitly." >&2
       return 1
       ;;
   esac
@@ -331,7 +334,7 @@ validate_required_services() {
       print_warning "Prometheus port-forward disabled by ENABLE_PROMETHEUS_FORWARD=false."
       ;;
     auto|AUTO|"")
-      if resolve_prometheus_service; then
+      if resolve_prometheus_service true; then
         PROMETHEUS_FORWARD_ENABLED=true
       else
         PROMETHEUS_FORWARD_ENABLED=false

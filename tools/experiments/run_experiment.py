@@ -1924,27 +1924,24 @@ def always_on_worker_pod_seconds_reference(windows: list[dict[str, Any]], fallba
     return max(1, len(fallback_stream_keys)) * fallback_duration, "fallback_len_stream_keys_times_query_window"
 
 
-def execute_experiment(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]:
-    simplified_warning = None
-    if config.scenario in SIMPLIFIED_MODE_UNSUPPORTED_LIFECYCLE_SCENARIOS or config.kill_worker or config.kill_proxy:
-        simplified_warning = {
-            "event": "simplified_lifecycle_scenario_warning",
-            "experiment_id": config.experiment_id,
-            "scenario": config.scenario,
-            "run_id": config.run_id,
-            "timestamp": now_epoch(),
-            "status": "unsupported_recovery_handover_semantics",
-            "message": (
-                "Simplified mode disables controller handover, auto-recovery and orphan cleanup; "
-                "this run observes terminal/no-recovery behavior rather than validating automatic resilience."
-            ),
-        }
-        print(f"WARNING: {simplified_warning['message']}", file=sys.stderr)
-    if config.dry_run:
-        result = {"dry_run": True, "would_run": config.scenario, "stream_keys": config.stream_keys, "status": "valid"}
-        if simplified_warning:
-            result["simplified_lifecycle_warning"] = simplified_warning
-        return result
+def simplified_lifecycle_warning(config: RunnerConfig) -> dict[str, Any] | None:
+    if config.scenario not in SIMPLIFIED_MODE_UNSUPPORTED_LIFECYCLE_SCENARIOS and not config.kill_worker and not config.kill_proxy:
+        return None
+    return {
+        "event": "simplified_lifecycle_scenario_warning",
+        "experiment_id": config.experiment_id,
+        "scenario": config.scenario,
+        "run_id": config.run_id,
+        "timestamp": now_epoch(),
+        "status": "unsupported_recovery_handover_semantics",
+        "message": (
+            "Simplified mode disables controller handover, auto-recovery and orphan cleanup; "
+            "this run observes terminal/no-recovery behavior rather than validating automatic resilience."
+        ),
+    }
+
+
+def execute_experiment(config: RunnerConfig, dirs: dict[str, Path], simplified_warning: dict[str, Any] | None = None) -> dict[str, Any]:
     if not shutil.which(config.ffmpeg_path) and not Path(config.ffmpeg_path).exists():
         raise RuntimeError(f"ffmpeg not found: {config.ffmpeg_path}")
     if simplified_warning:
@@ -3483,15 +3480,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     report_root = prepare_report_root(config)
     dirs = ensure_layout(report_root)
     metadata = {**asdict(config), "output_dir": str(config.output_dir), "report_root": str(config.report_root), "started_at": now_epoch(), "started_at_iso": now_iso()}
+    simplified_warning = simplified_lifecycle_warning(config)
+    if simplified_warning:
+        print(f"WARNING: {simplified_warning['message']}", file=sys.stderr)
+        metadata["simplified_lifecycle_warning"] = simplified_warning
     write_json(dirs["root"] / "metadata.json", metadata)
     if config.dry_run:
         execution = {"dry_run": True, "config": metadata}
+        if simplified_warning:
+            execution["simplified_lifecycle_warning"] = simplified_warning
         write_json(dirs["root"] / "report.json", execution)
-        (dirs["root"] / "report.md").write_text("# Dry run\n\nConfiguração validada. Nenhum experimento foi executado.\n", encoding="utf-8")
+        dry_report = "# Dry run\n\nConfiguração validada. Nenhum experimento foi executado.\n"
+        if simplified_warning:
+            dry_report += f"\n> Aviso: {simplified_warning['message']}\n"
+        (dirs["root"] / "report.md").write_text(dry_report, encoding="utf-8")
         return 0
     exit_code = 0
     try:
-        execution = execute_experiment(config, dirs)
+        execution = execute_experiment(config, dirs, simplified_warning=simplified_warning)
     except Exception as exc:
         execution = {"error": {"type": type(exc).__name__, "message": str(exc)}, "started_at": metadata["started_at"], "ended_at": now_epoch()}
         exit_code = 1
