@@ -46,53 +46,25 @@ PROMETHEUS_LEGACY_LATEST_FILENAME = "prometheus_range_queries.json"
 PROMETHEUS_INSTANT_LATEST_FILENAME = "prometheus_instant_queries.json"
 PROMETHEUS_INSTANT_RUN_PREFIX = "prometheus_instant_queries.run."
 PROMETHEUS_RUN_PREFIX = "prometheus_range_queries.run."
+# In simplified mode, Prometheus strictness is intentionally small. The runner
+# still collects all DEFAULT_PROMQL rows, but only controller allocation/stream
+# gauges are required for --require-prometheus-analysis by default. cAdvisor
+# CPU/memory, detailed lifecycle histograms, handover and recovery metrics are
+# best-effort because this project version disables those controller behaviors.
 CORE_PROMETHEUS_METRICS_FOR_ANALYSIS = {
-    "workers_active",
-    "proxies_active",
-    "controllers_active",
-    "pod_cpu_rate",
-    "pod_memory_working_set",
+    "controller_active_streams",
+    "controller_active_allocations",
 }
 
 SCENARIO_PROMETHEUS_METRICS_FOR_ANALYSIS = {
-    "cold-start": {
-        "controller_active_streams",
-        "controller_active_allocations",
-        "stream_lifecycle_phase_seconds_p95",
-    },
-    "concurrency": {
-        "controller_active_streams",
-        "controller_active_allocations",
-        "stream_lifecycle_phase_seconds_p95",
-    },
-    "release": {
-        "controller_active_streams",
-        "controller_active_allocations",
-    },
-    "worker-failure": {
-        "worker_recovery_total",
-        "worker_recovery_duration_seconds_p95",
-    },
-    "proxy-failure": {
-        "controller_active_streams",
-        "controller_active_allocations",
-        "proxy_rtmp_active_streams",
-    },
-    "handover": {
-        "handover_attempts_total",
-        "handover_success_total",
-        "handover_conflict_total",
-    },
-    "duplicate-streamkey": {
-        "handover_attempts_total",
-        "handover_success_total",
-        "handover_conflict_total",
-    },
-    "pilot-capacity": {
-        "controller_active_streams",
-        "controller_active_allocations",
-        "stream_lifecycle_phase_seconds_p95",
-    },
+    "cold-start": set(),
+    "concurrency": set(),
+    "release": set(),
+    "worker-failure": set(),
+    "proxy-failure": set(),
+    "handover": set(),
+    "duplicate-streamkey": set(),
+    "pilot-capacity": set(),
 }
 
 # Metrics such as proxy_network_receive_bps/proxy_network_transmit_bps are
@@ -3231,9 +3203,9 @@ def build_stream_result_rows(config: RunnerConfig, dirs: dict[str, Path]) -> lis
 def required_prometheus_metrics_for_analysis(config: RunnerConfig) -> set[str]:
     """Return the Prometheus metrics that must have samples for this scenario.
 
-    The runner still collects every query in DEFAULT_PROMQL, but a smoke/cold-start
-    run must not fail just because handover, recovery, orphan cleanup, or optional
-    network metrics did not occur in that scenario.
+    The runner still collects every query in DEFAULT_PROMQL, but simplified-mode
+    runs must not fail just because CPU/memory, lifecycle histograms, handover,
+    recovery, orphan cleanup, or optional network metrics did not occur.
     """
     required = set(CORE_PROMETHEUS_METRICS_FOR_ANALYSIS) | set(SCENARIO_PROMETHEUS_METRICS_FOR_ANALYSIS.get(config.scenario, set()))
     if config.require_network_metrics:
@@ -3484,7 +3456,7 @@ def discussion_text(config: RunnerConfig, report_json: dict[str, Any]) -> str:
     else:
         lines.append("Como o Prometheus não foi configurado, a discussão quantitativa de recursos e custo relativo não pode ser sustentada por séries temporais nesta execução.")
     if config.scenario in {"worker-failure", "proxy-failure", "handover", "duplicate-streamkey"}:
-        lines.append("O cenário executado também contribui para a análise qualitativa de resiliência e correção arquitetural, especialmente quanto a recuperação de worker, limitação de falha de proxy, handover seguro ou rejeição de streamKey duplicada.")
+        lines.append("Nesta versão simplificada, cenários de falha, handover e streamKey duplicada são tratados como evidência qualitativa/reduzida; recuperação automática e handover não são responsabilidades ativas do controller.")
     if missing:
         lines.append("As métricas ausentes devem ser explicitadas como limitação metodológica; conclusões sobre elas não devem ser afirmadas sem nova instrumentação ou nova execução experimental.")
     return "\n\n".join(lines)

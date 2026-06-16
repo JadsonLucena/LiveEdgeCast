@@ -130,12 +130,11 @@ if [[ $CONTEXT =~ (kind) ]]; then
 elif [[ ! $CONTEXT =~ (docker-desktop|localhost|127\.0\.0\.1) ]]; then
     print_warning "Remote/managed cluster detected: $CONTEXT"
     print_warning "Ensure $PROXY_IMAGE, $WORKER_IMAGE and $CONTROLLER_IMAGE are available in the cluster registry."
-    echo -n "Continue with deployment? (y/n): "
-    read -r continue_deploy
-    if [[ ! $continue_deploy =~ ^[Yy]$ ]]; then
-        print_error "Deployment cancelled. Please push images to cluster registry first."
+    if [[ "${DEPLOY_REMOTE_CLUSTER:-false}" != "true" && "${DEPLOY_REMOTE_CLUSTER:-0}" != "1" ]]; then
+        print_error "Non-interactive safety stop. Set DEPLOY_REMOTE_CLUSTER=true after pushing images to the cluster registry."
         exit 1
     fi
+    print_warning "DEPLOY_REMOTE_CLUSTER=true set; continuing without an interactive prompt."
 fi
 
 print_step "Applying RBAC for Controller..."
