@@ -497,6 +497,7 @@ class ManagedPublisher:
         publisher_index: int,
         stream_keys: list[str] | None = None,
         publisher_mode: str = "single",
+        stream_output_urls: dict[str, list[str]] | None = None,
     ):
         self.experiment_id = config.experiment_id
         self.scenario = config.scenario
@@ -504,6 +505,7 @@ class ManagedPublisher:
         self.stream_key = stream_key
         self.stream_keys = stream_keys or [stream_key]
         self.publisher_mode = publisher_mode
+        self.stream_output_urls = stream_output_urls or {}
         self.command = command
         self.process = process
         self.stdout_path = stdout_path
@@ -557,10 +559,14 @@ class ManagedPublisher:
 RTMP_URL_PATTERN = re.compile(r"(rtmps?://)[^\]\[|\s]+")
 
 
+def redact_text(value: str) -> str:
+    return RTMP_URL_PATTERN.sub(r"\1...", value)
+
+
 def redact_command(command: Sequence[str]) -> list[str]:
     redacted: list[str] = []
     for part in command:
-        redacted.append(RTMP_URL_PATTERN.sub(r"\1...", part))
+        redacted.append(redact_text(part))
     return redacted
 
 
@@ -689,6 +695,13 @@ def start_tee_stream_key_publisher(
     stdout_path = dirs["logs"] / f"publisher-{config.experiment_id}-r{repetition:03d}-i001-{safe_name}.stdout.log"
     stderr_path = dirs["logs"] / f"publisher-{config.experiment_id}-r{repetition:03d}-i001-{safe_name}.stderr.log"
     command = ffmpeg_command_for_stream_keys(config, stream_keys)
+    output_urls_by_stream = {
+        stream_key: [
+            redact_text(rtmp_target(base_url, stream_key))
+            for base_url in [config.rtmp_url, *(config.tee_rtmp_urls or [])]
+        ]
+        for stream_key in stream_keys
+    }
     started_at = now_epoch()
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
@@ -707,8 +720,25 @@ def start_tee_stream_key_publisher(
             "rtmp_url_role": "primary",
             "publisher_mode": "tee_stream_keys",
             "publisher_group_size": len(stream_keys),
+            "publisher_group_id": f"{config.run_id}-r{repetition}-tee-{process.pid}",
+            "publisher_shared_log": True,
+            "tee_output_urls": output_urls_by_stream[stream_key],
+            "tee_output_count": len(output_urls_by_stream[stream_key]),
         })
-    return ManagedPublisher(config, stream_keys[0], command, process, stdout_path, stderr_path, started_at, repetition, 1, stream_keys=stream_keys, publisher_mode="tee_stream_keys")
+    return ManagedPublisher(
+        config,
+        stream_keys[0],
+        command,
+        process,
+        stdout_path,
+        stderr_path,
+        started_at,
+        repetition,
+        1,
+        stream_keys=stream_keys,
+        publisher_mode="tee_stream_keys",
+        stream_output_urls=output_urls_by_stream,
+    )
 
 
 def publisher_process_status(result: dict[str, Any]) -> str:
@@ -768,6 +798,11 @@ def record_publisher_results(config: RunnerConfig, dirs: dict[str, Path], publis
             result = {**base_result, "stream_key": stream_key}
             if len(publisher.stream_keys) > 1:
                 result["publisher_index"] = offset + 1
+                result["publisher_group_id"] = f"{publisher.run_id}-r{publisher.repetition}-tee-{publisher.process.pid}"
+                result["publisher_shared_log"] = True
+            if stream_key in publisher.stream_output_urls:
+                result["tee_output_urls"] = publisher.stream_output_urls[stream_key]
+                result["tee_output_count"] = len(publisher.stream_output_urls[stream_key])
             result["publisher_process_status"] = publisher_process_status(result)
             result["publisher_status"] = publisher_status(config, result)
             append_jsonl(dirs["raw"] / "publishers.jsonl", {"event": "publisher_finished", **result})

@@ -1288,6 +1288,44 @@ def test_ffmpeg_command_enforces_constant_bitrate_for_source_file(tmp_path):
     assert command[command.index("-x264-params") + 1] == "nal-hrd=cbr:force-cfr=1"
 
 
+def test_record_publisher_results_preserves_per_stream_tee_metadata(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+
+    class FakeProcess:
+        pid = 4242
+
+        def poll(self):
+            return 0
+
+    publisher = runner.ManagedPublisher(
+        cfg,
+        "key1",
+        ["ffmpeg", "-f", "tee", "redacted"],
+        FakeProcess(),
+        tmp_path / "stdout.log",
+        tmp_path / "stderr.log",
+        1.0,
+        1,
+        1,
+        stream_keys=["key1", "key2"],
+        publisher_mode="tee_stream_keys",
+        stream_output_urls={
+            "key1": ["rtmp://..."],
+            "key2": ["rtmp://..."],
+        },
+    )
+    publisher.ended_at = 2.0
+
+    rows = runner.record_publisher_results(cfg, dirs, [publisher])
+
+    assert [row["stream_key"] for row in rows] == ["key1", "key2"]
+    assert {row["publisher_group_id"] for row in rows} == {"run-r1-tee-4242"}
+    assert all(row["publisher_shared_log"] is True for row in rows)
+    assert all(row["publisher_group_size"] == 2 for row in rows)
+    assert all(row["tee_output_urls"] == ["rtmp://..."] for row in rows)
+
+
 def test_ffmpeg_command_uses_tee_for_multiple_stream_keys_to_same_rtmp_url(tmp_path):
     cfg = config(tmp_path)
 
