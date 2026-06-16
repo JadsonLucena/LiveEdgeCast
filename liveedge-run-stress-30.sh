@@ -6,6 +6,8 @@ set -euo pipefail
 #
 # Important: this script can manage the local port-forwards through ./tools/port-forward.sh.
 # Use MANAGE_PORT_FORWARD=true to enable automatic restart/readiness checks.
+# Set TEE_RTMP_URLS to a comma-separated list of extra RTMP base URLs when the same
+# encoded stream should be mirrored to multiple destinations through ffmpeg -f tee.
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
@@ -17,6 +19,7 @@ PROMETHEUS_URL="${PROMETHEUS_URL:-${PROM_URL:-}}"
 CONTROLLER_URL="${CONTROLLER_URL:-http://127.0.0.1:8000}"
 RTMP_URL="${RTMP_URL:-${LIVEEDGECAST_RTMP_URL:-rtmp://127.0.0.1:1935/live}}"
 SECONDARY_RTMP_URL="${SECONDARY_RTMP_URL:-}"
+TEE_RTMP_URLS="${TEE_RTMP_URLS:-${LIVEEDGECAST_TEE_RTMP_URLS:-}}"
 
 TESTSRC_SIZE="${TESTSRC_SIZE:-1920x1080}"
 TESTSRC_RATE="${TESTSRC_RATE:-30}"
@@ -350,6 +353,7 @@ build_flags() {
   bool_true "$ALLOW_RESTORE_FAILURE" && flags+=(--allow-restore-failure)
   bool_true "$ALLOW_UNSCOPED_CONTEXT" && flags+=(--allow-unscoped-context)
   bool_true "$CONSTANT_BITRATE" && flags+=(--constant-bitrate)
+  [[ -n "$TEE_RTMP_URLS" ]] && flags+=(--tee-rtmp-urls "$TEE_RTMP_URLS")
   bool_true "$ALLOW_WORKER_CLEANUP" && flags+=(--allow-worker-cleanup)
   printf '%s\n' "${flags[@]}"
 }
@@ -529,8 +533,12 @@ run_stress_level() {
       fi
 
       if [[ "$rep" -lt "$repetitions" && "$cooldown" -gt 0 ]]; then
-        log "Cooldown after ${stream_count} streams repetition ${rep}: ${cooldown}s"
-        sleep "$cooldown"
+        if bool_true "$DRY_RUN"; then
+          log "DRY_RUN=true; skipping cooldown after ${stream_count} streams repetition ${rep}: ${cooldown}s"
+        else
+          log "Cooldown after ${stream_count} streams repetition ${rep}: ${cooldown}s"
+          sleep "$cooldown"
+        fi
       fi
     done
   else
@@ -615,8 +623,12 @@ run_stress_level() {
   fi
 
   if [[ "$WAIT_AFTER_LEVEL_SECONDS" -gt 0 ]]; then
-    log "Waiting ${WAIT_AFTER_LEVEL_SECONDS}s after level ${stream_count}..."
-    sleep "$WAIT_AFTER_LEVEL_SECONDS"
+    if bool_true "$DRY_RUN"; then
+      log "DRY_RUN=true; skipping wait after level ${stream_count}: ${WAIT_AFTER_LEVEL_SECONDS}s"
+    else
+      log "Waiting ${WAIT_AFTER_LEVEL_SECONDS}s after level ${stream_count}..."
+      sleep "$WAIT_AFTER_LEVEL_SECONDS"
+    fi
   fi
 }
 
@@ -632,7 +644,8 @@ testsrc_rate=$TESTSRC_RATE
 bitrate=$BITRATE
 audio_bitrate=$AUDIO_BITRATE
 constant_bitrate=$CONSTANT_BITRATE
-profile=YouTube-like 720p30 H.264 4Mbps video + AAC 128kbps
+tee_rtmp_urls=$TEE_RTMP_URLS
+profile=YouTube-like ${TESTSRC_SIZE}@${TESTSRC_RATE}fps H.264 ${BITRATE} video + AAC ${AUDIO_BITRATE}
 require_destination_received=$REQUIRE_DESTINATION_RECEIVED
 allow_partial=$ALLOW_PARTIAL
 allow_inconclusive=$ALLOW_INCONCLUSIVE

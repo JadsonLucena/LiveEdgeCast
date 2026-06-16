@@ -157,6 +157,7 @@ class RunnerConfig:
     controller_container: str | None = None
     worker_metric_label_selector: str | None = 'namespace="$namespace"'
     constant_bitrate: bool = False
+    tee_rtmp_urls: list[str] | None = None
 
     @property
     def report_root(self) -> Path:
@@ -239,6 +240,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--testsrc-rate", default=os.getenv("LIVEEDGECAST_TESTSRC_RATE", "30"), help="Synthetic lavfi testsrc frame rate used when --source-file is omitted. Default: 30.")
     parser.add_argument("--audio-bitrate", default=os.getenv("LIVEEDGECAST_AUDIO_BITRATE", "128k"), help="AAC audio bitrate used by generated publishers. Default: 128k.")
     parser.add_argument("--constant-bitrate", action="store_true", help="Enforce constant video bitrate for FFmpeg publishers with minrate=maxrate=bitrate, VBV buffer sizing, and x264 HRD CBR signaling.")
+    parser.add_argument("--tee-rtmp-urls", default=os.getenv("LIVEEDGECAST_TEE_RTMP_URLS"), help="Comma-separated extra RTMP base URLs mirrored by each publisher with ffmpeg -f tee after a single local encode. Example: rtmp://host-a/live,rtmp://host-b/live")
     parser.add_argument("--namespace", default=os.getenv("NAMESPACE", "media"))
     parser.add_argument("--prometheus-url", default=os.getenv("PROMETHEUS_URL"))
     parser.add_argument("--controller-url", default=os.getenv("LIVEEDGECAST_CONTROLLER_URL"))
@@ -288,6 +290,10 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         parser.error("--saturation-error-rate must be between 0 and 1")
     if args.overwrite and args.resume:
         parser.error("--overwrite and --resume are mutually exclusive")
+    try:
+        tee_rtmp_urls = parse_csv_urls(args.tee_rtmp_urls)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
 
     output_dir = args.output_dir
     if args.experiment_id:
@@ -354,7 +360,18 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         controller_container=args.controller_container,
         worker_metric_label_selector=args.worker_metric_label_selector,
         constant_bitrate=args.constant_bitrate,
+        tee_rtmp_urls=tee_rtmp_urls,
     )
+
+
+def parse_csv_urls(value: str | None) -> list[str] | None:
+    if not value:
+        return None
+    urls = [item.strip().rstrip("/") for item in value.split(",") if item.strip()]
+    invalid = [url for url in urls if not url.startswith(("rtmp://", "rtmps://"))]
+    if invalid:
+        raise argparse.ArgumentTypeError(f"tee RTMP URL(s) must start with rtmp:// or rtmps://: {', '.join(invalid[:5])}")
+    return urls or None
 
 
 def load_stream_keys(inline: str | None, file_path: Path | None) -> list[str]:
@@ -541,7 +558,7 @@ def ffmpeg_vbv_bufsize(video_bitrate: str) -> str:
     if not match:
         return "20000k"
     value = float(match.group(1)) * 2
-    unit = match.group(2) or "k"
+    unit = match.group(2)
     rendered = str(int(value)) if value.is_integer() else str(value).rstrip("0").rstrip(".")
     return f"{rendered}{unit}"
 
@@ -556,9 +573,25 @@ def add_constant_bitrate_options(command: list[str], video_bitrate: str) -> None
     ])
 
 
+def ffmpeg_tee_escape(url: str) -> str:
+    return url.replace("\\", "\\\\").replace("|", "\\|").replace("[", "\\[").replace("]", "\\]")
+
+
+def rtmp_target(base_url: str, stream_key: str) -> str:
+    return f"{base_url.rstrip('/')}/{quote(stream_key, safe='')}"
+
+
+def ffmpeg_output_args(config: RunnerConfig, stream_key: str, primary_url: str) -> list[str]:
+    targets = [rtmp_target(primary_url, stream_key)]
+    targets.extend(rtmp_target(url, stream_key) for url in (config.tee_rtmp_urls or []))
+    if len(targets) == 1:
+        return ["-f", "flv", targets[0]]
+    tee_targets = "|".join(f"[f=flv:onfail=abort]{ffmpeg_tee_escape(target)}" for target in targets)
+    return ["-f", "tee", tee_targets]
+
+
 def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None = None) -> list[str]:
     base_url = (rtmp_url or config.rtmp_url).rstrip("/")
-    target = f"{base_url}/{quote(stream_key, safe='')}"
     command = [config.ffmpeg_path, "-hide_banner", "-nostdin", "-re"]
     if config.source_file:
         command.extend(["-stream_loop", "-1", "-i", config.source_file, "-t", str(config.duration_seconds)])
@@ -589,7 +622,7 @@ def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None =
         command.extend([
             "-c:a", "aac", "-b:a", config.audio_bitrate, "-ar", "44100",
         ])
-    command.extend(["-f", "flv", target])
+    command.extend(ffmpeg_output_args(config, stream_key, base_url))
     return command
 
 
