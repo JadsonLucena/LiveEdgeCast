@@ -381,7 +381,11 @@ FFMPEG_PID=$!
 echo "$FFMPEG_PID" > "$PID_FILE"
 start_progress_reader
 
-EXIT_CODE="$(wait_for_ffmpeg_exit "$FFMPEG_PID")"
+set +e
+wait "$FFMPEG_PID"
+EXIT_CODE=$?
+set -e
+
 echo "$EXIT_CODE" > "$LAST_EXIT_FILE"
 printf '%s %s\n' "$FFMPEG_RUN_ID" "$EXIT_CODE" >> "$EXIT_EVENT_FILE"
 cat "$ATTEMPT_LOG_FILE" >> "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" 2>/dev/null || true
