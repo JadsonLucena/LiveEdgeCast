@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "🚀 Deploying LiveEdgeCast with KEDA RTMP Serverless Architecture..."
+echo "🚀 Deploying LiveEdgeCast simplified RTMP architecture..."
 
 set -e
 
@@ -46,23 +46,14 @@ if ! kubectl cluster-info >/dev/null 2>&1; then
 fi
 print_success "kubectl can connect to cluster"
 
-print_step "Checking KEDA installation..."
-if ! kubectl get namespace keda >/dev/null 2>&1; then
-    print_error "KEDA namespace not found. Please install KEDA first:"
-    echo "  helm repo add kedacore https://kedacore.github.io/charts"
-    echo "  helm repo update"
-    echo "  helm install keda kedacore/keda --namespace keda --create-namespace"
-    exit 1
-fi
-
 kubectl apply -f k8s/namespaces.yaml || { print_error "Failed to create namespace"; exit 1; }
 
-kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/media --timeout=30s || {
+kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/media || {
     print_error "Namespace 'media' failed to become active"
     exit 1
 }
-kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/monitoring --timeout=30s || {
-    print_error "Namespace 'keda' failed to become active"
+kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/monitoring || {
+    print_error "Namespace 'monitoring' failed to become active"
     exit 1
 }
 
@@ -161,20 +152,7 @@ kubectl wait --for=condition=available deployment/proxy -n media --timeout=120s 
 }
 print_success "RTMP Proxy is ready"
 
-print_step "Verifying KEDA ScaledObjects..."
-sleep 5
-
-if kubectl get scaledobject proxy-scaler -n media >/dev/null 2>&1; then
-    print_success "RTMP Proxy ScaledObject is active"
-else
-    print_warning "RTMP Proxy ScaledObject not found"
-fi
-
-if kubectl get scaledobject worker-scaler -n media >/dev/null 2>&1; then
-    print_warning "RTMP Worker ScaledObject found (should be disabled - Controller manages workers)"
-else
-    print_success "RTMP Worker scaling managed by Controller (KEDA disabled as expected)"
-fi
+print_step "Skipping KEDA checks (simplified mode manages workers via controller; proxy uses fixed Deployment replicas)."
 
 print_step "Checking pod status..."
 CONTROLLER_PODS=$(kubectl get pods -l app=controller -n media --no-headers 2>/dev/null | wc -l)
@@ -185,19 +163,10 @@ print_success "RTMP Controller: $CONTROLLER_PODS pod(s) running"
 print_success "RTMP Proxy: $PROXY_PODS pod(s) running"
 
 if [ "$WORKER_PODS" -eq 0 ]; then
-    print_warning "No worker pods running (KEDA serverless - workers will scale on demand)"
+    print_warning "No worker pods running (expected until proxy publish hook asks controller to create one)"
 else
     print_success "RTMP Workers: $WORKER_PODS pod(s) running"
 fi
-
-print_step "Checking KEDA Operator status..."
-kubectl get pods -n keda -l app=keda-operator --no-headers | grep Running >/dev/null || {
-    print_warning "KEDA Operator may not be ready yet"
-}
-
-kubectl get pods -n keda -l app=keda-metrics-apiserver --no-headers | grep Running >/dev/null || {
-    print_warning "KEDA Metrics API Server may not be ready yet"
-}
 
 print_step "Getting NodePort access information..."
 
@@ -217,17 +186,14 @@ echo ""
 print_step "RTMP Proxy Pods:"
 kubectl get pods -l app=proxy -n media
 echo ""
-print_step "RTMP Worker Pods (Serverless):"
+print_step "RTMP Worker Pods (created per stream by controller):"
 kubectl get pods -l app=worker -n media
-echo ""
-print_step "KEDA ScaledObjects:"
-kubectl get scaledobject -n media
 echo ""
 print_step "Services:"
 kubectl get svc -n media
 
 echo ""
-print_success "🎉 LiveEdgeCast RTMP Serverless is ready!"
+print_success "🎉 LiveEdgeCast simplified RTMP pipeline is ready!"
 echo ""
 echo -e "${GREEN}📡 RTMP Streaming (NodePort - External Access):${NC}"
 echo "  📺 From Windows/OBS: rtmp://localhost:31935/live/{your-youtube-key}"
@@ -247,7 +213,6 @@ echo "  📊 Controller status: kubectl logs -l app=controller -n media --tail=5
 echo "  📋 Controller logs: kubectl logs -l app=controller -n media -f"
 echo "  📋 Proxy logs: kubectl logs -l app=proxy -n media -f"
 echo "  📋 Worker logs: kubectl logs -l app=worker -n media -f"
-echo "  🔍 KEDA status: kubectl get scaledobject -n media"
 echo "  📈 Metrics: kubectl top pods -n media"
 echo ""
 echo -e "${YELLOW}🎬 Testing with FFmpeg (NodePort):${NC}"
@@ -265,22 +230,11 @@ echo "  ffmpeg -re -i video1.mp4 -f flv rtmp://localhost:31935/live/key1 &"
 echo "  ffmpeg -re -i video2.mp4 -f flv rtmp://localhost:31935/live/key2 &"
 echo "  ffmpeg -re -i video3.mp4 -f flv rtmp://localhost:31935/live/key3 &"
 echo ""
-echo -e "${YELLOW}💡 Multi-Stream Serverless Architecture v2.0:${NC}"
-echo -e "${YELLOW}   • Controller: Única fonte da verdade para workers (state recovery via métricas)${NC}"
-echo -e "${YELLOW}   • Proxy: Suporte multi-stream via FFmpeg dedicado por publicação${NC}"
-echo -e "${YELLOW}   • Workers: True Serverless (0 replicas) escalados 1:1 pelo Controller${NC}"
-echo -e "${YELLOW}   • Garantia: 1 stream = 1 worker = 1 processo FFmpeg isolado${NC}"
-echo -e "${YELLOW}   • Scripts: Embarcados na imagem Docker (on_publish_start/done.sh)${NC}"
-echo -e "${YELLOW}   • Roteamento: NGINX → FFmpeg → Worker dedicado → YouTube${NC}"
-echo ""
-echo -e "${YELLOW}📊 Auto-Scaling Configuration:${NC}"
-echo -e "${YELLOW}   Proxy Scaling (1-10 replicas via KEDA):${NC}"
-echo -e "${YELLOW}   • Primary: >800 Mbps inbound (80% of 1Gbps per node)${NC}"
-echo -e "${YELLOW}   • Secondary: >50 active connections or >80% CPU${NC}"
-echo -e "${YELLOW}   Worker Scaling (0-100 replicas via Controller):${NC}"
-echo -e "${YELLOW}   • Controller API: /streams/started e /streams/ended orquestram workers${NC}"
-echo -e "${YELLOW}   • Mapeamento bidirecional: stream ↔ worker${NC}"
-echo -e "${YELLOW}   • State recovery: Automático via métricas RTMP ao reiniciar${NC}"
+echo -e "${YELLOW}💡 Simplified Multi-Stream Architecture:${NC}"
+echo -e "${YELLOW}   • Proxy: exec_publish chama /streams/started; exec_publish_done chama /streams/ended${NC}"
+echo -e "${YELLOW}   • Controller: cria/reusa 1 worker por stream e remove no publish_done${NC}"
+echo -e "${YELLOW}   • Workers: execução única de FFmpeg; sem timeout/retry/auto-recovery local${NC}"
+echo -e "${YELLOW}   • Proxy replicas: geridas diretamente pelo Deployment, sem KEDA/ScaledObject${NC}"
 echo ""
 echo -e "${GREEN}🚀 Ready to receive RTMP streams!${NC}"
 echo ""

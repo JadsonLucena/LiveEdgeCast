@@ -216,8 +216,7 @@ if [[ "$WORKER_COUNT" == "0" ]]; then
   fi
 
   echo ""
-  echo "--- HPA / KEDA objects related to worker ---"
-  kubectl get scaledobject -n "$NAMESPACE" 2>/dev/null | filter_stream "worker|NAME|NAMESPACE"
+  echo "--- HPA objects related to worker (KEDA disabled in simplified mode) ---"
   kubectl get hpa -n "$NAMESPACE" 2>/dev/null | filter_stream "worker|NAME"
 
   echo ""
