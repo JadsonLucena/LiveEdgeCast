@@ -570,6 +570,14 @@ def log_event(event_type: str, stream: str, status: str, tags: dict, generation=
     }
     logger.info(json.dumps(payload))
 
+
+def metric_best_effort(description: str, callback) -> None:
+    """Run a metric update without allowing observability failures to affect lifecycle."""
+    try:
+        callback()
+    except Exception as metric_error:
+        logger.warning(f"[Metrics] Failed {description}: {metric_error}")
+
 NAMESPACE = "media"
 WORKER_DEPLOYMENT = "worker"
 WORKER_SERVICE = "worker"
@@ -3068,11 +3076,13 @@ def allocate_worker(
             metric_reason = type(e).__name__
         raise
     finally:
-        try:
-            stream_allocation_duration_seconds.observe(time.monotonic() - started_at)
-            stream_allocation_total.labels(status=metric_status, reason=metric_reason).inc()
-        except Exception as metric_error:
-            logger.warning(f"[Metrics] Failed recording allocation metrics: {metric_error}")
+        metric_best_effort(
+            "recording allocation metrics",
+            lambda: (
+                stream_allocation_duration_seconds.observe(time.monotonic() - started_at),
+                stream_allocation_total.labels(status=metric_status, reason=metric_reason).inc(),
+            ),
+        )
 
 
 async def release_worker(stream: str = Query(..., description="Stream name to release")):
@@ -3121,7 +3131,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
             logger.info(f"[Release] Released worker {worker_name} from stream '{stream}'")
             try:
                 core.delete_namespaced_pod(name=worker_name, namespace=NAMESPACE, grace_period_seconds=0)
-                record_worker_delete_metric("success", "released")
+                metric_best_effort("recording worker delete metric", lambda: record_worker_delete_metric("success", "released"))
                 metric_reason = "released"
                 log_controller_event(
                     "worker_deleted",
@@ -3135,7 +3145,7 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 if e.status == 404:
                     metric_status = "success"
                     metric_reason = "pod_already_deleted"
-                    record_worker_delete_metric("success", "pod_already_deleted")
+                    metric_best_effort("recording worker already deleted metric", lambda: record_worker_delete_metric("success", "pod_already_deleted"))
                     logger.info(f"[Release] Worker pod {worker_name} was already deleted")
                     log_controller_event(
                         "worker_deleted",
@@ -3148,8 +3158,8 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
                 else:
                     metric_status = "warning"
                     metric_reason = "delete_failed"
-                    record_kubernetes_api_error("delete", "pod", e)
-                    record_worker_delete_metric("warning", "delete_failed")
+                    metric_best_effort("recording Kubernetes delete error metric", lambda: record_kubernetes_api_error("delete", "pod", e))
+                    metric_best_effort("recording worker delete failure metric", lambda: record_worker_delete_metric("warning", "delete_failed"))
                     log_controller_event(
                         "worker_deleted",
                         stream=stream,
@@ -3179,8 +3189,13 @@ async def release_worker(stream: str = Query(..., description="Stream name to re
         metric_reason = type(e).__name__
         raise
     finally:
-        stream_release_duration_seconds.observe(time.monotonic() - started_at)
-        stream_release_total.labels(status=metric_status, reason=metric_reason).inc()
+        metric_best_effort(
+            "recording release metrics",
+            lambda: (
+                stream_release_duration_seconds.observe(time.monotonic() - started_at),
+                stream_release_total.labels(status=metric_status, reason=metric_reason).inc(),
+            ),
+        )
 
 
 def register_stream(
@@ -3229,11 +3244,13 @@ def register_stream(
             metric_reason = type(e).__name__
         raise
     finally:
-        try:
-            stream_registration_duration_seconds.observe(time.monotonic() - started_at)
-            stream_registration_total.labels(status=metric_status, reason=metric_reason).inc()
-        except Exception as metric_error:
-            logger.warning(f"[Metrics] Failed recording registration metrics: {metric_error}")
+        metric_best_effort(
+            "recording registration metrics",
+            lambda: (
+                stream_registration_duration_seconds.observe(time.monotonic() - started_at),
+                stream_registration_total.labels(status=metric_status, reason=metric_reason).inc(),
+            ),
+        )
 
 
 @app.post("/streams/started")
@@ -3278,9 +3295,18 @@ def stream_started(
 
         replay = registration.get("status") == "idempotent_replay" and allocation.get("status") == "idempotent_replay"
         event_status = "idempotent_replay" if replay else "started_event_processed"
-        stream_started_events_total.labels(status=event_status, reason=("idempotent_replay" if replay else "state_transition")).inc()
+        metric_best_effort(
+            "recording stream started metric",
+            lambda: stream_started_events_total.labels(
+                status=event_status,
+                reason=("idempotent_replay" if replay else "state_transition"),
+            ).inc(),
+        )
         if replay:
-            idempotent_replay_total.labels(status="replay", reason="streams_started").inc()
+            metric_best_effort(
+                "recording stream started replay metric",
+                lambda: idempotent_replay_total.labels(status="replay", reason="streams_started").inc(),
+            )
         log_prefix = "Idempotent replay" if replay else "State changed"
         logger.info(f"[StreamsStarted] {log_prefix} for stream '{stream}' proxy='{proxy_pod}'")
 
@@ -3295,11 +3321,19 @@ def stream_started(
         }
     except Exception as e:
         metric_reason = type(e).__name__
-        stream_started_events_total.labels(status="error", reason=metric_reason).inc()
+        metric_best_effort(
+            "recording stream started error metric",
+            lambda: stream_started_events_total.labels(status="error", reason=metric_reason).inc(),
+        )
         raise
     finally:
-        stream_event_to_controller_seconds.labels(event="started").observe(time.monotonic() - started_at)
-        stream_event_to_controller_total.labels(event="started", status=metric_status, reason=metric_reason).inc()
+        metric_best_effort(
+            "recording stream started controller metrics",
+            lambda: (
+                stream_event_to_controller_seconds.labels(event="started").observe(time.monotonic() - started_at),
+                stream_event_to_controller_total.labels(event="started", status=metric_status, reason=metric_reason).inc(),
+            ),
+        )
 
 
 
@@ -3562,8 +3596,12 @@ async def stream_ended(
     session_id: Optional[str] = Query(None, description="RTMP publish session id"),
     t_publish_start_proxy: Optional[float] = Query(None, description="Proxy-side publish-start epoch seconds echoed from start hook"),
 ):
-    """Single controller entrypoint when proxy publish ends.
-    Controller performs full cleanup (registry + worker release).
+    """Single lifecycle entrypoint for exec_publish_done.
+
+    In the simplified controller, publish_done always delegates to release_worker:
+    delete the mapped worker if one exists and clean all in-memory/persisted stream
+    state.  It intentionally does not perform ownership, session, handover or
+    recovery decisions.
     """
     started_at = time.monotonic()
     metric_status = "error"
@@ -3576,106 +3614,21 @@ async def stream_ended(
         status=LOG_STATUS_RECEIVED,
     )
     try:
-        with allocation_lock:
-            if proxy_pod:
-                current = stream_registry.get(stream)
-                if current and current.get("proxy_pod") == proxy_pod:
-                    current_session = current.get("session_id")
-                    if current_session and not session_id and not ALLOW_LEGACY_ENDED_WITHOUT_SESSION_ID:
-                        stale_ended_events_ignored_total.labels(status=LOG_STATUS_IGNORED, reason="missing_session_id").inc()
-                        stream_ended_events_total.labels(status=LOG_STATUS_IGNORED, reason="missing_session_id_for_session_scoped_stream").inc()
-                        logger.info(
-                            f"[StreamsEnded] Ignored ended event without session_id for session-scoped stream '{stream}' "
-                            f"from proxy='{proxy_pod}' current_session='{current_session}'"
-                        )
-                        log_controller_event(
-                            "stale_event_ignored",
-                            stream=stream,
-                            proxy_pod=proxy_pod,
-                            started_at=started_at,
-                            status=LOG_STATUS_IGNORED,
-                            level=logging.WARNING,
-                            message="publish_done without session_id ignored for session-scoped stream",
-                        )
-                        metric_status = "success"
-                        metric_reason = "missing_session_id_ignored"
-                        return {
-                            "status": "stale_ended_ignored",
-                            "reason": "missing_session_id_for_session_scoped_stream",
-                            "stream": stream,
-                            "proxy_pod": proxy_pod,
-                            "current_session_id": current_session,
-                        }
-                    if session_id and current_session and session_id != current_session:
-                        stale_ended_events_ignored_total.labels(status=LOG_STATUS_IGNORED, reason="session_id_mismatch").inc()
-                        stream_ended_events_total.labels(status=LOG_STATUS_IGNORED, reason="stale_session_mismatch").inc()
-                        logger.info(
-                            f"[StreamsEnded] Ignored stale ended event for stream '{stream}' "
-                            f"from proxy='{proxy_pod}' session='{session_id}' current_session='{current_session}'"
-                        )
-                        log_controller_event(
-                            "stale_event_ignored",
-                            stream=stream,
-                            proxy_pod=proxy_pod,
-                            started_at=started_at,
-                            status=LOG_STATUS_IGNORED,
-                            level=logging.WARNING,
-                            message="stale publish_done ignored due to session_id mismatch",
-                        )
-                        metric_status = "success"
-                        metric_reason = "stale_session_ignored"
-                        return {
-                            "status": "stale_ended_ignored",
-                            "reason": "session_id_mismatch",
-                            "stream": stream,
-                            "proxy_pod": proxy_pod,
-                            "received_session_id": session_id,
-                            "current_session_id": current_session,
-                        }
-                    mark_stream_terminal_locked(
-                        stream=stream,
-                        proxy_pod=proxy_pod,
-                        session_id=session_id or current_session,
-                        generation=generation_to_int(stream_generation.get(stream)),
-                        reason="streams_ended",
-                    )
-                    stream_registry.pop(stream, None)
-                    stream_to_proxy.pop(stream, None)
-                    cleanup_stream_lifecycle_tracking_locked(stream)
-                    persist_state_locked()
-                elif current and current.get("proxy_pod") != proxy_pod:
-                    current_owner = current.get("proxy_pod")
-                    stale_ended_events_ignored_total.labels(status=LOG_STATUS_IGNORED, reason="proxy_owner_mismatch").inc()
-                    stream_ended_events_total.labels(status=LOG_STATUS_IGNORED, reason="stale_owner_mismatch").inc()
-                    logger.info(
-                        f"[StreamsEnded] Ignored stale ended event for stream '{stream}' "
-                        f"from proxy='{proxy_pod}' current_owner='{current_owner}'"
-                    )
-                    log_controller_event(
-                        "stale_event_ignored",
-                        stream=stream,
-                        proxy_pod=proxy_pod,
-                        started_at=started_at,
-                        status=LOG_STATUS_IGNORED,
-                        level=logging.WARNING,
-                    )
-                    metric_status = "success"
-                    metric_reason = "stale_ended_ignored"
-                    return {
-                        "status": "stale_ended_ignored",
-                        "stream": stream,
-                        "proxy_pod": proxy_pod,
-                        "current_owner": current_owner,
-                    }
-
         release_result = await release_worker(stream=stream)
         replay = release_result.get("status") == "not_found"
-        event_status = "idempotent_replay" if replay else "ended"
-        stream_ended_events_total.labels(status=event_status, reason=("idempotent_replay" if replay else "state_transition")).inc()
+        event_status = "not_found" if replay else "ended"
+        event_reason = "no_worker_mapping" if replay else "publish_done_cleanup"
+        metric_best_effort(
+            "recording stream ended metric",
+            lambda: stream_ended_events_total.labels(status=event_status, reason=event_reason).inc(),
+        )
         if replay:
-            idempotent_replay_total.labels(status="replay", reason="streams_ended").inc()
+            metric_best_effort(
+                "recording stream ended replay metric",
+                lambda: idempotent_replay_total.labels(status="replay", reason="streams_ended").inc(),
+            )
         logger.info(
-            f"[StreamsEnded] {'Idempotent replay' if replay else 'State changed'} for stream '{stream}' "
+            f"[StreamsEnded] exec_publish_done cleanup for stream '{stream}' "
             f"proxy='{proxy_pod}' release_status='{release_result.get('status')}'"
         )
         metric_status = "success"
@@ -3683,11 +3636,19 @@ async def stream_ended(
         return {"status": event_status, "stream": stream, "release": release_result}
     except Exception as e:
         metric_reason = type(e).__name__
-        stream_ended_events_total.labels(status="error", reason=metric_reason).inc()
+        metric_best_effort(
+            "recording stream ended error metric",
+            lambda: stream_ended_events_total.labels(status="error", reason=metric_reason).inc(),
+        )
         raise
     finally:
-        stream_event_to_controller_seconds.labels(event="ended").observe(time.monotonic() - started_at)
-        stream_event_to_controller_total.labels(event="ended", status=metric_status, reason=metric_reason).inc()
+        metric_best_effort(
+            "recording stream ended controller metrics",
+            lambda: (
+                stream_event_to_controller_seconds.labels(event="ended").observe(time.monotonic() - started_at),
+                stream_event_to_controller_total.labels(event="ended", status=metric_status, reason=metric_reason).inc(),
+            ),
+        )
 
 @app.get('/metrics')
 def metrics():
