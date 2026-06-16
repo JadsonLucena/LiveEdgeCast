@@ -586,7 +586,7 @@ def ffmpeg_output_args(config: RunnerConfig, stream_key: str, primary_url: str) 
     targets.extend(rtmp_target(url, stream_key) for url in (config.tee_rtmp_urls or []))
     if len(targets) == 1:
         return ["-f", "flv", targets[0]]
-    tee_targets = "|".join(f"[f=flv:onfail=abort]{ffmpeg_tee_escape(target)}" for target in targets)
+    tee_targets = "|".join(f"[f=flv:onfail=ignore]{ffmpeg_tee_escape(target)}" for target in targets)
     return ["-f", "tee", tee_targets]
 
 

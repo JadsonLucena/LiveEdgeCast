@@ -1277,9 +1277,9 @@ def test_ffmpeg_command_uses_tee_for_extra_rtmp_destinations(tmp_path):
 
     assert command[-2] == "tee"
     assert command[-1] == (
-        "[f=flv:onfail=abort]rtmp://example/live/key1|"
-        "[f=flv:onfail=abort]rtmp://mirror-a/live/key1|"
-        "[f=flv:onfail=abort]rtmp://mirror-b/live/key1"
+        "[f=flv:onfail=ignore]rtmp://example/live/key1|"
+        "[f=flv:onfail=ignore]rtmp://mirror-a/live/key1|"
+        "[f=flv:onfail=ignore]rtmp://mirror-b/live/key1"
     )
     assert command.count("-c:v") == 1
 
