@@ -10,12 +10,6 @@ spec:
     name: proxy
   minReplicas: 1
   maxReplicas: 5
-  behavior:
-    # Simplified mode has no proxy handover/recovery. Allow HPA to add proxy
-    # capacity, but never let it automatically remove a proxy that may still
-    # own long-lived RTMP publishers.
-    scaleDown:
-      selectPolicy: Disabled
   metrics:
     - type: Resource
       resource:
