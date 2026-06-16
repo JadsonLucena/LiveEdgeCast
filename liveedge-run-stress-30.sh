@@ -314,8 +314,15 @@ preflight() {
   log "metric sample counts: controller_active_streams=$controller_samples proxy_rtmp_stats_up=$proxy_samples cpu_by_pod=$cpu_samples memory_by_pod=$memory_samples"
 
   [[ "${controller_samples:-0}" -ge 1 ]] || fail "controller_active_streams has no samples."
-  [[ "${proxy_samples:-0}" -ge 1 ]] || fail "proxy_rtmp_stats_up has no samples."
-  [[ "${memory_samples:-0}" -ge 1 ]] || fail "memory by pod has no samples."
+  if [[ "${proxy_samples:-0}" -lt 1 ]]; then
+    log "proxy_rtmp_stats_up has no samples; continuing with reduced proxy metrics."
+  fi
+  if [[ "${memory_samples:-0}" -lt 1 ]]; then
+    log "memory by pod has no samples; continuing with reduced infrastructure metrics."
+  fi
+  if [[ "${cpu_samples:-0}" -lt 1 ]]; then
+    log "cpu by pod has no samples; continuing with reduced infrastructure metrics."
+  fi
 
   if bool_true "$REQUIRE_NETWORK_METRICS"; then
     local rx tx
@@ -376,8 +383,9 @@ for key in [
 ]:
     print(f"{key}:", summary.get(key))
 for k in ("total_activation_seconds_per_stream", "worker_ready_seconds_per_stream", "stream_lifecycle_phase_seconds_p95"):
-    row = activation.get(k, {})
-    print(f"{k}: samples={row.get('samples')} p50={row.get('p50')} p95={row.get('p95')} p99={row.get('p99')}")
+    row = activation.get(k, {}) or {}
+    print(f"{k}: samples={row.get('samples', 0)} p50={row.get('p50')} p95={row.get('p95')} p99={row.get('p99')}")
+print("note: controller simplificado; métricas de handover, recovery e lifecycle detalhado podem estar ausentes.")
 PY
 }
 

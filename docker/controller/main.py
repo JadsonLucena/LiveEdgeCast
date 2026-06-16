@@ -517,25 +517,21 @@ async def app_lifespan(_app: FastAPI):
     global proxy_rtmp_stats_task
     global worker_pod_events_task
     await asyncio.sleep(5)
-    recover_state()
-    registry_health_task = asyncio.create_task(monitor_stream_registry_health())
-    worker_health_task = asyncio.create_task(monitor_worker_health())
-    worker_orphan_sweeper_task = asyncio.create_task(sweep_orphan_workers())
+    # Pragmatic controller mode: workers are created/deleted only by proxy
+    # publish hooks (/streams/started and /streams/ended).  Background
+    # health/recovery/handover/orphan cleanup loops are intentionally disabled
+    # for this version. Metrics collectors are best-effort and must not affect
+    # the worker lifecycle.
     metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
     proxy_rtmp_stats_task = asyncio.create_task(collect_proxy_rtmp_stats())
-    worker_pod_events_task = asyncio.create_task(collect_worker_pod_lifecycle_events())
     try:
         yield
     finally:
         pending_tasks = [
             task
             for task in (
-                registry_health_task,
-                worker_health_task,
-                worker_orphan_sweeper_task,
                 metrics_collection_task,
                 proxy_rtmp_stats_task,
-                worker_pod_events_task,
             )
             if task and not task.done()
         ]
@@ -2267,7 +2263,10 @@ async def collect_proxy_rtmp_stats_once() -> None:
 
 async def collect_proxy_rtmp_stats():
     while True:
-        await collect_proxy_rtmp_stats_once()
+        try:
+            await collect_proxy_rtmp_stats_once()
+        except Exception as e:
+            logger.warning(f"[ProxyRtmpStats] Best-effort stats collection failed: {e}")
         await asyncio.sleep(PROXY_RTMP_STATS_INTERVAL_SECONDS)
 
 
@@ -2503,11 +2502,13 @@ def update_worker_pods_available_metric() -> None:
 
 
 async def collect_infrastructure_metrics():
-    # Publish the worker readiness gauge promptly so short smoke tests get a
-    # series even before the first periodic interval completes. The heavy
-    # resource metrics remain sourced from Prometheus/cAdvisor.
+    # Publish worker pod gauges as best-effort observability. Metrics failures
+    # must never interrupt the simplified publish-start/publish-done lifecycle.
     while True:
-        update_worker_pods_available_metric()
+        try:
+            update_worker_pods_available_metric()
+        except Exception as e:
+            logger.warning(f"[Metrics] Best-effort infrastructure collection failed: {e}")
         await asyncio.sleep(5)
 
 
@@ -3010,177 +3011,55 @@ def allocate_worker(
     proxy_pod: str = Query(None, description="Proxy pod name for pull-only architecture"),
     ownership_already_verified: bool = False,
 ):
-    """
-    Aloca um worker dedicado para uma stream.
-    Controller é a ÚNICA fonte da verdade para scale-up.
+    """Create one worker for the publish-start event.
 
-    Estratégia de concorrência:
-    - usar lock para decisões/mutação de estado interno
-    - executar criação/consulta principal de worker/proxy fora do lock
-    - revalidar estado ao voltar do I/O para evitar corridas
-    - exceção: a verificação de ownership/handover roda sob o lock para manter
-      transições atômicas e pode consultar Kubernetes/HTTP ao avaliar saúde do owner
+    This version deliberately avoids handover, recovery and concurrency handling.
+    If a worker is already mapped for the stream, the existing mapping is returned
+    to keep duplicate proxy callbacks harmless.
     """
     started_at = time.monotonic()
     metric_status = "error"
     metric_reason = "exception"
     try:
-        stale_worker_from_registration: Optional[str] = None
-        registration_proxy_for_cleanup: Optional[str] = None
         with allocation_lock:
-            if proxy_pod and not ownership_already_verified:
-                current_before = dict(stream_registry.get(stream) or {})
-                current_owner_before = current_before.get("proxy_pod")
-                if not _try_handover_stream_owner_locked(stream, proxy_pod):
-                    owner = stream_registry.get(stream, {}).get("proxy_pod")
-                    metric_reason = "owner_conflict"
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"stream '{stream}' owned by proxy '{owner}'"
-                    )
-                force_new_generation = bool(current_owner_before and current_owner_before != proxy_pod)
-                stale_worker_from_registration = register_or_refresh_stream(
-                    stream,
-                    proxy_pod,
-                    force_new_generation=force_new_generation,
-                )
-                registration_proxy_for_cleanup = proxy_pod
-                persist_state_locked()
-
             existing_worker = stream_to_worker.get(stream)
-            owner_proxy = stream_registry.get(stream, {}).get("proxy_pod")
-            generation_snapshot = stream_generation.get(stream)
+            owner_proxy = (stream_registry.get(stream) or {}).get("proxy_pod") or proxy_pod
+            generation_snapshot = generation_to_int(stream_generation.get(stream)) or 1
             session_snapshot = (stream_registry.get(stream) or {}).get("session_id")
 
-        if stale_worker_from_registration:
-            delete_worker_pod_best_effort(
-                stale_worker_from_registration,
-                stream,
-                registration_proxy_for_cleanup or owner_proxy,
-                "session_replaced_during_allocate",
-            )
+        if existing_worker:
+            metric_status = "success"
+            metric_reason = "existing_worker"
+            proxy_address = resolve_proxy_address(owner_proxy) if owner_proxy else None
+            return {
+                "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
+                "name": existing_worker,
+                "proxy": proxy_address,
+                "worker": existing_worker,
+                "status": "existing_worker",
+            }
 
         if not owner_proxy:
             metric_reason = "missing_proxy_owner"
             raise HTTPException(status_code=409, detail=f"stream '{stream}' has no proxy owner")
 
         proxy_address = resolve_proxy_address(owner_proxy)
-
-        if existing_worker:
-            usable, replay_reason, should_delete_existing = inspect_existing_worker_for_replay(
-                existing_worker,
-                generation_to_int(generation_snapshot),
-                session_snapshot,
-            )
-            if usable:
-                logger.info(
-                    f"[Allocate] Idempotent replay for stream '{stream}' "
-                    f"existing worker={existing_worker} proxy={proxy_address} reason={replay_reason}"
-                )
-                metric_status = "success"
-                metric_reason = "idempotent_replay"
-                return {
-                    "pod": f"{existing_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
-                    "name": existing_worker,
-                    "proxy": proxy_address,
-                    "status": "idempotent_replay",
-                    "reason": replay_reason,
-                }
-
-            logger.warning(
-                f"[Allocate] Existing worker '{existing_worker}' for stream '{stream}' is not reusable: {replay_reason}. "
-                "Clearing mapping and creating a fresh worker."
-            )
-            stale_worker_to_delete = existing_worker if should_delete_existing else None
-            with allocation_lock:
-                if stream_to_worker.get(stream) == existing_worker:
-                    stream_to_worker.pop(stream, None)
-                    worker_to_stream.pop(existing_worker, None)
-                    cleanup_worker_lifecycle_tracking_locked(existing_worker)
-                    worker_ready_since.pop(existing_worker, None)
-                    worker_not_ready_since.pop(existing_worker, None)
-                    worker_create_started_at.pop(existing_worker, None)
-                    old_uid = worker_pod_uid_by_name.pop(existing_worker, None)
-                    if old_uid:
-                        worker_health_failures.pop(old_uid, None)
-                    persist_state_locked()
-                else:
-                    stale_worker_to_delete = None
-            if stale_worker_to_delete:
-                delete_worker_pod_best_effort(stale_worker_to_delete, stream, owner_proxy, f"stale_idempotent_replay_{replay_reason}")
-
         pod_name = create_worker_pod_for_stream(
             stream=stream,
             proxy_dns=proxy_address,
             proxy_pod=owner_proxy,
-            generation=generation_to_int(generation_snapshot) or 1,
+            generation=generation_snapshot,
             session_id=session_snapshot,
         )
 
-        discard_created_worker: Optional[str] = None
-        discard_reason: Optional[str] = None
-        replay_worker: Optional[str] = None
-        stale_owner_for_log: Optional[str] = None
-
         with allocation_lock:
-            current_worker = stream_to_worker.get(stream)
-            current_owner = stream_registry.get(stream, {}).get("proxy_pod")
-            current_generation = stream_generation.get(stream)
-
-            if current_worker:
-                logger.info(
-                    f"[Allocate] Concurrent allocation detected for stream '{stream}'. "
-                    f"Discarding newly created worker '{pod_name}' and keeping '{current_worker}'."
-                )
-                worker_create_started_at.pop(pod_name, None)
-                cleanup_worker_lifecycle_tracking_locked(pod_name)
-                discard_created_worker = pod_name
-                discard_reason = "concurrent_allocation"
-                replay_worker = current_worker
-
-            elif current_owner != owner_proxy or current_generation != generation_snapshot:
-                logger.warning(
-                    f"[Allocate] Ownership changed while creating worker for stream '{stream}'. "
-                    f"expected_owner='{owner_proxy}' current_owner='{current_owner}'. Deleting '{pod_name}'."
-                )
-                worker_create_started_at.pop(pod_name, None)
-                cleanup_worker_lifecycle_tracking_locked(pod_name)
-                discard_created_worker = pod_name
-                discard_reason = "stale_allocation"
-                stale_owner_for_log = current_owner
-
-            else:
-                stream_to_worker[stream] = pod_name
-                worker_to_stream[pod_name] = stream
-                persist_state_locked()
-
-        if discard_created_worker:
-            delete_worker_pod_best_effort(discard_created_worker, stream, owner_proxy, discard_reason or "discard_created_worker")
-
-        if replay_worker:
-            metric_status = "success"
-            metric_reason = "concurrent_idempotent_replay"
-            return {
-                "pod": f"{replay_worker}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local",
-                "name": replay_worker,
-                "proxy": proxy_address,
-                "status": "idempotent_replay"
-            }
-
-        if stale_owner_for_log is not None:
-            log_controller_event(
-                "stale_event_ignored",
-                stream=stream,
-                proxy_pod=stale_owner_for_log,
-                worker_pod=pod_name,
-                status=LOG_STATUS_IGNORED,
-                level=logging.WARNING,
-            )
-            metric_reason = "ownership_changed"
-            raise HTTPException(status_code=409, detail=f"stream '{stream}' ownership changed during allocation")
+            stream_to_worker[stream] = pod_name
+            worker_to_stream[pod_name] = stream
+            update_controller_state_gauges_locked()
+            persist_state_locked()
 
         worker_dns = f"{pod_name}.{WORKER_SERVICE}.{NAMESPACE}.svc.cluster.local"
-        logger.info(f"[Allocate] Created dedicated worker pod {pod_name} for stream '{stream}'")
+        logger.info(f"[Allocate] Created worker pod {pod_name} for stream '{stream}'")
         metric_status = "success"
         metric_reason = "created"
         return {"pod": worker_dns, "name": pod_name, "proxy": proxy_address, "worker": pod_name, "status": "created"}
@@ -3189,8 +3068,11 @@ def allocate_worker(
             metric_reason = type(e).__name__
         raise
     finally:
-        stream_allocation_duration_seconds.observe(time.monotonic() - started_at)
-        stream_allocation_total.labels(status=metric_status, reason=metric_reason).inc()
+        try:
+            stream_allocation_duration_seconds.observe(time.monotonic() - started_at)
+            stream_allocation_total.labels(status=metric_status, reason=metric_reason).inc()
+        except Exception as metric_error:
+            logger.warning(f"[Metrics] Failed recording allocation metrics: {metric_error}")
 
 
 async def release_worker(stream: str = Query(..., description="Stream name to release")):
@@ -3307,74 +3189,51 @@ def register_stream(
     session_id: Optional[str] = Query(None, description="RTMP publish session id"),
     publish_start_ts: Optional[float] = Query(None, description="Proxy-side publish-start epoch seconds"),
 ):
+    """Record the proxy that received exec_publish without handover logic."""
     started_at = time.monotonic()
     metric_status = "error"
     metric_reason = "exception"
     try:
-        stale_worker_to_delete = None
         with allocation_lock:
-            current = dict(stream_registry.get(stream) or {})
-            current_owner = current.get("proxy_pod")
-            was_replay = current and current_owner == proxy_pod and (not session_id or current.get("session_id") == session_id)
-
-            if not _try_handover_stream_owner_locked(stream, proxy_pod):
-                current_owner = stream_registry.get(stream, {}).get("proxy_pod")
-                metric_reason = "owner_conflict"
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"stream '{stream}' already owned by proxy '{current_owner}'"
-                )
-
-            force_new_generation = bool(current_owner and current_owner != proxy_pod)
-            stale_worker_to_delete = register_or_refresh_stream(
-                stream,
-                proxy_pod,
-                session_id=session_id,
-                publish_start_ts=publish_start_ts,
-                force_new_generation=force_new_generation,
-            )
+            previous_generation = generation_to_int(stream_generation.get(stream)) or 0
+            stream_registry[stream] = {
+                "proxy_pod": proxy_pod,
+                "session_id": session_id,
+                "publish_start_ts": publish_start_ts,
+            }
+            stream_to_proxy[stream] = proxy_pod
+            stream_generation[stream] = previous_generation + 1
+            generation = stream_generation[stream]
+            update_controller_state_gauges_locked()
             persist_state_locked()
 
-            if was_replay:
-                logger.info(f"[Register] Idempotent replay for stream '{stream}' on proxy '{proxy_pod}'")
-                status = "idempotent_replay"
-                metric_status = "success"
-                metric_reason = "idempotent_replay"
-            else:
-                logger.info(f"[Register] State changed for stream '{stream}' owner='{proxy_pod}'")
-                status = "registered"
-                metric_status = "success"
-                metric_reason = "registered"
-
-            generation = stream_generation.get(stream)
-            log_controller_event(
-                "stream_registered",
-                stream=stream,
-                proxy_pod=proxy_pod,
-                started_at=started_at,
-                status=status,
-            )
-
-            response = {
-                "status": status,
-                "stream": stream,
-                "proxy_pod": proxy_pod,
-                "generation": generation,
-                "healthcheck_interval_seconds": PROXY_HEALTHCHECK_INTERVAL_SECONDS,
-                "max_failed_healthchecks": PROXY_HEALTHCHECK_MAX_FAILURES
-            }
-
-        if stale_worker_to_delete:
-            delete_worker_pod_best_effort(stale_worker_to_delete, stream, proxy_pod, "session_replaced")
-
-        return response
+        log_controller_event(
+            "stream_registered",
+            stream=stream,
+            proxy_pod=proxy_pod,
+            started_at=started_at,
+            status="registered",
+        )
+        metric_status = "success"
+        metric_reason = "registered"
+        return {
+            "status": "registered",
+            "stream": stream,
+            "proxy_pod": proxy_pod,
+            "generation": generation,
+            "healthcheck_interval_seconds": None,
+            "max_failed_healthchecks": None,
+        }
     except Exception as e:
         if metric_reason == "exception":
             metric_reason = type(e).__name__
         raise
     finally:
-        stream_registration_duration_seconds.observe(time.monotonic() - started_at)
-        stream_registration_total.labels(status=metric_status, reason=metric_reason).inc()
+        try:
+            stream_registration_duration_seconds.observe(time.monotonic() - started_at)
+            stream_registration_total.labels(status=metric_status, reason=metric_reason).inc()
+        except Exception as metric_error:
+            logger.warning(f"[Metrics] Failed recording registration metrics: {metric_error}")
 
 
 @app.post("/streams/started")
@@ -3832,4 +3691,9 @@ async def stream_ended(
 
 @app.get('/metrics')
 def metrics():
-    return Response(generate_latest(), media_type='text/plain; version=0.0.4; charset=utf-8')
+    try:
+        payload = generate_latest()
+    except Exception as e:
+        logger.warning(f"[Metrics] Failed to generate Prometheus payload: {e}")
+        payload = b"# metrics temporarily unavailable\n"
+    return Response(payload, media_type='text/plain; version=0.0.4; charset=utf-8')
