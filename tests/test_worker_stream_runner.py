@@ -85,11 +85,15 @@ case "$*" in
       fi
     fi
     case "$state" in
-      active) printf '{"active": true}
+      active) printf '{"status":"active","active":true,"terminal":false}
 ' ;;
-      inactive) printf '{"active": false}
+      ended) printf '{"status":"ended_explicitly","active":false,"terminal":true}
 ' ;;
-      *) printf '{"active": null}
+      not_visible) printf '{"status":"not_visible_in_proxy_stats","active":null,"terminal":false}
+' ;;
+      inactive) printf '{"status":"not_visible_in_proxy_stats","active":null,"terminal":false}
+' ;;
+      *) printf '{"status":"unknown","active":null,"terminal":false}
 ' ;;
     esac
     ;;
@@ -140,7 +144,7 @@ def _run_runner(tmp_path: Path, scenario: str, stream_status: str = "inactive", 
 
 
 def test_input_connection_refused_retries_and_then_succeeds(tmp_path):
-    result = _run_runner(tmp_path, "input_refused_once_then_progress", status_sequence="active,active,inactive")
+    result = _run_runner(tmp_path, "input_refused_once_then_progress", status_sequence="active,active,ended")
 
     assert result.returncode == 0, result.stdout
     assert "ffmpeg_input_open_attempt_failed" in result.stdout

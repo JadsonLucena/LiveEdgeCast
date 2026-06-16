@@ -142,20 +142,22 @@ try:
 except json.JSONDecodeError:
     print("unknown")
 else:
+    status = str(data.get("status") or "")
+    terminal = data.get("terminal") is True
     active = data.get("active")
-    if active is True:
+    if terminal or status in {"ended_explicitly", "stream_ended", "terminal"}:
+        print("ended")
+    elif active is True or status == "active":
         print("active")
-    elif active is False:
-        print("inactive")
     else:
         print("unknown")
 PYSTATUS
 }
 
-exit_cleanly_if_stream_inactive() {
+exit_cleanly_if_stream_terminal() {
   local state
   state="$(controller_stream_activity_state)"
-  if [ "$state" = "inactive" ]; then
+  if [ "$state" = "ended" ]; then
     log_json "worker_shutdown" "stream_already_ended" "$(elapsed_ms "$RUNNER_START_MS")"
     exit 0
   fi
@@ -373,12 +375,12 @@ while true; do
   CURRENT_ATTEMPT="$attempt"
   now_seconds=$(date +%s)
   if [ "$now_seconds" -ge "$input_open_deadline" ]; then
-    exit_cleanly_if_stream_inactive
+    exit_cleanly_if_stream_terminal
     log_json "worker_error" "input_open_timeout" "$(elapsed_ms "$RUNNER_START_MS")"
     exit "$INPUT_OPEN_TIMEOUT_EXIT_CODE"
   fi
 
-  exit_cleanly_if_stream_inactive
+  exit_cleanly_if_stream_terminal
 
   rm -f "$PROGRESS_FILE"
   : > "$PROGRESS_FILE"
@@ -454,7 +456,7 @@ while true; do
     fi
 
     stream_state="$(controller_stream_activity_state)"
-    if [ "$stream_state" = "inactive" ]; then
+    if [ "$stream_state" = "ended" ]; then
       log_json "ffmpeg_completed_after_stream_end" "ok" "$(elapsed_ms "$RUNNER_START_MS")"
       exit 0
     fi
@@ -473,7 +475,7 @@ while true; do
   # No observable input/progress was opened. This is usually a transient race while
   # the proxy accepts publish and the worker cold-starts. Retry until the overall deadline.
   if [ "$EXIT_CODE" -eq 0 ]; then
-    exit_cleanly_if_stream_inactive
+    exit_cleanly_if_stream_terminal
     log_json "ffmpeg_exited_without_progress" "exit_0_attempt_${attempt}" "$(elapsed_ms "$RUNNER_START_MS")"
   else
     if ffmpeg_attempt_log_has_destination_open_error "$ATTEMPT_LOG_FILE"; then
@@ -490,7 +492,7 @@ while true; do
 
   now_seconds=$(date +%s)
   if [ "$now_seconds" -ge "$input_open_deadline" ]; then
-    exit_cleanly_if_stream_inactive
+    exit_cleanly_if_stream_terminal
     log_json "worker_error" "input_open_timeout_last_exit_${last_exit_code}" "$(elapsed_ms "$RUNNER_START_MS")"
     exit "$INPUT_OPEN_TIMEOUT_EXIT_CODE"
   fi

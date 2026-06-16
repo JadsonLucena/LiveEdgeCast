@@ -588,6 +588,8 @@ stream_to_proxy: Dict[str, str] = {}
 stream_generation: Dict[str, int] = {}
 stream_generation_high_water: Dict[str, int] = {}
 stream_registry: Dict[str, Dict[str, str]] = {}
+# Explicit terminal sessions observed through /streams/ended. Proxy /stats absence is not terminal.
+stream_terminal_sessions: Dict[str, Dict[str, Any]] = {}
 
 registry_health_task: Optional[asyncio.Task] = None
 worker_health_task: Optional[asyncio.Task] = None
@@ -617,6 +619,7 @@ WORKER_ORPHAN_SWEEP_INTERVAL_SECONDS = 60
 WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS = get_int_env("WORKER_POD_LIFECYCLE_WATCH_TIMEOUT_SECONDS", 5, min_value=1)
 CONTROLLER_DESTINATION_CALLBACK_ENABLED = get_bool_env("CONTROLLER_DESTINATION_CALLBACK_ENABLED", False)
 STREAM_GENERATION_HIGH_WATER_MAX_ENTRIES = get_int_env("STREAM_GENERATION_HIGH_WATER_MAX_ENTRIES", 10000, min_value=1)
+STREAM_TERMINAL_SESSION_MAX_ENTRIES = get_int_env("STREAM_TERMINAL_SESSION_MAX_ENTRIES", 20000, min_value=1)
 PROXY_READY_HEALTH_DELAY_SECONDS = 3  # Wait after proxy Ready before proxy /health probes.
 proxy_health_failures: Dict[str, int] = {}
 worker_ready_since: Dict[str, float] = {}
@@ -899,6 +902,80 @@ def prune_stream_generation_high_water_locked() -> None:
     if removed_entries:
         logger.info(f"[GenerationHighWater] Pruned {removed_entries} inactive stream generation high-water entries")
 
+
+
+def stream_terminal_session_key(stream: str, session_id: Optional[str], generation: Optional[int]) -> str:
+    return f"{stream}\0{session_id or ''}\0{generation if generation is not None else ''}"
+
+
+def prune_stream_terminal_sessions_locked() -> None:
+    excess_entries = len(stream_terminal_sessions) - STREAM_TERMINAL_SESSION_MAX_ENTRIES
+    if excess_entries <= 0:
+        return
+    removed_entries = 0
+    for key in list(stream_terminal_sessions):
+        stream_terminal_sessions.pop(key, None)
+        removed_entries += 1
+        if removed_entries >= excess_entries:
+            break
+    if removed_entries:
+        logger.info(f"[TerminalSessions] Pruned {removed_entries} terminal stream session entries")
+
+
+def mark_stream_terminal_locked(
+    stream: str,
+    proxy_pod: Optional[str],
+    session_id: Optional[str],
+    generation: Optional[int],
+    reason: str = "streams_ended",
+) -> Dict[str, Any]:
+    normalized_generation = generation_to_int(generation)
+    entry = {
+        "stream": stream,
+        "proxy_pod": proxy_pod,
+        "session_id": session_id,
+        "generation": normalized_generation,
+        "ended_at": time.time(),
+        "reason": reason,
+    }
+    stream_terminal_sessions[stream_terminal_session_key(stream, session_id, normalized_generation)] = entry
+    prune_stream_terminal_sessions_locked()
+    return entry
+
+
+def lookup_stream_terminal_locked(
+    stream: str,
+    proxy_pod: Optional[str] = None,
+    session_id: Optional[str] = None,
+    generation: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    normalized_generation = generation_to_int(generation)
+    candidates = []
+    if session_id or normalized_generation is not None:
+        candidates.append(stream_terminal_session_key(stream, session_id, normalized_generation))
+    if session_id and normalized_generation is None:
+        candidates.extend(
+            key for key, value in stream_terminal_sessions.items()
+            if value.get("stream") == stream and value.get("session_id") == session_id
+        )
+    for key in candidates:
+        entry = stream_terminal_sessions.get(key)
+        if not entry:
+            continue
+        if proxy_pod and entry.get("proxy_pod") and entry.get("proxy_pod") != proxy_pod:
+            continue
+        return dict(entry)
+    return None
+
+
+def stream_has_explicit_terminal_locked(stream: str, proxy_pod: Optional[str] = None) -> bool:
+    for entry in stream_terminal_sessions.values():
+        if entry.get("stream") != stream:
+            continue
+        if proxy_pod and entry.get("proxy_pod") and entry.get("proxy_pod") != proxy_pod:
+            continue
+        return True
+    return False
 
 def lifecycle_key_for_worker_locked(worker_pod: str) -> Optional[Tuple[str, int]]:
     indexed = worker_lifecycle_index.get(worker_pod)
@@ -1275,6 +1352,7 @@ def persist_state_locked() -> None:
         "stream_registry": stream_registry,
         "stream_generation": stream_generation,
         "stream_generation_high_water": stream_generation_high_water,
+        "stream_terminal_sessions": stream_terminal_sessions,
     }
     body = client.V1ConfigMap(
         metadata=client.V1ObjectMeta(name=STATE_CONFIGMAP_NAME, namespace=NAMESPACE),
@@ -1375,6 +1453,14 @@ def restore_persisted_state_locked() -> StateRestoreResult:
                 logger.warning(f"[State Recovery] Invalid stream generation high-water for '{stream}': {generation}")
                 continue
             set_stream_generation_high_water_locked(stream, normalized_generation)
+
+    stream_terminal_sessions.clear()
+    restored_terminal_sessions = data.get("stream_terminal_sessions", {})
+    if isinstance(restored_terminal_sessions, dict):
+        for key, value in restored_terminal_sessions.items():
+            if isinstance(value, dict):
+                stream_terminal_sessions[str(key)] = value
+    prune_stream_terminal_sessions_locked()
 
     for stream, generation in list(stream_generation.items()):
         set_stream_generation_high_water_locked(
@@ -2620,29 +2706,36 @@ async def monitor_worker_health():
                     )
                     continue
 
+                with allocation_lock:
+                    explicit_terminal = stream_has_explicit_terminal_locked(stream, owner_proxy)
+                if explicit_terminal:
+                    logger.info(
+                        f"[WorkerHealth] Worker '{worker_pod}' is unhealthy, and stream '{stream}' "
+                        f"has an explicit ended event. Releasing stale allocation."
+                    )
+                    await release_worker(stream=stream)
+                    continue
+
                 if get_proxy_health_status(owner_proxy) != "healthy":
                     logger.info(
                         f"[WorkerHealth] Delaying replacement of worker '{worker_pod}' for stream '{stream}' "
-                        f"because owner proxy '{owner_proxy}' is not healthy."
+                        f"because owner proxy '{owner_proxy}' is not healthy and no explicit stream end was observed."
                     )
                     continue
 
                 stream_active = get_stream_activity_on_proxy(stream, owner_proxy)
                 if stream_active is False:
                     logger.info(
-                        f"[WorkerHealth] Worker '{worker_pod}' is unhealthy, but stream '{stream}' "
-                        f"is no longer active on proxy '{owner_proxy}'. Releasing stale allocation instead of replacing."
+                        f"[WorkerHealth] Stream '{stream}' is not visible in proxy stats, but no explicit ended event "
+                        f"was observed. Treating stats absence as non-terminal and attempting worker replacement."
                     )
-                    await release_worker(stream=stream)
-                    continue
-                if stream_active is None:
+                elif stream_active is None:
                     logger.info(
-                        f"[WorkerHealth] Delaying replacement of worker '{worker_pod}' for stream '{stream}' "
-                        f"because proxy stream activity is inconclusive."
+                        f"[WorkerHealth] Proxy stream activity is inconclusive for stream '{stream}', but no explicit "
+                        "ended event was observed. Attempting worker replacement."
                     )
-                    continue
 
-                logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for active stream '{stream}'. Replacing.")
+                logger.warning(f"[WorkerHealth] Worker '{worker_pod}' unhealthy for non-terminal stream '{stream}'. Replacing.")
                 recovery_started_at = time.monotonic()
                 recovery_status = "error"
                 recovery_reason = "exception"
@@ -3450,12 +3543,32 @@ def stream_status(
     session_id: Optional[str] = Query(None, description="Expected RTMP session id"),
     requested_generation: Optional[int] = Query(None, alias="generation", description="Expected stream generation"),
 ):
-    """Returns lightweight stream activity information for workers and diagnostics.
+    """Returns stream lifecycle state for workers and diagnostics.
 
-    active=True/False is returned only when the controller/proxy state is sufficiently
-    conclusive. active=None means the controller could not safely determine activity.
+    terminal=true is returned only from explicit /streams/ended evidence.
+    Absence from proxy /stats is non-terminal because stats can lag or be incomplete during cold start.
     """
     with allocation_lock:
+        terminal_entry = lookup_stream_terminal_locked(
+            stream,
+            proxy_pod=proxy_pod,
+            session_id=session_id,
+            generation=requested_generation,
+        )
+        if terminal_entry:
+            return {
+                "status": "ended_explicitly",
+                "stream": stream,
+                "active": False,
+                "terminal": True,
+                "reason": terminal_entry.get("reason", "streams_ended"),
+                "proxy_pod": terminal_entry.get("proxy_pod"),
+                "worker_pod": stream_to_worker.get(stream),
+                "generation": terminal_entry.get("generation"),
+                "session_id": terminal_entry.get("session_id"),
+                "ended_at": terminal_entry.get("ended_at"),
+            }
+
         current = dict(stream_registry.get(stream) or {})
         owner_proxy = current.get("proxy_pod")
         worker_pod = stream_to_worker.get(stream)
@@ -3463,10 +3576,14 @@ def stream_status(
 
     if not current or not owner_proxy:
         return {
-            "status": "not_found",
+            "status": "registry_missing",
             "stream": stream,
-            "active": False,
-            "reason": "stream_not_registered",
+            "active": None,
+            "terminal": False,
+            "reason": "stream_not_registered_and_no_explicit_end",
+            "requested_proxy_pod": proxy_pod,
+            "requested_session_id": session_id,
+            "requested_generation": int(requested_generation) if requested_generation is not None else None,
         }
 
     if proxy_pod and owner_proxy != proxy_pod:
@@ -3474,6 +3591,7 @@ def stream_status(
             "status": "owner_mismatch",
             "stream": stream,
             "active": None,
+            "terminal": False,
             "reason": "proxy_owner_mismatch",
             "requested_proxy_pod": proxy_pod,
             "owner_proxy_pod": owner_proxy,
@@ -3488,6 +3606,7 @@ def stream_status(
             "status": "session_missing",
             "stream": stream,
             "active": None,
+            "terminal": False,
             "reason": "current_stream_has_no_session_id",
             "requested_session_id": session_id,
             "session_id": current_session,
@@ -3500,6 +3619,7 @@ def stream_status(
             "status": "session_mismatch",
             "stream": stream,
             "active": None,
+            "terminal": False,
             "reason": "session_id_mismatch",
             "requested_session_id": session_id,
             "session_id": current_session,
@@ -3515,6 +3635,7 @@ def stream_status(
                 "status": "generation_missing",
                 "stream": stream,
                 "active": None,
+                "terminal": False,
                 "reason": "current_stream_has_no_generation",
                 "requested_generation": int(requested_generation),
                 "generation": active_generation,
@@ -3527,6 +3648,7 @@ def stream_status(
                 "status": "generation_mismatch",
                 "stream": stream,
                 "active": None,
+                "terminal": False,
                 "reason": "stream_generation_mismatch",
                 "requested_generation": int(requested_generation),
                 "generation": current_generation,
@@ -3537,20 +3659,37 @@ def stream_status(
 
     activity = get_stream_activity_on_proxy(stream, owner_proxy)
     if activity is True:
-        status = "active"
-        reason = "observed_on_proxy"
-    elif activity is False:
-        status = "ended"
-        reason = "not_observed_on_proxy"
-    else:
-        status = "unknown"
-        reason = "proxy_stats_inconclusive"
+        return {
+            "status": "active",
+            "stream": stream,
+            "active": True,
+            "terminal": False,
+            "reason": "observed_on_proxy",
+            "proxy_pod": owner_proxy,
+            "worker_pod": worker_pod,
+            "generation": active_generation,
+            "session_id": current.get("session_id"),
+        }
+
+    if activity is False:
+        return {
+            "status": "not_visible_in_proxy_stats",
+            "stream": stream,
+            "active": None,
+            "terminal": False,
+            "reason": "proxy_stats_did_not_contain_stream_not_terminal",
+            "proxy_pod": owner_proxy,
+            "worker_pod": worker_pod,
+            "generation": active_generation,
+            "session_id": current.get("session_id"),
+        }
 
     return {
-        "status": status,
+        "status": "unknown",
         "stream": stream,
-        "active": activity,
-        "reason": reason,
+        "active": None,
+        "terminal": False,
+        "reason": "proxy_stats_inconclusive",
         "proxy_pod": owner_proxy,
         "worker_pod": worker_pod,
         "generation": active_generation,
@@ -3634,6 +3773,13 @@ async def stream_ended(
                             "received_session_id": session_id,
                             "current_session_id": current_session,
                         }
+                    mark_stream_terminal_locked(
+                        stream=stream,
+                        proxy_pod=proxy_pod,
+                        session_id=session_id or current_session,
+                        generation=generation_to_int(stream_generation.get(stream)),
+                        reason="streams_ended",
+                    )
                     stream_registry.pop(stream, None)
                     stream_to_proxy.pop(stream, None)
                     cleanup_stream_lifecycle_tracking_locked(stream)
