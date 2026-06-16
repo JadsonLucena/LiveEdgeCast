@@ -37,8 +37,6 @@ check_command() {
 print_step "Checking prerequisites..."
 check_command "docker"
 check_command "kubectl"
-check_command "helm"
-
 if ! kubectl cluster-info >/dev/null 2>&1; then
     print_error "Cannot connect to Kubernetes cluster!"
     kubectl config current-context 2>/dev/null || echo "  No active context found"
@@ -61,15 +59,23 @@ if kubectl get apiservice v1beta1.metrics.k8s.io >/dev/null 2>&1; then
     print_success "Kubernetes Metrics API is available for CPU/memory-based proxy HPA"
 else
     print_warning "Kubernetes Metrics API (metrics-server) was not found. The proxy HPA will be created, but CPU/memory scaling stays inactive until metrics-server is installed."
+    print_warning "Install metrics-server or enable it in your local cluster before expecting proxy HPA scaling."
 fi
 
-if ! kubectl get service kube-prometheus-stack-prometheus -n monitoring >/dev/null 2>&1; then
+INSTALL_PROMETHEUS="${INSTALL_PROMETHEUS:-false}"
+PROMETHEUS_AVAILABLE=false
+
+if kubectl get service kube-prometheus-stack-prometheus -n monitoring >/dev/null 2>&1; then
+    PROMETHEUS_AVAILABLE=true
+    print_success "Prometheus stack already available in namespace 'monitoring' for observability/reporting"
+elif [[ "$INSTALL_PROMETHEUS" == "true" || "$INSTALL_PROMETHEUS" == "1" ]]; then
+    check_command "helm"
     print_warning "Prometheus service not found in namespace 'monitoring'. Installing Prometheus stack for experiment/report observability only (not proxy scaling)..."
     print_step "Installing Prometheus stack..."
-    
+
     helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
     helm repo update >/dev/null 2>&1
-    
+
     helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
         --namespace monitoring --create-namespace \
         --set prometheus-node-exporter.enabled=false \
@@ -78,10 +84,11 @@ if ! kubectl get service kube-prometheus-stack-prometheus -n monitoring >/dev/nu
         print_error "Failed to install Prometheus"
         exit 1
     }
-    
+
+    PROMETHEUS_AVAILABLE=true
     print_success "Prometheus installed successfully for observability/reporting"
 else
-    print_success "Prometheus stack already available in namespace 'monitoring' for observability/reporting"
+    print_warning "Prometheus stack not found and INSTALL_PROMETHEUS=false; continuing without Prometheus observability/reporting."
 fi
 
 print_step "Building LiveEdgeCast proxy image..."
@@ -139,8 +146,41 @@ kubectl apply -f k8s/controller-rbac.yaml || { print_error "RBAC setup failed"; 
 print_success "Controller RBAC configured"
 
 print_step "Deploying to Kubernetes..."
-kubectl apply -R -f k8s/ || { print_error "Deployment failed"; exit 1; }
-print_success "Kubernetes manifests applied"
+CORE_MANIFESTS=(
+    k8s/controller-state-configmap.yaml
+    k8s/controller-service.yaml
+    k8s/controller-deployment.yaml
+    k8s/worker-service.yaml
+    k8s/worker-deployment.yaml
+    k8s/proxy-service.yaml
+    k8s/proxy-deployment.yaml
+    k8s/proxy-lb-configmap.yaml
+    k8s/proxy-lb-deployment.yaml
+    k8s/proxy-lb-service.yaml
+    k8s/proxy-hpa.yaml
+)
+CORE_APPLY_ARGS=()
+for manifest in "${CORE_MANIFESTS[@]}"; do
+    CORE_APPLY_ARGS+=(-f "$manifest")
+done
+kubectl apply "${CORE_APPLY_ARGS[@]}" || { print_error "Core deployment failed"; exit 1; }
+print_success "Core Kubernetes manifests applied"
+
+if [[ "$PROMETHEUS_AVAILABLE" == "true" ]] && \
+   kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1 && \
+   kubectl get crd prometheusrules.monitoring.coreos.com >/dev/null 2>&1; then
+    kubectl apply -f k8s/controller-service-monitor.yaml \
+        -f k8s/worker-service-monitor.yaml \
+        -f k8s/proxy-service-monitor.yaml \
+        -f k8s/proxy-observability-rules.yaml \
+        -f k8s/observability/liveedgecast-resource-rules.yaml || {
+        print_error "Observability manifest deployment failed"
+        exit 1
+    }
+    print_success "Prometheus observability manifests applied"
+else
+    print_warning "Skipping Prometheus ServiceMonitor/PrometheusRule manifests; Prometheus Operator CRDs are unavailable or Prometheus is disabled."
+fi
 
 print_step "Waiting for RTMP Controller deployment to be ready..."
 kubectl wait --for=condition=available deployment/controller -n media --timeout=120s || {
@@ -265,10 +305,14 @@ fi
 
 echo ""
 echo -e "${BLUE}📊 Monitoring (Optional):${NC}"
-echo "  To access Prometheus UI:"
-echo "    kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090"
-echo "    Then open: http://localhost:9090"
-echo ""
-echo "  Useful Prometheus queries for reporting/observability (not proxy scaling):"
-echo "    - container_memory_working_set_bytes{namespace=\"media\",pod=~\"proxy-.*\"}/1024/1024  # proxy MB"
-echo "    - rate(container_cpu_usage_seconds_total{namespace=\"media\",pod=~\"proxy-.*\"}[1m])*100  # proxy CPU %"
+if [[ "$PROMETHEUS_AVAILABLE" == "true" ]]; then
+    echo "  To access Prometheus UI:"
+    echo "    kubectl port-forward -n monitoring svc/kube-prometheus-stack-prometheus 9090:9090"
+    echo "    Then open: http://localhost:9090"
+    echo ""
+    echo "  Useful Prometheus queries for reporting/observability (not proxy scaling):"
+    echo "    - container_memory_working_set_bytes{namespace=\"media\",pod=~\"proxy-.*\"}/1024/1024  # proxy MB"
+    echo "    - rate(container_cpu_usage_seconds_total{namespace=\"media\",pod=~\"proxy-.*\"}[1m])*100  # proxy CPU %"
+else
+    echo "  Prometheus is disabled. Set INSTALL_PROMETHEUS=true before running tools/up.sh if you need report graphs."
+fi

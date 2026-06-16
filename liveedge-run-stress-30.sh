@@ -13,7 +13,7 @@ CURL_BIN="${CURL_BIN:-curl}"
 JQ_BIN="${JQ_BIN:-jq}"
 
 NAMESPACE="${NAMESPACE:-media}"
-PROMETHEUS_URL="${PROMETHEUS_URL:-${PROM_URL:-http://127.0.0.1:9090}}"
+PROMETHEUS_URL="${PROMETHEUS_URL:-${PROM_URL:-}}"
 CONTROLLER_URL="${CONTROLLER_URL:-http://127.0.0.1:8000}"
 RTMP_URL="${RTMP_URL:-${LIVEEDGECAST_RTMP_URL:-rtmp://127.0.0.1:1935/live}}"
 SECONDARY_RTMP_URL="${SECONDARY_RTMP_URL:-}"
@@ -140,7 +140,9 @@ wait_for_local_endpoints() {
       controller_ok="false"
     fi
 
-    if "$CURL_BIN" -fsS "${PROMETHEUS_URL%/}/-/ready" >/dev/null 2>&1; then
+    if [[ -z "$PROMETHEUS_URL" ]]; then
+      prometheus_ok="skipped"
+    elif "$CURL_BIN" -fsS "${PROMETHEUS_URL%/}/-/ready" >/dev/null 2>&1; then
       prometheus_ok="true"
     else
       prometheus_ok="false"
@@ -152,7 +154,7 @@ wait_for_local_endpoints() {
       rtmp_ok="false"
     fi
 
-    if [[ "$controller_ok" == "true" && "$prometheus_ok" == "true" && "$rtmp_ok" == "true" ]]; then
+    if [[ "$controller_ok" == "true" && ( "$prometheus_ok" == "true" || "$prometheus_ok" == "skipped" ) && "$rtmp_ok" == "true" ]]; then
       log "Local endpoints ready: controller=${controller_ok} prometheus=${prometheus_ok} rtmp=${rtmp_ok}"
       return 0
     fi
@@ -297,6 +299,15 @@ preflight() {
   "$CURL_BIN" -fsS "${CONTROLLER_URL%/}/health" | tee -a "$CAMPAIGN_LOG" || fail "Controller health endpoint failed. Check port-forward svc/controller 8000:8000."
   echo | tee -a "$CAMPAIGN_LOG" >/dev/null
 
+  if [[ -z "$PROMETHEUS_URL" ]]; then
+    if bool_true "$REQUIRE_PROMETHEUS_ANALYSIS"; then
+      fail "REQUIRE_PROMETHEUS_ANALYSIS=true but PROMETHEUS_URL is empty."
+    fi
+    log "PROMETHEUS_URL is empty; skipping Prometheus readiness, target, and metric preflight checks."
+    log "Preflight passed with reduced observability."
+    return 0
+  fi
+
   log "Checking Prometheus readiness: ${PROMETHEUS_URL%/}/-/ready"
   "$CURL_BIN" -fsS "${PROMETHEUS_URL%/}/-/ready" | tee -a "$CAMPAIGN_LOG" || fail "Prometheus not ready. Check port-forward to 9090."
   echo | tee -a "$CAMPAIGN_LOG" >/dev/null
@@ -438,7 +449,6 @@ run_experiment_once() {
     --repetitions 1
     --cooldown-seconds 0
     --startup-interval-seconds 0
-    --prometheus-url "$PROMETHEUS_URL"
     --controller-url "$CONTROLLER_URL"
     --namespace "$NAMESPACE"
     --rtmp-url "$RTMP_URL"
@@ -453,6 +463,9 @@ run_experiment_once() {
     --overwrite
   )
 
+  if [[ -n "$PROMETHEUS_URL" ]]; then
+    cmd+=(--prometheus-url "$PROMETHEUS_URL")
+  fi
   if [[ -n "$SECONDARY_RTMP_URL" ]]; then
     cmd+=(--secondary-rtmp-url "$SECONDARY_RTMP_URL")
   fi
@@ -552,7 +565,6 @@ run_stress_level() {
       --repetitions "$repetitions"
       --cooldown-seconds "$cooldown"
       --startup-interval-seconds 0
-      --prometheus-url "$PROMETHEUS_URL"
       --controller-url "$CONTROLLER_URL"
       --namespace "$NAMESPACE"
       --rtmp-url "$RTMP_URL"
@@ -566,6 +578,9 @@ run_stress_level() {
       "${flags[@]}"
       --overwrite
     )
+    if [[ -n "$PROMETHEUS_URL" ]]; then
+      cmd+=(--prometheus-url "$PROMETHEUS_URL")
+    fi
     if [[ -n "$SECONDARY_RTMP_URL" ]]; then
       cmd+=(--secondary-rtmp-url "$SECONDARY_RTMP_URL")
     fi

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 : "${LIVEEDGECAST_RTMP_URL:?Set LIVEEDGECAST_RTMP_URL, e.g. rtmp://127.0.0.1:1935/live}"
-: "${PROMETHEUS_URL:?Set PROMETHEUS_URL, e.g. http://127.0.0.1:9090}"
+PROMETHEUS_URL="${PROMETHEUS_URL:-}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 NAMESPACE="${NAMESPACE:-media}"
@@ -27,6 +27,9 @@ EXTRA_ARGS=()
 if [[ -n "${CONTROLLER_URL}" ]]; then
   EXTRA_ARGS+=(--controller-url "${CONTROLLER_URL}")
 fi
+if [[ -n "${PROMETHEUS_URL}" ]]; then
+  EXTRA_ARGS+=(--prometheus-url "${PROMETHEUS_URL}")
+fi
 if [[ "${PATCH_PROXY_CONTEXT}" == "true" || "${PATCH_PROXY_CONTEXT}" == "1" ]]; then
   EXTRA_ARGS+=(--patch-proxy-context)
 fi
@@ -34,6 +37,10 @@ if [[ "${REQUIRE_DESTINATION_RECEIVED}" == "true" || "${REQUIRE_DESTINATION_RECE
   EXTRA_ARGS+=(--require-destination-received)
 fi
 if [[ "${REQUIRE_PROMETHEUS_ANALYSIS}" == "true" || "${REQUIRE_PROMETHEUS_ANALYSIS}" == "1" ]]; then
+  if [[ -z "${PROMETHEUS_URL}" ]]; then
+    echo "REQUIRE_PROMETHEUS_ANALYSIS=true requires PROMETHEUS_URL" >&2
+    exit 1
+  fi
   EXTRA_ARGS+=(--require-prometheus-analysis)
 fi
 if [[ "${ALLOW_PARTIAL}" == "true" || "${ALLOW_PARTIAL}" == "1" ]]; then
@@ -58,7 +65,6 @@ fi
   --duration-seconds "${DURATION_SECONDS}" \
   --repetitions 1 \
   --rtmp-url "${LIVEEDGECAST_RTMP_URL}" \
-  --prometheus-url "${PROMETHEUS_URL}" \
   --namespace "${NAMESPACE}" \
   --output-dir "${OUTPUT_DIR}" \
   --bitrate "${BITRATE}" \
