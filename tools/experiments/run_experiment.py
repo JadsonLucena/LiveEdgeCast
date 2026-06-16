@@ -158,6 +158,7 @@ class RunnerConfig:
     worker_metric_label_selector: str | None = 'namespace="$namespace"'
     constant_bitrate: bool = False
     tee_rtmp_urls: list[str] | None = None
+    tee_stream_keys: bool = False
 
     @property
     def report_root(self) -> Path:
@@ -241,6 +242,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--audio-bitrate", default=os.getenv("LIVEEDGECAST_AUDIO_BITRATE", "128k"), help="AAC audio bitrate used by generated publishers. Default: 128k.")
     parser.add_argument("--constant-bitrate", action="store_true", help="Enforce constant video bitrate for FFmpeg publishers with minrate=maxrate=bitrate, VBV buffer sizing, and x264 HRD CBR signaling.")
     parser.add_argument("--tee-rtmp-urls", default=os.getenv("LIVEEDGECAST_TEE_RTMP_URLS"), help="Comma-separated extra RTMP base URLs mirrored by each publisher with ffmpeg -f tee after a single local encode. Provide base URLs only; the generated streamKey is appended automatically. Example: rtmp://host-a/live,rtmp://host-b/live")
+    parser.add_argument("--tee-stream-keys", action="store_true", default=bool_true_env("LIVEEDGECAST_TEE_STREAM_KEYS"), help="For concurrency runs, publish all generated streamKeys from one local FFmpeg encode using tee outputs to the configured RTMP base URL.")
     parser.add_argument("--namespace", default=os.getenv("NAMESPACE", "media"))
     parser.add_argument("--prometheus-url", default=os.getenv("PROMETHEUS_URL"))
     parser.add_argument("--controller-url", default=os.getenv("LIVEEDGECAST_CONTROLLER_URL"))
@@ -361,7 +363,12 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         worker_metric_label_selector=args.worker_metric_label_selector,
         constant_bitrate=args.constant_bitrate,
         tee_rtmp_urls=tee_rtmp_urls,
+        tee_stream_keys=args.tee_stream_keys,
     )
+
+
+def bool_true_env(name: str) -> bool:
+    return os.getenv(name, "").lower() in {"1", "true", "yes", "y"}
 
 
 def parse_csv_urls(value: str | None) -> list[str] | None:
@@ -488,11 +495,15 @@ class ManagedPublisher:
         started_at: float,
         repetition: int,
         publisher_index: int,
+        stream_keys: list[str] | None = None,
+        publisher_mode: str = "single",
     ):
         self.experiment_id = config.experiment_id
         self.scenario = config.scenario
         self.run_id = config.run_id
         self.stream_key = stream_key
+        self.stream_keys = stream_keys or [stream_key]
+        self.publisher_mode = publisher_mode
         self.command = command
         self.process = process
         self.stdout_path = stdout_path
@@ -537,6 +548,8 @@ class ManagedPublisher:
             "stdout": str(self.stdout_path),
             "stderr": str(self.stderr_path),
             "command": redact_command(self.command),
+            "publisher_mode": self.publisher_mode,
+            "publisher_group_size": len(self.stream_keys),
         }
 
 
@@ -581,16 +594,19 @@ def rtmp_target(base_url: str, stream_key: str) -> str:
     return f"{base_url.rstrip('/')}/{quote(stream_key, safe='')}"
 
 
-def ffmpeg_output_args(config: RunnerConfig, stream_key: str, primary_url: str) -> list[str]:
-    targets = [rtmp_target(primary_url, stream_key)]
-    targets.extend(rtmp_target(url, stream_key) for url in (config.tee_rtmp_urls or []))
+def ffmpeg_output_args(config: RunnerConfig, stream_keys: Sequence[str], primary_url: str) -> list[str]:
+    targets = [rtmp_target(primary_url, key) for key in stream_keys]
+    for url in config.tee_rtmp_urls or []:
+        targets.extend(rtmp_target(url, key) for key in stream_keys)
     if len(targets) == 1:
         return ["-f", "flv", targets[0]]
     tee_targets = "|".join(f"[f=flv:onfail=ignore]{ffmpeg_tee_escape(target)}" for target in targets)
     return ["-f", "tee", tee_targets]
 
 
-def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None = None) -> list[str]:
+def ffmpeg_command_for_stream_keys(config: RunnerConfig, stream_keys: Sequence[str], rtmp_url: str | None = None) -> list[str]:
+    if not stream_keys:
+        raise ValueError("at least one stream key is required")
     base_url = (rtmp_url or config.rtmp_url).rstrip("/")
     command = [config.ffmpeg_path, "-hide_banner", "-nostdin", "-re"]
     if config.source_file:
@@ -622,8 +638,12 @@ def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None =
         command.extend([
             "-c:a", "aac", "-b:a", config.audio_bitrate, "-ar", "44100",
         ])
-    command.extend(ffmpeg_output_args(config, stream_key, base_url))
+    command.extend(ffmpeg_output_args(config, stream_keys, base_url))
     return command
+
+
+def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None = None) -> list[str]:
+    return ffmpeg_command_for_stream_keys(config, [stream_key], rtmp_url=rtmp_url)
 
 
 def start_publisher(
@@ -654,8 +674,42 @@ def start_publisher(
         "timestamp": started_at,
         "command": redact_command(command),
         "rtmp_url_role": "secondary" if rtmp_url_override else "primary",
+        "publisher_mode": "single",
+        "publisher_group_size": 1,
     })
     return ManagedPublisher(config, stream_key, command, process, stdout_path, stderr_path, started_at, repetition, publisher_index)
+
+
+def start_tee_stream_key_publisher(
+    config: RunnerConfig,
+    dirs: dict[str, Path],
+    stream_keys: list[str],
+    repetition: int,
+) -> ManagedPublisher:
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", f"tee-{len(stream_keys)}streams")
+    stdout_path = dirs["logs"] / f"publisher-{config.experiment_id}-r{repetition:03d}-i001-{safe_name}.stdout.log"
+    stderr_path = dirs["logs"] / f"publisher-{config.experiment_id}-r{repetition:03d}-i001-{safe_name}.stderr.log"
+    command = ffmpeg_command_for_stream_keys(config, stream_keys)
+    started_at = now_epoch()
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        process = subprocess.Popen(command, stdout=stdout, stderr=stderr, start_new_session=True)
+    for index, stream_key in enumerate(stream_keys, start=1):
+        append_jsonl(dirs["raw"] / "publishers.jsonl", {
+            "event": "publisher_started",
+            "experiment_id": config.experiment_id,
+            "scenario": config.scenario,
+            "run_id": config.run_id,
+            "stream_key": stream_key,
+            "repetition": repetition,
+            "publisher_index": index,
+            "pid": process.pid,
+            "timestamp": started_at,
+            "command": redact_command(command),
+            "rtmp_url_role": "primary",
+            "publisher_mode": "tee_stream_keys",
+            "publisher_group_size": len(stream_keys),
+        })
+    return ManagedPublisher(config, stream_keys[0], command, process, stdout_path, stderr_path, started_at, repetition, 1, stream_keys=stream_keys, publisher_mode="tee_stream_keys")
 
 
 def publisher_process_status(result: dict[str, Any]) -> str:
@@ -708,11 +762,17 @@ def wait_or_stop_publishers(
 
 
 def record_publisher_results(config: RunnerConfig, dirs: dict[str, Path], publishers: list[ManagedPublisher]) -> list[dict[str, Any]]:
-    results = [publisher.result() for publisher in publishers]
-    for result in results:
-        result["publisher_process_status"] = publisher_process_status(result)
-        result["publisher_status"] = publisher_status(config, result)
-        append_jsonl(dirs["raw"] / "publishers.jsonl", {"event": "publisher_finished", **result})
+    results: list[dict[str, Any]] = []
+    for publisher in publishers:
+        base_result = publisher.result()
+        for offset, stream_key in enumerate(publisher.stream_keys):
+            result = {**base_result, "stream_key": stream_key}
+            if len(publisher.stream_keys) > 1:
+                result["publisher_index"] = offset + 1
+            result["publisher_process_status"] = publisher_process_status(result)
+            result["publisher_status"] = publisher_status(config, result)
+            append_jsonl(dirs["raw"] / "publishers.jsonl", {"event": "publisher_finished", **result})
+            results.append(result)
     return results
 
 
@@ -1833,10 +1893,13 @@ def execute_single_run(config: RunnerConfig, dirs: dict[str, Path], repetition: 
             time.sleep(config.reconnect_delay_seconds)
             publishers.append(start_publisher(config, dirs, key, repetition, 2, suffix="-handover-b", rtmp_url_override=config.secondary_rtmp_url))
         else:
-            for index, key in enumerate(stream_keys):
-                publishers.append(start_publisher(config, dirs, key, repetition, index + 1))
-                if index < len(stream_keys) - 1 and config.startup_interval_seconds:
-                    time.sleep(config.startup_interval_seconds)
+            if config.scenario == "concurrency" and config.tee_stream_keys and len(stream_keys) > 1:
+                publishers.append(start_tee_stream_key_publisher(config, dirs, stream_keys, repetition))
+            else:
+                for index, key in enumerate(stream_keys):
+                    publishers.append(start_publisher(config, dirs, key, repetition, index + 1))
+                    if index < len(stream_keys) - 1 and config.startup_interval_seconds:
+                        time.sleep(config.startup_interval_seconds)
         if config.scenario == "release":
             time.sleep(min(config.release_after_seconds, config.duration_seconds))
             # Capture worker/controller evidence while the stream is still expected to be active.

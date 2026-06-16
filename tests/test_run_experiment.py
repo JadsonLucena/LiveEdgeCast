@@ -1269,6 +1269,20 @@ def test_ffmpeg_command_enforces_constant_bitrate_for_source_file(tmp_path):
     assert command[command.index("-x264-params") + 1] == "nal-hrd=cbr:force-cfr=1"
 
 
+def test_ffmpeg_command_uses_tee_for_multiple_stream_keys_to_same_rtmp_url(tmp_path):
+    cfg = config(tmp_path)
+
+    command = runner.ffmpeg_command_for_stream_keys(cfg, ["key1", "key2", "key3"])
+
+    assert command[-2] == "tee"
+    assert command[-1] == (
+        "[f=flv:onfail=ignore]rtmp://example/live/key1|"
+        "[f=flv:onfail=ignore]rtmp://example/live/key2|"
+        "[f=flv:onfail=ignore]rtmp://example/live/key3"
+    )
+    assert command.count("-c:v") == 1
+
+
 def test_ffmpeg_command_uses_tee_for_extra_rtmp_destinations(tmp_path):
     cfg = config(tmp_path)
     cfg.tee_rtmp_urls = ["rtmp://mirror-a/live", "rtmp://mirror-b/live"]
@@ -1295,6 +1309,7 @@ def test_parse_args_accepts_generated_source_controls(tmp_path):
         "--testsrc-rate", "30",
         "--audio-bitrate", "128k",
         "--constant-bitrate",
+        "--tee-stream-keys",
         "--tee-rtmp-urls", "rtmp://mirror-a/live,rtmps://mirror-b/live",
     ])
 
@@ -1304,6 +1319,7 @@ def test_parse_args_accepts_generated_source_controls(tmp_path):
     assert cfg.testsrc_rate == "30"
     assert cfg.audio_bitrate == "128k"
     assert cfg.constant_bitrate is True
+    assert cfg.tee_stream_keys is True
     assert cfg.tee_rtmp_urls == ["rtmp://mirror-a/live", "rtmps://mirror-b/live"]
 
 

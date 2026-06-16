@@ -6,10 +6,11 @@ set -euo pipefail
 #
 # Important: this script can manage the local port-forwards through ./tools/port-forward.sh.
 # Use MANAGE_PORT_FORWARD=true to enable automatic restart/readiness checks.
-# Set TEE_RTMP_URLS to a comma-separated list of extra RTMP base URLs when the same
-# encoded stream should be mirrored to multiple destinations through ffmpeg -f tee.
-# Do not include stream keys in TEE_RTMP_URLS; this script keeps generating streamKey
-# values automatically and run_experiment.py appends each key to every RTMP base URL.
+# By default this script asks run_experiment.py to publish all generated streamKeys
+# in each concurrency run from a single local FFmpeg encode using ffmpeg -f tee.
+# Set TEE_STREAM_KEYS=false to fall back to one FFmpeg process per streamKey.
+# TEE_RTMP_URLS is optional and only adds extra RTMP base URLs; streamKey values are
+# still generated automatically and appended to RTMP_URL and every extra base URL.
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
@@ -22,6 +23,7 @@ CONTROLLER_URL="${CONTROLLER_URL:-http://127.0.0.1:8000}"
 RTMP_URL="${RTMP_URL:-${LIVEEDGECAST_RTMP_URL:-rtmp://127.0.0.1:1935/live}}"
 SECONDARY_RTMP_URL="${SECONDARY_RTMP_URL:-}"
 TEE_RTMP_URLS="${TEE_RTMP_URLS:-${LIVEEDGECAST_TEE_RTMP_URLS:-}}"
+TEE_STREAM_KEYS="${TEE_STREAM_KEYS:-true}"
 
 TESTSRC_SIZE="${TESTSRC_SIZE:-1920x1080}"
 TESTSRC_RATE="${TESTSRC_RATE:-30}"
@@ -355,6 +357,7 @@ build_flags() {
   bool_true "$ALLOW_RESTORE_FAILURE" && flags+=(--allow-restore-failure)
   bool_true "$ALLOW_UNSCOPED_CONTEXT" && flags+=(--allow-unscoped-context)
   bool_true "$CONSTANT_BITRATE" && flags+=(--constant-bitrate)
+  bool_true "$TEE_STREAM_KEYS" && flags+=(--tee-stream-keys)
   [[ -n "$TEE_RTMP_URLS" ]] && flags+=(--tee-rtmp-urls "$TEE_RTMP_URLS")
   bool_true "$ALLOW_WORKER_CLEANUP" && flags+=(--allow-worker-cleanup)
   printf '%s\n' "${flags[@]}"
@@ -647,6 +650,7 @@ bitrate=$BITRATE
 audio_bitrate=$AUDIO_BITRATE
 constant_bitrate=$CONSTANT_BITRATE
 tee_rtmp_urls=$TEE_RTMP_URLS
+tee_stream_keys=$TEE_STREAM_KEYS
 profile=YouTube-like ${TESTSRC_SIZE}@${TESTSRC_RATE}fps H.264 ${BITRATE} video + AAC ${AUDIO_BITRATE}
 require_destination_received=$REQUIRE_DESTINATION_RECEIVED
 allow_partial=$ALLOW_PARTIAL
