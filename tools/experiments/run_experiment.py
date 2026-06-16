@@ -156,6 +156,7 @@ class RunnerConfig:
     proxy_container: str | None = None
     controller_container: str | None = None
     worker_metric_label_selector: str | None = 'namespace="$namespace"'
+    constant_bitrate: bool = False
 
     @property
     def report_root(self) -> Path:
@@ -237,6 +238,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
     parser.add_argument("--testsrc-size", default=os.getenv("LIVEEDGECAST_TESTSRC_SIZE", "1920x1080"), help="Synthetic lavfi testsrc size used when --source-file is omitted. Default: 1920x1080.")
     parser.add_argument("--testsrc-rate", default=os.getenv("LIVEEDGECAST_TESTSRC_RATE", "30"), help="Synthetic lavfi testsrc frame rate used when --source-file is omitted. Default: 30.")
     parser.add_argument("--audio-bitrate", default=os.getenv("LIVEEDGECAST_AUDIO_BITRATE", "128k"), help="AAC audio bitrate used by generated publishers. Default: 128k.")
+    parser.add_argument("--constant-bitrate", action="store_true", help="Enforce constant video bitrate for FFmpeg publishers with minrate=maxrate=bitrate, VBV buffer sizing, and x264 HRD CBR signaling.")
     parser.add_argument("--namespace", default=os.getenv("NAMESPACE", "media"))
     parser.add_argument("--prometheus-url", default=os.getenv("PROMETHEUS_URL"))
     parser.add_argument("--controller-url", default=os.getenv("LIVEEDGECAST_CONTROLLER_URL"))
@@ -351,6 +353,7 @@ def parse_args(argv: Sequence[str] | None = None) -> RunnerConfig:
         proxy_container=args.proxy_container,
         controller_container=args.controller_container,
         worker_metric_label_selector=args.worker_metric_label_selector,
+        constant_bitrate=args.constant_bitrate,
     )
 
 
@@ -533,6 +536,26 @@ def redact_command(command: Sequence[str]) -> list[str]:
 
 
 
+def ffmpeg_vbv_bufsize(video_bitrate: str) -> str:
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)?)([kKmMgG]?)$", video_bitrate.strip())
+    if not match:
+        return "20000k"
+    value = float(match.group(1)) * 2
+    unit = match.group(2) or "k"
+    rendered = str(int(value)) if value.is_integer() else str(value).rstrip("0").rstrip(".")
+    return f"{rendered}{unit}"
+
+
+def add_constant_bitrate_options(command: list[str], video_bitrate: str) -> None:
+    command.extend([
+        "-b:v", video_bitrate,
+        "-minrate", video_bitrate,
+        "-maxrate", video_bitrate,
+        "-bufsize", ffmpeg_vbv_bufsize(video_bitrate),
+        "-x264-params", "nal-hrd=cbr:force-cfr=1",
+    ])
+
+
 def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None = None) -> list[str]:
     base_url = (rtmp_url or config.rtmp_url).rstrip("/")
     target = f"{base_url}/{quote(stream_key, safe='')}"
@@ -540,7 +563,12 @@ def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None =
     if config.source_file:
         command.extend(["-stream_loop", "-1", "-i", config.source_file, "-t", str(config.duration_seconds)])
         if config.bitrate:
-            command.extend(["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency", "-b:v", config.bitrate, "-c:a", "aac"])
+            command.extend(["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency"])
+            if config.constant_bitrate:
+                add_constant_bitrate_options(command, config.bitrate)
+            else:
+                command.extend(["-b:v", config.bitrate])
+            command.extend(["-c:a", "aac"])
         else:
             command.extend(["-c", "copy"])
     else:
@@ -553,7 +581,12 @@ def ffmpeg_command(config: RunnerConfig, stream_key: str, rtmp_url: str | None =
             "-c:v", "libx264", "-preset", "veryfast",
             "-pix_fmt", "yuv420p", "-r", config.testsrc_rate, "-g", "60", "-keyint_min", "60",
             "-sc_threshold", "0", "-bf", "2", "-refs", "1", "-coder", "1",
-            "-b:v", video_bitrate, "-minrate", video_bitrate, "-maxrate", video_bitrate, "-bufsize", "20000k",
+        ])
+        if config.constant_bitrate:
+            add_constant_bitrate_options(command, video_bitrate)
+        else:
+            command.extend(["-b:v", video_bitrate, "-minrate", video_bitrate, "-maxrate", video_bitrate, "-bufsize", "20000k"])
+        command.extend([
             "-c:a", "aac", "-b:a", config.audio_bitrate, "-ar", "44100",
         ])
     command.extend(["-f", "flv", target])

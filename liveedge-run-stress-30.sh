@@ -22,6 +22,7 @@ TESTSRC_SIZE="${TESTSRC_SIZE:-1920x1080}"
 TESTSRC_RATE="${TESTSRC_RATE:-30}"
 BITRATE="${BITRATE:-10000k}"
 AUDIO_BITRATE="${AUDIO_BITRATE:-128k}"
+CONSTANT_BITRATE="${CONSTANT_BITRATE:-true}"
 
 BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-./reports-stress/$(date +%Y%m%d-%H%M%S)}"
 
@@ -348,6 +349,7 @@ build_flags() {
   bool_true "$ALLOW_INCONCLUSIVE" && flags+=(--allow-inconclusive)
   bool_true "$ALLOW_RESTORE_FAILURE" && flags+=(--allow-restore-failure)
   bool_true "$ALLOW_UNSCOPED_CONTEXT" && flags+=(--allow-unscoped-context)
+  bool_true "$CONSTANT_BITRATE" && flags+=(--constant-bitrate)
   bool_true "$ALLOW_WORKER_CLEANUP" && flags+=(--allow-worker-cleanup)
   printf '%s\n' "${flags[@]}"
 }
@@ -629,6 +631,7 @@ testsrc_size=$TESTSRC_SIZE
 testsrc_rate=$TESTSRC_RATE
 bitrate=$BITRATE
 audio_bitrate=$AUDIO_BITRATE
+constant_bitrate=$CONSTANT_BITRATE
 profile=YouTube-like 720p30 H.264 4Mbps video + AAC 128kbps
 require_destination_received=$REQUIRE_DESTINATION_RECEIVED
 allow_partial=$ALLOW_PARTIAL

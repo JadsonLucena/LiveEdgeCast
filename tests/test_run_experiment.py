@@ -1234,6 +1234,35 @@ def test_ffmpeg_command_generates_1080p30_testsrc_by_default(tmp_path):
     assert command[-1] == "rtmp://example/live/key1"
 
 
+
+def test_ffmpeg_command_enforces_constant_bitrate_when_requested(tmp_path):
+    cfg = config(tmp_path)
+    cfg.bitrate = "6500k"
+    cfg.constant_bitrate = True
+
+    command = runner.ffmpeg_command(cfg, "key1")
+
+    assert command[command.index("-b:v") + 1] == "6500k"
+    assert command[command.index("-minrate") + 1] == "6500k"
+    assert command[command.index("-maxrate") + 1] == "6500k"
+    assert command[command.index("-bufsize") + 1] == "13000k"
+    assert command[command.index("-x264-params") + 1] == "nal-hrd=cbr:force-cfr=1"
+
+
+def test_ffmpeg_command_enforces_constant_bitrate_for_source_file(tmp_path):
+    cfg = config(tmp_path)
+    cfg.source_file = "sample.mp4"
+    cfg.bitrate = "4M"
+    cfg.constant_bitrate = True
+
+    command = runner.ffmpeg_command(cfg, "key1")
+
+    assert "-c:v" in command and "libx264" in command
+    assert command[command.index("-minrate") + 1] == "4M"
+    assert command[command.index("-maxrate") + 1] == "4M"
+    assert command[command.index("-bufsize") + 1] == "8M"
+    assert command[command.index("-x264-params") + 1] == "nal-hrd=cbr:force-cfr=1"
+
 def test_parse_args_accepts_generated_source_controls(tmp_path):
     cfg = runner.parse_args([
         "--stream-keys", "key1,key2",
@@ -1244,6 +1273,7 @@ def test_parse_args_accepts_generated_source_controls(tmp_path):
         "--testsrc-size", "1920x1080",
         "--testsrc-rate", "30",
         "--audio-bitrate", "128k",
+        "--constant-bitrate",
     ])
 
     assert cfg.stream_keys == ["key1", "key2"]
@@ -1251,6 +1281,7 @@ def test_parse_args_accepts_generated_source_controls(tmp_path):
     assert cfg.testsrc_size == "1920x1080"
     assert cfg.testsrc_rate == "30"
     assert cfg.audio_bitrate == "128k"
+    assert cfg.constant_bitrate is True
 
 
 def test_correctness_uses_unknown_run_id_controller_events_as_worker_evidence(tmp_path):

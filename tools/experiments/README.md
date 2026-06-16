@@ -8,8 +8,10 @@ This directory contains runnable experiment drivers for load and failure scenari
 - `--concurrency`
 - `--duration-seconds` / `--duration_seconds`
 - `--bitrate`
+- `--audio-bitrate`
+- `--constant-bitrate`
 
-Quando os scripts geram fonte sintética com FFmpeg/lavfi, o padrão recomendado para os testes atuais é `testsrc=size=1920x1080:rate=30` com `10000k` de bitrate de vídeo, CBR aproximado (`minrate=maxrate=10000k`, `bufsize=20000k`), áudio AAC `128k` em `44.1kHz`, GOP de 60 frames e saída FLV/RTMP por streamKey.
+Quando os scripts geram fonte sintética com FFmpeg/lavfi, o padrão recomendado para os testes atuais é `testsrc=size=1920x1080:rate=30` com `10000k` de bitrate de vídeo, CBR aproximado (`minrate=maxrate=10000k`, `bufsize=20000k`), áudio AAC `128k` em `44.1kHz`, GOP de 60 frames e saída FLV/RTMP por streamKey. Use `--constant-bitrate` para tornar o CBR explícito também no encoder x264 (`nal-hrd=cbr:force-cfr=1`) e calcular `bufsize` como 2x o bitrate informado; o script `liveedge-run-stress-30.sh` habilita essa opção por padrão via `CONSTANT_BITRATE=true`.
 
 Every script validates arguments before starting, writes execution logs, and creates per-run artifacts under:
 
