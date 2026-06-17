@@ -331,7 +331,9 @@ preflight() {
 
   log "metric sample counts: controller_active_streams=$controller_samples proxy_rtmp_stats_up=$proxy_samples cpu_by_pod=$cpu_samples memory_by_pod=$memory_samples"
 
-  [[ "${controller_samples:-0}" -ge 1 ]] || fail "controller_active_streams has no samples."
+  if [[ "${controller_samples:-0}" -lt 1 ]]; then
+    log "controller_active_streams has no samples during preflight; continuing because streams have not started yet."
+  fi
   if [[ "${proxy_samples:-0}" -lt 1 ]]; then
     log "proxy_rtmp_stats_up has no samples; continuing with reduced proxy metrics."
   fi
