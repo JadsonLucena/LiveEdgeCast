@@ -55,6 +55,10 @@ SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
 WAIT_TARGETS_SECONDS="${WAIT_TARGETS_SECONDS:-120}"
 WAIT_TARGETS_INTERVAL_SECONDS="${WAIT_TARGETS_INTERVAL_SECONDS:-5}"
 WAIT_AFTER_LEVEL_SECONDS="${WAIT_AFTER_LEVEL_SECONDS:-10}"
+STRESS_LEVELS="${STRESS_LEVELS:-1,2,3,5,8,13,21,30}"
+STRESS_REPETITIONS="${STRESS_REPETITIONS:-3}"
+STRESS_DURATION_SECONDS="${STRESS_DURATION_SECONDS:-60}"
+STRESS_COOLDOWN_SECONDS="${STRESS_COOLDOWN_SECONDS:-30}"
 
 # Port-forward management. These variables were previously being passed by the caller but not used.
 MANAGE_PORT_FORWARD="${MANAGE_PORT_FORWARD:-false}"
@@ -757,26 +761,30 @@ port_forward_restart_before_preflight=$PORT_FORWARD_RESTART_BEFORE_PREFLIGHT
 port_forward_restart_before_level=$PORT_FORWARD_RESTART_BEFORE_LEVEL
 port_forward_restart_after_level=$PORT_FORWARD_RESTART_AFTER_LEVEL
 unique_keys_per_repetition=$UNIQUE_KEYS_PER_REPETITION
+stress_levels=$STRESS_LEVELS
+stress_repetitions=$STRESS_REPETITIONS
+stress_duration_seconds=$STRESS_DURATION_SECONDS
+stress_cooldown_seconds=$STRESS_COOLDOWN_SECONDS
 EOF_META
 }
 
+stress_levels() {
+  printf '%s
+' "$STRESS_LEVELS" | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | awk 'NF'
+}
+
 print_estimated_duration() {
-  "$PYTHON_BIN" - <<'PY' | tee -a "$CAMPAIGN_LOG"
-levels = [
-    (1, 3, 30, 30),
-    (2, 3, 30, 30),
-    (3, 3, 30, 30),
-    (5, 3, 30, 30),
-    (8, 3, 30, 30),
-    (13, 3, 30, 30),
-    (21, 3, 30, 30),
-    (34, 3, 30, 30),
-]
+  "$PYTHON_BIN" - "$STRESS_LEVELS" "$STRESS_REPETITIONS" "$STRESS_DURATION_SECONDS" "$STRESS_COOLDOWN_SECONDS" <<'PY' | tee -a "$CAMPAIGN_LOG"
+import sys
+levels = [int(item.strip()) for item in sys.argv[1].split(",") if item.strip()]
+reps = int(sys.argv[2])
+duration = int(sys.argv[3])
+cooldown = int(sys.argv[4])
 seconds = 0
-for streams, reps, duration, cooldown in levels:
+for _streams in levels:
     seconds += reps * duration + max(reps - 1, 0) * cooldown
 print("=== Planned stress levels ===")
-for streams, reps, duration, cooldown in levels:
+for streams in levels:
     print(f"{streams:>2} streams | repetitions={reps:<2} | duration={duration:>3}s | cooldown={cooldown:>3}s")
 print(f"Estimated lower-bound wall time: {seconds/60:.1f} minutes ({seconds/3600:.2f} hours), excluding pod startup/cleanup/overhead")
 PY
@@ -799,14 +807,10 @@ main() {
     log "SKIP_PREFLIGHT=true; skipping preflight checks."
   fi
 
-  run_stress_level 1  3 30 30
-  run_stress_level 2  3 30 30
-  run_stress_level 3  3 30 30
-  run_stress_level 5  3 30 30
-  run_stress_level 8  3 30 30
-  run_stress_level 13 3 30 30
-  run_stress_level 21 3 30 30
-  run_stress_level 34 3 30 30
+  local stream_count
+  while IFS= read -r stream_count; do
+    run_stress_level "$stream_count" "$STRESS_REPETITIONS" "$STRESS_DURATION_SECONDS" "$STRESS_COOLDOWN_SECONDS"
+  done < <(stress_levels)
 
   log "Campaign finished successfully. Output: $BASE_OUTPUT_DIR"
 }

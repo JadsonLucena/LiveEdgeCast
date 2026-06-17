@@ -118,3 +118,6 @@ Correctness metrics combine Kubernetes snapshots with controller structured even
 - `tools/experiments/smoke_k8s_experiment.sh` passes `--controller-url` by default from `CONTROLLER_URL`/`LIVEEDGECAST_CONTROLLER_URL` or `http://127.0.0.1:8000`; set `CONTROLLER_URL=` to skip controller preflight artifacts.
 - `PATCH_PROXY_CONTEXT=true` enables `--patch-proxy-context` in the smoke script. Use this for official multi-run campaigns when controller metrics must be scoped by experiment context.
 - `REQUIRE_NETWORK_METRICS=true` enables `--require-network-metrics` in the smoke script for clusters that expose Pod network counters.
+
+
+Stress campaign defaults for `liveedge-run-stress-30.sh`: `STRESS_LEVELS=1,2,3,5,8,13,21,30`, `STRESS_REPETITIONS=3`, `STRESS_DURATION_SECONDS=60`, and `STRESS_COOLDOWN_SECONDS=30`. The levels keep a Fibonacci-like ramp while ending at the script target of 30 simultaneous streams; three repetitions per level and 60-second runs provide a more defensible minimum window for article/report statistics than 30-second runs while keeping total campaign time practical. Override these variables when a paper needs a denser sweep around a saturation point or longer steady-state windows.
