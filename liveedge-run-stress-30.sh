@@ -45,6 +45,10 @@ REQUIRE_PROMETHEUS_ANALYSIS="${REQUIRE_PROMETHEUS_ANALYSIS:-false}"
 REQUIRE_MIN_DURATION="${REQUIRE_MIN_DURATION:-true}"
 CONTINUE_ON_SHORT_RUN="${CONTINUE_ON_SHORT_RUN:-false}"
 MIN_LEVEL_DURATION_RATIO="${MIN_LEVEL_DURATION_RATIO:-0.70}"
+RETRY_ON_NOISY_RUN="${RETRY_ON_NOISY_RUN:-true}"
+MAX_NOISY_RUN_RATIO="${MAX_NOISY_RUN_RATIO:-0.10}"
+MAX_LEVEL_RETRIES="${MAX_LEVEL_RETRIES:-1}"
+FAIL_ON_NOISY_AFTER_RETRIES="${FAIL_ON_NOISY_AFTER_RETRIES:-true}"
 
 DRY_RUN="${DRY_RUN:-false}"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
@@ -427,19 +431,96 @@ PY
   fi
 }
 
+should_retry_report() {
+  local report_dir="$1"
+  if ! bool_true "$RETRY_ON_NOISY_RUN"; then
+    return 1
+  fi
+  if [[ ! -f "$report_dir/report.json" ]]; then
+    return 1
+  fi
+
+  local decision
+  decision=$("$PYTHON_BIN" - "$report_dir/report.json" "$MAX_NOISY_RUN_RATIO" <<'PY'
+import json, sys
+path = sys.argv[1]
+threshold = float(sys.argv[2])
+data = json.load(open(path, encoding="utf-8"))
+summary = data.get("summary", {})
+publishers = int(summary.get("publishers") or 0)
+publisher_failures = int(summary.get("publisher_failure_count") or 0)
+publisher_nonzero = int(summary.get("publisher_nonzero_process_count") or 0)
+publisher_bad = max(publisher_failures, publisher_nonzero)
+publisher_ratio = (publisher_bad / publishers) if publishers else 0.0
+valid_activation = int(summary.get("valid_activation_samples") or 0)
+invalid_activation = int(summary.get("invalid_activation_samples") or 0)
+activation_total = valid_activation + invalid_activation
+activation_ratio = (invalid_activation / activation_total) if activation_total else 0.0
+reasons = []
+if publishers and publisher_ratio > threshold:
+    reasons.append(f"publisher_bad_ratio={publisher_ratio:.3f} ({publisher_bad}/{publishers})")
+if activation_total and activation_ratio > threshold:
+    reasons.append(f"invalid_activation_ratio={activation_ratio:.3f} ({invalid_activation}/{activation_total})")
+if reasons:
+    print("retry " + "; ".join(reasons))
+else:
+    print(f"ok publisher_bad_ratio={publisher_ratio:.3f} invalid_activation_ratio={activation_ratio:.3f}")
+PY
+)
+  log "Noisy-run retry check for $report_dir: $decision threshold=$MAX_NOISY_RUN_RATIO"
+  [[ "$decision" == retry* ]]
+}
+
+run_experiment_with_retries() {
+  local stream_count="$1"
+  local repetition_index="$2"
+  local duration="$3"
+  local scenario="$4"
+  local attempt=1 rc=0
+
+  while true; do
+    set +e
+    run_experiment_once "$stream_count" "$repetition_index" "$duration" "$scenario" "$attempt"
+    rc=$?
+    set -e
+
+    if [[ "$rc" -eq 75 ]]; then
+      if [[ "$attempt" -le "$MAX_LEVEL_RETRIES" ]]; then
+        log "Retrying ${stream_count} streams repetition ${repetition_index}: noisy run detected on attempt ${attempt}; max retries=${MAX_LEVEL_RETRIES}."
+        attempt=$(( attempt + 1 ))
+        continue
+      fi
+      if bool_true "$FAIL_ON_NOISY_AFTER_RETRIES"; then
+        fail "Noisy run persisted for ${stream_count} streams repetition ${repetition_index} after ${MAX_LEVEL_RETRIES} retries."
+      fi
+      log "Noisy run persisted after retries, but FAIL_ON_NOISY_AFTER_RETRIES=false; continuing."
+      return 0
+    fi
+
+    return "$rc"
+  done
+}
+
 run_experiment_once() {
   local stream_count="$1"
   local repetition_index="$2"
   local duration="$3"
   local scenario="$4"
+  local attempt_index="${5:-1}"
   local timestamp experiment_id report_dir key_file
 
   timestamp="$(date +%Y%m%d-%H%M%S)"
   if bool_true "$UNIQUE_KEYS_PER_REPETITION"; then
     experiment_id="stress-${stream_count}streams-r${repetition_index}-${timestamp}"
+    if [[ "$attempt_index" -gt 1 ]]; then
+      experiment_id="${experiment_id}-retry${attempt_index}"
+    fi
     key_file="$(make_keys "$stream_count" "stress-${stream_count}streams-r${repetition_index}" "$timestamp")"
   else
     experiment_id="stress-${stream_count}streams-${timestamp}"
+    if [[ "$attempt_index" -gt 1 ]]; then
+      experiment_id="${experiment_id}-retry${attempt_index}"
+    fi
     key_file="$(make_keys "$stream_count" "stress-${stream_count}streams" "$timestamp")"
   fi
   report_dir="$BASE_OUTPUT_DIR/$experiment_id"
@@ -467,7 +548,7 @@ run_experiment_once() {
     --rtmp-url "$RTMP_URL"
     --output-dir "$report_dir"
     --experiment-id "$experiment_id"
-    --run-id "stress-${stream_count}streams-r${repetition_index}"
+    --run-id "stress-${stream_count}streams-r${repetition_index}-a${attempt_index}"
     --bitrate "$BITRATE"
     --testsrc-size "$TESTSRC_SIZE"
     --testsrc-rate "$TESTSRC_RATE"
@@ -508,6 +589,10 @@ run_experiment_once() {
     fail "run_experiment.py failed for ${stream_count} streams repetition ${repetition_index} with rc=$rc. See $CAMPAIGN_LOG"
   fi
 
+  if should_retry_report "$report_dir"; then
+    return 75
+  fi
+
   check_elapsed_guard "$stream_count" 1 "$duration" "$elapsed"
 }
 
@@ -531,7 +616,7 @@ run_stress_level() {
         ensure_port_forward_ready
       fi
 
-      run_experiment_once "$stream_count" "$rep" "$duration" "$scenario"
+      run_experiment_with_retries "$stream_count" "$rep" "$duration" "$scenario"
 
       if bool_true "$PORT_FORWARD_RESTART_AFTER_LEVEL"; then
         manage_port_forward restart
@@ -661,6 +746,10 @@ patch_proxy_context=$PATCH_PROXY_CONTEXT
 require_min_duration=$REQUIRE_MIN_DURATION
 continue_on_short_run=$CONTINUE_ON_SHORT_RUN
 min_level_duration_ratio=$MIN_LEVEL_DURATION_RATIO
+retry_on_noisy_run=$RETRY_ON_NOISY_RUN
+max_noisy_run_ratio=$MAX_NOISY_RUN_RATIO
+max_level_retries=$MAX_LEVEL_RETRIES
+fail_on_noisy_after_retries=$FAIL_ON_NOISY_AFTER_RETRIES
 manage_port_forward=$MANAGE_PORT_FORWARD
 port_forward_script=$PORT_FORWARD_SCRIPT
 port_forward_watchdog=$PORT_FORWARD_WATCHDOG
