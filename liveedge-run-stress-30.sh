@@ -6,6 +6,11 @@ set -euo pipefail
 #
 # Important: this script can manage the local port-forwards through ./tools/port-forward.sh.
 # Use MANAGE_PORT_FORWARD=true to enable automatic restart/readiness checks.
+# By default this script asks run_experiment.py to publish all generated streamKeys
+# in each concurrency run from a single local FFmpeg encode using ffmpeg -f tee.
+# Set TEE_STREAM_KEYS=false to fall back to one FFmpeg process per streamKey.
+# TEE_RTMP_URLS is optional and only adds extra RTMP base URLs; streamKey values are
+# still generated automatically and appended to RTMP_URL and every extra base URL.
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 KUBECTL_BIN="${KUBECTL_BIN:-kubectl}"
@@ -17,11 +22,14 @@ PROMETHEUS_URL="${PROMETHEUS_URL:-${PROM_URL:-}}"
 CONTROLLER_URL="${CONTROLLER_URL:-http://127.0.0.1:8000}"
 RTMP_URL="${RTMP_URL:-${LIVEEDGECAST_RTMP_URL:-rtmp://127.0.0.1:1935/live}}"
 SECONDARY_RTMP_URL="${SECONDARY_RTMP_URL:-}"
+TEE_RTMP_URLS="${TEE_RTMP_URLS:-${LIVEEDGECAST_TEE_RTMP_URLS:-}}"
+TEE_STREAM_KEYS="${TEE_STREAM_KEYS:-true}"
 
 TESTSRC_SIZE="${TESTSRC_SIZE:-1920x1080}"
 TESTSRC_RATE="${TESTSRC_RATE:-30}"
 BITRATE="${BITRATE:-10000k}"
 AUDIO_BITRATE="${AUDIO_BITRATE:-128k}"
+CONSTANT_BITRATE="${CONSTANT_BITRATE:-true}"
 
 BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:-./reports-stress/$(date +%Y%m%d-%H%M%S)}"
 
@@ -37,12 +45,20 @@ REQUIRE_PROMETHEUS_ANALYSIS="${REQUIRE_PROMETHEUS_ANALYSIS:-false}"
 REQUIRE_MIN_DURATION="${REQUIRE_MIN_DURATION:-true}"
 CONTINUE_ON_SHORT_RUN="${CONTINUE_ON_SHORT_RUN:-false}"
 MIN_LEVEL_DURATION_RATIO="${MIN_LEVEL_DURATION_RATIO:-0.70}"
+RETRY_ON_NOISY_RUN="${RETRY_ON_NOISY_RUN:-true}"
+MAX_NOISY_RUN_RATIO="${MAX_NOISY_RUN_RATIO:-0.10}"
+MAX_LEVEL_RETRIES="${MAX_LEVEL_RETRIES:-1}"
+FAIL_ON_NOISY_AFTER_RETRIES="${FAIL_ON_NOISY_AFTER_RETRIES:-true}"
 
 DRY_RUN="${DRY_RUN:-false}"
 SKIP_PREFLIGHT="${SKIP_PREFLIGHT:-false}"
 WAIT_TARGETS_SECONDS="${WAIT_TARGETS_SECONDS:-120}"
 WAIT_TARGETS_INTERVAL_SECONDS="${WAIT_TARGETS_INTERVAL_SECONDS:-5}"
 WAIT_AFTER_LEVEL_SECONDS="${WAIT_AFTER_LEVEL_SECONDS:-10}"
+STRESS_LEVELS="${STRESS_LEVELS:-1,2,3,5,8,13,21,34}"
+STRESS_REPETITIONS="${STRESS_REPETITIONS:-3}"
+STRESS_DURATION_SECONDS="${STRESS_DURATION_SECONDS:-60}"
+STRESS_COOLDOWN_SECONDS="${STRESS_COOLDOWN_SECONDS:-30}"
 
 # Port-forward management. These variables were previously being passed by the caller but not used.
 MANAGE_PORT_FORWARD="${MANAGE_PORT_FORWARD:-false}"
@@ -323,7 +339,9 @@ preflight() {
 
   log "metric sample counts: controller_active_streams=$controller_samples proxy_rtmp_stats_up=$proxy_samples cpu_by_pod=$cpu_samples memory_by_pod=$memory_samples"
 
-  [[ "${controller_samples:-0}" -ge 1 ]] || fail "controller_active_streams has no samples."
+  if [[ "${controller_samples:-0}" -lt 1 ]]; then
+    log "controller_active_streams has no samples during preflight; continuing because streams have not started yet."
+  fi
   if [[ "${proxy_samples:-0}" -lt 1 ]]; then
     log "proxy_rtmp_stats_up has no samples; continuing with reduced proxy metrics."
   fi
@@ -348,6 +366,9 @@ build_flags() {
   bool_true "$ALLOW_INCONCLUSIVE" && flags+=(--allow-inconclusive)
   bool_true "$ALLOW_RESTORE_FAILURE" && flags+=(--allow-restore-failure)
   bool_true "$ALLOW_UNSCOPED_CONTEXT" && flags+=(--allow-unscoped-context)
+  bool_true "$CONSTANT_BITRATE" && flags+=(--constant-bitrate)
+  bool_true "$TEE_STREAM_KEYS" && flags+=(--tee-stream-keys)
+  [[ -n "$TEE_RTMP_URLS" ]] && flags+=(--tee-rtmp-urls "$TEE_RTMP_URLS")
   bool_true "$ALLOW_WORKER_CLEANUP" && flags+=(--allow-worker-cleanup)
   printf '%s\n' "${flags[@]}"
 }
@@ -414,19 +435,96 @@ PY
   fi
 }
 
+should_retry_report() {
+  local report_dir="$1"
+  if ! bool_true "$RETRY_ON_NOISY_RUN"; then
+    return 1
+  fi
+  if [[ ! -f "$report_dir/report.json" ]]; then
+    return 1
+  fi
+
+  local decision
+  decision=$("$PYTHON_BIN" - "$report_dir/report.json" "$MAX_NOISY_RUN_RATIO" <<'PY'
+import json, sys
+path = sys.argv[1]
+threshold = float(sys.argv[2])
+data = json.load(open(path, encoding="utf-8"))
+summary = data.get("summary", {})
+publishers = int(summary.get("publishers") or 0)
+publisher_failures = int(summary.get("publisher_failure_count") or 0)
+publisher_nonzero = int(summary.get("publisher_nonzero_process_count") or 0)
+publisher_bad = max(publisher_failures, publisher_nonzero)
+publisher_ratio = (publisher_bad / publishers) if publishers else 0.0
+valid_activation = int(summary.get("valid_activation_samples") or 0)
+invalid_activation = int(summary.get("invalid_activation_samples") or 0)
+activation_total = valid_activation + invalid_activation
+activation_ratio = (invalid_activation / activation_total) if activation_total else 0.0
+reasons = []
+if publishers and publisher_ratio > threshold:
+    reasons.append(f"publisher_bad_ratio={publisher_ratio:.3f} ({publisher_bad}/{publishers})")
+if activation_total and activation_ratio > threshold:
+    reasons.append(f"invalid_activation_ratio={activation_ratio:.3f} ({invalid_activation}/{activation_total})")
+if reasons:
+    print("retry " + "; ".join(reasons))
+else:
+    print(f"ok publisher_bad_ratio={publisher_ratio:.3f} invalid_activation_ratio={activation_ratio:.3f}")
+PY
+)
+  log "Noisy-run retry check for $report_dir: $decision threshold=$MAX_NOISY_RUN_RATIO"
+  [[ "$decision" == retry* ]]
+}
+
+run_experiment_with_retries() {
+  local stream_count="$1"
+  local repetition_index="$2"
+  local duration="$3"
+  local scenario="$4"
+  local attempt=1 rc=0
+
+  while true; do
+    set +e
+    run_experiment_once "$stream_count" "$repetition_index" "$duration" "$scenario" "$attempt"
+    rc=$?
+    set -e
+
+    if [[ "$rc" -eq 75 ]]; then
+      if [[ "$attempt" -le "$MAX_LEVEL_RETRIES" ]]; then
+        log "Retrying ${stream_count} streams repetition ${repetition_index}: noisy run detected on attempt ${attempt}; max retries=${MAX_LEVEL_RETRIES}."
+        attempt=$(( attempt + 1 ))
+        continue
+      fi
+      if bool_true "$FAIL_ON_NOISY_AFTER_RETRIES"; then
+        fail "Noisy run persisted for ${stream_count} streams repetition ${repetition_index} after ${MAX_LEVEL_RETRIES} retries."
+      fi
+      log "Noisy run persisted after retries, but FAIL_ON_NOISY_AFTER_RETRIES=false; continuing."
+      return 0
+    fi
+
+    return "$rc"
+  done
+}
+
 run_experiment_once() {
   local stream_count="$1"
   local repetition_index="$2"
   local duration="$3"
   local scenario="$4"
+  local attempt_index="${5:-1}"
   local timestamp experiment_id report_dir key_file
 
   timestamp="$(date +%Y%m%d-%H%M%S)"
   if bool_true "$UNIQUE_KEYS_PER_REPETITION"; then
     experiment_id="stress-${stream_count}streams-r${repetition_index}-${timestamp}"
+    if [[ "$attempt_index" -gt 1 ]]; then
+      experiment_id="${experiment_id}-retry${attempt_index}"
+    fi
     key_file="$(make_keys "$stream_count" "stress-${stream_count}streams-r${repetition_index}" "$timestamp")"
   else
     experiment_id="stress-${stream_count}streams-${timestamp}"
+    if [[ "$attempt_index" -gt 1 ]]; then
+      experiment_id="${experiment_id}-retry${attempt_index}"
+    fi
     key_file="$(make_keys "$stream_count" "stress-${stream_count}streams" "$timestamp")"
   fi
   report_dir="$BASE_OUTPUT_DIR/$experiment_id"
@@ -454,7 +552,7 @@ run_experiment_once() {
     --rtmp-url "$RTMP_URL"
     --output-dir "$report_dir"
     --experiment-id "$experiment_id"
-    --run-id "stress-${stream_count}streams-r${repetition_index}"
+    --run-id "stress-${stream_count}streams-r${repetition_index}-a${attempt_index}"
     --bitrate "$BITRATE"
     --testsrc-size "$TESTSRC_SIZE"
     --testsrc-rate "$TESTSRC_RATE"
@@ -495,6 +593,10 @@ run_experiment_once() {
     fail "run_experiment.py failed for ${stream_count} streams repetition ${repetition_index} with rc=$rc. See $CAMPAIGN_LOG"
   fi
 
+  if should_retry_report "$report_dir"; then
+    return 75
+  fi
+
   check_elapsed_guard "$stream_count" 1 "$duration" "$elapsed"
 }
 
@@ -518,7 +620,7 @@ run_stress_level() {
         ensure_port_forward_ready
       fi
 
-      run_experiment_once "$stream_count" "$rep" "$duration" "$scenario"
+      run_experiment_with_retries "$stream_count" "$rep" "$duration" "$scenario"
 
       if bool_true "$PORT_FORWARD_RESTART_AFTER_LEVEL"; then
         manage_port_forward restart
@@ -527,8 +629,12 @@ run_stress_level() {
       fi
 
       if [[ "$rep" -lt "$repetitions" && "$cooldown" -gt 0 ]]; then
-        log "Cooldown after ${stream_count} streams repetition ${rep}: ${cooldown}s"
-        sleep "$cooldown"
+        if bool_true "$DRY_RUN"; then
+          log "DRY_RUN=true; skipping cooldown after ${stream_count} streams repetition ${rep}: ${cooldown}s"
+        else
+          log "Cooldown after ${stream_count} streams repetition ${rep}: ${cooldown}s"
+          sleep "$cooldown"
+        fi
       fi
     done
   else
@@ -613,8 +719,12 @@ run_stress_level() {
   fi
 
   if [[ "$WAIT_AFTER_LEVEL_SECONDS" -gt 0 ]]; then
-    log "Waiting ${WAIT_AFTER_LEVEL_SECONDS}s after level ${stream_count}..."
-    sleep "$WAIT_AFTER_LEVEL_SECONDS"
+    if bool_true "$DRY_RUN"; then
+      log "DRY_RUN=true; skipping wait after level ${stream_count}: ${WAIT_AFTER_LEVEL_SECONDS}s"
+    else
+      log "Waiting ${WAIT_AFTER_LEVEL_SECONDS}s after level ${stream_count}..."
+      sleep "$WAIT_AFTER_LEVEL_SECONDS"
+    fi
   fi
 }
 
@@ -629,7 +739,10 @@ testsrc_size=$TESTSRC_SIZE
 testsrc_rate=$TESTSRC_RATE
 bitrate=$BITRATE
 audio_bitrate=$AUDIO_BITRATE
-profile=YouTube-like 720p30 H.264 4Mbps video + AAC 128kbps
+constant_bitrate=$CONSTANT_BITRATE
+tee_rtmp_urls=$TEE_RTMP_URLS
+tee_stream_keys=$TEE_STREAM_KEYS
+profile=YouTube-like ${TESTSRC_SIZE}@${TESTSRC_RATE}fps H.264 ${BITRATE} video + AAC ${AUDIO_BITRATE}
 require_destination_received=$REQUIRE_DESTINATION_RECEIVED
 allow_partial=$ALLOW_PARTIAL
 allow_inconclusive=$ALLOW_INCONCLUSIVE
@@ -637,6 +750,10 @@ patch_proxy_context=$PATCH_PROXY_CONTEXT
 require_min_duration=$REQUIRE_MIN_DURATION
 continue_on_short_run=$CONTINUE_ON_SHORT_RUN
 min_level_duration_ratio=$MIN_LEVEL_DURATION_RATIO
+retry_on_noisy_run=$RETRY_ON_NOISY_RUN
+max_noisy_run_ratio=$MAX_NOISY_RUN_RATIO
+max_level_retries=$MAX_LEVEL_RETRIES
+fail_on_noisy_after_retries=$FAIL_ON_NOISY_AFTER_RETRIES
 manage_port_forward=$MANAGE_PORT_FORWARD
 port_forward_script=$PORT_FORWARD_SCRIPT
 port_forward_watchdog=$PORT_FORWARD_WATCHDOG
@@ -644,26 +761,30 @@ port_forward_restart_before_preflight=$PORT_FORWARD_RESTART_BEFORE_PREFLIGHT
 port_forward_restart_before_level=$PORT_FORWARD_RESTART_BEFORE_LEVEL
 port_forward_restart_after_level=$PORT_FORWARD_RESTART_AFTER_LEVEL
 unique_keys_per_repetition=$UNIQUE_KEYS_PER_REPETITION
+stress_levels=$STRESS_LEVELS
+stress_repetitions=$STRESS_REPETITIONS
+stress_duration_seconds=$STRESS_DURATION_SECONDS
+stress_cooldown_seconds=$STRESS_COOLDOWN_SECONDS
 EOF_META
 }
 
+stress_levels() {
+  printf '%s
+' "$STRESS_LEVELS" | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | awk 'NF'
+}
+
 print_estimated_duration() {
-  "$PYTHON_BIN" - <<'PY' | tee -a "$CAMPAIGN_LOG"
-levels = [
-    (1, 3, 30, 30),
-    (2, 3, 30, 30),
-    (3, 3, 30, 30),
-    (5, 3, 30, 30),
-    (8, 3, 30, 30),
-    (13, 3, 30, 30),
-    (21, 3, 30, 30),
-    (34, 3, 30, 30),
-]
+  "$PYTHON_BIN" - "$STRESS_LEVELS" "$STRESS_REPETITIONS" "$STRESS_DURATION_SECONDS" "$STRESS_COOLDOWN_SECONDS" <<'PY' | tee -a "$CAMPAIGN_LOG"
+import sys
+levels = [int(item.strip()) for item in sys.argv[1].split(",") if item.strip()]
+reps = int(sys.argv[2])
+duration = int(sys.argv[3])
+cooldown = int(sys.argv[4])
 seconds = 0
-for streams, reps, duration, cooldown in levels:
+for _streams in levels:
     seconds += reps * duration + max(reps - 1, 0) * cooldown
 print("=== Planned stress levels ===")
-for streams, reps, duration, cooldown in levels:
+for streams in levels:
     print(f"{streams:>2} streams | repetitions={reps:<2} | duration={duration:>3}s | cooldown={cooldown:>3}s")
 print(f"Estimated lower-bound wall time: {seconds/60:.1f} minutes ({seconds/3600:.2f} hours), excluding pod startup/cleanup/overhead")
 PY
@@ -686,14 +807,10 @@ main() {
     log "SKIP_PREFLIGHT=true; skipping preflight checks."
   fi
 
-  run_stress_level 1  3 30 30
-  run_stress_level 2  3 30 30
-  run_stress_level 3  3 30 30
-  run_stress_level 5  3 30 30
-  run_stress_level 8  3 30 30
-  run_stress_level 13 3 30 30
-  run_stress_level 21 3 30 30
-  run_stress_level 34 3 30 30
+  local stream_count
+  while IFS= read -r stream_count; do
+    run_stress_level "$stream_count" "$STRESS_REPETITIONS" "$STRESS_DURATION_SECONDS" "$STRESS_COOLDOWN_SECONDS"
+  done < <(stress_levels)
 
   log "Campaign finished successfully. Output: $BASE_OUTPUT_DIR"
 }

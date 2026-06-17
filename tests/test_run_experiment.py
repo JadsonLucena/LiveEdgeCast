@@ -1234,6 +1234,127 @@ def test_ffmpeg_command_generates_1080p30_testsrc_by_default(tmp_path):
     assert command[-1] == "rtmp://example/live/key1"
 
 
+def test_redact_command_redacts_tee_targets_with_embedded_rtmp_urls():
+    command = [
+        "ffmpeg",
+        "-f",
+        "tee",
+        "[f=flv:onfail=ignore]rtmp://user:pass@example/live/key1|"
+        "[f=flv:onfail=ignore]rtmps://mirror/live/key1",
+    ]
+
+    redacted = runner.redact_command(command)
+
+    assert "user:pass@example" not in redacted[-1]
+    assert "mirror/live/key1" not in redacted[-1]
+    assert redacted[-1] == (
+        "[f=flv:onfail=ignore]rtmp://...|"
+        "[f=flv:onfail=ignore]rtmps://..."
+    )
+
+
+def test_ffmpeg_vbv_bufsize_preserves_bitrate_units():
+    assert runner.ffmpeg_vbv_bufsize("6500k") == "13000k"
+    assert runner.ffmpeg_vbv_bufsize("4M") == "8M"
+    assert runner.ffmpeg_vbv_bufsize("1200000") == "2400000"
+
+
+def test_ffmpeg_command_enforces_constant_bitrate_when_requested(tmp_path):
+    cfg = config(tmp_path)
+    cfg.bitrate = "6500k"
+    cfg.constant_bitrate = True
+
+    command = runner.ffmpeg_command(cfg, "key1")
+
+    assert command[command.index("-b:v") + 1] == "6500k"
+    assert command[command.index("-minrate") + 1] == "6500k"
+    assert command[command.index("-maxrate") + 1] == "6500k"
+    assert command[command.index("-bufsize") + 1] == "13000k"
+    assert command[command.index("-x264-params") + 1] == "nal-hrd=cbr:force-cfr=1"
+
+
+def test_ffmpeg_command_enforces_constant_bitrate_for_source_file(tmp_path):
+    cfg = config(tmp_path)
+    cfg.source_file = "sample.mp4"
+    cfg.bitrate = "4M"
+    cfg.constant_bitrate = True
+
+    command = runner.ffmpeg_command(cfg, "key1")
+
+    assert "-c:v" in command and "libx264" in command
+    assert command[command.index("-minrate") + 1] == "4M"
+    assert command[command.index("-maxrate") + 1] == "4M"
+    assert command[command.index("-bufsize") + 1] == "8M"
+    assert command[command.index("-x264-params") + 1] == "nal-hrd=cbr:force-cfr=1"
+
+
+def test_record_publisher_results_preserves_per_stream_tee_metadata(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+
+    class FakeProcess:
+        pid = 4242
+
+        def poll(self):
+            return 0
+
+    publisher = runner.ManagedPublisher(
+        cfg,
+        "key1",
+        ["ffmpeg", "-f", "tee", "redacted"],
+        FakeProcess(),
+        tmp_path / "stdout.log",
+        tmp_path / "stderr.log",
+        1.0,
+        1,
+        1,
+        stream_keys=["key1", "key2"],
+        publisher_mode="tee_stream_keys",
+        stream_output_urls={
+            "key1": ["rtmp://..."],
+            "key2": ["rtmp://..."],
+        },
+    )
+    publisher.ended_at = 2.0
+
+    rows = runner.record_publisher_results(cfg, dirs, [publisher])
+
+    assert [row["stream_key"] for row in rows] == ["key1", "key2"]
+    assert {row["publisher_group_id"] for row in rows} == {"run-r1-tee-4242"}
+    assert all(row["publisher_shared_log"] is True for row in rows)
+    assert all(row["publisher_group_size"] == 2 for row in rows)
+    assert all(row["tee_output_urls"] == ["rtmp://..."] for row in rows)
+
+
+def test_ffmpeg_command_uses_tee_for_multiple_stream_keys_to_same_rtmp_url(tmp_path):
+    cfg = config(tmp_path)
+
+    command = runner.ffmpeg_command_for_stream_keys(cfg, ["key1", "key2", "key3"])
+
+    assert command[-2] == "tee"
+    assert command[-1] == (
+        "[f=flv:onfail=ignore]rtmp://example/live/key1|"
+        "[f=flv:onfail=ignore]rtmp://example/live/key2|"
+        "[f=flv:onfail=ignore]rtmp://example/live/key3"
+    )
+    assert command.count("-c:v") == 1
+
+
+def test_ffmpeg_command_uses_tee_for_extra_rtmp_destinations(tmp_path):
+    cfg = config(tmp_path)
+    cfg.tee_rtmp_urls = ["rtmp://mirror-a/live", "rtmp://mirror-b/live"]
+
+    command = runner.ffmpeg_command(cfg, "key1")
+
+    assert command[-2] == "tee"
+    assert command[-1] == (
+        "[f=flv:onfail=ignore]rtmp://example/live/key1|"
+        "[f=flv:onfail=ignore]rtmp://mirror-a/live/key1|"
+        "[f=flv:onfail=ignore]rtmp://mirror-b/live/key1"
+    )
+    assert command.count("-c:v") == 1
+
+
 def test_parse_args_accepts_generated_source_controls(tmp_path):
     cfg = runner.parse_args([
         "--stream-keys", "key1,key2",
@@ -1244,6 +1365,9 @@ def test_parse_args_accepts_generated_source_controls(tmp_path):
         "--testsrc-size", "1920x1080",
         "--testsrc-rate", "30",
         "--audio-bitrate", "128k",
+        "--constant-bitrate",
+        "--tee-stream-keys",
+        "--tee-rtmp-urls", "rtmp://mirror-a/live,rtmps://mirror-b/live",
     ])
 
     assert cfg.stream_keys == ["key1", "key2"]
@@ -1251,6 +1375,9 @@ def test_parse_args_accepts_generated_source_controls(tmp_path):
     assert cfg.testsrc_size == "1920x1080"
     assert cfg.testsrc_rate == "30"
     assert cfg.audio_bitrate == "128k"
+    assert cfg.constant_bitrate is True
+    assert cfg.tee_stream_keys is True
+    assert cfg.tee_rtmp_urls == ["rtmp://mirror-a/live", "rtmps://mirror-b/live"]
 
 
 def test_correctness_uses_unknown_run_id_controller_events_as_worker_evidence(tmp_path):

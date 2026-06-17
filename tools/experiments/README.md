@@ -8,8 +8,12 @@ This directory contains runnable experiment drivers for load and failure scenari
 - `--concurrency`
 - `--duration-seconds` / `--duration_seconds`
 - `--bitrate`
+- `--audio-bitrate`
+- `--constant-bitrate`
+- `--tee-stream-keys`
+- `--tee-rtmp-urls`
 
-Quando os scripts geram fonte sintética com FFmpeg/lavfi, o padrão recomendado para os testes atuais é `testsrc=size=1920x1080:rate=30` com `10000k` de bitrate de vídeo, CBR aproximado (`minrate=maxrate=10000k`, `bufsize=20000k`), áudio AAC `128k` em `44.1kHz`, GOP de 60 frames e saída FLV/RTMP por streamKey.
+Quando os scripts geram fonte sintética com FFmpeg/lavfi, o padrão recomendado para os testes atuais é `testsrc=size=1920x1080:rate=30` com `10000k` de bitrate de vídeo, CBR aproximado (`minrate=maxrate=10000k`, `bufsize=20000k`), áudio AAC `128k` em `44.1kHz`, GOP de 60 frames e saída FLV/RTMP por streamKey. Use `--constant-bitrate` para tornar o CBR explícito também no encoder x264 (`nal-hrd=cbr:force-cfr=1`) e calcular `bufsize` como 2x o bitrate informado; o script `liveedge-run-stress-30.sh` habilita essa opção por padrão via `CONSTANT_BITRATE=true`. No teste de stress, `TEE_STREAM_KEYS=true` é o padrão: para cada nível de concorrência, as streamKeys continuam sendo geradas automaticamente, mas o runner usa uma única codificação local e cria múltiplas saídas `ffmpeg -f tee` para a mesma `RTMP_URL`, mudando apenas a streamKey no final da URL. Exemplo: com `RTMP_URL=rtmp://proxy/live` e três chaves geradas, o comando publica para `rtmp://proxy/live/<key1>|rtmp://proxy/live/<key2>|rtmp://proxy/live/<key3>`, mantendo um único encoder local. Quando for necessário espelhar também para bases RTMP adicionais, use `--tee-rtmp-urls` (ou `TEE_RTMP_URLS`) com URLs base, como `rtmp://proxy-a/live,rtmp://proxy-b/live`; as mesmas streamKeys geradas serão anexadas a cada base. Todas as saídas tee usam `onfail=ignore` para evitar que uma falha isolada em um destino derrube todo o teste. Em modo `tee_stream_keys`, stdout/stderr do FFmpeg são compartilhados pelo grupo porque há um único processo, mas `publishers.jsonl` mantém linhas por streamKey com `publisher_mode`, `publisher_group_id`, `publisher_group_size`, `publisher_shared_log` e `tee_output_urls` para preservar a distinção usada pelos relatórios.
 
 Every script validates arguments before starting, writes execution logs, and creates per-run artifacts under:
 
@@ -114,3 +118,6 @@ Correctness metrics combine Kubernetes snapshots with controller structured even
 - `tools/experiments/smoke_k8s_experiment.sh` passes `--controller-url` by default from `CONTROLLER_URL`/`LIVEEDGECAST_CONTROLLER_URL` or `http://127.0.0.1:8000`; set `CONTROLLER_URL=` to skip controller preflight artifacts.
 - `PATCH_PROXY_CONTEXT=true` enables `--patch-proxy-context` in the smoke script. Use this for official multi-run campaigns when controller metrics must be scoped by experiment context.
 - `REQUIRE_NETWORK_METRICS=true` enables `--require-network-metrics` in the smoke script for clusters that expose Pod network counters.
+
+
+Stress campaign defaults for `liveedge-run-stress-30.sh`: `STRESS_LEVELS=1,2,3,5,8,13,21,34`, `STRESS_REPETITIONS=3`, `STRESS_DURATION_SECONDS=60`, and `STRESS_COOLDOWN_SECONDS=30`. The levels keep the Fibonacci ramp through 34 simultaneous streams; three repetitions per level and 60-second runs provide a more defensible minimum window for article/report statistics than 30-second runs while keeping total campaign time practical. Override these variables when a paper needs a denser sweep around a saturation point or longer steady-state windows.
