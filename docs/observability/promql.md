@@ -1042,7 +1042,9 @@ Prometheus usando os snapshots das consultas de CPU, memória, rede e Pod-segund
 
 Se `k8s/observability/liveedgecast-resource-rules.yaml` estiver aplicado, os
 painéis podem usar as séries pré-agregadas abaixo em vez de repetir as expressões
-longas nos dashboards:
+longas nos dashboards. As séries `liveedgecast:pod:network_*:rate5m` preservam
+`namespace` e `pod`; as séries `liveedgecast:component:*` reduzem cardinalidade
+para comparações agregadas.
 
 ```promql
 liveedgecast:component:cpu_cores:rate5m
@@ -1050,6 +1052,30 @@ liveedgecast:component:cpu_cores:rate5m
 
 ```promql
 liveedgecast:component:memory_working_set_bytes
+```
+
+```promql
+liveedgecast:pod:network_receive_bytes_per_second:rate5m
+```
+
+```promql
+liveedgecast:pod:network_transmit_bytes_per_second:rate5m
+```
+
+```promql
+liveedgecast:pod:network_receive_packets_per_second:rate5m
+```
+
+```promql
+liveedgecast:pod:network_transmit_packets_per_second:rate5m
+```
+
+```promql
+liveedgecast:pod:network_receive_errors_per_second:rate5m
+```
+
+```promql
+liveedgecast:pod:network_transmit_errors_per_second:rate5m
 ```
 
 ```promql
