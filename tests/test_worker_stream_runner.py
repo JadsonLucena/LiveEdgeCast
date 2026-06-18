@@ -170,6 +170,8 @@ def _run_runner(
             "CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS": "1",
             "CONTROLLER_CALLBACK_MAX_TIME_SECONDS": "1",
             "FFPROBE_TIMEOUT_SECONDS": "1",
+            "FFMPEG_STARTUP_MAX_ATTEMPTS": "2",
+            "FFMPEG_STARTUP_RETRY_INTERVAL_SECONDS": "0.05",
         }
     )
     if extra_env:
@@ -185,11 +187,12 @@ def _run_runner(
     )
 
 
-def test_input_connection_refused_exits_without_self_recovery(tmp_path):
+def test_transient_input_connection_refused_retries_until_progress(tmp_path):
     result = _run_runner(tmp_path, "input_refused_once_then_progress", status_sequence="active,active,ended")
 
-    assert result.returncode == 251, result.stdout
-    assert "ffmpeg_exit_251_no_self_recovery" in result.stdout
+    assert result.returncode == 0, result.stdout
+    assert "ffmpeg_exit_251_before_progress_retrying" in result.stdout
+    assert (tmp_path / "state" / "ffmpeg_attempts").read_text() == "2"
     assert "destination_open_failed" not in result.stdout
 
 
@@ -197,7 +200,8 @@ def test_input_connection_refused_is_not_classified_as_destination_failure(tmp_p
     result = _run_runner(tmp_path, "input_refused_always", stream_status="active")
 
     assert result.returncode == 251, result.stdout
-    assert "ffmpeg_exit_251_no_self_recovery" in result.stdout
+    assert "ffmpeg_exit_251_before_progress_attempts_exhausted" in result.stdout
+    assert (tmp_path / "state" / "ffmpeg_attempts").read_text() == "2"
     assert "destination_open_failed" not in result.stdout
 
 
@@ -205,7 +209,7 @@ def test_explicit_output_open_failure_exits_with_destination_code(tmp_path):
     result = _run_runner(tmp_path, "destination_refused", stream_status="active")
 
     assert result.returncode == 1, result.stdout
-    assert "ffmpeg_exit_1_no_self_recovery" in result.stdout
+    assert "ffmpeg_exit_1_before_progress_attempts_exhausted" in result.stdout
 
 
 def test_ffmpeg_transcodes_to_h264_and_youtube_1080p30_profile(tmp_path):
@@ -416,10 +420,11 @@ def test_worker_logs_watchdog_when_ffmpeg_never_reports_progress(tmp_path):
         },
     )
 
-    assert result.returncode == 0, result.stdout
+    assert result.returncode == 1, result.stdout
     assert "ffmpeg_process_spawned" in result.stdout
     assert "ffmpeg_no_progress_after_0.05s" in result.stdout
     assert "[ffmpeg-watchdog] Input opened but no frames have been written yet" in result.stdout
+    assert "ffmpeg_exit_0_before_progress_attempts_exhausted" in result.stdout
 
 
 def test_real_ffmpeg_accepts_youtube_filter_and_encoder_options():

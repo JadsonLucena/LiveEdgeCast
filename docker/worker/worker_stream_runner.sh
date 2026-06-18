@@ -38,12 +38,14 @@ PYMS
 )"
 FFMPEG_START_MS=""
 
-# Simplified worker mode: start FFmpeg once and let it run until it exits or the
-# controller deletes the worker pod on exec_publish_done. No input-open deadline,
-# no per-attempt timeout and no retry/self-recovery loop are used here.
+# Simplified worker mode: retry only startup attempts that exit before FFmpeg
+# emits progress. Once progress is observed, let FFmpeg run until it exits or
+# the controller deletes the worker pod on exec_publish_done.
 FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS="${PROGRESS_NOTIFY_POLL_SECONDS:-0.2}"
 FFMPEG_LOGLEVEL="${FFMPEG_LOGLEVEL:-warning}"
 FFMPEG_STARTUP_PROGRESS_TIMEOUT_SECONDS="${FFMPEG_STARTUP_PROGRESS_TIMEOUT_SECONDS:-15}"
+FFMPEG_STARTUP_MAX_ATTEMPTS="${FFMPEG_STARTUP_MAX_ATTEMPTS:-5}"
+FFMPEG_STARTUP_RETRY_INTERVAL_SECONDS="${FFMPEG_STARTUP_RETRY_INTERVAL_SECONDS:-2}"
 FFPROBE_TIMEOUT_SECONDS="${FFPROBE_TIMEOUT_SECONDS:-10}"
 
 json_escape() {
@@ -540,58 +542,76 @@ rm -rf "$PROGRESS_NOTIFY_LOCK" "$PROGRESS_LOG_LOCK" "$STARTED_NOTIFY_LOCK" "$STA
 : > "$PROGRESS_FILE"
 
 attempt=1
-CURRENT_ATTEMPT="$attempt"
-FFMPEG_START_MS="$(current_epoch_ms)"
-FFMPEG_RUN_ID=""
-ATTEMPT_LOG_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.attempt_${attempt}.log"
-: > "$ATTEMPT_LOG_FILE"
-build_ffmpeg_transcode_args
+EXIT_CODE=1
+FINAL_EXIT_CODE=1
 
-ffmpeg \
-  -loglevel "$FFMPEG_LOGLEVEL" \
-  -nostats \
-  -progress "/tmp/ffmpeg_${SAFE_STREAM_KEY}.progress" \
-  -i "$PROXY_RTMP" \
-  "${FFMPEG_TRANSCODE_ARGS[@]}" \
-  -progress "$PROGRESS_FILE" \
-  -f flv "$TARGET_RTMP" \
-  >> "$ATTEMPT_LOG_FILE" 2>&1 &
+while [ "$attempt" -le "$FFMPEG_STARTUP_MAX_ATTEMPTS" ]; do
+  CURRENT_ATTEMPT="$attempt"
+  FFMPEG_START_MS="$(current_epoch_ms)"
+  FFMPEG_RUN_ID=""
+  ATTEMPT_LOG_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.attempt_${attempt}.log"
+  : > "$ATTEMPT_LOG_FILE"
+  : > "$PROGRESS_FILE"
+  build_ffmpeg_transcode_args
 
-FFMPEG_PID=$!
-FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-${FFMPEG_PID}-${RANDOM}"
-log_json "ffmpeg_process_spawned" "single_attempt_no_timeout" "$(elapsed_ms "$FFMPEG_START_MS")"
-echo "$FFMPEG_PID" > "$PID_FILE"
-start_progress_reader
-start_progress_watchdog
+  ffmpeg \
+    -loglevel "$FFMPEG_LOGLEVEL" \
+    -nostats \
+    -progress "/tmp/ffmpeg_${SAFE_STREAM_KEY}.progress" \
+    -i "$PROXY_RTMP" \
+    "${FFMPEG_TRANSCODE_ARGS[@]}" \
+    -progress "$PROGRESS_FILE" \
+    -f flv "$TARGET_RTMP" \
+    >> "$ATTEMPT_LOG_FILE" 2>&1 &
 
-set +e
-wait "$FFMPEG_PID"
-EXIT_CODE=$?
-set -e
+  FFMPEG_PID=$!
+  FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-${FFMPEG_PID}-${RANDOM}"
+  log_json "ffmpeg_process_spawned" "attempt_${attempt}" "$(elapsed_ms "$FFMPEG_START_MS")"
+  echo "$FFMPEG_PID" > "$PID_FILE"
+  start_progress_reader
+  start_progress_watchdog
 
-echo "$EXIT_CODE" > "$LAST_EXIT_FILE"
-printf '%s %s\n' "$FFMPEG_RUN_ID" "$EXIT_CODE" >> "$EXIT_EVENT_FILE"
-cat "$ATTEMPT_LOG_FILE" >> "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" 2>/dev/null || true
-rm -f "$PID_FILE"
+  set +e
+  wait "$FFMPEG_PID"
+  EXIT_CODE=$?
+  set -e
 
-if progress_file_has_complete_line; then
-  for progress_notify_retry in 1 2 3; do
-    if notify_first_progress_once; then
-      break
+  echo "$EXIT_CODE" > "$LAST_EXIT_FILE"
+  printf '%s %s\n' "$FFMPEG_RUN_ID" "$EXIT_CODE" >> "$EXIT_EVENT_FILE"
+  cat "$ATTEMPT_LOG_FILE" >> "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" 2>/dev/null || true
+  rm -f "$PID_FILE"
+
+  if progress_file_has_complete_line; then
+    for progress_notify_retry in 1 2 3; do
+      if notify_first_progress_once; then
+        break
+      fi
+      sleep "$FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS"
+    done
+  fi
+  stop_progress_watchdog
+  stop_progress_reader
+
+  log_json "ffmpeg_exited" "exit_${EXIT_CODE}" "$(elapsed_ms "$FFMPEG_START_MS")"
+  if progress_file_has_complete_line; then
+    FINAL_EXIT_CODE="$EXIT_CODE"
+    break
+  fi
+
+  FINAL_EXIT_CODE="$EXIT_CODE"
+  if [ "$attempt" -lt "$FFMPEG_STARTUP_MAX_ATTEMPTS" ]; then
+    log_json "worker_warning" "ffmpeg_exit_${EXIT_CODE}_before_progress_retrying" "$(elapsed_ms "$RUNNER_START_MS")"
+    tail -n 40 "$ATTEMPT_LOG_FILE" | sed 's/^/[ffmpeg-retry] /' || true
+    sleep "$FFMPEG_STARTUP_RETRY_INTERVAL_SECONDS"
+  else
+    log_json "worker_error" "ffmpeg_exit_${EXIT_CODE}_before_progress_attempts_exhausted" "$(elapsed_ms "$RUNNER_START_MS")"
+    tail -n 40 "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" | sed 's/^/[ffmpeg] /' || true
+    if [ "$FINAL_EXIT_CODE" -eq 0 ]; then
+      FINAL_EXIT_CODE=1
     fi
-    sleep "$FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS"
-  done
-fi
-stop_progress_watchdog
-stop_progress_reader
+  fi
 
-log_json "ffmpeg_exited" "exit_${EXIT_CODE}_no_retry" "$(elapsed_ms "$FFMPEG_START_MS")"
-if [ "$EXIT_CODE" -ne 0 ]; then
-  log_json "worker_error" "ffmpeg_exit_${EXIT_CODE}_no_self_recovery" "$(elapsed_ms "$RUNNER_START_MS")"
-  tail -n 40 "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" | sed 's/^/[ffmpeg] /' || true
-fi
+  attempt=$((attempt + 1))
+done
 
-# Do not retry or recover locally. restartPolicy=Never on worker pods keeps this
-# as a terminal worker result; the controller will only delete workers when the
-# proxy emits exec_publish_done.
-exit "$EXIT_CODE"
+exit "$FINAL_EXIT_CODE"
