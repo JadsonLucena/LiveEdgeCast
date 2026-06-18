@@ -367,7 +367,14 @@ def parse_fps(value):
             return float(num) / den if den else 0.0
         return float(value)
     except (TypeError, ValueError):
-        return 30.0
+        return 0.0
+
+def first_positive_fps(*values):
+    for value in values:
+        fps_value = parse_fps(value)
+        if fps_value > 0:
+            return fps_value
+    return 30.0
 
 try:
     data = json.loads(os.environ.get("PROBE_JSON", "{}"))
@@ -378,18 +385,27 @@ video_stream = next(
     (stream for stream in data.get("streams", []) if stream.get("codec_type") == "video"),
     {},
 )
+width = int(video_stream.get("width") or 1280)
 height = int(video_stream.get("height") or 720)
-fps = parse_fps(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "30/1")
+# Treat the shorter display axis as the YouTube resolution class so portrait
+# streams such as 1080x1920 map to 1080p instead of being mistaken for 2160p.
+resolution_axis = min(width, height)
+fps = first_positive_fps(video_stream.get("avg_frame_rate"), video_stream.get("r_frame_rate"), "30/1")
 fps_bucket = 60 if fps > 45 else 30
+output_fps = int(round(min(fps, fps_bucket)))
+if output_fps <= 0:
+    output_fps = fps_bucket
 
 if not video_stream:
     selected = profiles[-1]
 else:
     candidates = [profile for profile in profiles if profile["fps"] == fps_bucket]
-    selected = min(candidates, key=lambda profile: (abs(profile["height"] - height), profile["height"]))
-output_height = min(height, selected["height"]) if selected["height"] <= 720 else selected["height"]
+    selected = min(candidates, key=lambda profile: (abs(profile["height"] - resolution_axis), profile["height"]))
+# Normalize to the chosen profile axis. The 240p-720p30 bucket is a range, so
+# sub-720p inputs keep their original shorter axis instead of being upscaled.
+output_resolution_axis = min(resolution_axis, selected["height"]) if selected["height"] <= 720 else selected["height"]
 
-print(f'{selected["name"]}|{output_height}|{selected["fps"]}|{selected["bitrate"]}|{selected["h264_level"]}')
+print(f'{selected["name"]}|{output_resolution_axis}|{output_fps}|{selected["bitrate"]}|{selected["h264_level"]}')
 PYYT
 }
 
@@ -419,6 +435,9 @@ build_ffmpeg_transcode_args() {
     -pix_fmt yuv420p
     -profile:v high
     -level:v "$YOUTUBE_H264_LEVEL"
+    -bf 2
+    -refs 1
+    -coder 1
     -b:v "$YOUTUBE_VIDEO_BITRATE"
     -maxrate "$YOUTUBE_VIDEO_BITRATE"
     -bufsize "$(( ${YOUTUBE_VIDEO_BITRATE%M} * 2 ))M"
@@ -426,7 +445,10 @@ build_ffmpeg_transcode_args() {
     -g "$(( YOUTUBE_PROFILE_FPS * 2 ))"
     -keyint_min "$(( YOUTUBE_PROFILE_FPS * 2 ))"
     -sc_threshold 0
-    -vf "scale=-2:$YOUTUBE_PROFILE_HEIGHT"
+    -vf "scale=w='if(lte(iw,ih),$YOUTUBE_PROFILE_HEIGHT,-2)':h='if(lte(iw,ih),-2,$YOUTUBE_PROFILE_HEIGHT)',setsar=1"
+    -colorspace bt709
+    -color_primaries bt709
+    -color_trc bt709
     -c:a aac
     -b:a 128k
     -ar 44100
