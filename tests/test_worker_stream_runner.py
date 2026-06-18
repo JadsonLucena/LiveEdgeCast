@@ -74,6 +74,10 @@ exit 0
 if [ "${FAKE_FFPROBE_FAIL:-0}" = "1" ]; then
   exit 1
 fi
+if [ "${FAKE_FFPROBE_INVALID_JSON:-0}" = "1" ]; then
+  printf 'not-json'
+  exit 0
+fi
 width="${FAKE_FFPROBE_WIDTH:-1920}"
 height="${FAKE_FFPROBE_HEIGHT:-1080}"
 avg_fps="${FAKE_FFPROBE_AVG_FPS:-${FAKE_FFPROBE_FPS:-30000/1001}}"
@@ -256,6 +260,26 @@ def test_ffmpeg_uses_720p30_when_it_is_the_closest_profile_above_720p(tmp_path):
     assert "-vf\nscale=w='if(lte(iw,ih),720,-2)':h='if(lte(iw,ih),-2,720)',setsar=1" in args
 
 
+def test_ffmpeg_uses_720p60_profile(tmp_path):
+    result = _run_runner(
+        tmp_path,
+        "success",
+        stream_status="active",
+        extra_env={
+            "FAKE_FFPROBE_HEIGHT": "720",
+            "FAKE_FFPROBE_FPS": "60/1",
+        },
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert '"status":"720p60"' in result.stdout
+    args = (tmp_path / "state" / "ffmpeg_args").read_text()
+    assert "-b:v\n6M" in args
+    assert "-level:v\n3.2" in args
+    assert "-r\n60" in args
+    assert "-vf\nscale=w='if(lte(iw,ih),720,-2)':h='if(lte(iw,ih),-2,720)',setsar=1" in args
+
+
 def test_ffmpeg_preserves_sub_720p_height_with_240p_to_720p_profile(tmp_path):
     result = _run_runner(
         tmp_path,
@@ -303,6 +327,22 @@ def test_ffmpeg_falls_back_to_720p30_when_ffprobe_fails(tmp_path):
 
     assert result.returncode == 0, result.stdout
     assert "ffprobe_failed_using_youtube_240p_720p30_defaults" in result.stdout
+    assert '"status":"240p-720p30"' in result.stdout
+    args = (tmp_path / "state" / "ffmpeg_args").read_text()
+    assert "-b:v\n4M" in args
+    assert "-level:v\n3.1" in args
+
+
+def test_ffmpeg_falls_back_to_720p30_when_ffprobe_returns_invalid_json(tmp_path):
+    result = _run_runner(
+        tmp_path,
+        "success",
+        stream_status="active",
+        extra_env={"FAKE_FFPROBE_INVALID_JSON": "1"},
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert "ffprobe_invalid_json_using_youtube_240p_720p30_defaults" in result.stdout
     assert '"status":"240p-720p30"' in result.stdout
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-b:v\n4M" in args

@@ -342,6 +342,20 @@ start_progress_reader() {
   PROGRESS_READER_PID=$!
 }
 
+json_is_valid() {
+  local value="${1:-}"
+  JSON_VALUE="$value" python3 - <<'PYJSON'
+import json
+import os
+import sys
+
+try:
+    json.loads(os.environ.get("JSON_VALUE", ""))
+except json.JSONDecodeError:
+    sys.exit(1)
+PYJSON
+}
+
 select_youtube_encoder_settings() {
   local probe_json="${1:-}"
   PROBE_JSON="$probe_json" python3 - <<'PYYT'
@@ -410,7 +424,7 @@ PYYT
 }
 
 build_ffmpeg_transcode_args() {
-  local probe_json profile_name profile_height profile_fps video_bitrate h264_level
+  local probe_json profile_name profile_axis profile_fps video_bitrate h264_level
   set +e
   probe_json="$(timeout "$FFPROBE_TIMEOUT_SECONDS" ffprobe -v error -select_streams v:0 \
     -show_entries stream=codec_type,width,height,avg_frame_rate,r_frame_rate \
@@ -420,15 +434,18 @@ build_ffmpeg_transcode_args() {
   if [ "$probe_exit" -ne 0 ] || [ -z "$probe_json" ]; then
     probe_json='{}'
     log_json "worker_warning" "ffprobe_failed_using_youtube_240p_720p30_defaults" "$(elapsed_ms "$RUNNER_START_MS")"
+  elif ! json_is_valid "$probe_json"; then
+    probe_json='{}'
+    log_json "worker_warning" "ffprobe_invalid_json_using_youtube_240p_720p30_defaults" "$(elapsed_ms "$RUNNER_START_MS")"
   fi
-  IFS='|' read -r profile_name profile_height profile_fps video_bitrate h264_level < <(select_youtube_encoder_settings "$probe_json")
+  IFS='|' read -r profile_name profile_axis profile_fps video_bitrate h264_level < <(select_youtube_encoder_settings "$probe_json")
   YOUTUBE_PROFILE_NAME="$profile_name"
-  YOUTUBE_PROFILE_HEIGHT="$profile_height"
+  YOUTUBE_OUTPUT_AXIS="$profile_axis"
   YOUTUBE_PROFILE_FPS="$profile_fps"
   YOUTUBE_VIDEO_BITRATE="$video_bitrate"
   YOUTUBE_H264_LEVEL="$h264_level"
   log_json "youtube_encoder_profile_selected" "$YOUTUBE_PROFILE_NAME" "$(elapsed_ms "$RUNNER_START_MS")"
-  log_json "youtube_encoder_output_selected" "axis_${YOUTUBE_PROFILE_HEIGHT}_fps_${YOUTUBE_PROFILE_FPS}" "$(elapsed_ms "$RUNNER_START_MS")"
+  log_json "youtube_encoder_output_selected" "axis_${YOUTUBE_OUTPUT_AXIS}_fps_${YOUTUBE_PROFILE_FPS}" "$(elapsed_ms "$RUNNER_START_MS")"
 
   FFMPEG_TRANSCODE_ARGS=(
     -c:v libx264
@@ -448,7 +465,7 @@ build_ffmpeg_transcode_args() {
     -g "$(( YOUTUBE_PROFILE_FPS * 2 ))"
     -keyint_min "$(( YOUTUBE_PROFILE_FPS * 2 ))"
     -sc_threshold 0
-    -vf "scale=w='if(lte(iw,ih),$YOUTUBE_PROFILE_HEIGHT,-2)':h='if(lte(iw,ih),-2,$YOUTUBE_PROFILE_HEIGHT)',setsar=1"
+    -vf "scale=w='if(lte(iw,ih),$YOUTUBE_OUTPUT_AXIS,-2)':h='if(lte(iw,ih),-2,$YOUTUBE_OUTPUT_AXIS)',setsar=1"
     -colorspace bt709
     -color_primaries bt709
     -color_trc bt709
