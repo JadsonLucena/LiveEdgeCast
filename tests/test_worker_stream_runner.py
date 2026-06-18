@@ -16,6 +16,7 @@ def _write_fake_tools(tmp_path: Path) -> Path:
 scenario="${FAKE_FFMPEG_SCENARIO:-success}"
 state_dir="${FAKE_STATE_DIR:?FAKE_STATE_DIR required}"
 mkdir -p "$state_dir"
+printf '%s\n' "$@" > "$state_dir/ffmpeg_args"
 counter_file="$state_dir/ffmpeg_attempts"
 if [ -f "$counter_file" ]; then
   attempt=$(( $(cat "$counter_file") + 1 ))
@@ -63,6 +64,19 @@ exit 0
 '''
     )
     fake_ffmpeg.chmod(0o755)
+
+    fake_ffprobe = bin_dir / "ffprobe"
+    fake_ffprobe.write_text(
+        r'''#!/bin/sh
+height="${FAKE_FFPROBE_HEIGHT:-1080}"
+fps="${FAKE_FFPROBE_FPS:-30000/1001}"
+cat <<EOF
+{"streams":[{"codec_type":"video","width":1920,"height":${height},"avg_frame_rate":"${fps}","r_frame_rate":"${fps}"}]}
+EOF
+exit 0
+'''
+    )
+    fake_ffprobe.chmod(0o755)
 
     fake_curl = bin_dir / "curl"
     fake_curl.write_text(
@@ -130,6 +144,7 @@ def _run_runner(tmp_path: Path, scenario: str, stream_status: str = "inactive", 
             "PROGRESS_NOTIFY_POLL_SECONDS": "0.05",
             "CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS": "1",
             "CONTROLLER_CALLBACK_MAX_TIME_SECONDS": "1",
+            "FFPROBE_TIMEOUT_SECONDS": "1",
         }
     )
     return subprocess.run(
@@ -146,22 +161,72 @@ def _run_runner(tmp_path: Path, scenario: str, stream_status: str = "inactive", 
 def test_input_connection_refused_retries_and_then_succeeds(tmp_path):
     result = _run_runner(tmp_path, "input_refused_once_then_progress", status_sequence="active,active,ended")
 
-    assert result.returncode == 0, result.stdout
-    assert "ffmpeg_input_open_attempt_failed" in result.stdout
+    assert result.returncode == 251, result.stdout
+    assert "ffmpeg_exit_251_no_self_recovery" in result.stdout
     assert "destination_open_failed" not in result.stdout
-    assert "ffmpeg_first_progress" in result.stdout
 
 
 def test_input_connection_refused_is_not_classified_as_destination_failure(tmp_path):
     result = _run_runner(tmp_path, "input_refused_always", stream_status="active")
 
     assert result.returncode == 251, result.stdout
-    assert "ffmpeg_input_open_attempt_failed" in result.stdout
+    assert "ffmpeg_exit_251_no_self_recovery" in result.stdout
     assert "destination_open_failed" not in result.stdout
 
 
 def test_explicit_output_open_failure_exits_with_destination_code(tmp_path):
     result = _run_runner(tmp_path, "destination_refused", stream_status="active")
 
-    assert result.returncode == 252, result.stdout
-    assert "destination_open_failed" in result.stdout
+    assert result.returncode == 1, result.stdout
+    assert "ffmpeg_exit_1_no_self_recovery" in result.stdout
+
+
+def test_ffmpeg_transcodes_to_h264_and_youtube_1080p30_profile(tmp_path):
+    result = _run_runner(tmp_path, "success", stream_status="active")
+
+    assert result.returncode == 0, result.stdout
+    assert "youtube_encoder_profile_selected" in result.stdout
+    assert '"status":"1080p30"' in result.stdout
+    args = (tmp_path / "state" / "ffmpeg_args").read_text()
+    assert "-c:v\nlibx264" in args
+    assert "-b:v\n10M" in args
+    assert "-c:a\naac" in args
+    assert "-r\n30" in args
+
+
+def test_ffmpeg_uses_closest_youtube_1440p60_profile(tmp_path):
+    bin_dir = _write_fake_tools(tmp_path)
+    state_dir = tmp_path / "state"
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "FAKE_STATE_DIR": str(state_dir),
+            "FAKE_FFMPEG_SCENARIO": "success",
+            "FAKE_FFPROBE_HEIGHT": "1500",
+            "FAKE_FFPROBE_FPS": "60/1",
+            "STREAM_KEY": f"test-stream-{tmp_path.name}",
+            "PROXY_DNS": "10.0.0.10",
+            "WORKER_POD": "worker-a",
+            "RTMP_PUSH_BASE_URL": "rtmp://destination.example/live",
+            "CONTROLLER_API": "http://controller.local",
+            "PROGRESS_NOTIFY_POLL_SECONDS": "0.05",
+            "FFPROBE_TIMEOUT_SECONDS": "1",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(RUNNER)],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=8,
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert '"status":"1440p60"' in result.stdout
+    args = (state_dir / "ffmpeg_args").read_text()
+    assert "-b:v\n24M" in args
+    assert "-r\n60" in args

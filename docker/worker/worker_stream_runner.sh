@@ -42,6 +42,7 @@ FFMPEG_START_MS=""
 # no per-attempt timeout and no retry/self-recovery loop are used here.
 FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS="${PROGRESS_NOTIFY_POLL_SECONDS:-0.2}"
 FFMPEG_LOGLEVEL="${FFMPEG_LOGLEVEL:-warning}"
+FFPROBE_TIMEOUT_SECONDS="${FFPROBE_TIMEOUT_SECONDS:-10}"
 
 json_escape() {
   local value="${1:-}"
@@ -341,6 +342,97 @@ start_progress_reader() {
   PROGRESS_READER_PID=$!
 }
 
+select_youtube_encoder_settings() {
+  local probe_json="${1:-}"
+  PROBE_JSON="$probe_json" python3 - <<'PYYT'
+import json
+import os
+
+profiles = [
+    {"name": "2160p60", "height": 2160, "fps": 60, "bitrate": "35M"},
+    {"name": "2160p30", "height": 2160, "fps": 30, "bitrate": "30M"},
+    {"name": "1440p60", "height": 1440, "fps": 60, "bitrate": "24M"},
+    {"name": "1440p30", "height": 1440, "fps": 30, "bitrate": "15M"},
+    {"name": "1080p60", "height": 1080, "fps": 60, "bitrate": "12M"},
+    {"name": "1080p30", "height": 1080, "fps": 30, "bitrate": "10M"},
+    {"name": "720p60", "height": 720, "fps": 60, "bitrate": "6M"},
+    {"name": "240p-720p30", "height": 720, "fps": 30, "bitrate": "4M"},
+]
+
+def parse_fps(value):
+    try:
+        if "/" in value:
+            num, den = value.split("/", 1)
+            den = float(den)
+            return float(num) / den if den else 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 30.0
+
+try:
+    data = json.loads(os.environ.get("PROBE_JSON", "{}"))
+except json.JSONDecodeError:
+    data = {}
+
+video_stream = next(
+    (stream for stream in data.get("streams", []) if stream.get("codec_type") == "video"),
+    {},
+)
+height = int(video_stream.get("height") or 720)
+fps = parse_fps(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "30/1")
+fps_bucket = 60 if fps > 45 else 30
+
+if fps_bucket == 30 and height <= 720:
+    selected = profiles[-1]
+else:
+    candidates = [profile for profile in profiles if profile["fps"] == fps_bucket and not (profile["fps"] == 30 and profile["height"] == 720)]
+    selected = min(candidates, key=lambda profile: (abs(profile["height"] - height), profile["height"]))
+
+print(f'{selected["name"]}|{selected["height"]}|{selected["fps"]}|{selected["bitrate"]}')
+PYYT
+}
+
+build_ffmpeg_transcode_args() {
+  local probe_json profile_name profile_height profile_fps video_bitrate
+  set +e
+  probe_json="$(timeout "$FFPROBE_TIMEOUT_SECONDS" ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_type,width,height,avg_frame_rate,r_frame_rate \
+    -of json "$PROXY_RTMP" 2>/dev/null)"
+  probe_exit=$?
+  set -e
+  if [ "$probe_exit" -ne 0 ] || [ -z "$probe_json" ]; then
+    probe_json='{}'
+    log_json "worker_warning" "ffprobe_failed_using_youtube_720p30_defaults" "$(elapsed_ms "$RUNNER_START_MS")"
+  fi
+  IFS='|' read -r profile_name profile_height profile_fps video_bitrate < <(select_youtube_encoder_settings "$probe_json")
+  YOUTUBE_PROFILE_NAME="$profile_name"
+  YOUTUBE_PROFILE_HEIGHT="$profile_height"
+  YOUTUBE_PROFILE_FPS="$profile_fps"
+  YOUTUBE_VIDEO_BITRATE="$video_bitrate"
+  log_json "youtube_encoder_profile_selected" "$YOUTUBE_PROFILE_NAME" "$(elapsed_ms "$RUNNER_START_MS")"
+
+  FFMPEG_TRANSCODE_ARGS=(
+    -c:v libx264
+    -preset veryfast
+    -pix_fmt yuv420p
+    -profile:v high
+    -level:v 4.2
+    -b:v "$YOUTUBE_VIDEO_BITRATE"
+    -maxrate "$YOUTUBE_VIDEO_BITRATE"
+    -bufsize "$(( ${YOUTUBE_VIDEO_BITRATE%M} * 2 ))M"
+    -r "$YOUTUBE_PROFILE_FPS"
+    -g "$(( YOUTUBE_PROFILE_FPS * 2 ))"
+    -keyint_min "$(( YOUTUBE_PROFILE_FPS * 2 ))"
+    -sc_threshold 0
+    -vf "scale=-2:min(ih\\,$YOUTUBE_PROFILE_HEIGHT)"
+    -c:a aac
+    -b:a 128k
+    -ar 44100
+    -ac 2
+    -flvflags no_duration_filesize
+  )
+}
+
 RTMP_PUSH_BASE_URL="${RTMP_PUSH_BASE_URL:-}"
 PROXY_ADDR="${PROXY_DNS:-}"
 CONTROLLER_API="${CONTROLLER_API:-http://controller.media.svc.cluster.local:8000}"
@@ -361,23 +453,24 @@ rm -rf "$PROGRESS_NOTIFY_LOCK" "$PROGRESS_LOG_LOCK" "$STARTED_NOTIFY_LOCK" "$STA
 attempt=1
 CURRENT_ATTEMPT="$attempt"
 FFMPEG_START_MS="$(current_epoch_ms)"
-FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-single_attempt-${RANDOM}"
+FFMPEG_RUN_ID=""
 ATTEMPT_LOG_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.attempt_${attempt}.log"
 : > "$ATTEMPT_LOG_FILE"
 log_json "ffmpeg_process_spawned" "single_attempt_no_timeout" "$(elapsed_ms "$FFMPEG_START_MS")"
+build_ffmpeg_transcode_args
 
 ffmpeg \
   -loglevel "$FFMPEG_LOGLEVEL" \
   -nostats \
   -progress "/tmp/ffmpeg_${SAFE_STREAM_KEY}.progress" \
   -i "$PROXY_RTMP" \
-  -c:v copy \
-  -c:a copy \
+  "${FFMPEG_TRANSCODE_ARGS[@]}" \
   -progress "$PROGRESS_FILE" \
   -f flv "$TARGET_RTMP" \
   >> "$ATTEMPT_LOG_FILE" 2>&1 &
 
 FFMPEG_PID=$!
+FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-${FFMPEG_PID}-${RANDOM}"
 echo "$FFMPEG_PID" > "$PID_FILE"
 start_progress_reader
 
@@ -392,7 +485,12 @@ cat "$ATTEMPT_LOG_FILE" >> "/tmp/ffmpeg_${SAFE_STREAM_KEY}.log" 2>/dev/null || t
 rm -f "$PID_FILE"
 
 if progress_file_has_complete_line; then
-  notify_first_progress_once || true
+  for progress_notify_retry in 1 2 3; do
+    if notify_first_progress_once; then
+      break
+    fi
+    sleep "$FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS"
+  done
 fi
 stop_progress_reader
 
