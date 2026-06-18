@@ -419,7 +419,7 @@ build_ffmpeg_transcode_args() {
   set -e
   if [ "$probe_exit" -ne 0 ] || [ -z "$probe_json" ]; then
     probe_json='{}'
-    log_json "worker_warning" "ffprobe_failed_using_youtube_720p30_defaults" "$(elapsed_ms "$RUNNER_START_MS")"
+    log_json "worker_warning" "ffprobe_failed_using_youtube_240p_720p30_defaults" "$(elapsed_ms "$RUNNER_START_MS")"
   fi
   IFS='|' read -r profile_name profile_height profile_fps video_bitrate h264_level < <(select_youtube_encoder_settings "$probe_json")
   YOUTUBE_PROFILE_NAME="$profile_name"
@@ -428,6 +428,7 @@ build_ffmpeg_transcode_args() {
   YOUTUBE_VIDEO_BITRATE="$video_bitrate"
   YOUTUBE_H264_LEVEL="$h264_level"
   log_json "youtube_encoder_profile_selected" "$YOUTUBE_PROFILE_NAME" "$(elapsed_ms "$RUNNER_START_MS")"
+  log_json "youtube_encoder_output_selected" "axis_${YOUTUBE_PROFILE_HEIGHT}_fps_${YOUTUBE_PROFILE_FPS}" "$(elapsed_ms "$RUNNER_START_MS")"
 
   FFMPEG_TRANSCODE_ARGS=(
     -c:v libx264
@@ -440,7 +441,9 @@ build_ffmpeg_transcode_args() {
     -coder 1
     -b:v "$YOUTUBE_VIDEO_BITRATE"
     -maxrate "$YOUTUBE_VIDEO_BITRATE"
+    -minrate "$YOUTUBE_VIDEO_BITRATE"
     -bufsize "$(( ${YOUTUBE_VIDEO_BITRATE%M} * 2 ))M"
+    -x264-params "nal-hrd=cbr:force-cfr=1"
     -r "$YOUTUBE_PROFILE_FPS"
     -g "$(( YOUTUBE_PROFILE_FPS * 2 ))"
     -keyint_min "$(( YOUTUBE_PROFILE_FPS * 2 ))"

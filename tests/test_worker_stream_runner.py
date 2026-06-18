@@ -1,6 +1,9 @@
 import os
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -204,13 +207,16 @@ def test_ffmpeg_transcodes_to_h264_and_youtube_1080p30_profile(tmp_path):
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-c:v\nlibx264" in args
     assert "-b:v\n10M" in args
+    assert "-minrate\n10M" in args
     assert "-level:v\n4.0" in args
     assert "-bf\n2" in args
     assert "-refs\n1" in args
     assert "-coder\n1" in args
+    assert "-x264-params\nnal-hrd=cbr:force-cfr=1" in args
     assert "-c:a\naac" in args
     assert "-r\n30" in args
     assert "-colorspace\nbt709" in args
+    assert '"event_type":"youtube_encoder_output_selected"' in result.stdout
 
 
 def test_ffmpeg_uses_closest_youtube_1440p60_profile(tmp_path):
@@ -296,7 +302,7 @@ def test_ffmpeg_falls_back_to_720p30_when_ffprobe_fails(tmp_path):
     )
 
     assert result.returncode == 0, result.stdout
-    assert "ffprobe_failed_using_youtube_720p30_defaults" in result.stdout
+    assert "ffprobe_failed_using_youtube_240p_720p30_defaults" in result.stdout
     assert '"status":"240p-720p30"' in result.stdout
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-b:v\n4M" in args
@@ -357,3 +363,75 @@ def test_ffmpeg_selects_profile_by_shorter_axis_for_portrait_streams(tmp_path):
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-b:v\n10M" in args
     assert "-vf\nscale=w='if(lte(iw,ih),1080,-2)':h='if(lte(iw,ih),-2,1080)',setsar=1" in args
+
+
+def test_real_ffmpeg_accepts_youtube_filter_and_encoder_options():
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        pytest.skip("ffmpeg binary is not available")
+
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=30",
+            "-frames:v",
+            "2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "high",
+            "-level:v",
+            "3.1",
+            "-bf",
+            "2",
+            "-refs",
+            "1",
+            "-coder",
+            "1",
+            "-b:v",
+            "4M",
+            "-maxrate",
+            "4M",
+            "-minrate",
+            "4M",
+            "-bufsize",
+            "8M",
+            "-x264-params",
+            "nal-hrd=cbr:force-cfr=1",
+            "-r",
+            "30",
+            "-g",
+            "60",
+            "-keyint_min",
+            "60",
+            "-sc_threshold",
+            "0",
+            "-vf",
+            "scale=w='if(lte(iw,ih),720,-2)':h='if(lte(iw,ih),-2,720)',setsar=1",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-f",
+            "null",
+            "-",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
