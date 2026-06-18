@@ -24,6 +24,52 @@ spec:
                 "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
               )
             )
+        - record: liveedgecast:pod:network_receive_bytes_per_second:rate5m
+          expr: |
+            sum by (namespace, pod) (
+              rate(container_network_receive_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m])
+            )
+        - record: liveedgecast:pod:network_transmit_bytes_per_second:rate5m
+          expr: |
+            sum by (namespace, pod) (
+              rate(container_network_transmit_bytes_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m])
+            )
+        - record: liveedgecast:pod:network_receive_packets_per_second:rate5m
+          expr: |
+            sum by (namespace, pod) (
+              rate(container_network_receive_packets_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m])
+            )
+        - record: liveedgecast:pod:network_transmit_packets_per_second:rate5m
+          expr: |
+            sum by (namespace, pod) (
+              rate(container_network_transmit_packets_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m])
+            )
+        - record: liveedgecast:pod:network_receive_errors_per_second:rate5m
+          expr: |
+            sum by (namespace, pod) (
+              rate(container_network_receive_errors_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m])
+            )
+        - record: liveedgecast:pod:network_transmit_errors_per_second:rate5m
+          expr: |
+            sum by (namespace, pod) (
+              rate(container_network_transmit_errors_total{namespace="media",interface!="lo",pod=~"(proxy-lb|proxy|worker|controller)-.*"}[5m])
+            )
+        - record: liveedgecast:component:network_receive_bytes_per_second:rate5m
+          expr: |
+            sum by (component) (
+              label_replace(
+                liveedgecast:pod:network_receive_bytes_per_second:rate5m{namespace="media"},
+                "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+              )
+            )
+        - record: liveedgecast:component:network_transmit_bytes_per_second:rate5m
+          expr: |
+            sum by (component) (
+              label_replace(
+                liveedgecast:pod:network_transmit_bytes_per_second:rate5m{namespace="media"},
+                "component", "$1", "pod", "^(proxy-lb|proxy|worker|controller)-.*"
+              )
+            )
     - name: liveedgecast.resources.kube_state_metrics
       interval: 30s
       rules:
