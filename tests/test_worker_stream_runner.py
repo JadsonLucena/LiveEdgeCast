@@ -68,10 +68,14 @@ exit 0
     fake_ffprobe = bin_dir / "ffprobe"
     fake_ffprobe.write_text(
         r'''#!/bin/sh
+if [ "${FAKE_FFPROBE_FAIL:-0}" = "1" ]; then
+  exit 1
+fi
+width="${FAKE_FFPROBE_WIDTH:-1920}"
 height="${FAKE_FFPROBE_HEIGHT:-1080}"
 fps="${FAKE_FFPROBE_FPS:-30000/1001}"
 cat <<EOF
-{"streams":[{"codec_type":"video","width":1920,"height":${height},"avg_frame_rate":"${fps}","r_frame_rate":"${fps}"}]}
+{"streams":[{"codec_type":"video","width":${width},"height":${height},"avg_frame_rate":"${fps}","r_frame_rate":"${fps}"}]}
 EOF
 exit 0
 '''
@@ -119,7 +123,14 @@ exit 0
     return bin_dir
 
 
-def _run_runner(tmp_path: Path, scenario: str, stream_status: str = "inactive", status_sequence: str = "", timeout_seconds: int = 8):
+def _run_runner(
+    tmp_path: Path,
+    scenario: str,
+    stream_status: str = "inactive",
+    status_sequence: str = "",
+    timeout_seconds: int = 8,
+    extra_env: dict[str, str] | None = None,
+):
     bin_dir = _write_fake_tools(tmp_path)
     state_dir = tmp_path / "state"
     env = os.environ.copy()
@@ -147,6 +158,8 @@ def _run_runner(tmp_path: Path, scenario: str, stream_status: str = "inactive", 
             "FFPROBE_TIMEOUT_SECONDS": "1",
         }
     )
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         ["bash", str(RUNNER)],
         cwd=REPO_ROOT,
@@ -158,7 +171,7 @@ def _run_runner(tmp_path: Path, scenario: str, stream_status: str = "inactive", 
     )
 
 
-def test_input_connection_refused_retries_and_then_succeeds(tmp_path):
+def test_input_connection_refused_exits_without_self_recovery(tmp_path):
     result = _run_runner(tmp_path, "input_refused_once_then_progress", status_sequence="active,active,ended")
 
     assert result.returncode == 251, result.stdout
@@ -190,43 +203,96 @@ def test_ffmpeg_transcodes_to_h264_and_youtube_1080p30_profile(tmp_path):
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-c:v\nlibx264" in args
     assert "-b:v\n10M" in args
+    assert "-level:v\n4.0" in args
     assert "-c:a\naac" in args
     assert "-r\n30" in args
 
 
 def test_ffmpeg_uses_closest_youtube_1440p60_profile(tmp_path):
-    bin_dir = _write_fake_tools(tmp_path)
-    state_dir = tmp_path / "state"
-    env = os.environ.copy()
-    env.update(
-        {
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "FAKE_STATE_DIR": str(state_dir),
-            "FAKE_FFMPEG_SCENARIO": "success",
+    result = _run_runner(
+        tmp_path,
+        "success",
+        stream_status="active",
+        extra_env={
             "FAKE_FFPROBE_HEIGHT": "1500",
             "FAKE_FFPROBE_FPS": "60/1",
-            "STREAM_KEY": f"test-stream-{tmp_path.name}",
-            "PROXY_DNS": "10.0.0.10",
-            "WORKER_POD": "worker-a",
-            "RTMP_PUSH_BASE_URL": "rtmp://destination.example/live",
-            "CONTROLLER_API": "http://controller.local",
-            "PROGRESS_NOTIFY_POLL_SECONDS": "0.05",
-            "FFPROBE_TIMEOUT_SECONDS": "1",
-        }
-    )
-
-    result = subprocess.run(
-        ["bash", str(RUNNER)],
-        cwd=REPO_ROOT,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=8,
+        },
     )
 
     assert result.returncode == 0, result.stdout
     assert '"status":"1440p60"' in result.stdout
-    args = (state_dir / "ffmpeg_args").read_text()
+    args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-b:v\n24M" in args
+    assert "-level:v\n5.1" in args
     assert "-r\n60" in args
+
+
+def test_ffmpeg_uses_720p30_when_it_is_the_closest_profile_above_720p(tmp_path):
+    result = _run_runner(
+        tmp_path,
+        "success",
+        stream_status="active",
+        extra_env={
+            "FAKE_FFPROBE_HEIGHT": "800",
+            "FAKE_FFPROBE_FPS": "30/1",
+        },
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert '"status":"240p-720p30"' in result.stdout
+    args = (tmp_path / "state" / "ffmpeg_args").read_text()
+    assert "-b:v\n4M" in args
+    assert "-vf\nscale=-2:720" in args
+
+
+def test_ffmpeg_preserves_sub_720p_height_with_240p_to_720p_profile(tmp_path):
+    result = _run_runner(
+        tmp_path,
+        "success",
+        stream_status="active",
+        extra_env={
+            "FAKE_FFPROBE_HEIGHT": "480",
+            "FAKE_FFPROBE_FPS": "30/1",
+        },
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert '"status":"240p-720p30"' in result.stdout
+    args = (tmp_path / "state" / "ffmpeg_args").read_text()
+    assert "-b:v\n4M" in args
+    assert "-vf\nscale=-2:480" in args
+
+
+def test_ffmpeg_uses_2160p60_profile_with_4k_h264_level(tmp_path):
+    result = _run_runner(
+        tmp_path,
+        "success",
+        stream_status="active",
+        extra_env={
+            "FAKE_FFPROBE_HEIGHT": "2160",
+            "FAKE_FFPROBE_FPS": "60/1",
+        },
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert '"status":"2160p60"' in result.stdout
+    args = (tmp_path / "state" / "ffmpeg_args").read_text()
+    assert "-b:v\n35M" in args
+    assert "-level:v\n5.2" in args
+    assert "-vf\nscale=-2:2160" in args
+
+
+def test_ffmpeg_falls_back_to_720p30_when_ffprobe_fails(tmp_path):
+    result = _run_runner(
+        tmp_path,
+        "success",
+        stream_status="active",
+        extra_env={"FAKE_FFPROBE_FAIL": "1"},
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert "ffprobe_failed_using_youtube_720p30_defaults" in result.stdout
+    assert '"status":"240p-720p30"' in result.stdout
+    args = (tmp_path / "state" / "ffmpeg_args").read_text()
+    assert "-b:v\n4M" in args
+    assert "-level:v\n3.1" in args

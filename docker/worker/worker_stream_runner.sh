@@ -349,14 +349,14 @@ import json
 import os
 
 profiles = [
-    {"name": "2160p60", "height": 2160, "fps": 60, "bitrate": "35M"},
-    {"name": "2160p30", "height": 2160, "fps": 30, "bitrate": "30M"},
-    {"name": "1440p60", "height": 1440, "fps": 60, "bitrate": "24M"},
-    {"name": "1440p30", "height": 1440, "fps": 30, "bitrate": "15M"},
-    {"name": "1080p60", "height": 1080, "fps": 60, "bitrate": "12M"},
-    {"name": "1080p30", "height": 1080, "fps": 30, "bitrate": "10M"},
-    {"name": "720p60", "height": 720, "fps": 60, "bitrate": "6M"},
-    {"name": "240p-720p30", "height": 720, "fps": 30, "bitrate": "4M"},
+    {"name": "2160p60", "height": 2160, "fps": 60, "bitrate": "35M", "h264_level": "5.2"},
+    {"name": "2160p30", "height": 2160, "fps": 30, "bitrate": "30M", "h264_level": "5.1"},
+    {"name": "1440p60", "height": 1440, "fps": 60, "bitrate": "24M", "h264_level": "5.1"},
+    {"name": "1440p30", "height": 1440, "fps": 30, "bitrate": "15M", "h264_level": "5.0"},
+    {"name": "1080p60", "height": 1080, "fps": 60, "bitrate": "12M", "h264_level": "4.2"},
+    {"name": "1080p30", "height": 1080, "fps": 30, "bitrate": "10M", "h264_level": "4.0"},
+    {"name": "720p60", "height": 720, "fps": 60, "bitrate": "6M", "h264_level": "3.2"},
+    {"name": "240p-720p30", "height": 720, "fps": 30, "bitrate": "4M", "h264_level": "3.1"},
 ]
 
 def parse_fps(value):
@@ -382,18 +382,19 @@ height = int(video_stream.get("height") or 720)
 fps = parse_fps(video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate") or "30/1")
 fps_bucket = 60 if fps > 45 else 30
 
-if fps_bucket == 30 and height <= 720:
+if not video_stream:
     selected = profiles[-1]
 else:
-    candidates = [profile for profile in profiles if profile["fps"] == fps_bucket and not (profile["fps"] == 30 and profile["height"] == 720)]
+    candidates = [profile for profile in profiles if profile["fps"] == fps_bucket]
     selected = min(candidates, key=lambda profile: (abs(profile["height"] - height), profile["height"]))
+output_height = min(height, selected["height"]) if selected["height"] <= 720 else selected["height"]
 
-print(f'{selected["name"]}|{selected["height"]}|{selected["fps"]}|{selected["bitrate"]}')
+print(f'{selected["name"]}|{output_height}|{selected["fps"]}|{selected["bitrate"]}|{selected["h264_level"]}')
 PYYT
 }
 
 build_ffmpeg_transcode_args() {
-  local probe_json profile_name profile_height profile_fps video_bitrate
+  local probe_json profile_name profile_height profile_fps video_bitrate h264_level
   set +e
   probe_json="$(timeout "$FFPROBE_TIMEOUT_SECONDS" ffprobe -v error -select_streams v:0 \
     -show_entries stream=codec_type,width,height,avg_frame_rate,r_frame_rate \
@@ -404,11 +405,12 @@ build_ffmpeg_transcode_args() {
     probe_json='{}'
     log_json "worker_warning" "ffprobe_failed_using_youtube_720p30_defaults" "$(elapsed_ms "$RUNNER_START_MS")"
   fi
-  IFS='|' read -r profile_name profile_height profile_fps video_bitrate < <(select_youtube_encoder_settings "$probe_json")
+  IFS='|' read -r profile_name profile_height profile_fps video_bitrate h264_level < <(select_youtube_encoder_settings "$probe_json")
   YOUTUBE_PROFILE_NAME="$profile_name"
   YOUTUBE_PROFILE_HEIGHT="$profile_height"
   YOUTUBE_PROFILE_FPS="$profile_fps"
   YOUTUBE_VIDEO_BITRATE="$video_bitrate"
+  YOUTUBE_H264_LEVEL="$h264_level"
   log_json "youtube_encoder_profile_selected" "$YOUTUBE_PROFILE_NAME" "$(elapsed_ms "$RUNNER_START_MS")"
 
   FFMPEG_TRANSCODE_ARGS=(
@@ -416,7 +418,7 @@ build_ffmpeg_transcode_args() {
     -preset veryfast
     -pix_fmt yuv420p
     -profile:v high
-    -level:v 4.2
+    -level:v "$YOUTUBE_H264_LEVEL"
     -b:v "$YOUTUBE_VIDEO_BITRATE"
     -maxrate "$YOUTUBE_VIDEO_BITRATE"
     -bufsize "$(( ${YOUTUBE_VIDEO_BITRATE%M} * 2 ))M"
@@ -424,7 +426,7 @@ build_ffmpeg_transcode_args() {
     -g "$(( YOUTUBE_PROFILE_FPS * 2 ))"
     -keyint_min "$(( YOUTUBE_PROFILE_FPS * 2 ))"
     -sc_threshold 0
-    -vf "scale=-2:min(ih\\,$YOUTUBE_PROFILE_HEIGHT)"
+    -vf "scale=-2:$YOUTUBE_PROFILE_HEIGHT"
     -c:a aac
     -b:a 128k
     -ar 44100
