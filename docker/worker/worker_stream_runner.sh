@@ -27,6 +27,7 @@ STARTED_NOTIFY_ERROR_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.started_notify_error_l
 STARTED_LOG_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.started_logged"
 STARTED_LOG_LOCK="/tmp/ffmpeg_${SAFE_STREAM_KEY}.started_log.lock"
 PROGRESS_READER_PID=""
+PROGRESS_WATCHDOG_PID=""
 FFMPEG_PID=""
 CURRENT_ATTEMPT=""
 FFMPEG_RUN_ID=""
@@ -42,6 +43,7 @@ FFMPEG_START_MS=""
 # no per-attempt timeout and no retry/self-recovery loop are used here.
 FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS="${PROGRESS_NOTIFY_POLL_SECONDS:-0.2}"
 FFMPEG_LOGLEVEL="${FFMPEG_LOGLEVEL:-warning}"
+FFMPEG_STARTUP_PROGRESS_TIMEOUT_SECONDS="${FFMPEG_STARTUP_PROGRESS_TIMEOUT_SECONDS:-15}"
 FFPROBE_TIMEOUT_SECONDS="${FFPROBE_TIMEOUT_SECONDS:-10}"
 
 json_escape() {
@@ -294,10 +296,19 @@ stop_progress_reader() {
   fi
 }
 
+stop_progress_watchdog() {
+  if [ -n "${PROGRESS_WATCHDOG_PID:-}" ]; then
+    kill -TERM "$PROGRESS_WATCHDOG_PID" 2>/dev/null || true
+    wait "$PROGRESS_WATCHDOG_PID" 2>/dev/null || true
+    PROGRESS_WATCHDOG_PID=""
+  fi
+}
+
 cleanup() {
   if [ "${BASH_SUBSHELL:-0}" != "0" ] || [ "${BASHPID:-$$}" != "$MAIN_BASHPID" ]; then
     return 0
   fi
+  stop_progress_watchdog
   stop_progress_reader
   if [ -n "${FFMPEG_PID:-}" ] && kill -0 "$FFMPEG_PID" 2>/dev/null; then
     kill -TERM "$FFMPEG_PID" 2>/dev/null || true
@@ -340,6 +351,38 @@ start_progress_reader() {
     done
   ) &
   PROGRESS_READER_PID=$!
+}
+
+start_progress_watchdog() {
+  (
+    local timeout_ms deadline_ms now_ms
+    timeout_ms="$(WATCHDOG_TIMEOUT_SECONDS="$FFMPEG_STARTUP_PROGRESS_TIMEOUT_SECONDS" python3 - <<'PYWATCHDOG'
+import os
+
+try:
+    timeout = float(os.environ.get("WATCHDOG_TIMEOUT_SECONDS", "15"))
+except ValueError:
+    timeout = 15.0
+print(max(1, int(timeout * 1000)))
+PYWATCHDOG
+)"
+    deadline_ms="$(( $(current_epoch_ms) + timeout_ms ))"
+    while [ -n "${FFMPEG_PID:-}" ] && kill -0 "$FFMPEG_PID" 2>/dev/null; do
+      progress_file_has_complete_line && exit 0
+      now_ms="$(current_epoch_ms)"
+      [ "$now_ms" -ge "$deadline_ms" ] && break
+      sleep "$FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS"
+    done
+    if [ -n "${FFMPEG_PID:-}" ] \
+      && kill -0 "$FFMPEG_PID" 2>/dev/null \
+      && ! progress_file_has_complete_line; then
+      log_json "worker_warning" "ffmpeg_no_progress_after_${FFMPEG_STARTUP_PROGRESS_TIMEOUT_SECONDS}s" "$(elapsed_ms "${FFMPEG_START_MS:-$RUNNER_START_MS}")"
+      if [ -n "${ATTEMPT_LOG_FILE:-}" ] && [ -f "$ATTEMPT_LOG_FILE" ]; then
+        tail -n 40 "$ATTEMPT_LOG_FILE" | sed 's/^/[ffmpeg-watchdog] /' || true
+      fi
+    fi
+  ) &
+  PROGRESS_WATCHDOG_PID=$!
 }
 
 json_is_valid() {
@@ -424,7 +467,9 @@ PYYT
 }
 
 build_ffmpeg_transcode_args() {
-  local probe_json profile_name profile_axis profile_fps video_bitrate
+  local probe_json profile_name profile_axis profile_fps video_bitrate ffprobe_start_ms
+  ffprobe_start_ms="$(current_epoch_ms)"
+  log_json "ffprobe_started" "probing_proxy_rtmp" "$(elapsed_ms "$RUNNER_START_MS")"
   set +e
   probe_json="$(timeout "$FFPROBE_TIMEOUT_SECONDS" ffprobe -v error -select_streams v:0 \
     -show_entries stream=codec_type,width,height,avg_frame_rate,r_frame_rate \
@@ -433,10 +478,12 @@ build_ffmpeg_transcode_args() {
   set -e
   if [ "$probe_exit" -ne 0 ] || [ -z "$probe_json" ]; then
     probe_json='{}'
-    log_json "worker_warning" "ffprobe_failed_using_youtube_240p_720p30_defaults" "$(elapsed_ms "$RUNNER_START_MS")"
+    log_json "worker_warning" "ffprobe_failed_using_youtube_240p_720p30_defaults" "$(elapsed_ms "$ffprobe_start_ms")"
   elif ! json_is_valid "$probe_json"; then
     probe_json='{}'
-    log_json "worker_warning" "ffprobe_invalid_json_using_youtube_240p_720p30_defaults" "$(elapsed_ms "$RUNNER_START_MS")"
+    log_json "worker_warning" "ffprobe_invalid_json_using_youtube_240p_720p30_defaults" "$(elapsed_ms "$ffprobe_start_ms")"
+  else
+    log_json "ffprobe_completed" "ok" "$(elapsed_ms "$ffprobe_start_ms")"
   fi
   IFS='|' read -r profile_name profile_axis profile_fps video_bitrate < <(select_youtube_encoder_settings "$probe_json")
   YOUTUBE_PROFILE_NAME="$profile_name"
@@ -498,7 +545,6 @@ FFMPEG_START_MS="$(current_epoch_ms)"
 FFMPEG_RUN_ID=""
 ATTEMPT_LOG_FILE="/tmp/ffmpeg_${SAFE_STREAM_KEY}.attempt_${attempt}.log"
 : > "$ATTEMPT_LOG_FILE"
-log_json "ffmpeg_process_spawned" "single_attempt_no_timeout" "$(elapsed_ms "$FFMPEG_START_MS")"
 build_ffmpeg_transcode_args
 
 ffmpeg \
@@ -513,8 +559,10 @@ ffmpeg \
 
 FFMPEG_PID=$!
 FFMPEG_RUN_ID="${EPOCHREALTIME:-$(date +%s)}-${FFMPEG_PID}-${RANDOM}"
+log_json "ffmpeg_process_spawned" "single_attempt_no_timeout" "$(elapsed_ms "$FFMPEG_START_MS")"
 echo "$FFMPEG_PID" > "$PID_FILE"
 start_progress_reader
+start_progress_watchdog
 
 set +e
 wait "$FFMPEG_PID"
@@ -534,6 +582,7 @@ if progress_file_has_complete_line; then
     sleep "$FFMPEG_PROGRESS_NOTIFY_POLL_SECONDS"
   done
 fi
+stop_progress_watchdog
 stop_progress_reader
 
 log_json "ffmpeg_exited" "exit_${EXIT_CODE}_no_retry" "$(elapsed_ms "$FFMPEG_START_MS")"

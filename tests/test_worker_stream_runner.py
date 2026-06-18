@@ -58,6 +58,12 @@ if [ "$scenario" = "destination_refused" ]; then
   exit 1
 fi
 
+if [ "$scenario" = "no_progress_slow_success" ]; then
+  echo "Input opened but no frames have been written yet" >&2
+  sleep "${FAKE_FFMPEG_SLEEP_SECONDS:-0.2}"
+  exit 0
+fi
+
 if [ -n "$progress_path" ]; then
   printf 'frame=1
 progress=end
@@ -397,6 +403,23 @@ def test_ffmpeg_selects_profile_by_shorter_axis_for_portrait_streams(tmp_path):
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-b:v\n10M" in args
     assert "-vf\nscale=w='if(lte(iw,ih),1080,-2)':h='if(lte(iw,ih),-2,1080)',setsar=1" in args
+
+
+def test_worker_logs_watchdog_when_ffmpeg_never_reports_progress(tmp_path):
+    result = _run_runner(
+        tmp_path,
+        "no_progress_slow_success",
+        stream_status="active",
+        extra_env={
+            "FAKE_FFMPEG_SLEEP_SECONDS": "1.5",
+            "FFMPEG_STARTUP_PROGRESS_TIMEOUT_SECONDS": "0.05",
+        },
+    )
+
+    assert result.returncode == 0, result.stdout
+    assert "ffmpeg_process_spawned" in result.stdout
+    assert "ffmpeg_no_progress_after_0.05s" in result.stdout
+    assert "[ffmpeg-watchdog] Input opened but no frames have been written yet" in result.stdout
 
 
 def test_real_ffmpeg_accepts_youtube_filter_and_encoder_options():
