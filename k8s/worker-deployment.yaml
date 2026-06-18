@@ -29,12 +29,15 @@ spec:
               name: metrics
               protocol: TCP
           resources:
+            # Workers now transcode each live stream to H.264/AAC instead of
+            # copying codecs. Reserve a practical minimum for one live
+            # transcode while still allowing CPU burst for higher resolutions.
             requests:
-              memory: "256Mi"
-              cpu: "250m"
+              memory: "2Gi"
+              cpu: "2000m"
             limits:
-              memory: "1Gi"
-              cpu: "1000m"
+              memory: "4Gi"
+              cpu: "4000m"
           startupProbe:
             httpGet:
               path: /healthz

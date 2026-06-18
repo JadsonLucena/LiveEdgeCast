@@ -1777,6 +1777,10 @@ def test_worker_and_proxy_scripts_url_encode_controller_callbacks():
     worker_deployment = Path('k8s/worker-deployment.yaml').read_text()
     assert 'containerPort: 9113' in worker_deployment
     assert 'name: metrics' in worker_deployment
+    assert 'memory: "2Gi"' in worker_deployment
+    assert 'cpu: "2000m"' in worker_deployment
+    assert 'memory: "4Gi"' in worker_deployment
+    assert 'cpu: "4000m"' in worker_deployment
     assert 'CONTROLLER_API="${CONTROLLER_API:-http://controller.media.svc.cluster.local:8000}"' in proxy_script
     assert '--connect-timeout "${CONTROLLER_CALLBACK_CONNECT_TIMEOUT_SECONDS:-1}"' in proxy_script
     assert '--data-urlencode "proxy_pod=${PROXY_POD}"' in proxy_script
