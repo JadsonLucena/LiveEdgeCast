@@ -363,14 +363,14 @@ import json
 import os
 
 profiles = [
-    {"name": "2160p60", "height": 2160, "fps": 60, "bitrate": "35M", "h264_level": "5.2"},
-    {"name": "2160p30", "height": 2160, "fps": 30, "bitrate": "30M", "h264_level": "5.1"},
-    {"name": "1440p60", "height": 1440, "fps": 60, "bitrate": "24M", "h264_level": "5.1"},
-    {"name": "1440p30", "height": 1440, "fps": 30, "bitrate": "15M", "h264_level": "5.0"},
-    {"name": "1080p60", "height": 1080, "fps": 60, "bitrate": "12M", "h264_level": "4.2"},
-    {"name": "1080p30", "height": 1080, "fps": 30, "bitrate": "10M", "h264_level": "4.0"},
-    {"name": "720p60", "height": 720, "fps": 60, "bitrate": "6M", "h264_level": "3.2"},
-    {"name": "240p-720p30", "height": 720, "fps": 30, "bitrate": "4M", "h264_level": "3.1"},
+    {"name": "2160p60", "height": 2160, "fps": 60, "bitrate": "35M"},
+    {"name": "2160p30", "height": 2160, "fps": 30, "bitrate": "30M"},
+    {"name": "1440p60", "height": 1440, "fps": 60, "bitrate": "24M"},
+    {"name": "1440p30", "height": 1440, "fps": 30, "bitrate": "15M"},
+    {"name": "1080p60", "height": 1080, "fps": 60, "bitrate": "12M"},
+    {"name": "1080p30", "height": 1080, "fps": 30, "bitrate": "10M"},
+    {"name": "720p60", "height": 720, "fps": 60, "bitrate": "6M"},
+    {"name": "240p-720p30", "height": 720, "fps": 30, "bitrate": "4M"},
 ]
 
 def parse_fps(value):
@@ -419,12 +419,12 @@ else:
 # sub-720p inputs keep their original shorter axis instead of being upscaled.
 output_resolution_axis = min(resolution_axis, selected["height"]) if selected["height"] <= 720 else selected["height"]
 
-print(f'{selected["name"]}|{output_resolution_axis}|{output_fps}|{selected["bitrate"]}|{selected["h264_level"]}')
+print(f'{selected["name"]}|{output_resolution_axis}|{output_fps}|{selected["bitrate"]}')
 PYYT
 }
 
 build_ffmpeg_transcode_args() {
-  local probe_json profile_name profile_axis profile_fps video_bitrate h264_level
+  local probe_json profile_name profile_axis profile_fps video_bitrate
   set +e
   probe_json="$(timeout "$FFPROBE_TIMEOUT_SECONDS" ffprobe -v error -select_streams v:0 \
     -show_entries stream=codec_type,width,height,avg_frame_rate,r_frame_rate \
@@ -438,12 +438,11 @@ build_ffmpeg_transcode_args() {
     probe_json='{}'
     log_json "worker_warning" "ffprobe_invalid_json_using_youtube_240p_720p30_defaults" "$(elapsed_ms "$RUNNER_START_MS")"
   fi
-  IFS='|' read -r profile_name profile_axis profile_fps video_bitrate h264_level < <(select_youtube_encoder_settings "$probe_json")
+  IFS='|' read -r profile_name profile_axis profile_fps video_bitrate < <(select_youtube_encoder_settings "$probe_json")
   YOUTUBE_PROFILE_NAME="$profile_name"
   YOUTUBE_OUTPUT_AXIS="$profile_axis"
   YOUTUBE_PROFILE_FPS="$profile_fps"
   YOUTUBE_VIDEO_BITRATE="$video_bitrate"
-  YOUTUBE_H264_LEVEL="$h264_level"
   log_json "youtube_encoder_profile_selected" "$YOUTUBE_PROFILE_NAME" "$(elapsed_ms "$RUNNER_START_MS")"
   log_json "youtube_encoder_output_selected" "axis_${YOUTUBE_OUTPUT_AXIS}_fps_${YOUTUBE_PROFILE_FPS}" "$(elapsed_ms "$RUNNER_START_MS")"
 
@@ -452,7 +451,6 @@ build_ffmpeg_transcode_args() {
     -preset veryfast
     -pix_fmt yuv420p
     -profile:v high
-    -level:v "$YOUTUBE_H264_LEVEL"
     -bf 2
     -refs 1
     -coder 1

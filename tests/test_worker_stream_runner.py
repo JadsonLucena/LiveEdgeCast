@@ -212,7 +212,6 @@ def test_ffmpeg_transcodes_to_h264_and_youtube_1080p30_profile(tmp_path):
     assert "-c:v\nlibx264" in args
     assert "-b:v\n10M" in args
     assert "-minrate\n10M" in args
-    assert "-level:v\n4.0" in args
     assert "-bf\n2" in args
     assert "-refs\n1" in args
     assert "-coder\n1" in args
@@ -238,7 +237,6 @@ def test_ffmpeg_uses_closest_youtube_1440p60_profile(tmp_path):
     assert '"status":"1440p60"' in result.stdout
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-b:v\n24M" in args
-    assert "-level:v\n5.1" in args
     assert "-r\n60" in args
 
 
@@ -275,7 +273,6 @@ def test_ffmpeg_uses_720p60_profile(tmp_path):
     assert '"status":"720p60"' in result.stdout
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-b:v\n6M" in args
-    assert "-level:v\n3.2" in args
     assert "-r\n60" in args
     assert "-vf\nscale=w='if(lte(iw,ih),720,-2)':h='if(lte(iw,ih),-2,720)',setsar=1" in args
 
@@ -298,7 +295,7 @@ def test_ffmpeg_preserves_sub_720p_height_with_240p_to_720p_profile(tmp_path):
     assert "-vf\nscale=w='if(lte(iw,ih),480,-2)':h='if(lte(iw,ih),-2,480)',setsar=1" in args
 
 
-def test_ffmpeg_uses_2160p60_profile_with_4k_h264_level(tmp_path):
+def test_ffmpeg_uses_2160p60_profile(tmp_path):
     result = _run_runner(
         tmp_path,
         "success",
@@ -313,7 +310,6 @@ def test_ffmpeg_uses_2160p60_profile_with_4k_h264_level(tmp_path):
     assert '"status":"2160p60"' in result.stdout
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-b:v\n35M" in args
-    assert "-level:v\n5.2" in args
     assert "-vf\nscale=w='if(lte(iw,ih),2160,-2)':h='if(lte(iw,ih),-2,2160)',setsar=1" in args
 
 
@@ -330,7 +326,6 @@ def test_ffmpeg_falls_back_to_720p30_when_ffprobe_fails(tmp_path):
     assert '"status":"240p-720p30"' in result.stdout
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-b:v\n4M" in args
-    assert "-level:v\n3.1" in args
 
 
 def test_ffmpeg_falls_back_to_720p30_when_ffprobe_returns_invalid_json(tmp_path):
@@ -346,7 +341,6 @@ def test_ffmpeg_falls_back_to_720p30_when_ffprobe_returns_invalid_json(tmp_path)
     assert '"status":"240p-720p30"' in result.stdout
     args = (tmp_path / "state" / "ffmpeg_args").read_text()
     assert "-b:v\n4M" in args
-    assert "-level:v\n3.1" in args
 
 
 def test_ffmpeg_uses_r_frame_rate_when_avg_frame_rate_is_zero(tmp_path):
@@ -429,8 +423,6 @@ def test_real_ffmpeg_accepts_youtube_filter_and_encoder_options():
             "yuv420p",
             "-profile:v",
             "high",
-            "-level:v",
-            "3.1",
             "-bf",
             "2",
             "-refs",
