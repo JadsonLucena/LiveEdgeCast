@@ -33,10 +33,10 @@ spec:
             # copying codecs. Reserve a practical minimum for one live
             # transcode while still allowing CPU burst for higher resolutions.
             requests:
-              memory: "2Gi"
+              memory: "1Gi"
               cpu: "2000m"
             limits:
-              memory: "4Gi"
+              memory: "2Gi"
               cpu: "4000m"
           startupProbe:
             httpGet:
