@@ -30,13 +30,13 @@ spec:
               protocol: TCP
           resources:
             # Workers now transcode each live stream to H.264/AAC instead of
-            # copying codecs. Reserve a practical minimum for one live
-            # transcode while still allowing CPU burst for higher resolutions.
+            # copying codecs. Reserve a dedicated quad-core / 4 GiB budget for
+            # one live transcode.
             requests:
-              memory: "1Gi"
-              cpu: "2000m"
+              memory: "4Gi"
+              cpu: "4000m"
             limits:
-              memory: "2Gi"
+              memory: "4Gi"
               cpu: "4000m"
           startupProbe:
             httpGet:
