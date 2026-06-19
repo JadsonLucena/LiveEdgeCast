@@ -44,6 +44,63 @@ if ! kubectl cluster-info >/dev/null 2>&1; then
 fi
 print_success "kubectl can connect to cluster"
 
+PROXY_NODE_NAME="${PROXY_NODE_NAME:-}"
+PROXY_NODE_LABEL_KEY="${PROXY_NODE_LABEL_KEY:-liveedgecast.io/node-role}"
+PROXY_NODE_LABEL_VALUE="${PROXY_NODE_LABEL_VALUE:-proxy}"
+PROXY_NODE_CPUS="${PROXY_NODE_CPUS:-2}"
+PROXY_NODE_MEMORY="${PROXY_NODE_MEMORY:-2g}"
+LIMIT_PROXY_NODE_RESOURCES="${LIMIT_PROXY_NODE_RESOURCES:-false}"
+PATCH_PROXY_NODE_SELECTOR="${PATCH_PROXY_NODE_SELECTOR:-false}"
+
+configure_proxy_node() {
+    if [[ -z "$PROXY_NODE_NAME" ]]; then
+        return 0
+    fi
+
+    print_step "Configuring proxy node '$PROXY_NODE_NAME'..."
+    kubectl get node "$PROXY_NODE_NAME" >/dev/null || {
+        print_error "Proxy node '$PROXY_NODE_NAME' was not found"
+        exit 1
+    }
+    kubectl label node "$PROXY_NODE_NAME" "${PROXY_NODE_LABEL_KEY}=${PROXY_NODE_LABEL_VALUE}" --overwrite || {
+        print_error "Failed to label proxy node '$PROXY_NODE_NAME'"
+        exit 1
+    }
+    print_success "Proxy node '$PROXY_NODE_NAME' labeled ${PROXY_NODE_LABEL_KEY}=${PROXY_NODE_LABEL_VALUE}"
+
+    if [[ "$LIMIT_PROXY_NODE_RESOURCES" == "true" || "$LIMIT_PROXY_NODE_RESOURCES" == "1" ]]; then
+        if docker inspect "$PROXY_NODE_NAME" >/dev/null 2>&1; then
+            docker update --cpus "$PROXY_NODE_CPUS" --memory "$PROXY_NODE_MEMORY" "$PROXY_NODE_NAME" >/dev/null || {
+                print_error "Failed to update Docker resource limits for proxy node '$PROXY_NODE_NAME'"
+                exit 1
+            }
+            print_success "Docker-backed proxy node '$PROXY_NODE_NAME' limited to ${PROXY_NODE_CPUS} CPU / ${PROXY_NODE_MEMORY} memory"
+        else
+            print_warning "LIMIT_PROXY_NODE_RESOURCES=true, but '$PROXY_NODE_NAME' is not a local Docker container. Configure 2 vCPU / 2 GiB in the cluster provider instead."
+        fi
+    fi
+}
+
+patch_proxy_node_selector() {
+    if [[ -z "$PROXY_NODE_NAME" ]]; then
+        return 0
+    fi
+    if [[ "$PATCH_PROXY_NODE_SELECTOR" != "true" && "$PATCH_PROXY_NODE_SELECTOR" != "1" ]]; then
+        print_warning "Proxy node was labeled, but proxy Deployment was not pinned. Set PATCH_PROXY_NODE_SELECTOR=true to schedule proxy Pods on ${PROXY_NODE_LABEL_KEY}=${PROXY_NODE_LABEL_VALUE}."
+        return 0
+    fi
+
+    print_step "Patching proxy Deployment nodeSelector..."
+    kubectl patch deployment proxy -n media --type merge \
+        -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"${PROXY_NODE_LABEL_KEY}\":\"${PROXY_NODE_LABEL_VALUE}\"}}}}}" || {
+        print_error "Failed to patch proxy Deployment nodeSelector"
+        exit 1
+    }
+    print_success "Proxy Deployment pinned to ${PROXY_NODE_LABEL_KEY}=${PROXY_NODE_LABEL_VALUE}"
+}
+
+configure_proxy_node
+
 kubectl apply -f k8s/namespaces.yaml || { print_error "Failed to create namespace"; exit 1; }
 
 kubectl wait --for jsonpath='{.status.phase}=Active' --timeout=30s namespace/media || {
@@ -166,6 +223,8 @@ for manifest in "${CORE_MANIFESTS[@]}"; do
 done
 kubectl apply "${CORE_APPLY_ARGS[@]}" || { print_error "Core deployment failed"; exit 1; }
 print_success "Core Kubernetes manifests applied"
+
+patch_proxy_node_selector
 
 if [[ "$PROMETHEUS_AVAILABLE" == "true" ]] && \
    kubectl get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1 && \
