@@ -1148,13 +1148,13 @@ count(kube_pod_info{namespace="$namespace", pod=~"proxy-.*"})
 ### pod_cpu_rate
 
 ```promql
-sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))
+sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))
 ```
 
 Fallback para instalações cAdvisor antigas que usam `pod_name`/`container_name`:
 
 ```promql
-sum by (pod_name) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container_name!="", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))
+sum by (pod_name) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))
 ```
 
 Fallback por componente usado pelo runner quando a consulta bruta não contém
@@ -1167,13 +1167,13 @@ liveedgecast:component:cpu_cores:rate5m{component=~"(proxy-lb|proxy|worker|contr
 ### pod_memory_working_set
 
 ```promql
-sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})
+sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})
 ```
 
 Fallback para labels legados:
 
 ```promql
-sum by (pod_name) (container_memory_working_set_bytes{namespace="$namespace", container_name!="", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"})
+sum by (pod_name) (container_memory_working_set_bytes{namespace="$namespace", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"})
 ```
 
 Fallback por componente:

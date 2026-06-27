@@ -1210,6 +1210,13 @@ def test_resource_usage_falls_back_to_legacy_pod_name_cpu_labels(tmp_path):
     assert worker_cpu["mean"] == "1.0"
 
 
+def test_resource_promql_keeps_empty_container_pod_cgroup_fallback():
+    assert 'container!=""' not in runner.DEFAULT_PROMQL["pod_cpu_rate"]
+    assert 'container_name!=""' not in runner.DEFAULT_PROMQL["pod_name_cpu_rate"]
+    assert 'container!="POD"' in runner.DEFAULT_PROMQL["pod_cpu_rate"]
+    assert 'container_name!="POD"' in runner.DEFAULT_PROMQL["pod_name_cpu_rate"]
+
+
 def test_require_prometheus_analysis_affects_automation_verdict(tmp_path):
     cfg = config(tmp_path)
     cfg.prometheus_url = "http://prometheus.example"

@@ -96,7 +96,10 @@ compatível com `pod_name` e coleta as recording rules
 `liveedgecast:component:memory_working_set_bytes` como fallback por componente.
 Se a série bruta não tiver worker, mas qualquer fallback tiver worker,
 `resource_usage.csv` mantém o resultado sob `metric=pod_cpu_rate` ou
-`metric=pod_memory_working_set` para compatibilidade.
+`metric=pod_memory_working_set` para compatibilidade. As consultas brutas
+excluem apenas o container infra `POD` e mantêm séries com container vazio,
+porque alguns clusters expõem somente o agregado do cgroup do Pod; remover
+`container=""` pode fazer CPU/memória desaparecerem por completo.
 
 ### `correctness_metrics.csv`
 
