@@ -1064,6 +1064,40 @@ def test_resource_activity_ignores_extra_prometheus_run_files(tmp_path):
     assert metrics["prometheus_coverage"]["extra_run_ids"] == ["stale"]
 
 
+def test_resource_usage_groups_cpu_by_explicit_worker_component_label(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 0.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 10.0, "stream_keys": ["key1"]})
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run.run.json",
+        {
+            "_metadata": {"run_id": "run", "started_at": 0.0, "ended_at": 10.0},
+            "pod_cpu_rate": {
+                "available": True,
+                "response": {
+                    "status": "success",
+                    "data": {
+                        "result": [
+                            {
+                                "metric": {"component": "worker"},
+                                "values": [[0.0, "0.25"], [5.0, "0.5"]],
+                            }
+                        ]
+                    },
+                },
+            },
+        },
+    )
+
+    runner.build_metrics(cfg, dirs)
+    rows = runner.csv_rows(dirs["metrics"] / "resource_usage.csv")
+    worker_cpu = next(row for row in rows if row["metric"] == "pod_cpu_rate" and row["component"] == "worker")
+
+    assert worker_cpu["samples"] == "2"
+    assert worker_cpu["mean"] == "0.375"
+
+
 def test_require_prometheus_analysis_affects_automation_verdict(tmp_path):
     cfg = config(tmp_path)
     cfg.prometheus_url = "http://prometheus.example"

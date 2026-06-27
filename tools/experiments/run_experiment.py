@@ -2270,7 +2270,17 @@ def prom_series_values_by_component(result: dict[str, Any]) -> dict[str, list[fl
     grouped: dict[str, list[float]] = {}
     for series in data.get("result") or []:
         metric = series.get("metric") or {}
-        component = infer_component(metric.get("pod") or metric.get("pod_name") or metric.get("container") or "")
+        # Prefer explicit workload labels when they exist, then fall back to
+        # pod-name inference. Some Prometheus/cAdvisor setups expose resource
+        # series without a ``pod`` label after recording rules, but retain
+        # labels such as ``component`` or ``app``. If we only inferred from the
+        # pod label, valid worker CPU samples could be grouped as ``unknown``
+        # (or disappear from the expected worker row in resource_usage.csv).
+        component = (
+            str(metric.get("component") or metric.get("app") or metric.get("app_kubernetes_io_name") or "").strip()
+            or infer_component(metric.get("pod") or metric.get("pod_name") or metric.get("container") or "")
+        )
+        component = infer_component(component) if component else "unknown"
         if component == "unknown" and metric.get("job"):
             component = infer_component(str(metric.get("job")))
         bucket = grouped.setdefault(component, [])

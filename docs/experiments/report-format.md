@@ -75,6 +75,17 @@ Registra falhas injetadas e, quando possível, tempo de recuperação observado.
 
 Resume séries do Prometheus para CPU, memória e rede, incluindo média, mediana, P50, P95, P99, mínimo, máximo e intervalo de confiança.
 
+Se `pod_cpu_rate` aparecer sem a linha `component=worker`, primeiro consulte
+`metrics/prometheus_metric_coverage.csv`: `query_success=true` com
+`samples_observed=false` indica que a consulta Prometheus executou, mas o
+cAdvisor/kubelet não retornou amostras no intervalo do experimento. Isso costuma
+ocorrer quando o worker é muito curto para o scrape/range de `rate(...[1m])`, a
+janela consultada não cobre a vida do Pod, ou o cluster não expõe
+`container_cpu_usage_seconds_total` para Pods encerrados. Quando há amostras, o
+runner agrupa por labels explícitos de workload (`component`, `app`,
+`app_kubernetes_io_name`) antes de inferir o componente pelo nome do Pod, para
+preservar CPU de workers vinda de recording rules que removem o label `pod`.
+
 ### `correctness_metrics.csv`
 
 Resume indícios de correção por `run_id + repetition + streamKey`. O arquivo separa `worker_observed_for_stream`, `at_most_one_worker_per_stream` e `one_worker_per_stream`, evitando considerar uma stream sem worker observado como válida. Duplicidade combina snapshots de pods com eventos estruturados do controller para reduzir o risco de perder sobreposições transitórias; substituições históricas entre repetições não são tratadas como duplicidade. A coluna `worker_observed_for_stream` considera evidências densas de controller events (`worker_created`, `worker_ready_observed`, `ffmpeg_started`, `ffmpeg_first_progress`) para não perder workers curtos que nasceram e morreram entre snapshots Kubernetes.
@@ -153,4 +164,3 @@ Além de `raw/prometheus_range_queries.run.<run-id>.json`, o runner salva `raw/p
 A tabela `Resultado por streamKey` combina snapshots Kubernetes com eventos estruturados do controller. Quando o worker é criado e removido entre snapshots, `initial_worker`, `final_worker` e `proxy_owner` podem ser preenchidos por eventos como `worker_created`, `worker_ready_observed`, `ffmpeg_started` e `ffmpeg_first_progress`.
 
 `activation_metrics.csv` inclui `event_detection_status` para indicar se `event_detection_seconds` foi observado diretamente, ficou ausente ou foi normalizado para `0.0` por ruído pequeno de ordenação/clock entre proxy e controller.
-
