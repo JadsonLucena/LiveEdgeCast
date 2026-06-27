@@ -88,9 +88,11 @@ DEFAULT_PROMQL = {
     "workers_active": 'count(kube_pod_info{namespace="$namespace", pod=~"worker-.*"})',
     "proxies_active": 'count(kube_pod_info{namespace="$namespace", pod=~"proxy-.*"})',
     "controllers_active": 'count(kube_pod_info{namespace="$namespace", pod=~"controller-.*"})',
-    "pod_cpu_rate": 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))',
+    "pod_cpu_rate": 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))',
+    "pod_name_cpu_rate": 'sum by (pod_name) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container_name!="", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))',
     "component_cpu_rate": 'liveedgecast:component:cpu_cores:rate5m{component=~"(proxy-lb|proxy|worker|controller)"}',
-    "pod_memory_working_set": 'sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})',
+    "pod_memory_working_set": 'sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})',
+    "pod_name_memory_working_set": 'sum by (pod_name) (container_memory_working_set_bytes{namespace="$namespace", container_name!="", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"})',
     "component_memory_working_set": 'liveedgecast:component:memory_working_set_bytes{component=~"(proxy-lb|proxy|worker|controller)"}',
     "stream_lifecycle_phase_seconds_p50": 'histogram_quantile(0.50, sum by (le, phase) (increase(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
     "stream_lifecycle_phase_seconds_p95": 'histogram_quantile(0.95, sum by (le, phase) (increase(stream_lifecycle_phase_seconds_bucket$controller_label_selector[5m])))',
@@ -1555,7 +1557,14 @@ def update_prometheus_index(config: RunnerConfig, dirs: dict[str, Path], path: P
 
 def collect_prometheus(config: RunnerConfig, dirs: dict[str, Path], start: float, end: float, controller_label_selector: str | None = None) -> dict[str, Any]:
     resource_settle_seconds = max(0.0, float(getattr(config, "prometheus_resource_settle_seconds", 0.0) or 0.0))
-    resource_metric_names = {"pod_cpu_rate", "component_cpu_rate", "pod_memory_working_set", "component_memory_working_set"}
+    resource_metric_names = {
+        "pod_cpu_rate",
+        "pod_name_cpu_rate",
+        "component_cpu_rate",
+        "pod_memory_working_set",
+        "pod_name_memory_working_set",
+        "component_memory_working_set",
+    }
     resource_query_end = end
     if resource_settle_seconds > 0:
         time.sleep(resource_settle_seconds)
@@ -3031,15 +3040,16 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
 
     resource_rows = []
     resource_metric_fallbacks = {
-        "pod_cpu_rate": "component_cpu_rate",
-        "pod_memory_working_set": "component_memory_working_set",
+        "pod_cpu_rate": ("pod_name_cpu_rate", "component_cpu_rate"),
+        "pod_memory_working_set": ("pod_name_memory_working_set", "component_memory_working_set"),
     }
     for metric_name in ("pod_cpu_rate", "pod_memory_working_set"):
         grouped_components = prom_series_values_by_component(prom.get(metric_name, {}))
-        fallback_components = prom_series_values_by_component(prom.get(resource_metric_fallbacks[metric_name], {}))
-        for component, fallback_values in fallback_components.items():
-            if component not in grouped_components or not grouped_components[component]:
-                grouped_components[component] = fallback_values
+        for fallback_metric_name in resource_metric_fallbacks[metric_name]:
+            fallback_components = prom_series_values_by_component(prom.get(fallback_metric_name, {}))
+            for component, fallback_values in fallback_components.items():
+                if component not in grouped_components or not grouped_components[component]:
+                    grouped_components[component] = fallback_values
         if not grouped_components:
             resource_rows.append({"metric": metric_name, "component": "not_observable", **stats([])})
             continue

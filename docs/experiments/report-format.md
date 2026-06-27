@@ -81,17 +81,20 @@ Se `pod_cpu_rate` aparecer sem a linha `component=worker`, primeiro consulte
 cAdvisor/kubelet não retornou amostras no intervalo do experimento. Isso costuma
 ocorrer quando o worker é muito curto para o scrape/range de `rate(...[1m])`, a
 janela consultada não cobre a vida do Pod, ou o cluster não expõe
-`container_cpu_usage_seconds_total` para Pods encerrados. Por padrão, o runner
-aguarda `--prometheus-resource-settle-seconds=30` antes de coletar recursos e
-estende apenas a janela de CPU/memória até esse instante, reduzindo perdas
-intermitentes por alinhamento de scrape sem inflar `workers_active`/Pod-seconds.
+`container_cpu_usage_seconds_total` para Pods encerrados, ou quando o cAdvisor do
+cluster usa os labels legados `pod_name`/`container_name` em vez de
+`pod`/`container`. Por padrão, o runner aguarda
+`--prometheus-resource-settle-seconds=30` antes de coletar recursos e estende
+apenas a janela de CPU/memória até esse instante, reduzindo perdas intermitentes
+por alinhamento de scrape sem inflar `workers_active`/Pod-seconds.
 Quando há amostras, o runner agrupa por labels explícitos de workload
 (`component`, `app`, `app_kubernetes_io_name`) antes de inferir o componente pelo
 nome do Pod, para preservar CPU de workers vinda de recording rules que removem
-o label `pod`. Além da consulta bruta por Pod, o runner coleta as recording
-rules `liveedgecast:component:cpu_cores:rate5m` e
-`liveedgecast:component:memory_working_set_bytes` como fallback por componente;
-se a série bruta não tiver worker, mas a recording rule tiver `component=worker`,
+o label `pod`. Além da consulta bruta por Pod, o runner tenta uma consulta
+compatível com `pod_name` e coleta as recording rules
+`liveedgecast:component:cpu_cores:rate5m` e
+`liveedgecast:component:memory_working_set_bytes` como fallback por componente.
+Se a série bruta não tiver worker, mas qualquer fallback tiver worker,
 `resource_usage.csv` mantém o resultado sob `metric=pod_cpu_rate` ou
 `metric=pod_memory_working_set` para compatibilidade.
 
