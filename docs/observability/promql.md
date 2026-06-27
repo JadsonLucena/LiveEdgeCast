@@ -1151,10 +1151,23 @@ count(kube_pod_info{namespace="$namespace", pod=~"proxy-.*"})
 sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))
 ```
 
+Fallback por componente usado pelo runner quando a consulta bruta não contém
+algum componente, especialmente workers curtos:
+
+```promql
+liveedgecast:component:cpu_cores:rate5m{component=~"(proxy-lb|proxy|worker|controller)"}
+```
+
 ### pod_memory_working_set
 
 ```promql
 sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})
+```
+
+Fallback por componente:
+
+```promql
+liveedgecast:component:memory_working_set_bytes{component=~"(proxy-lb|proxy|worker|controller)"}
 ```
 
 ### proxy_network_receive_bps
@@ -1174,4 +1187,3 @@ histogram_quantile(0.95, sum by (le, phase) (increase(stream_lifecycle_phase_sec
 ```promql
 histogram_quantile(0.95, sum by (le) (rate(worker_recovery_duration_seconds_bucket[5m])))
 ```
-

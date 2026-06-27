@@ -881,7 +881,9 @@ def test_collect_prometheus_extends_only_resource_query_window_after_settle(monk
     assert result["_metadata"]["ended_at"] == 120.0
     assert result["_metadata"]["resource_query_ended_at"] == 135.0
     assert result["pod_cpu_rate"]["range_end"] == 135.0
+    assert result["component_cpu_rate"]["range_end"] == 135.0
     assert result["pod_memory_working_set"]["range_end"] == 135.0
+    assert result["component_memory_working_set"]["range_end"] == 135.0
     assert result["workers_active"]["range_end"] == 120.0
 
 
@@ -1137,6 +1139,42 @@ def test_resource_usage_groups_cpu_by_explicit_worker_component_label(tmp_path):
 
     assert worker_cpu["samples"] == "2"
     assert worker_cpu["mean"] == "0.375"
+
+
+def test_resource_usage_falls_back_to_component_cpu_recording_rule(tmp_path):
+    cfg = config(tmp_path)
+    dirs = runner.ensure_layout(cfg.report_root)
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_started", "run_id": "run", "repetition": 1, "timestamp": 0.0, "stream_keys": ["key1"]})
+    runner.append_jsonl(dirs["raw"] / "streams.jsonl", {"event": "run_finished", "run_id": "run", "repetition": 1, "ended_at": 10.0, "stream_keys": ["key1"]})
+    runner.write_json(
+        dirs["raw"] / "prometheus_range_queries.run.run.json",
+        {
+            "_metadata": {"run_id": "run", "started_at": 0.0, "ended_at": 10.0},
+            "pod_cpu_rate": {
+                "available": True,
+                "response": {
+                    "status": "success",
+                    "data": {"result": [{"metric": {"pod": "proxy-a"}, "values": [[0.0, "0.1"]]}]},
+                },
+            },
+            "component_cpu_rate": {
+                "available": True,
+                "response": {
+                    "status": "success",
+                    "data": {"result": [{"metric": {"component": "worker"}, "values": [[0.0, "1.25"], [5.0, "1.75"]]}]},
+                },
+            },
+        },
+    )
+
+    runner.build_metrics(cfg, dirs)
+    rows = runner.csv_rows(dirs["metrics"] / "resource_usage.csv")
+    worker_cpu = next(row for row in rows if row["metric"] == "pod_cpu_rate" and row["component"] == "worker")
+    proxy_cpu = next(row for row in rows if row["metric"] == "pod_cpu_rate" and row["component"] == "proxy")
+
+    assert worker_cpu["samples"] == "2"
+    assert worker_cpu["mean"] == "1.5"
+    assert proxy_cpu["samples"] == "1"
 
 
 def test_require_prometheus_analysis_affects_automation_verdict(tmp_path):

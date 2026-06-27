@@ -88,7 +88,12 @@ intermitentes por alinhamento de scrape sem inflar `workers_active`/Pod-seconds.
 Quando há amostras, o runner agrupa por labels explícitos de workload
 (`component`, `app`, `app_kubernetes_io_name`) antes de inferir o componente pelo
 nome do Pod, para preservar CPU de workers vinda de recording rules que removem
-o label `pod`.
+o label `pod`. Além da consulta bruta por Pod, o runner coleta as recording
+rules `liveedgecast:component:cpu_cores:rate5m` e
+`liveedgecast:component:memory_working_set_bytes` como fallback por componente;
+se a série bruta não tiver worker, mas a recording rule tiver `component=worker`,
+`resource_usage.csv` mantém o resultado sob `metric=pod_cpu_rate` ou
+`metric=pod_memory_working_set` para compatibilidade.
 
 ### `correctness_metrics.csv`
 
