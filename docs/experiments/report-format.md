@@ -81,10 +81,14 @@ Se `pod_cpu_rate` aparecer sem a linha `component=worker`, primeiro consulte
 cAdvisor/kubelet não retornou amostras no intervalo do experimento. Isso costuma
 ocorrer quando o worker é muito curto para o scrape/range de `rate(...[1m])`, a
 janela consultada não cobre a vida do Pod, ou o cluster não expõe
-`container_cpu_usage_seconds_total` para Pods encerrados. Quando há amostras, o
-runner agrupa por labels explícitos de workload (`component`, `app`,
-`app_kubernetes_io_name`) antes de inferir o componente pelo nome do Pod, para
-preservar CPU de workers vinda de recording rules que removem o label `pod`.
+`container_cpu_usage_seconds_total` para Pods encerrados. Por padrão, o runner
+aguarda `--prometheus-resource-settle-seconds=30` antes de coletar recursos e
+estende apenas a janela de CPU/memória até esse instante, reduzindo perdas
+intermitentes por alinhamento de scrape sem inflar `workers_active`/Pod-seconds.
+Quando há amostras, o runner agrupa por labels explícitos de workload
+(`component`, `app`, `app_kubernetes_io_name`) antes de inferir o componente pelo
+nome do Pod, para preservar CPU de workers vinda de recording rules que removem
+o label `pod`.
 
 ### `correctness_metrics.csv`
 

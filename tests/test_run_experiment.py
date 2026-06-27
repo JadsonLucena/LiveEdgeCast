@@ -431,6 +431,7 @@ def test_prometheus_scope_uses_effective_patch_result(monkeypatch, tmp_path):
     cfg = config(tmp_path)
     cfg.patch_proxy_context = True
     cfg.prometheus_url = "http://prometheus.example"
+    cfg.prometheus_resource_settle_seconds = 0
     dirs = runner.ensure_layout(cfg.report_root)
     captured = []
 
@@ -811,6 +812,7 @@ def test_duplicate_publisher_nonzero_without_rejection_changes_exit_code(monkeyp
 def test_collect_prometheus_writes_per_run_files_and_loads_resume_safe_evidence(monkeypatch, tmp_path):
     cfg = config(tmp_path)
     cfg.prometheus_url = "http://prometheus.example"
+    cfg.prometheus_resource_settle_seconds = 0
     dirs = runner.ensure_layout(cfg.report_root)
 
     def fake_prometheus_query(config_arg, query, start, end, step=5, controller_label_selector=None):
@@ -842,6 +844,45 @@ def test_collect_prometheus_writes_per_run_files_and_loads_resume_safe_evidence(
     merged = runner.load_prometheus_evidence(dirs)
     assert [run["run_id"] for run in merged["_metadata"]["runs"]] == ["run", "run2"]
     assert runner.prom_values(merged["workers_active"]) == [1.0, 1.0, 2.0, 2.0]
+
+
+def test_collect_prometheus_extends_only_resource_query_window_after_settle(monkeypatch, tmp_path):
+    cfg = config(tmp_path)
+    cfg.prometheus_url = "http://prometheus.example"
+    cfg.prometheus_resource_settle_seconds = 15
+    dirs = runner.ensure_layout(cfg.report_root)
+    calls = []
+
+    monkeypatch.setattr(runner.time, "sleep", lambda seconds: calls.append(("sleep", seconds)))
+    monkeypatch.setattr(runner, "now_epoch", lambda: 135.0)
+
+    def fake_prometheus_query(config_arg, query, start, end, step=5, controller_label_selector=None):
+        calls.append(("range", query, start, end))
+        return {
+            "available": True,
+            "query": query,
+            "rendered_query": query,
+            "range_start": start,
+            "range_end": end,
+            "response": {"status": "success", "data": {"result": []}},
+        }
+
+    monkeypatch.setattr(runner, "prometheus_query", fake_prometheus_query)
+    monkeypatch.setattr(runner, "prometheus_instant_query", lambda config, query, ts, controller_label_selector=None: {
+        "available": True,
+        "query": query,
+        "rendered_query": query,
+        "response": {"status": "success", "data": {"result": []}},
+    })
+
+    result = runner.collect_prometheus(cfg, dirs, start=100.0, end=120.0)
+
+    assert ("sleep", 15) in calls
+    assert result["_metadata"]["ended_at"] == 120.0
+    assert result["_metadata"]["resource_query_ended_at"] == 135.0
+    assert result["pod_cpu_rate"]["range_end"] == 135.0
+    assert result["pod_memory_working_set"]["range_end"] == 135.0
+    assert result["workers_active"]["range_end"] == 120.0
 
 
 def test_always_on_worker_reference_is_window_and_stream_count_aware(tmp_path):
