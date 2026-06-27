@@ -100,6 +100,10 @@ Se a série bruta não tiver worker, mas qualquer fallback tiver worker,
 excluem apenas o container infra `POD` e mantêm séries com container vazio,
 porque alguns clusters expõem somente o agregado do cgroup do Pod; remover
 `container=""` pode fazer CPU/memória desaparecerem por completo.
+Para CPU, se `rate(...[1m])` não produzir worker, mas o contador
+`container_cpu_usage_seconds_total` tiver múltiplas amostras no intervalo da
+execução, o runner calcula taxas por deltas adjacentes do contador como último
+fallback antes de marcar o worker como ausente.
 
 ### `correctness_metrics.csv`
 

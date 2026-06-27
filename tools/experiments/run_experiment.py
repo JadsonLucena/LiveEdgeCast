@@ -90,6 +90,8 @@ DEFAULT_PROMQL = {
     "controllers_active": 'count(kube_pod_info{namespace="$namespace", pod=~"controller-.*"})',
     "pod_cpu_rate": 'sum by (pod) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))',
     "pod_name_cpu_rate": 'sum by (pod_name) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))',
+    "pod_cpu_usage_seconds_total": 'sum by (pod) (container_cpu_usage_seconds_total{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})',
+    "pod_name_cpu_usage_seconds_total": 'sum by (pod_name) (container_cpu_usage_seconds_total{namespace="$namespace", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"})',
     "component_cpu_rate": 'liveedgecast:component:cpu_cores:rate5m{component=~"(proxy-lb|proxy|worker|controller)"}',
     "pod_memory_working_set": 'sum by (pod) (container_memory_working_set_bytes{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})',
     "pod_name_memory_working_set": 'sum by (pod_name) (container_memory_working_set_bytes{namespace="$namespace", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"})',
@@ -1560,6 +1562,8 @@ def collect_prometheus(config: RunnerConfig, dirs: dict[str, Path], start: float
     resource_metric_names = {
         "pod_cpu_rate",
         "pod_name_cpu_rate",
+        "pod_cpu_usage_seconds_total",
+        "pod_name_cpu_usage_seconds_total",
         "component_cpu_rate",
         "pod_memory_working_set",
         "pod_name_memory_working_set",
@@ -2315,6 +2319,42 @@ def prom_series_values_by_component(result: dict[str, Any]) -> dict[str, list[fl
     return grouped
 
 
+def prom_counter_rates_by_component(result: dict[str, Any]) -> dict[str, list[float]]:
+    """Derive per-sample rates from counter range samples grouped by component.
+
+    PromQL ``rate(...[1m])`` can return no series for short-lived workers when
+    the worker lifetime and scrape cadence leave too few samples inside each
+    one-minute evaluation window. The raw cumulative CPU counter often still has
+    multiple samples across the full experiment window, so derive adjacent
+    positive deltas as a fallback instead of marking worker CPU not observable.
+    """
+    response = result.get("response") or {}
+    data = response.get("data") or {}
+    grouped: dict[str, list[float]] = {}
+    for series in data.get("result") or []:
+        metric = series.get("metric") or {}
+        component = (
+            str(metric.get("component") or metric.get("app") or metric.get("app_kubernetes_io_name") or "").strip()
+            or infer_component(metric.get("pod") or metric.get("pod_name") or metric.get("container") or metric.get("container_name") or "")
+        )
+        component = infer_component(component) if component else "unknown"
+        if component == "unknown" and metric.get("job"):
+            component = infer_component(str(metric.get("job")))
+        samples = []
+        for ts, value in series.get("values") or []:
+            try:
+                samples.append((float(ts), float(value)))
+            except Exception:
+                continue
+        samples.sort()
+        bucket = grouped.setdefault(component, [])
+        for (t1, v1), (t2, v2) in zip(samples, samples[1:]):
+            if t2 <= t1 or v2 < v1:
+                continue
+            bucket.append((v2 - v1) / (t2 - t1))
+    return {component: values for component, values in grouped.items() if values}
+
+
 def prom_time_integral(result: dict[str, Any], fallback_duration: float = 0.0) -> tuple[float | None, str]:
     """Integrate a Prometheus count-like query over time using step-wise samples."""
     response = result.get("response") or {}
@@ -3040,13 +3080,16 @@ def build_metrics(config: RunnerConfig, dirs: dict[str, Path]) -> dict[str, Any]
 
     resource_rows = []
     resource_metric_fallbacks = {
-        "pod_cpu_rate": ("pod_name_cpu_rate", "component_cpu_rate"),
+        "pod_cpu_rate": ("pod_name_cpu_rate", "pod_cpu_usage_seconds_total", "pod_name_cpu_usage_seconds_total", "component_cpu_rate"),
         "pod_memory_working_set": ("pod_name_memory_working_set", "component_memory_working_set"),
     }
     for metric_name in ("pod_cpu_rate", "pod_memory_working_set"):
         grouped_components = prom_series_values_by_component(prom.get(metric_name, {}))
         for fallback_metric_name in resource_metric_fallbacks[metric_name]:
-            fallback_components = prom_series_values_by_component(prom.get(fallback_metric_name, {}))
+            if fallback_metric_name.endswith("_cpu_usage_seconds_total"):
+                fallback_components = prom_counter_rates_by_component(prom.get(fallback_metric_name, {}))
+            else:
+                fallback_components = prom_series_values_by_component(prom.get(fallback_metric_name, {}))
             for component, fallback_values in fallback_components.items():
                 if component not in grouped_components or not grouped_components[component]:
                     grouped_components[component] = fallback_values

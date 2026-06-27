@@ -1157,6 +1157,17 @@ Fallback para instalações cAdvisor antigas que usam `pod_name`/`container_name
 sum by (pod_name) (rate(container_cpu_usage_seconds_total{namespace="$namespace", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"}[1m]))
 ```
 
+Fallback final do runner quando `rate(...[1m])` não retorna worker, mas o
+contador bruto tem amostras suficientes na janela completa:
+
+```promql
+sum by (pod) (container_cpu_usage_seconds_total{namespace="$namespace", container!="POD", pod=~"(proxy-lb|proxy|worker|controller)-.*"})
+```
+
+```promql
+sum by (pod_name) (container_cpu_usage_seconds_total{namespace="$namespace", container_name!="POD", pod_name=~"(proxy-lb|proxy|worker|controller)-.*"})
+```
+
 Fallback por componente usado pelo runner quando a consulta bruta não contém
 algum componente, especialmente workers curtos:
 
