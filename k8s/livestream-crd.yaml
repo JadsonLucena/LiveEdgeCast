@@ -1,0 +1,107 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: livestreams.liveedgecast.io
+spec:
+  group: liveedgecast.io
+  scope: Namespaced
+  names:
+    plural: livestreams
+    singular: livestream
+    kind: LiveStream
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - streamKey
+                - source
+                - target
+              properties:
+                streamKey:
+                  type: string
+                  minLength: 1
+                source:
+                  type: object
+                  required:
+                    - proxyName
+                    - sessionId
+                    - url
+                  properties:
+                    proxyName:
+                      type: string
+                    sessionId:
+                      type: string
+                    url:
+                      type: string
+                target:
+                  type: object
+                  required:
+                    - url
+                  properties:
+                    url:
+                      type: string
+                recoveryPolicy:
+                  type: object
+                  default:
+                    retryIntervalSeconds: 2
+                    maxRetries: 5
+                    interruptionTTLSeconds: 10
+                  properties:
+                    retryIntervalSeconds:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      default: 2
+                    maxRetries:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      default: 5
+                    interruptionTTLSeconds:
+                      type: integer
+                      format: int32
+                      minimum: 0
+                      default: 10
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Registered
+                    - Provisioning
+                    - Starting
+                    - Streaming
+                    - Recovering
+                    - Interrupted
+                    - Handover
+                    - Stopping
+                observedGeneration:
+                  type: integer
+                  format: int64
+                source:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                job:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                processing:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                interruption:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
