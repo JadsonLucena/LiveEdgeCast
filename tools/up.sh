@@ -63,8 +63,14 @@ kubectl delete deployment/proxy-lb deployment/worker configmap/proxy-lb-config \
     service/proxy-entry service/worker -n media --ignore-not-found=true
 kubectl apply -f k8s/
 
+# The controller image uses a local, mutable `latest` tag with imagePullPolicy:
+# Never. Applying an unchanged Pod template would otherwise leave an existing
+# controller Pod running the previously loaded image.
+print_step "Restarting the controller to use the newly loaded image..."
+kubectl rollout restart deployment/controller -n media
+
 print_step "Waiting for core deployments..."
-kubectl wait --for=condition=available deployment/controller -n media --timeout=120s
+kubectl rollout status deployment/controller -n media --timeout=120s
 kubectl wait --for=condition=available deployment/proxy -n media --timeout=120s
 
 print_success "LiveEdgeCast is ready"
