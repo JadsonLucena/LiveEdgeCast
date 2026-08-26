@@ -12,8 +12,6 @@ import json
 import copy
 from typing import Dict, Optional
 from xml.etree import ElementTree as ET
-from prometheus_client import Counter, Gauge, Histogram, generate_latest
-from fastapi.responses import Response
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -61,21 +59,6 @@ proxy_ready_since: Dict[str, float] = {}
 STATE_CONFIGMAP_NAME = "controller-state"
 STATE_CONFIGMAP_KEY = "state.json"
 STATE_SCHEMA_VERSION = 2
-
-metrics_collection_task: Optional[asyncio.Task] = None
-
-pod_cpu_usage_percent = Gauge('pod_cpu_usage_percent','Pod CPU usage percentage (0-100)',['pod','namespace'])
-pod_memory_usage_bytes = Gauge('pod_memory_usage_bytes','Pod memory usage in bytes',['pod','namespace'])
-pod_memory_usage_percent = Gauge('pod_memory_usage_percent','Pod memory usage as percent of limit',['pod','namespace'])
-pod_network_io_bytes_total = Counter('pod_network_io_bytes_total','Total network I/O bytes',['pod','direction'])
-pod_ready_status = Gauge('pod_ready_status','Is pod ready (0 or 1)',['pod','namespace'])
-proxy_active_connections = Gauge('proxy_active_connections','Active RTMP connections to proxy',['proxy_pod'])
-proxy_bandwidth_mbps = Gauge('proxy_bandwidth_mbps','Current proxy bandwidth in Mbps',['proxy_pod'])
-worker_pods_available = Gauge('worker_pods_available','Available worker pods for allocation',['namespace'])
-stream_proxy_handover_counter = Counter('stream_proxy_handover_total','Total proxy handovers accepted by controller',['stream'])
-handover_attempts_total = Counter('handover_attempts_total', 'Total proxy handover attempts', ['stream'])
-handover_success_total = Counter('handover_success_total', 'Total successful proxy handovers', ['stream'])
-handover_conflict_total = Counter('handover_conflict_total', 'Total conflicting proxy handovers denied', ['stream'])
 
 try:
     config.load_incluster_config()
@@ -268,11 +251,9 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
     - handover allowed if previous owner is ineligible by any criterion:
       proxy unhealthy/dead
     """
-    handover_attempts_total.labels(stream=stream).inc()
     current = stream_registry.get(stream)
     if not current:
         register_or_refresh_stream(stream, candidate_proxy_pod)
-        handover_success_total.labels(stream=stream).inc()
         return True
 
     current_owner = current.get("proxy_pod")
@@ -299,11 +280,8 @@ def try_handover_stream_owner(stream: str, candidate_proxy_pod: str) -> bool:
         if stream in stream_to_worker:
             replace_worker_pod_for_stream_locked(stream=stream, proxy_dns=proxy_dns)
 
-        handover_success_total.labels(stream=stream).inc()
-        stream_proxy_handover_counter.labels(stream=stream).inc()
         return True
 
-    handover_conflict_total.labels(stream=stream).inc()
     logger.warning(
         f"[Handover] Denied ownership change for stream '{stream}' from '{current_owner}' "
         f"to '{candidate_proxy_pod}' (owner_unhealthy={owner_unhealthy}, owner_stream_active={owner_stream_active})"
@@ -455,7 +433,7 @@ def recover_state(
 ):
     """
     Recupera estado de alocações após reinício do controller.
-    Verifica quais workers estão realmente ocupados consultando suas métricas RTMP.
+    Restaura as alocações persistidas quando disponíveis.
     """
     logger.info("[State Recovery] Starting state recovery...")
     
@@ -470,58 +448,6 @@ def recover_state(
         # Sem estado persistido: não reaproveitar pods já existentes.
         # No modelo por-env (STREAM_KEY/PROXY_DNS), reuso pode carregar config obsoleta.
         logger.info("[State Recovery] No persisted state found. Skipping worker auto-recovery to avoid stale env reuse.")
-
-
-def get_pod_metrics(pod_name: str, namespace: str) -> dict:
-    try:
-        pod = core.read_namespaced_pod(name=pod_name, namespace=namespace)
-        memory_limit = 0
-        for container in pod.spec.containers or []:
-            limits = container.resources.limits if container.resources else None
-            if limits and limits.get('memory'):
-                mem = str(limits.get('memory'))
-                if mem.endswith('Mi'):
-                    memory_limit += int(mem[:-2]) * 1024 * 1024
-        ready = any(c.type == 'Ready' and c.status == 'True' for c in (pod.status.conditions or []))
-        return {'memory_limit': memory_limit, 'ready': ready}
-    except Exception as e:
-        logger.warning(f'Failed to get metrics for {pod_name}: {e}')
-        return {}
-
-def collect_pod_metrics():
-    try:
-        pods = core.list_namespaced_pod(namespace=NAMESPACE,label_selector='app in (proxy, worker)').items
-        for pod in pods:
-            name = pod.metadata.name
-            m = get_pod_metrics(name, NAMESPACE)
-            pod_ready_status.labels(pod=name, namespace=NAMESPACE).set(1 if m.get('ready') else 0)
-            memory_limit = m.get('memory_limit', 0)
-            if memory_limit > 0:
-                pod_memory_usage_bytes.labels(pod=name, namespace=NAMESPACE).set(memory_limit * 0.5)
-                pod_memory_usage_percent.labels(pod=name, namespace=NAMESPACE).set(50)
-    except Exception as e:
-        logger.warning(f'Failed to collect pod metrics: {e}')
-
-def collect_allocation_metrics():
-    with allocation_lock:
-        try:
-            pods = core.list_namespaced_pod(namespace=NAMESPACE, label_selector="app=worker").items
-            ready = 0
-            for pod in pods:
-                conditions = {c.type: c.status for c in (pod.status.conditions or [])}
-                if conditions.get("Ready") == "True":
-                    ready += 1
-            worker_pods_available.labels(namespace=NAMESPACE).set(ready)
-        except Exception:
-            pass
-
-async def collect_infrastructure_metrics():
-    while True:
-        await asyncio.sleep(30)
-        collect_pod_metrics()
-        collect_allocation_metrics()
-
-
 
 
 async def monitor_worker_health():
@@ -714,26 +640,23 @@ async def sweep_orphan_workers():
 
 @app.on_event("startup")
 async def startup_event():
-    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
+    global registry_health_task, worker_health_task, worker_orphan_sweeper_task
     time.sleep(5)
     recover_state()
     registry_health_task = asyncio.create_task(monitor_stream_registry_health())
     worker_health_task = asyncio.create_task(monitor_worker_health())
     worker_orphan_sweeper_task = asyncio.create_task(sweep_orphan_workers())
-    metrics_collection_task = asyncio.create_task(collect_infrastructure_metrics())
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global registry_health_task, worker_health_task, worker_orphan_sweeper_task, metrics_collection_task
+    global registry_health_task, worker_health_task, worker_orphan_sweeper_task
     if registry_health_task and not registry_health_task.done():
         registry_health_task.cancel()
     if worker_health_task and not worker_health_task.done():
         worker_health_task.cancel()
     if worker_orphan_sweeper_task and not worker_orphan_sweeper_task.done():
         worker_orphan_sweeper_task.cancel()
-    if metrics_collection_task and not metrics_collection_task.done():
-        metrics_collection_task.cancel()
 
 
 @app.get("/health")
@@ -1007,7 +930,3 @@ async def stream_ended(
         f"proxy='{proxy_pod}' generation='{generation}' release_status='{release_result.get('status')}'"
     )
     return {"status": event_status, "stream": stream, "release": release_result}
-
-@app.get('/metrics')
-def metrics():
-    return Response(generate_latest(), media_type='text/plain; version=0.0.4; charset=utf-8')

@@ -27,9 +27,3 @@ Data: 2026-05-13
 
 ## Fase 6 — Persistência robusta
 - [x] Estado inclui `schema_version` e `stream_generation`.
-
-## Fase 7 — Observabilidade
-- [x] Métrica `stream_assignment_info` adicionada com labels de stream/proxy/worker/generation.
-
-## Fase 8 — Testes/checks mínimos
-- [x] Adicionado script de validação local.

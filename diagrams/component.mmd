@@ -2,53 +2,36 @@ flowchart LR
     subgraph Clients[RTMP Clients]
         OBS1[OBS / FFmpeg<br/>Stream 1]
         OBS2[OBS / FFmpeg<br/>Stream 2]
-        OBS3[OBS / FFmpeg<br/>Stream N]
+        OBSN[OBS / FFmpeg<br/>Stream N]
     end
 
-    subgraph K8sCluster[Kubernetes Cluster (namespace: media)]
-        subgraph Proxy[RTMP Proxy Pod(s)]
-            Nginx[NGINX-RTMP<br/>application live]
-            FFmpegPool[FFmpeg per Stream<br/>(1 processo por stream)]
-            Exporter[RTMP Stats Exporter<br/>(Python HTTP /metrics)]
+    subgraph K8sCluster[Kubernetes Cluster - media namespace]
+        LB[HAProxy entry service]
+
+        subgraph Proxies[RTMP Proxy Pods]
+            Proxy1[NGINX-RTMP Proxy 1]
+            Proxy2[NGINX-RTMP Proxy N]
         end
 
-        subgraph Controller[Controller API Pod]
-            FastAPI[FastAPI + Kubernetes Client<br/>/allocate, /release, /status]
+        Controller[Controller API<br/>FastAPI + Kubernetes client]
+
+        subgraph Workers[Dedicated RTMP Worker Pods]
+            Worker1[Worker for Stream 1]
+            Worker2[Worker for Stream 2]
+            WorkerN[Worker for Stream N]
         end
 
-        subgraph Workers[RTMP Worker Pods]
-            Worker1[Worker Pod 1<br/>nginx-rtmp + exporter]
-            Worker2[Worker Pod 2]
-            WorkerN[Worker Pod N]
-        end
-
-        subgraph PrometheusNS[Monitoring Namespace]
-            Prometheus[Prometheus Server]
-        end
-
-        subgraph KEDA_NS[KEDA]
-            KEDA[KEDA Operator]
-        end
+        State[(Controller state ConfigMap)]
     end
 
-    YouTube[(YouTube RTMP Endpoint<br/>rtmp://a.rtmp.youtube.com/live2/KEY)]
+    Destination[(YouTube RTMP endpoint)]
 
-    %% Connections
-    OBS1 -->|RTMP publish<br/>rtmp://proxy:1935/live/stream1| Nginx
-    OBS2 -->|RTMP publish| Nginx
-    OBS3 -->|RTMP publish| Nginx
-
-    Nginx -->|exec_publish<br/>on_publish_start.sh $name| FFmpegPool
-    FFmpegPool -->|HTTP /allocate?stream={name}| FastAPI
-    FastAPI -->|K8s API<br/>list/get pods<br/>patch deployment scale| Workers
-
-    FFmpegPool -->|RTMP relay per stream<br/>rtmp://worker-x/live/{stream}| Workers
-
-    Workers -->|push RTMP<br/>live2/KEY| YouTube
-
-    Nginx -->|/stats| Exporter
-    Exporter -->|/metrics| Prometheus
-    Workers -->|/metrics| Prometheus
-
-    Prometheus -->|Prometheus triggers| KEDA
-    KEDA -->|HPA ScaledObject| Proxy
+    OBS1 -->|RTMP publish| LB
+    OBS2 -->|RTMP publish| LB
+    OBSN -->|RTMP publish| LB
+    LB --> Proxies
+    Proxies -->|publish start and end events| Controller
+    Controller -->|create, replace, and delete pods| Workers
+    Controller <-->|persist and restore ownership| State
+    Workers -->|RTMP pull| Proxies
+    Workers -->|RTMP push| Destination
