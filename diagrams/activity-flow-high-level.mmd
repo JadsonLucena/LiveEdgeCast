@@ -1,10 +1,8 @@
 flowchart TD
     A([Stream starts]) --> B[Proxy receives RTMP publish]
-    B --> C[Proxy notifies Controller]
-    C --> D[Controller logs start notification]
-    D --> E[Proxy reports stream end]
-    E --> F[Controller logs end notification]
-    F --> G([End])
+    B --> C[Proxy serves stream]
+    C --> D[Stream ends without callback]
+    D --> G([End])
     M[Worker lifecycle is outside this cleanup phase]:::note
-    C -.-> M
+    B -.-> M
     classDef note fill:#fff3cd,stroke:#856404,color:#533f03

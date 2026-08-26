@@ -43,20 +43,13 @@ RUN apk add --no-cache \
     ca-certificates \
     openssl \
     pcre2 \
-    zlib \
-    curl \
-    jq \
-    bash
+    zlib
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
 COPY --from=builder /tmp/build/nginx-${NGINX_VERSION}/conf/mime.types /etc/nginx/mime.types
 RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
-    && mkdir -p /var/log/nginx /scripts \
-    && chmod 755 /scripts
+    && mkdir -p /var/log/nginx
 
-COPY on_publish_start.sh /scripts/on_publish_start.sh
-COPY on_publish_done.sh /scripts/on_publish_done.sh
-RUN chmod +x /scripts/*.sh
 COPY nginx.conf /etc/nginx/nginx.conf
 
 EXPOSE 1935 8080

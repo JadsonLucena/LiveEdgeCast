@@ -1,35 +1,26 @@
-# Stream Notification Lifecycle
+# Stream Lifecycle
 
-This document describes the current cleanup-phase architecture. Proxies notify the Controller about stream lifecycle events, but the Controller does **not** retain ownership state or provision and reconcile Workers. Worker Jobs or Operator behavior are intentionally outside this phase.
+This document describes the current cleanup-phase architecture. The Proxy accepts RTMP publishes, but does not invoke imperative Controller callbacks. The Controller does **not** retain ownership state or provision and reconcile Workers.
 
 ## Components
 
-- **Proxy** receives the RTMP publish, exposes health and statistics endpoints, and notifies the Controller when publishing starts or ends.
-- **Controller** accepts and logs stream start and end notifications.
+- **Proxy** receives the RTMP publish and exposes health and statistics endpoints.
+- **Controller** exposes only its health endpoint.
 
 There is no Worker Deployment or Worker Service. The Controller does not create, map, replace, inspect, or delete Worker Pods.
 
-The notifications are transient events. The Controller does not use them to build an ownership registry.
+There are no stream start/end notification endpoints or internal allocation/release endpoints.
 
-## Publish Start
+## Publish Lifecycle
 
 1. A broadcaster starts an RTMP publish through the public Proxy Service.
-2. The selected Proxy runs `on_publish_start.sh`.
-3. The Proxy calls `POST /streams/started?stream=<key>&proxy_pod=<pod>`.
-4. The Controller logs the notification and returns `started_event_processed`.
+2. The selected Proxy receives and serves the stream.
+3. Publishing ends without invoking a Controller callback.
 
-The endpoint does not allocate or start a Worker.
-
-## Publish End
-
-1. The Proxy runs `on_publish_done.sh` when publishing ends.
-2. The Proxy calls `POST /streams/ended?stream=<key>&proxy_pod=<pod>`.
-3. The Controller logs the notification and returns `ended`.
-
-No Worker is stopped or deleted by this endpoint.
+No Worker is allocated, started, stopped, or deleted by this flow.
 
 ## Responsibility Boundaries
 
-- **Proxy**: receive RTMP, report publish start/end, and expose health/statistics.
-- **Controller**: accept and log lifecycle notifications without retaining an ownership registry.
-- **Worker lifecycle**: deliberately unimplemented in this cleanup phase. A future phase may introduce a Job or Operator, but no such behavior is implied by the current API.
+- **Proxy**: receive RTMP and expose health/statistics.
+- **Controller**: expose health without stream lifecycle mutation APIs.
+- **Worker lifecycle**: deliberately unimplemented in this cleanup phase. A later phase may introduce declarative `LiveStream` resources; no compatibility callbacks are retained in the current API.

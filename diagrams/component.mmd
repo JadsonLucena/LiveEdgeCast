@@ -6,12 +6,11 @@ flowchart LR
     subgraph K8sCluster[Kubernetes Cluster - media namespace]
         PublicService[Public Proxy Service]
         Proxies[NGINX-RTMP Proxy Pods]
-        Controller[Controller API]
+        Controller[Controller health API]
     end
 
     OBS -->|RTMP publish| PublicService
     PublicService --> Proxies
-    Proxies -->|publish start/end events| Controller
     Boundary[No Worker Deployment, Service, or Pod reconciliation]:::note
     Controller -. cleanup-phase boundary .-> Boundary
     classDef note fill:#fff3cd,stroke:#856404,color:#533f03
