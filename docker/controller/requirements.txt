@@ -2,4 +2,3 @@ fastapi
 uvicorn[standard]
 kubernetes
 requests
-prometheus-client==0.17.1

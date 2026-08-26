@@ -106,16 +106,6 @@ This prevents split-brain and stale worker restarts from old ownership context.
 - If stream activity is not refreshed within TTL, registry entry expires.
 - Controller remains responsible for cleanup/reconciliation actions.
 
-## Observability
-
-Key metrics include:
-
-- stream delivery status/error counters;
-- proxy and worker health-related metrics;
-- `stream_assignment_info{stream, proxy_pod, worker_pod, generation}`.
-
-These metrics support per-stream tracking during normal operation, handover, and failover.
-
 ## Responsibility Boundaries
 
 - **Proxy**:

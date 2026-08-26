@@ -4,7 +4,7 @@ Data: 2026-05-13
 
 ## Conclusão rápida
 
-O projeto já implementa parte importante da arquitetura **pull-only** (Proxy recebe publish, Worker faz pull do Proxy e push para YouTube), com persistência de estado no Controller e monitoramento básico. Porém, ainda existem diferenças relevantes em relação ao fluxo desejado e aos guard rails descritos.
+O projeto já implementa parte importante da arquitetura **pull-only** (Proxy recebe publish, Worker faz pull do Proxy e push para YouTube), com persistência de estado no Controller e verificações básicas de saúde. Porém, ainda existem diferenças relevantes em relação ao fluxo desejado e aos guard rails descritos.
 
 ## O que já está alinhado
 
@@ -18,8 +18,8 @@ O projeto já implementa parte importante da arquitetura **pull-only** (Proxy re
 3. **Persistência de estado do Controller**
    - O estado crítico é salvo/restaurado em ConfigMap (`controller-state`).
 
-4. **Observabilidade inicial**
-   - Existem métricas Prometheus para proxy/worker/stream e endpoints `/health` e `/stats` em Proxy/Worker.
+4. **Verificações de saúde**
+   - Proxy e Worker expõem endpoints `/health` e `/stats` usados na reconciliação.
 
 5. **Sem heartbeat de Worker/Proxy por padrão de aplicação**
    - Worker/Proxy não expõem heartbeat customizado; saúde é por HTTP endpoints.
@@ -38,7 +38,7 @@ O projeto já implementa parte importante da arquitetura **pull-only** (Proxy re
    - Requisito pede startup imediato com argumentos de origem/destino no pod.
 
 4. **Health checks centralizados no Controller a cada 3s (proxy e worker)**
-   - Há healthcheck de proxy e coleta de métricas, mas a responsabilidade e frequência exata de 3s para ambos (proxy + worker) precisa ficar estrita e uniforme.
+   - Há healthcheck de proxy, mas a responsabilidade e frequência exata de 3s para ambos (proxy + worker) precisa ficar estrita e uniforme.
 
 5. **Failover de worker**
    - Existe recuperação/retry no próprio worker, mas a regra deseja que o Controller descarte worker defeituoso e substitua. Hoje a autocorreção local do worker pode atrasar esse ciclo.
@@ -72,10 +72,7 @@ O projeto já implementa parte importante da arquitetura **pull-only** (Proxy re
 6. **Reconciliação periódica com Kubernetes API**
    - Além de `/health` e `/stats`, conferir existência real do pod e fase (`Running/Ready`) para detectar inconsistências entre estado lógico e estado real.
 
-7. **Política de observabilidade por labels estáveis**
-   - Métricas segmentadas por `stream_key`, `proxy_pod`, `worker_pod`, `session_id` para correlação em reassign/handover.
-
-8. **Backoff controlado no Controller (não no Worker)**
+7. **Backoff controlado no Controller (não no Worker)**
    - Para manter “let’s crash”, o retry deve migrar para Controller com limite e jitter; Worker deve falhar rápido e sair.
 
 ## Direção recomendada de implementação
@@ -89,4 +86,3 @@ O projeto já implementa parte importante da arquitetura **pull-only** (Proxy re
    - recriação/substituição quando necessário.
 5. Garantir unicidade da stream key com lock + geração + persistência atômica.
 6. Externalizar URL de YouTube para ConfigMap/Env (`RTMP_PUSH_BASE_URL`).
-
