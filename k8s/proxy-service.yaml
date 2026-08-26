@@ -14,6 +14,18 @@ spec:
       port: 1935
       targetPort: 1935
       protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy-internal
+  namespace: media
+  labels:
+    app: proxy
+spec:
+  type: ClusterIP
+  selector: { app: proxy }
+  ports:
     - name: http
       port: 8080
       targetPort: 8080
