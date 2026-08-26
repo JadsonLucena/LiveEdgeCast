@@ -216,10 +216,6 @@ if [[ "$WORKER_COUNT" == "0" ]]; then
   fi
 
   echo ""
-  echo "--- HPA / KEDA objects related to worker ---"
-  kubectl get scaledobject -n "$NAMESPACE" 2>/dev/null | filter_stream "worker|NAME|NAMESPACE"
-  kubectl get hpa -n "$NAMESPACE" 2>/dev/null | filter_stream "worker|NAME"
-
   echo ""
   echo "--- Recent namespace events (worker/controller/proxy) ---"
   kubectl get events -n "$NAMESPACE" --sort-by=.lastTimestamp 2>/dev/null | tail -n 120 | filter_stream "worker|worker|controller|proxy|Failed|Warning|BackOff|Insufficient|Forbidden|Error"

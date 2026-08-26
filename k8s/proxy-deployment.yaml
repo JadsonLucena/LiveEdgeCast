@@ -4,6 +4,8 @@ metadata:
   name: proxy
   namespace: media
 spec:
+  # Proxy capacity is configured statically on this Deployment.
+  replicas: 1
   selector:
     matchLabels: { app: proxy }
   template:

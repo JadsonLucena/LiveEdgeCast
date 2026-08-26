@@ -6,7 +6,7 @@ flowchart LR
     end
 
     subgraph K8sCluster[Kubernetes Cluster (namespace: media)]
-        subgraph Proxy[RTMP Proxy Pod(s)]
+        subgraph Proxy[RTMP Proxy Deployment<br/>static replica count]
             Nginx[NGINX-RTMP<br/>application live]
             FFmpegPool[FFmpeg per Stream<br/>(1 processo por stream)]
             Exporter[RTMP Stats Exporter<br/>(Python HTTP /metrics)]
@@ -26,9 +26,6 @@ flowchart LR
             Prometheus[Prometheus Server]
         end
 
-        subgraph KEDA_NS[KEDA]
-            KEDA[KEDA Operator]
-        end
     end
 
     YouTube[(YouTube RTMP Endpoint<br/>rtmp://a.rtmp.youtube.com/live2/KEY)]
@@ -49,6 +46,3 @@ flowchart LR
     Nginx -->|/stats| Exporter
     Exporter -->|/metrics| Prometheus
     Workers -->|/metrics| Prometheus
-
-    Prometheus -->|Prometheus triggers| KEDA
-    KEDA -->|HPA ScaledObject| Proxy

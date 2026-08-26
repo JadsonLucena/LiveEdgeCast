@@ -14,7 +14,7 @@ stateDiagram-v2
 
     Streaming --> Idle : Cliente encerra stream\nFFmpeg killed\nnclients == 0\nController /release
 
-    Streaming --> Terminating : Pod being deleted\n(by autoscale or cluster)
+    Streaming --> Terminating : Pod being deleted\n(by Controller or cluster)
     Terminating --> [*]
 
     Idle --> Terminating : Scale-down / delete\nworker sem streams

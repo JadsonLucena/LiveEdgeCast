@@ -1,16 +1,15 @@
 # LiveEdgeCast
 
-🚀 **Serverless RTMP Edge Proxy for Low-Latency Live Stream Retransmission**
+🚀 **RTMP Edge Proxy for Low-Latency Live Stream Retransmission**
 
-LiveEdgeCast implements a serverless architecture on edge computing environments, focusing on the retransmission of live streams with minimal latency. The solution ensures high availability, responsiveness, and efficient resource utilization by dynamically provisioning compute resources only when needed.
+LiveEdgeCast runs on Kubernetes at the edge and focuses on retransmitting live streams with minimal latency. The proxy replica count is statically configured by the `replicas` field in `k8s/proxy-deployment.yaml`.
 
 ## 🎯 Project Goals
 
 - **Low-Latency Retransmission**: Minimize delay in live stream forwarding
 - **Edge Computing**: Deploy close to users for optimal performance  
-- **Serverless Execution**: Dynamic resource provisioning and cost optimization
 - **High Availability**: Fault-tolerant stream proxy architecture
-- **Efficient Resource Utilization**: Scale up/down based on demand
+- **Predictable Proxy Capacity**: A static replica count configured through the Proxy Deployment
 
 
 # How to Start and Stop the Project

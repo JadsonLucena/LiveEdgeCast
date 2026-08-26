@@ -8,6 +8,8 @@ This document defines the full end-to-end lifecycle for a live stream in the cur
 - **Controller**: single source of truth for ownership, allocation, start/stop orchestration, health reconciliation, and failover decisions.
 - **Worker**: dedicated pod per stream key. Pulls from the assigned Proxy pod and pushes to YouTube.
 
+Proxy capacity is fixed by the `replicas` field of the Proxy Deployment. Runtime metrics are used for observability, not to change the proxy replica count.
+
 ## Core State Model (Controller)
 
 Per stream key, the Controller maintains:
@@ -38,7 +40,7 @@ Important state structures:
    - `POST /streams/started?stream=<key>&proxy_pod=<proxyPod>`
 4. Controller handles the full flow:
    - registers/refreshes stream ownership in `stream_registry`;
-   - allocates an available worker or triggers scale-up if needed;
+   - allocates a worker for the stream;
    - if worker is already available, starts it immediately.
 5. Controller starts worker via `kubectl exec` passing:
    - `STREAM_KEY`
@@ -58,7 +60,7 @@ Important state structures:
 4. Controller performs all cleanup:
    - removes registry ownership for the stream if applicable;
    - releases worker allocation mapping;
-   - schedules scale-down when no streams are active.
+   - removes workers that are no longer assigned to active streams.
 
 ## Reconciliation Flow
 
