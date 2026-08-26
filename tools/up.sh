@@ -48,6 +48,7 @@ print_success "Container images built"
 
 CONTEXT=$(kubectl config current-context)
 if [[ $CONTEXT =~ kind ]]; then
+    check_command kind
     print_step "Loading images into the kind cluster..."
     kind load docker-image "$PROXY_IMAGE" "$WORKER_IMAGE" "$CONTROLLER_IMAGE"
 elif [[ ! $CONTEXT =~ (docker-desktop|localhost|127\.0\.0\.1) ]]; then
