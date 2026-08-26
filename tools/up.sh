@@ -36,15 +36,6 @@ fi
 kubectl apply -f k8s/namespaces.yaml
 kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/media --timeout=30s
 
-# Upgrade cleanup: applying the current manifest directory does not remove
-# resources that were shipped by older releases.
-print_step "Removing the legacy proxy autoscaler, if present..."
-if kubectl api-resources --api-group=keda.sh -o name | grep -qx 'scaledobjects.keda.sh'; then
-    kubectl delete scaledobject.keda.sh proxy-scaler -n media --ignore-not-found=true
-else
-    print_success "Legacy autoscaler API is not installed"
-fi
-
 PROXY_IMAGE="liveedgecast-proxy:latest"
 WORKER_IMAGE="liveedgecast-worker:latest"
 CONTROLLER_IMAGE="liveedgecast-controller:latest"
@@ -57,6 +48,7 @@ print_success "Container images built"
 
 CONTEXT=$(kubectl config current-context)
 if [[ $CONTEXT =~ kind ]]; then
+    check_command kind
     print_step "Loading images into the kind cluster..."
     kind load docker-image "$PROXY_IMAGE" "$WORKER_IMAGE" "$CONTROLLER_IMAGE"
 elif [[ ! $CONTEXT =~ (docker-desktop|localhost|127\.0\.0\.1) ]]; then

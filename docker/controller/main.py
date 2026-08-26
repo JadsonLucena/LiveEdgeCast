@@ -429,8 +429,7 @@ def check_worker_health(pod_name: str, pod_ip: Optional[str] = None) -> bool:
         return False
 
 
-def recover_state(
-):
+def recover_state():
     """
     Recupera estado de alocações após reinício do controller.
     Restaura as alocações persistidas quando disponíveis.
@@ -452,7 +451,6 @@ def recover_state(
 
 async def monitor_worker_health():
     """Worker health monitor using worker-specific Ready-to-/health delay before probing."""
-    """Controller-driven worker healthcheck every 3s, with 3 consecutive failures threshold."""
     while True:
         await asyncio.sleep(WORKER_HEALTHCHECK_INTERVAL_SECONDS)
         to_replace = []
