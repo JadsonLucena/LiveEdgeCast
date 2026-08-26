@@ -1,6 +1,6 @@
 flowchart TD
-    A([Início da transmissão]) --> B[Cliente envia vídeo ao Load Balancer]
-    B --> C[Load Balancer escolhe um Proxy disponível]
+    A([Início da transmissão]) --> B[Cliente envia vídeo ao Service público do proxy]
+    B --> C[Transmissão chega a um Proxy]
     C --> D[Proxy avisa o Controller que a transmissão começou]
 
     D --> E[Controller cria e configura um Worker dedicado]

@@ -62,12 +62,11 @@ kubectl apply -f k8s/
 print_step "Waiting for core deployments..."
 kubectl wait --for=condition=available deployment/controller -n media --timeout=120s
 kubectl wait --for=condition=available deployment/proxy -n media --timeout=120s
-kubectl wait --for=condition=available deployment/proxy-lb -n media --timeout=120s
 
-NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 print_success "LiveEdgeCast is ready"
 echo ""
-echo "RTMP ingest: rtmp://${NODE_IP}:31935/live/{stream-key}"
+echo "RTMP ingest is exposed on TCP port 1935 by the proxy LoadBalancer Service."
+echo "Run 'kubectl get service proxy -n media' to find its external address."
 echo ""
 echo "Useful commands:"
 echo "  kubectl get pods -n media"

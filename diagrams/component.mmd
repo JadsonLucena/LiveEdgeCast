@@ -6,7 +6,7 @@ flowchart LR
     end
 
     subgraph K8sCluster[Kubernetes Cluster - media namespace]
-        LB[HAProxy entry service]
+        PublicService[Public proxy Service]
 
         subgraph Proxies[RTMP Proxy Pods]
             Proxy1[NGINX-RTMP Proxy 1]
@@ -26,10 +26,10 @@ flowchart LR
 
     Destination[(YouTube RTMP endpoint)]
 
-    OBS1 -->|RTMP publish| LB
-    OBS2 -->|RTMP publish| LB
-    OBSN -->|RTMP publish| LB
-    LB --> Proxies
+    OBS1 -->|RTMP publish| PublicService
+    OBS2 -->|RTMP publish| PublicService
+    OBSN -->|RTMP publish| PublicService
+    PublicService --> Proxies
     Proxies -->|publish start and end events| Controller
     Controller -->|create, replace, and delete pods| Workers
     Controller <-->|persist and restore ownership| State
