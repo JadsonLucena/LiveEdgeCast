@@ -1,6 +1,6 @@
 flowchart TD
-    A([Início]) --> B[Cliente inicia publish RTMP no Load Balancer]
-    B --> C[HAProxy seleciona proxy com leastconn e encaminha stream]
+    A([Início]) --> B[Cliente inicia publish RTMP no Service público do proxy]
+    B --> C[Stream chega a um pod do proxy]
     C --> D[Proxy NGINX recebe /live/:streamKey]
     D --> E[exec_publish chama on_publish_start.sh]
     E --> F[Proxy notifica Controller: POST /streams/started?stream&proxy_pod]

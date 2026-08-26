@@ -57,17 +57,43 @@ elif [[ ! $CONTEXT =~ (docker-desktop|localhost|127\.0\.0\.1) ]]; then
 fi
 
 print_step "Applying Kubernetes resources..."
+# Plain kubectl apply does not prune resources removed from the manifests. Clean
+# up the retired ingress layer when upgrading an existing installation.
+kubectl delete deployment/proxy-lb configmap/proxy-lb-config service/proxy-entry \
+    -n media --ignore-not-found=true
 kubectl apply -f k8s/
 
 print_step "Waiting for core deployments..."
 kubectl wait --for=condition=available deployment/controller -n media --timeout=120s
 kubectl wait --for=condition=available deployment/proxy -n media --timeout=120s
-kubectl wait --for=condition=available deployment/proxy-lb -n media --timeout=120s
 
-NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
 print_success "LiveEdgeCast is ready"
 echo ""
-echo "RTMP ingest: rtmp://${NODE_IP}:31935/live/{stream-key}"
+if [[ $CONTEXT =~ kind ]]; then
+    PORT_FORWARD_PID_FILE="/tmp/liveedgecast-proxy-port-forward.pid"
+    if [[ -f $PORT_FORWARD_PID_FILE ]]; then
+        OLD_PORT_FORWARD_PID=$(cat "$PORT_FORWARD_PID_FILE")
+        if [[ $OLD_PORT_FORWARD_PID =~ ^[0-9]+$ ]] && \
+            [[ $(ps -p "$OLD_PORT_FORWARD_PID" -o args= 2>/dev/null) == *"kubectl port-forward"* ]]; then
+            kill "$OLD_PORT_FORWARD_PID" 2>/dev/null || true
+        fi
+    fi
+
+    print_step "Starting the local RTMP port forward..."
+    nohup kubectl port-forward -n media service/proxy 1935:1935 \
+        >/tmp/liveedgecast-proxy-port-forward.log 2>&1 &
+    PORT_FORWARD_PID=$!
+    echo "$PORT_FORWARD_PID" >"$PORT_FORWARD_PID_FILE"
+    sleep 1
+    if ! kill -0 "$PORT_FORWARD_PID" 2>/dev/null; then
+        print_error "Could not start the RTMP port forward. See /tmp/liveedgecast-proxy-port-forward.log."
+        exit 1
+    fi
+    echo "RTMP ingest: rtmp://127.0.0.1:1935/live/{stream-key}"
+else
+    echo "RTMP ingest is exposed on TCP port 1935 by the proxy LoadBalancer Service."
+    echo "Run 'kubectl get service proxy -n media' to find its external address."
+fi
 echo ""
 echo "Useful commands:"
 echo "  kubectl get pods -n media"
