@@ -2,29 +2,12 @@ flowchart TD
     A([Publish starts]) --> B[Client publishes RTMP through public Proxy Service]
     B --> C[Proxy receives stream]
     C --> D[on_publish_start.sh notifies POST /streams/started]
-    D --> E{Current owner?}
-    E -->|None or same Proxy| F[Register or refresh Proxy ownership]
-    E -->|Different Proxy| G{Old owner unhealthy or stream absent from /stats?}
-    G -->|No| H[Reject handover with HTTP 409]
-    G -->|Yes| I[Increment generation and transfer ownership]
-    F --> J[Persist ownership-only state]
-    I --> J
-    J --> K[Return registered or idempotent_replay]
+    D --> E[Controller logs event and returns started_event_processed]
+    E --> F([Publish continues])
+    F --> G[on_publish_done.sh notifies POST /streams/ended]
+    G --> H[Controller logs event and returns ended]
+    H --> I([End])
 
-    K --> L[Proxy health reconciliation every 3s with jitter]
-    L --> M{Failure threshold reached?}
-    M -->|No| L
-    M -->|Yes| N[Expire streams owned by unhealthy Proxy]
-    N --> O[Persist ownership-only state]
-
-    K --> P([Publish continues])
-    P --> Q[on_publish_done.sh notifies POST /streams/ended]
-    Q --> R{Owner and generation still match?}
-    R -->|No| S[Return stale_event_ignored]
-    R -->|Yes| T[Remove owner, registry entry, and generation]
-    T --> U[Persist state and return ended]
-    U --> V([End])
-
-    W[No Worker provisioning, mapping, health reconciliation, or deletion]:::note
-    J -. cleanup-phase boundary .-> W
+    W[No retained ownership or Worker lifecycle state]:::note
+    D -. cleanup-phase boundary .-> W
     classDef note fill:#fff3cd,stroke:#856404,color:#533f03

@@ -1,16 +1,10 @@
 flowchart TD
     A([Stream starts]) --> B[Proxy receives RTMP publish]
     B --> C[Proxy notifies Controller]
-    C --> D[Controller records Proxy ownership and generation]
-    D --> E[Controller persists ownership in ConfigMap]
-    E --> F{Proxy remains healthy?}
-    F -->|Yes| G[Keep ownership registration]
-    G --> F
-    F -->|No, threshold reached| H[Expire affected ownership records]
-    G --> I[Proxy reports stream end]
-    I --> J[Controller validates owner and generation]
-    J --> K[Controller clears and persists stream ownership]
-    K --> L([End])
+    C --> D[Controller logs start notification]
+    D --> E[Proxy reports stream end]
+    E --> F[Controller logs end notification]
+    F --> G([End])
     M[Worker lifecycle is outside this cleanup phase]:::note
-    D -.-> M
+    C -.-> M
     classDef note fill:#fff3cd,stroke:#856404,color:#533f03

@@ -7,14 +7,11 @@ flowchart LR
         PublicService[Public Proxy Service]
         Proxies[NGINX-RTMP Proxy Pods]
         Controller[Controller API]
-        State[(Ownership State ConfigMap)]
     end
 
     OBS -->|RTMP publish| PublicService
     PublicService --> Proxies
     Proxies -->|publish start/end events| Controller
-    Controller -->|read Proxy readiness and address| Proxies
-    Controller <-->|persist and restore ownership| State
     Boundary[No Worker Deployment, Service, or Pod reconciliation]:::note
     Controller -. cleanup-phase boundary .-> Boundary
     classDef note fill:#fff3cd,stroke:#856404,color:#533f03

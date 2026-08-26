@@ -2,30 +2,15 @@ sequenceDiagram
     participant C as RTMP Client
     participant P as Proxy
     participant A as Controller
-    participant S as State ConfigMap
 
     C->>P: Publish /live/streamX
     P->>A: POST /streams/started(streamX, proxyPod)
-    A->>A: Register/validate Proxy ownership
-    A->>S: Persist owner and generation
-    A-->>P: registered or idempotent_replay
-
-    loop Proxy health reconciliation
-        A->>P: Read readiness and GET /health
-        alt failure threshold reached
-            A->>A: Expire affected ownership
-            A->>S: Persist state
-        end
-    end
+    A->>A: Log start notification
+    A-->>P: started_event_processed
 
     C--xP: End publish
     P->>A: POST /streams/ended(streamX, proxyPod, generation?)
-    A->>A: Validate current owner/generation
-    alt current event
-        A->>S: Remove and persist ownership
-        A-->>P: ended
-    else stale event
-        A-->>P: stale_event_ignored
-    end
+    A->>A: Log end notification
+    A-->>P: ended
 
     Note over A: No Worker Pod lifecycle in this cleanup phase
