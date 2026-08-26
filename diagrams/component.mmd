@@ -1,37 +1,20 @@
 flowchart LR
     subgraph Clients[RTMP Clients]
-        OBS1[OBS / FFmpeg<br/>Stream 1]
-        OBS2[OBS / FFmpeg<br/>Stream 2]
-        OBSN[OBS / FFmpeg<br/>Stream N]
+        OBS[OBS / FFmpeg]
     end
 
     subgraph K8sCluster[Kubernetes Cluster - media namespace]
-        PublicService[Public proxy Service]
-
-        subgraph Proxies[RTMP Proxy Pods]
-            Proxy1[NGINX-RTMP Proxy 1]
-            Proxy2[NGINX-RTMP Proxy N]
-        end
-
-        Controller[Controller API<br/>FastAPI + Kubernetes client]
-
-        subgraph Workers[Dedicated RTMP Worker Pods]
-            Worker1[Worker for Stream 1]
-            Worker2[Worker for Stream 2]
-            WorkerN[Worker for Stream N]
-        end
-
-        State[(Controller state ConfigMap)]
+        PublicService[Public Proxy Service]
+        Proxies[NGINX-RTMP Proxy Pods]
+        Controller[Controller API]
+        State[(Ownership State ConfigMap)]
     end
 
-    Destination[(YouTube RTMP endpoint)]
-
-    OBS1 -->|RTMP publish| PublicService
-    OBS2 -->|RTMP publish| PublicService
-    OBSN -->|RTMP publish| PublicService
+    OBS -->|RTMP publish| PublicService
     PublicService --> Proxies
-    Proxies -->|publish start and end events| Controller
-    Controller -->|create, replace, and delete pods| Workers
+    Proxies -->|publish start/end events| Controller
+    Controller -->|read Proxy readiness and address| Proxies
     Controller <-->|persist and restore ownership| State
-    Workers -->|RTMP pull| Proxies
-    Workers -->|RTMP push| Destination
+    Boundary[No Worker Deployment, Service, or Pod reconciliation]:::note
+    Controller -. cleanup-phase boundary .-> Boundary
+    classDef note fill:#fff3cd,stroke:#856404,color:#533f03

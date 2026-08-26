@@ -1,20 +1,16 @@
 flowchart TD
-    A([Início da transmissão]) --> B[Cliente envia vídeo ao Service público do proxy]
-    B --> C[Transmissão chega a um Proxy]
-    C --> D[Proxy avisa o Controller que a transmissão começou]
-
-    D --> E[Controller cria e configura um Worker dedicado]
-    E --> F[Worker recebe o stream do Proxy e publica no destino]
-
-    F --> G{Transmissão continua estável?}
-    G -->|Sim| H[Controller mantém monitoramento de saúde]
-    H --> G
-
-    G -->|Não| I["Controller corrige automaticamente
-(recria Worker ou troca Proxy quando necessário)"]
-    I --> F
-
-    F --> J[Cliente encerra a transmissão]
-    J --> K[Proxy avisa o Controller que a transmissão terminou]
-    K --> L[Controller remove Worker e limpa o estado]
-    L --> M([Fim])
+    A([Stream starts]) --> B[Proxy receives RTMP publish]
+    B --> C[Proxy notifies Controller]
+    C --> D[Controller records Proxy ownership and generation]
+    D --> E[Controller persists ownership in ConfigMap]
+    E --> F{Proxy remains healthy?}
+    F -->|Yes| G[Keep ownership registration]
+    G --> F
+    F -->|No, threshold reached| H[Expire affected ownership records]
+    G --> I[Proxy reports stream end]
+    I --> J[Controller validates owner and generation]
+    J --> K[Controller clears and persists stream ownership]
+    K --> L([End])
+    M[Worker lifecycle is outside this cleanup phase]:::note
+    D -.-> M
+    classDef note fill:#fff3cd,stroke:#856404,color:#533f03

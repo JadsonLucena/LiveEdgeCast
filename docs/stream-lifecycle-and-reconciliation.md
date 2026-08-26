@@ -1,123 +1,70 @@
-# Stream Lifecycle and Reconciliation Flow
+# Stream Ownership Lifecycle and Proxy Reconciliation
 
-This document defines the full end-to-end lifecycle for a live stream in the current pull-only architecture.
+This document describes the current cleanup-phase architecture. The Controller tracks which Proxy owns each live stream, but it does **not** provision or reconcile Workers. Worker Jobs or Operator behavior are intentionally outside this phase.
 
 ## Components
 
-- **Proxy**: receives RTMP publish from broadcaster and only notifies the Controller.
-- **Controller**: single source of truth for ownership, allocation, start/stop orchestration, health reconciliation, and failover decisions.
-- **Worker**: dedicated pod per stream key. Pulls from the assigned Proxy pod and pushes to YouTube.
+- **Proxy** receives the RTMP publish, exposes health and statistics endpoints, and notifies the Controller when publishing starts or ends.
+- **Controller** owns stream-to-Proxy registration, handover decisions, generation tracking, state persistence, and Proxy health reconciliation.
+- **Controller state ConfigMap** preserves ownership across Controller restarts.
 
-## Core State Model (Controller)
+There is no Worker Deployment or Worker Service. The Controller does not create, map, replace, inspect, or delete Worker Pods.
 
-Per stream key, the Controller maintains:
+## Controller State
+
+For each stream key, the Controller persists the current Proxy owner and generation:
 
 ```json
 {
-  "streamKey": {
-    "proxyPod": "string",
-    "workerPod": "string",
-    "generation": 1,
-    "expiresAt": 0
-  }
+  "stream_to_proxy": {"stream-key": "proxy-pod"},
+  "stream_registry": {"stream-key": {"proxy_pod": "proxy-pod"}},
+  "stream_generation": {"stream-key": 1}
 }
 ```
 
-Important state structures:
+Worker allocation state is not part of the schema.
 
-- `stream_registry`: stream -> current proxy owner + TTL expiration.
-- `stream_to_worker`: stream -> allocated worker pod.
-- `worker_to_stream`: worker pod -> stream.
-- `stream_generation`: stream -> generation token.
+## Publish Start
 
-## Start Lifecycle (Publish Start)
+1. A broadcaster starts an RTMP publish through the public Proxy Service.
+2. The selected Proxy runs `on_publish_start.sh`.
+3. The Proxy calls `POST /streams/started?stream=<key>&proxy_pod=<pod>`.
+4. The Controller registers or refreshes that Proxy as the stream owner and persists the ownership state.
+5. A repeated event from the same owner returns `idempotent_replay`.
 
-1. Broadcaster starts RTMP publish into a Proxy pod.
-2. Proxy executes `on_publish_start.sh`.
-3. Proxy calls:
-   - `POST /streams/started?stream=<key>&proxy_pod=<proxyPod>`
-4. Controller handles the full flow:
-   - registers/refreshes stream ownership in `stream_registry`;
-   - allocates an available worker or triggers scale-up if needed;
-   - if worker is already available, starts it immediately.
-5. Controller starts worker via `kubectl exec` passing:
-   - `STREAM_KEY`
-   - `STREAM_GENERATION`
-   - `PROXY_DNS`
-6. Worker runs `worker_stream_runner.sh` (single-shot):
-   - pulls from `rtmp://<PROXY_DNS>:1935/live/<STREAM_KEY>`;
-   - pushes to `${RTMP_PUSH_BASE_URL}/${STREAM_KEY}`;
-   - exits non-zero on failure (crash-fast).
+The endpoint does not allocate or start a Worker.
 
-## End Lifecycle (Publish End)
+## Publish End
 
-1. Broadcaster stops publish in Proxy.
-2. Proxy executes `on_publish_done.sh`.
-3. Proxy calls:
-   - `POST /streams/ended?stream=<key>&proxy_pod=<proxyPod>`
-4. Controller performs all cleanup:
-   - removes registry ownership for the stream if applicable;
-   - releases worker allocation mapping;
-   - schedules scale-down when no streams are active.
+1. The Proxy runs `on_publish_done.sh` when publishing ends.
+2. The Proxy calls `POST /streams/ended?stream=<key>&proxy_pod=<pod>`.
+3. The Controller compares the optional owner and generation with current state.
+4. A stale event returns `stale_event_ignored` without changing ownership.
+5. A matching event removes the stream's owner, registry entry, and generation, then persists the state. Repeated end events return `idempotent_replay`.
 
-## Reconciliation Flow
+No Worker is stopped or deleted by this endpoint.
 
-### Proxy Health Reconciliation
+## Proxy Health Reconciliation
 
-- Controller checks proxy health every 3s.
-- If a proxy becomes unhealthy and exceeds failure threshold:
-  - all impacted streams in `stream_registry` are expired;
-  - mapped workers consuming from that proxy are deleted;
-  - reallocation/restart is driven by subsequent stream events and reconciler loop.
+The Controller checks every Proxy that owns an active stream:
 
-### Worker Health Reconciliation
+- A Ready delay prevents application probes during startup.
+- Health checks run every three seconds with jitter.
+- After three consecutive failures, the Controller expires every stream owned by that Proxy and persists the updated registry.
 
-- Controller checks worker health every 3s.
-- For each allocated stream:
-  - validates worker pod readiness;
-  - validates stream processing signal.
-- If unhealthy:
-  - removes mapping;
-  - deletes defective worker pod;
-  - allows replacement via normal allocation flow.
+This loop reconciles ownership state only. It does not perform Worker recovery or replacement.
 
-## Handover and Generation Rules
+## Handover and Generation
 
-When the same stream key is seen on another proxy pod:
+When the same stream key appears on another Proxy, the Controller checks whether the current owner is unhealthy or no longer reports the stream in `/stats`.
 
-1. Controller evaluates ownership handover eligibility.
-2. If handover is accepted:
-   - increments `stream_generation`;
-   - updates stream owner to new proxy.
-3. Worker start requests may include generation check:
-   - if generation mismatches, Controller ignores stale start.
+- If the current owner remains eligible, the handover is rejected with HTTP 409.
+- If handover is allowed, the Controller increments the generation, records the new Proxy owner, and persists the change.
 
-This prevents split-brain and stale worker restarts from old ownership context.
-
-## Failure Strategy (Crash-Fast)
-
-- Worker does not run long local recovery loops.
-- Worker failures are intentional signals for replacement.
-- Controller is responsible for replacement and convergence.
-
-## TTL and Inactivity Rules
-
-- `STREAM_TTL_SECONDS = 180`.
-- If stream activity is not refreshed within TTL, registry entry expires.
-- Controller remains responsible for cleanup/reconciliation actions.
+Generation protects ownership cleanup from stale end events; it is not a Worker lease in the current phase.
 
 ## Responsibility Boundaries
 
-- **Proxy**:
-  - notify start (`/streams/started`)
-  - notify end (`/streams/ended`)
-  - no allocation/reconciliation decisions.
-
-- **Worker**:
-  - execute pull/push for assigned stream.
-  - fail fast on any critical execution problem.
-
-- **Controller**:
-  - owns lifecycle orchestration;
-  - owns healthchecks and reconciliation;
-  - owns state persistence and generation safety.
+- **Proxy**: receive RTMP, report publish start/end, and expose health/statistics.
+- **Controller**: persist ownership, validate handovers, reject stale lifecycle events, and expire ownership after Proxy health failures.
+- **Worker lifecycle**: deliberately unimplemented in this cleanup phase. A future phase may introduce a Job or Operator, but no such behavior is implied by the current API.
