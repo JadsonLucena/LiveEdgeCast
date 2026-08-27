@@ -1,16 +1,8 @@
 sequenceDiagram
     participant C as RTMP Client
     participant P as Proxy
-    participant A as Controller
 
     C->>P: Publish /live/streamX
-    P->>A: POST /streams/started(streamX, proxyPod)
-    A->>A: Log start notification
-    A-->>P: started_event_processed
-
     C--xP: End publish
-    P->>A: POST /streams/ended(streamX, proxyPod, generation?)
-    A->>A: Log end notification
-    A-->>P: ended
 
-    Note over A: No Worker Pod lifecycle in this cleanup phase
+    Note over P: No Controller callback or Worker Pod lifecycle in this cleanup phase

@@ -1,13 +1,10 @@
 flowchart TD
     A([Publish starts]) --> B[Client publishes RTMP through public Proxy Service]
     B --> C[Proxy receives stream]
-    C --> D[on_publish_start.sh notifies POST /streams/started]
-    D --> E[Controller logs event and returns started_event_processed]
-    E --> F([Publish continues])
-    F --> G[on_publish_done.sh notifies POST /streams/ended]
-    G --> H[Controller logs event and returns ended]
-    H --> I([End])
+    C --> D([Publish continues])
+    D --> E[Publish ends without callback]
+    E --> F([End])
 
     W[No retained ownership or Worker lifecycle state]:::note
-    D -. cleanup-phase boundary .-> W
+    C -. cleanup-phase boundary .-> W
     classDef note fill:#fff3cd,stroke:#856404,color:#533f03
