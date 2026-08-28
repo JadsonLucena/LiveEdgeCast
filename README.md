@@ -1,9 +1,10 @@
 # LiveEdgeCast
 
 LiveEdgeCast is in a **cleanup phase**. This repository currently contains only a
-minimal RTMP proxy, a health-only placeholder service, a worker container image,
-and Kubernetes manifests for the proxy and placeholder. It does not currently
-implement stream orchestration or serverless retransmission.
+minimal RTMP proxy, a health-only application named `controller`, a worker
+container image, and Kubernetes manifests for the proxy and health-only
+application. It does not currently implement stream orchestration or serverless
+retransmission.
 
 ## Current repository state
 
@@ -11,7 +12,8 @@ The deployable Kubernetes resources are limited to:
 
 - the `media` namespace;
 - an NGINX-RTMP proxy Deployment and its public and internal Services; and
-- a health-only placeholder Deployment and ServiceAccount.
+- a `controller` Deployment and ServiceAccount whose application exposes only
+  `/health` (there is no Controller Service).
 
 The proxy accepts and serves RTMP streams. Nothing in the current application
 creates per-stream workloads, persists stream ownership, reacts to stream
@@ -54,9 +56,10 @@ target architecture only.
 ### Requirements
 
 - Docker
-- a Kubernetes cluster
+- a local kind or Docker Desktop Kubernetes cluster that can use locally built
+  Docker images
 - `kubectl`
-- `kind` when the active cluster is a kind cluster
+- `kind` when using a kind cluster
 
 Deploy the resources that currently exist:
 
@@ -70,12 +73,16 @@ For a kind cluster, the script also starts a local port forward. Publish to:
 rtmp://127.0.0.1:1935/live/{stream-key}
 ```
 
-On another cluster, inspect the `proxy` LoadBalancer Service for its external
-address:
+On Docker Desktop, inspect the local `proxy` LoadBalancer Service:
 
 ```sh
 kubectl get service proxy -n media
 ```
+
+Remote clusters are not supported by this cleanup-phase script. Both retained
+Deployments use locally built image names with `imagePullPolicy: Never`. Docker
+Desktop shares its local image store, while the script explicitly loads the
+images into kind.
 
 Remove the cleanup-phase deployment:
 
