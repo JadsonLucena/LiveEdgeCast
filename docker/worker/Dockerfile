@@ -5,6 +5,7 @@ RUN apk add --no-cache \
     ffmpeg \
     bash
 
-COPY --chmod=755 worker_stream_runner.sh entrypoint.sh /scripts/
+COPY worker_stream_runner.sh entrypoint.sh /scripts/
+RUN chmod 755 /scripts/worker_stream_runner.sh /scripts/entrypoint.sh
 
 ENTRYPOINT ["/scripts/entrypoint.sh"]
