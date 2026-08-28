@@ -16,8 +16,6 @@ spec:
         - name: controller
           image: liveedgecast-controller:latest
           imagePullPolicy: Never
-          ports:
-            - containerPort: 8000
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
