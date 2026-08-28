@@ -22,7 +22,6 @@ fi
 
 print_step "Stopping local port forwards..."
 pkill -f "kubectl.*port-forward.*1935" 2>/dev/null || true
-pkill -f "kubectl.*port-forward.*8080" 2>/dev/null || true
 
 if ! kubectl get namespace media >/dev/null 2>&1; then
     print_success "The media namespace is already absent"
