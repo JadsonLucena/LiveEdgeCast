@@ -29,8 +29,6 @@ if ! kubectl get namespace media >/dev/null 2>&1; then
 fi
 
 print_step "Deleting Kubernetes resources..."
-# Legacy per-stream workers were created directly and are not covered by a manifest.
-kubectl delete pods -l app=worker -n media --ignore-not-found=true
 kubectl delete -f k8s/ --ignore-not-found=true
 
 print_success "LiveEdgeCast shutdown completed"

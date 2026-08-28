@@ -1,8 +1,0 @@
-flowchart TD
-    A([Stream starts]) --> B[Proxy receives RTMP publish]
-    B --> C[Proxy serves stream]
-    C --> D[Stream ends without callback]
-    D --> G([End])
-    M[Worker lifecycle is outside this cleanup phase]:::note
-    B -.-> M
-    classDef note fill:#fff3cd,stroke:#856404,color:#533f03

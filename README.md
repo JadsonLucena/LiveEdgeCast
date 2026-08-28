@@ -1,50 +1,93 @@
 # LiveEdgeCast
 
-🚀 **Serverless RTMP Edge Proxy for Low-Latency Live Stream Retransmission**
+LiveEdgeCast is in a **cleanup phase**. This repository currently contains only a
+minimal RTMP proxy, a health-only application named `controller`, a worker
+container image, and Kubernetes manifests for the proxy and health-only
+application. It does not currently implement stream orchestration or serverless
+retransmission.
 
-LiveEdgeCast implements a serverless architecture on edge computing environments, focusing on the retransmission of live streams with minimal latency. The solution ensures high availability, responsiveness, and efficient resource utilization by dynamically provisioning compute resources only when needed.
+## Current repository state
 
-## 🎯 Project Goals
+The deployable Kubernetes resources are limited to:
 
-- **Low-Latency Retransmission**: Minimize delay in live stream forwarding
-- **Edge Computing**: Deploy close to users for optimal performance  
-- **Serverless Execution**: Dynamic resource provisioning and cost optimization
-- **High Availability**: Fault-tolerant stream proxy architecture
-- **Efficient Resource Utilization**: Scale up/down based on demand
+- the `media` namespace;
+- an NGINX-RTMP proxy Deployment and its public and internal Services; and
+- a `controller` Deployment and ServiceAccount whose application exposes only
+  `/health` (there is no Controller Service).
 
+The proxy accepts and serves RTMP streams. Nothing in the current application
+creates per-stream workloads, persists stream ownership, reacts to stream
+lifecycle callbacks, or performs autoscaling. The worker image is retained as a
+building block, but no Kubernetes resource launches it.
 
-# How to Start and Stop the Project
+The following are deliberately absent:
 
-To start the project, use the provided script:
+- the former imperative Controller lifecycle API;
+- HAProxy-based routing;
+- KEDA scaling and Prometheus metrics;
+- a shared Worker Deployment or Service; and
+- `LiveStream` custom resources, an Operator, and per-stream Jobs.
+
+The manifests and scripts are cleanup-phase scaffolding, not a production
+implementation of the target design.
+
+## Fixed target architecture
+
+Future implementation work must use one declarative ownership model:
+
+1. An RTMP ingest component records the desired stream as a `LiveStream` custom
+   resource.
+2. A Kubernetes Operator reconciles each `LiveStream` into one per-stream Job.
+3. The Job runs the worker image and forwards that stream to its configured
+   destination.
+4. Stream termination updates or removes the custom resource; the Operator then
+   reconciles the associated Job to the stopped state.
+
+Kubernetes API state is the source of truth in this target. There is no separate
+imperative Controller, HAProxy tier, Prometheus/KEDA scaling loop, or shared
+Worker Deployment in the design.
+
+**The CRD, Operator, ingest integration, and per-stream Job reconciliation are
+not implemented in this repository yet.** Their names above describe the fixed
+target architecture only.
+
+## Cleanup-phase deployment
+
+### Requirements
+
+- Docker
+- a local kind or Docker Desktop Kubernetes cluster that can use locally built
+  Docker images
+- `kubectl`
+- `kind` when using a kind cluster
+
+Deploy the resources that currently exist:
 
 ```sh
 ./tools/up.sh
 ```
 
-To stop the project, use:
+For a kind cluster, the script also starts a local port forward. Publish to:
+
+```text
+rtmp://127.0.0.1:1935/live/{stream-key}
+```
+
+On Docker Desktop, inspect the local `proxy` LoadBalancer Service:
+
+```sh
+kubectl get service proxy -n media
+```
+
+Remote clusters are not supported by this cleanup-phase script. Both retained
+Deployments use locally built image names with `imagePullPolicy: Never`. Docker
+Desktop shares its local image store, while the script explicitly loads the
+images into kind.
+
+Remove the cleanup-phase deployment:
 
 ```sh
 ./tools/down.sh
 ```
 
-# Running Directly with Docker
-
-Alternatively, you can run the project directly using Docker Compose:
-
-```sh
-RTMP_PUSH_URL=rtmp://a.rtmp.youtube.com/live2/2tww-t6fv-z2mh-0rsq-4z8t docker-compose up -d
-```
-
-To stop and remove the containers:
-
-```sh
-docker-compose down
-```
-
-# Requirements
-- **Docker**: Ensure Docker is installed and running.
-- **Kubernetes**: A Kubernetes cluster is required for deployment.
-- **kubectl**: Command-line tool for interacting with Kubernetes clusters.
-- **Docker Compose**: For running the project directly with Docker.
-# Environment Variables
-- **RTMP_PUSH_URL**: The RTMP URL to which the stream will be pushed. It should be in the format `rtmp://upstream.example.com/live/yourStreamKey`.
+These commands do not install a CRD or Operator and do not launch workers.
