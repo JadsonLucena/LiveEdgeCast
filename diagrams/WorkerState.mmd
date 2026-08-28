@@ -1,6 +1,0 @@
-flowchart TD
-    A[Worker lifecycle] --> B[Not managed by the Controller]
-    B --> C[No Deployment or Service template]
-    B --> D[No allocation mappings]
-    B --> E[No Pod create, replace, health, sweep, or delete]
-    B --> F[Future Job or Operator behavior is outside this cleanup phase]

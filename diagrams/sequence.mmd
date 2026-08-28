@@ -1,8 +1,0 @@
-sequenceDiagram
-    participant C as RTMP Client
-    participant P as Proxy
-
-    C->>P: Publish /live/streamX
-    C--xP: End publish
-
-    Note over P: No Controller callback or Worker Pod lifecycle in this cleanup phase

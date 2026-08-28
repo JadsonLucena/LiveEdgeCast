@@ -55,12 +55,6 @@ elif [[ ! $CONTEXT =~ (docker-desktop|localhost|127\.0\.0\.1) ]]; then
 fi
 
 print_step "Applying Kubernetes resources..."
-# Plain kubectl apply does not prune resources removed from the manifests. Clean
-# up retired ingress and Worker resources when upgrading an existing installation.
-# Directly-created workers have no Deployment owner and must be removed explicitly.
-kubectl delete pods -l app=worker -n media --ignore-not-found=true
-kubectl delete deployment/proxy-lb deployment/worker configmap/proxy-lb-config \
-    service/controller service/proxy-entry service/worker -n media --ignore-not-found=true
 kubectl apply -f k8s/
 
 # The controller image uses a local, mutable `latest` tag with imagePullPolicy:
