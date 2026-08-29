@@ -65,6 +65,14 @@ kubectl delete deployment/controller deployment/proxy-lb deployment/worker \
 print_step "Applying Kubernetes resources..."
 kubectl apply -f k8s/
 
+# The local mutable tag does not change the Pod template, so applying the
+# Deployment alone would leave an existing Pod running the previous image.
+print_step "Restarting the Proxy deployment to use the newly built image..."
+kubectl rollout restart deployment/proxy -n media
+
+print_step "Waiting for the Proxy deployment..."
+kubectl rollout status deployment/proxy -n media --timeout=120s
+
 print_success "LiveEdgeCast is ready"
 echo ""
 if [[ $CONTEXT == kind-* ]]; then
