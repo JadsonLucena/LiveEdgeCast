@@ -88,7 +88,16 @@ spec:
               properties:
                 phase:
                   type: string
-                  description: Current lifecycle phase of the live stream.
+                  description: Current lifecycle phase of the live stream. An absent LiveStream resource represents an offline stream.
+                  enum:
+                    - Registered
+                    - Provisioning
+                    - Starting
+                    - Streaming
+                    - Recovering
+                    - Interrupted
+                    - Handover
+                    - Stopping
                 observedGeneration:
                   type: integer
                   format: int64
