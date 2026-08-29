@@ -10,7 +10,8 @@ serverless retransmission.
 The deployable Kubernetes resources are limited to:
 
 - the `media` namespace;
-- an NGINX-RTMP Proxy Deployment and its public and internal Services.
+- an NGINX-RTMP Proxy Deployment and a single `LoadBalancer` Service for RTMP
+  over TCP port 1935.
 
 The proxy accepts and serves RTMP streams. Nothing in the current application
 creates per-stream workloads, persists stream ownership, reacts to stream
