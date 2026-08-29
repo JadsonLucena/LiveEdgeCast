@@ -1,19 +1,16 @@
 # LiveEdgeCast
 
-LiveEdgeCast is in a **cleanup phase**. This repository currently contains only a
-minimal RTMP proxy, a health-only application named `controller`, a worker
-container image, and Kubernetes manifests for the proxy and health-only
-application. It does not currently implement stream orchestration or serverless
-retransmission.
+LiveEdgeCast is building its **Phase 1 foundation**. This foundation contains
+only a minimal RTMP proxy, its Kubernetes exposure, and an FFmpeg-based Worker
+container image. It does not currently implement stream orchestration or
+serverless retransmission.
 
 ## Current repository state
 
 The deployable Kubernetes resources are limited to:
 
 - the `media` namespace;
-- an NGINX-RTMP proxy Deployment and its public and internal Services; and
-- a `controller` Deployment and ServiceAccount whose application exposes only
-  `/health` (there is no Controller Service).
+- an NGINX-RTMP Proxy Deployment and its public and internal Services.
 
 The proxy accepts and serves RTMP streams. Nothing in the current application
 creates per-stream workloads, persists stream ownership, reacts to stream
@@ -28,7 +25,11 @@ The following are deliberately absent:
 - a shared Worker Deployment or Service; and
 - `LiveStream` custom resources, an Operator, and per-stream Jobs.
 
-The manifests and scripts are cleanup-phase scaffolding, not a production
+Phase 1 does not retain a health-check application as a placeholder for the
+future Operator. The Operator will be introduced directly in its corresponding
+implementation phase.
+
+The manifests and scripts are Phase 1 foundation scaffolding, not a production
 implementation of the target design.
 
 ## Fixed target architecture
@@ -51,7 +52,7 @@ Worker Deployment in the design.
 not implemented in this repository yet.** Their names above describe the fixed
 target architecture only.
 
-## Cleanup-phase deployment
+## Phase 1 foundation deployment
 
 ### Requirements
 
@@ -79,12 +80,12 @@ On Docker Desktop, inspect the local `proxy` LoadBalancer Service:
 kubectl get service proxy -n media
 ```
 
-Remote clusters are not supported by this cleanup-phase script. Both retained
-Deployments use locally built image names with `imagePullPolicy: Never`. Docker
-Desktop shares its local image store, while the script explicitly loads the
-images into kind.
+Remote clusters are not supported by this Phase 1 script. The Proxy Deployment
+uses a locally built image name with `imagePullPolicy: Never`. Docker Desktop
+shares its local image store, while the script explicitly loads the Proxy image
+into kind.
 
-Remove the cleanup-phase deployment:
+Remove the Phase 1 foundation deployment:
 
 ```sh
 ./tools/down.sh
