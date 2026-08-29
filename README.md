@@ -1,9 +1,10 @@
 # LiveEdgeCast
 
-LiveEdgeCast is building its **Phase 1 foundation**. This foundation contains
-only a minimal RTMP proxy, its Kubernetes exposure, and an FFmpeg-based Worker
-container image. It does not currently implement stream orchestration or
-serverless retransmission.
+LiveEdgeCast contains the minimal foundation completed in **Phase 1** and the
+declarative `LiveStream` API established in **Phase 2**. The repository includes
+an RTMP Proxy, an FFmpeg-based Worker container image, and the `LiveStream` CRD.
+It does not yet include ingest integration, an Operator, or per-stream Jobs, so
+stream orchestration and serverless retransmission are not implemented.
 
 ## Current repository state
 
@@ -27,12 +28,13 @@ The following are deliberately absent:
 - a shared Worker Deployment or Service; and
 - an Operator, RTMP ingest integration, and per-stream Jobs.
 
-Phase 1 does not retain a health-check application as a placeholder for the
-future Operator. The Operator will be introduced directly in its corresponding
-implementation phase.
+The repository does not retain a health-check application as a placeholder for
+the future Operator. The Operator will be introduced directly in its
+corresponding implementation phase.
 
-The manifests and scripts are Phase 1 foundation scaffolding, not a production
-implementation of the target design.
+The manifests and scripts combine the completed Phase 1 foundation with the
+Phase 2 API definition; they are not a production implementation of the target
+design.
 
 ## Fixed target architecture
 
@@ -54,7 +56,7 @@ Worker Deployment in the design.
 implemented in this repository yet.** Their names above describe the fixed
 target architecture only.
 
-## Phase 1 foundation deployment
+## Current foundation and API deployment
 
 ### Requirements
 
@@ -82,16 +84,17 @@ On Docker Desktop, inspect the local `proxy` LoadBalancer Service:
 kubectl get service proxy -n media
 ```
 
-Remote clusters are not supported by this Phase 1 script. The Proxy Deployment
-uses a locally built image name with `imagePullPolicy: Never`. Docker Desktop
-shares its local image store, while the script explicitly loads the Proxy image
-into kind.
+Remote clusters are not supported by this local deployment script. The Proxy
+Deployment uses a locally built image name with `imagePullPolicy: Never`.
+Docker Desktop shares its local image store, while the script explicitly loads
+the Proxy image into kind.
 
-Remove the Phase 1 foundation deployment:
+Remove the current deployment:
 
 ```sh
 ./tools/down.sh
 ```
 
-These commands install the `LiveStream` CRD, but do not install an Operator,
-provide ingest integration, or launch workers.
+Applying `k8s/` installs the `LiveStream` CRD, but does not create any
+`LiveStream` instances, install an Operator, provide ingest integration, or
+create per-stream Jobs. Consequently, it does not launch Worker containers.
