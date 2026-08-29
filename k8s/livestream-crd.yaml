@@ -18,12 +18,72 @@ spec:
       schema:
         openAPIV3Schema:
           type: object
+          description: LiveStream describes a live media stream managed by LiveEdgeCast.
           properties:
             spec:
               type: object
-              x-kubernetes-preserve-unknown-fields: true
+              description: Desired configuration for the live stream.
+              additionalProperties: false
+              required:
+                - streamKey
+                - source
+                - target
+              properties:
+                streamKey:
+                  type: string
+                  description: Stream key used to identify and route the live stream.
+                source:
+                  type: object
+                  description: Source publication consumed by the live stream.
+                  additionalProperties: false
+                  required:
+                    - proxyName
+                    - sessionId
+                    - url
+                  properties:
+                    proxyName:
+                      type: string
+                      description: Name of the proxy that owns the source publication.
+                    sessionId:
+                      type: string
+                      description: Identifies a specific publication and is used to reject stale termination events.
+                    url:
+                      type: string
+                      description: URL from which the source publication is consumed.
+                target:
+                  type: object
+                  description: Destination to which the live stream is delivered.
+                  additionalProperties: false
+                  required:
+                    - url
+                  properties:
+                    url:
+                      type: string
+                      description: URL to which the live stream is delivered.
+                recoveryPolicy:
+                  type: object
+                  description: Retry and interruption handling policy for the live stream.
+                  default: {}
+                  additionalProperties: false
+                  properties:
+                    retryIntervalSeconds:
+                      type: integer
+                      description: Number of seconds to wait between recovery attempts.
+                      default: 2
+                      minimum: 0
+                    maxRetries:
+                      type: integer
+                      description: Maximum number of recovery attempts.
+                      default: 5
+                      minimum: 0
+                    interruptionTTLSeconds:
+                      type: integer
+                      description: Number of seconds an interruption may last before it expires.
+                      default: 10
+                      minimum: 0
             status:
               type: object
-              x-kubernetes-preserve-unknown-fields: true
+              description: Observed state of the live stream.
+              additionalProperties: false
       subresources:
         status: {}
