@@ -25,13 +25,15 @@ does not implement the Operator, per-stream Jobs, or Proxy callbacks.
 
 - Creation after `publication_started` begins in `Registered`.
 - `Registered` → `Provisioning` → `Starting` → `Streaming`.
-- A terminal Job failure while the source is available moves an active phase
-  through `Recovering` → `Provisioning`.
-- Loss of the source moves an active phase or `Recovering` to `Interrupted`.
+- A terminal Job failure while the source is available follows
+  `Provisioning` | `Starting` | `Streaming` → `Recovering` → `Provisioning`.
+- Loss of the source follows `Registered` | `Provisioning` | `Starting` |
+  `Streaming` | `Recovering` → `Interrupted`.
 - Reconnection within the TTL follows `Interrupted` → `Handover` →
   `Provisioning`.
 - An expired TTL or exhausted retry limit follows `Interrupted` → `Stopping`.
-- A source change during `Starting`, `Streaming`, or `Recovering` follows
+- A source change follows `Starting` | `Streaming` | `Recovering` →
   `Handover` → `Provisioning`.
-- The end of the current publication moves an active phase to `Stopping`.
+- The end of the current publication follows `Registered` | `Provisioning` |
+  `Starting` | `Streaming` | `Recovering` | `Handover` → `Stopping`.
 - Finalization removes the `LiveStream` resource.
