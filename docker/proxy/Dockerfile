@@ -28,7 +28,6 @@ RUN ./configure \
     --pid-path=/var/run/nginx.pid \
     --lock-path=/var/run/nginx.lock \
     --with-http_ssl_module \
-    --with-http_stub_status_module \
     --with-threads \
     --with-file-aio \
     --add-module=../nginx-rtmp-module-${NGINX_RTMP_MODULE_VERSION} \
@@ -46,12 +45,11 @@ RUN apk add --no-cache \
     zlib
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
-COPY --from=builder /tmp/build/nginx-${NGINX_VERSION}/conf/mime.types /etc/nginx/mime.types
 RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
     && mkdir -p /var/log/nginx
 
 COPY nginx.conf /etc/nginx/nginx.conf
 
-EXPOSE 1935 8080
+EXPOSE 1935
 STOPSIGNAL SIGQUIT
 CMD ["nginx", "-g", "daemon off;"]
