@@ -85,5 +85,115 @@ spec:
               type: object
               description: Observed state of the live stream.
               additionalProperties: false
+              properties:
+                phase:
+                  type: string
+                  description: Current lifecycle phase of the live stream.
+                observedGeneration:
+                  type: integer
+                  format: int64
+                  description: Most recent generation observed by the Operator.
+                source:
+                  type: object
+                  description: Observed state of the source publication.
+                  additionalProperties: false
+                  properties:
+                    proxyName:
+                      type: string
+                      description: Name of the proxy serving the observed source publication.
+                    sessionId:
+                      type: string
+                      description: Session identifier of the observed source publication.
+                    available:
+                      type: boolean
+                      description: Whether the source publication is currently available.
+                    lastSeenAt:
+                      type: string
+                      format: date-time
+                      description: Time at which the source publication was last observed.
+                job:
+                  type: object
+                  description: Observed state of the processing job.
+                  additionalProperties: false
+                  properties:
+                    name:
+                      type: string
+                      description: Name of the processing job.
+                    phase:
+                      type: string
+                      description: Current phase of the processing job.
+                    boundSourceSessionId:
+                      type: string
+                      description: Source session identifier to which the job is bound.
+                processing:
+                  type: object
+                  description: Observed processing health and progress.
+                  additionalProperties: false
+                  properties:
+                    healthy:
+                      type: boolean
+                      description: Whether processing is currently healthy.
+                    lastProgressAt:
+                      type: string
+                      format: date-time
+                      description: Time at which processing last made progress.
+                interruption:
+                  type: object
+                  description: Observed interruption and retry state.
+                  additionalProperties: false
+                  properties:
+                    startedAt:
+                      type: string
+                      format: date-time
+                      description: Time at which the current interruption started.
+                    retryCount:
+                      type: integer
+                      minimum: 0
+                      description: Number of recovery attempts made during the current interruption.
+                    lastRetryAt:
+                      type: string
+                      format: date-time
+                      description: Time at which recovery was last attempted.
+                conditions:
+                  type: array
+                  description: Conditions representing the latest available observations of the live stream.
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys:
+                    - type
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required:
+                      - type
+                      - status
+                      - reason
+                      - message
+                      - lastTransitionTime
+                      - observedGeneration
+                    properties:
+                      type:
+                        type: string
+                        description: Type of condition.
+                      status:
+                        type: string
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        description: Status of the condition, one of True, False, or Unknown.
+                      reason:
+                        type: string
+                        description: Machine-readable reason for the condition's last transition.
+                      message:
+                        type: string
+                        description: Human-readable details about the condition's last transition.
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                        description: Time at which the condition last transitioned between statuses.
+                      observedGeneration:
+                        type: integer
+                        format: int64
+                        description: Generation observed when the condition was set.
       subresources:
         status: {}
