@@ -55,13 +55,6 @@ if [[ $CONTEXT == kind-* ]]; then
     kind load docker-image "$PROXY_IMAGE"
 fi
 
-print_step "Removing resources retired before the Phase 1 foundation..."
-# Applying the retained manifests does not prune objects from older releases.
-kubectl delete pods -l app=worker -n media --ignore-not-found=true
-kubectl delete deployment/controller deployment/proxy-lb deployment/worker \
-    configmap/proxy-lb-config service/controller service/proxy-entry service/worker \
-    serviceaccount/controller -n media --ignore-not-found=true
-
 print_step "Applying Kubernetes resources..."
 kubectl apply -f k8s/
 
