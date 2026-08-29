@@ -44,36 +44,26 @@ kubectl apply -f k8s/namespaces.yaml
 kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/media --timeout=30s
 
 PROXY_IMAGE="liveedgecast-proxy:latest"
-CONTROLLER_IMAGE="liveedgecast-controller:latest"
 
-print_step "Building container images..."
+print_step "Building the Proxy container image..."
 docker build -t "$PROXY_IMAGE" -f docker/proxy/Dockerfile docker/proxy
-docker build -t "$CONTROLLER_IMAGE" -f docker/controller/Dockerfile docker/controller
-print_success "Container images built"
+print_success "Proxy container image built"
 
 if [[ $CONTEXT == kind-* ]]; then
     check_command kind
-    print_step "Loading images into the kind cluster..."
-    kind load docker-image "$PROXY_IMAGE" "$CONTROLLER_IMAGE"
+    print_step "Loading the Proxy image into the kind cluster..."
+    kind load docker-image "$PROXY_IMAGE"
 fi
 
-print_step "Removing resources retired by the cleanup phase..."
+print_step "Removing resources retired before the Phase 1 foundation..."
 # Applying the retained manifests does not prune objects from older releases.
 kubectl delete pods -l app=worker -n media --ignore-not-found=true
-kubectl delete deployment/proxy-lb deployment/worker configmap/proxy-lb-config \
-    service/controller service/proxy-entry service/worker -n media --ignore-not-found=true
+kubectl delete deployment/controller deployment/proxy-lb deployment/worker \
+    configmap/proxy-lb-config service/controller service/proxy-entry service/worker \
+    serviceaccount/controller -n media --ignore-not-found=true
 
 print_step "Applying Kubernetes resources..."
 kubectl apply -f k8s/
-
-# Both images use local, mutable `latest` tags with imagePullPolicy: Never.
-# Restart both Deployments so rerunning this script uses the images just loaded.
-print_step "Restarting deployments to use the newly loaded images..."
-kubectl rollout restart deployment/controller deployment/proxy -n media
-
-print_step "Waiting for core deployments..."
-kubectl rollout status deployment/controller -n media --timeout=120s
-kubectl rollout status deployment/proxy -n media --timeout=120s
 
 print_success "LiveEdgeCast is ready"
 echo ""
@@ -105,5 +95,4 @@ fi
 echo ""
 echo "Useful commands:"
 echo "  kubectl get pods -n media"
-echo "  kubectl logs -l app=controller -n media -f"
 echo "  kubectl logs -l app=proxy -n media -f"
