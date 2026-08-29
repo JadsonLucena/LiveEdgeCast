@@ -10,8 +10,9 @@ serverless retransmission.
 The deployable Kubernetes resources are limited to:
 
 - the `media` namespace;
-- an NGINX-RTMP Proxy Deployment and a single `LoadBalancer` Service for RTMP
-  over TCP port 1935.
+- an NGINX-RTMP Proxy Deployment;
+- the singular `proxy` Service, of type `LoadBalancer`, exposed on TCP port 1935;
+- the `LiveStream` CRD.
 
 The proxy accepts and serves RTMP streams. Nothing in the current application
 creates per-stream workloads, persists stream ownership, reacts to stream
@@ -24,7 +25,7 @@ The following are deliberately absent:
 - HAProxy-based routing;
 - KEDA scaling and Prometheus metrics;
 - a shared Worker Deployment or Service; and
-- `LiveStream` custom resources, an Operator, and per-stream Jobs.
+- an Operator, RTMP ingest integration, and per-stream Jobs.
 
 Phase 1 does not retain a health-check application as a placeholder for the
 future Operator. The Operator will be introduced directly in its corresponding
@@ -49,8 +50,8 @@ Kubernetes API state is the source of truth in this target. There is no separate
 imperative Controller, HAProxy tier, Prometheus/KEDA scaling loop, or shared
 Worker Deployment in the design.
 
-**The CRD, Operator, ingest integration, and per-stream Job reconciliation are
-not implemented in this repository yet.** Their names above describe the fixed
+**The Operator, ingest integration, and per-stream Job reconciliation are not
+implemented in this repository yet.** Their names above describe the fixed
 target architecture only.
 
 ## Phase 1 foundation deployment
@@ -92,4 +93,5 @@ Remove the Phase 1 foundation deployment:
 ./tools/down.sh
 ```
 
-These commands do not install a CRD or Operator and do not launch workers.
+These commands install the `LiveStream` CRD, but do not install an Operator,
+provide ingest integration, or launch workers.
