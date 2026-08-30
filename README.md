@@ -115,3 +115,39 @@ Applying `k8s/` installs the `LiveStream` CRD, Operator RBAC, and Operator
 Deployment, but does not create any `LiveStream` instances or provide ingest
 integration. A manually created `LiveStream` is reconciled into an owned
 per-stream Job.
+
+### Worker media health watchdog
+
+Each Worker receives `MEDIA_HEALTH_INTERVAL_SECONDS=10` from the Operator. The
+value is a positive integer in seconds and controls how long FFmpeg may run
+without reporting an increasing processed-media timestamp. Ten seconds is a
+small default intended to detect a stalled source promptly; change the
+`MEDIA_HEALTH_INTERVAL_SECONDS` constant in `docker/operator/src/jobs.py` when
+a deployment needs a different tolerance. The interval is part of the Job
+configuration identity, so after an Operator rollout it replaces Jobs created
+with the previous interval instead of retaining their immutable Pod templates.
+
+The Worker reads FFmpeg's dedicated `-progress` stream and refreshes its health
+state only when `out_time_us` or `out_time_ms` increases. If neither advances
+within the interval, the watchdog logs the stall, sends FFmpeg `SIGTERM`, waits
+briefly, and uses `SIGKILL` only if FFmpeg ignores the grace period. The Worker
+then waits for FFmpeg and exits non-zero. It does not restart FFmpeg or keep the
+container alive.
+
+The recovery flow is therefore **FFmpeg without media progress → container
+exits non-zero → Pod becomes `Failed` → the Kubernetes Job Controller creates
+the next retry**. The Operator does not poll the Worker and does not replace the
+Job while that Job is still retrying; it reacts only after the Job reaches a
+terminal condition.
+
+To validate a stalled source manually, publish a stream and then leave its
+connection open without producing more media. In another terminal, watch:
+
+```sh
+kubectl get pods -n media -w
+```
+
+After the configured interval, confirm that the Worker Pod becomes `Failed`
+and that a new Pod is created for the **same Job** (the Pod's `job-name` label
+remains unchanged). The Operator must not replace the Job before its terminal
+`Failed` condition.
