@@ -13,7 +13,7 @@ import source
 import status
 
 LOGGER = logging.getLogger(__name__)
-FINALIZER = "liveedgecast.io/finalizer"
+FINALIZER = "liveedgecast.io/stream-cleanup"
 
 
 class LifecycleAction(Enum):
