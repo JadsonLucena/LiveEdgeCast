@@ -14,6 +14,16 @@ monitor_dir=""
 
 log() { echo "[$(date)] [worker_stream_runner] $1"; }
 
+monotonic_milliseconds() {
+  local uptime_seconds uptime_fraction ignored
+
+  # /proc/uptime is monotonic and available in the Linux-based Alpine image.
+  # Avoid GNU date's %N extension, which BusyBox date does not implement.
+  IFS='. ' read -r uptime_seconds uptime_fraction ignored </proc/uptime
+  uptime_fraction="${uptime_fraction}000"
+  printf '%s%s\n' "$uptime_seconds" "${uptime_fraction:0:3}"
+}
+
 stop_auxiliary_processes() {
   if [ -n "$watchdog_pid" ]; then
     kill "$watchdog_pid" 2>/dev/null || true
@@ -96,7 +106,7 @@ last_progress_file="$monitor_dir/last-progress"
 watchdog_fired_file="$monitor_dir/watchdog-fired"
 mkfifo "$progress_fifo"
 
-started_at_ms="$(date +%s%3N)"
+started_at_ms="$(monotonic_milliseconds)"
 health_interval_ms=$((MEDIA_HEALTH_INTERVAL_SECONDS * 1000))
 printf '%s\n' "$started_at_ms" >"$last_progress_file"
 
@@ -110,7 +120,7 @@ printf '%s\n' "$started_at_ms" >"$last_progress_file"
         if [[ "$value" =~ ^[0-9]+$ ]]; then
           if (( 10#$value > last_media_timestamp[$key] )); then
             last_media_timestamp[$key]=$((10#$value))
-            printf '%s\n' "$(date +%s%3N)" >"$last_progress_file.tmp"
+            monotonic_milliseconds >"$last_progress_file.tmp"
             mv "$last_progress_file.tmp" "$last_progress_file"
           fi
         fi
@@ -129,7 +139,7 @@ ffmpeg_pid=$!
 (
   while kill -0 "$ffmpeg_pid" 2>/dev/null; do
     sleep 1
-    now_ms="$(date +%s%3N)"
+    now_ms="$(monotonic_milliseconds)"
     last_progress_ms="$(cat "$last_progress_file" 2>/dev/null || printf '%s' "$started_at_ms")"
     if (( now_ms - last_progress_ms >= health_interval_ms )); then
       printf '%s\n' "no increasing FFmpeg media timestamp for ${MEDIA_HEALTH_INTERVAL_SECONDS}s" >"$watchdog_fired_file"
