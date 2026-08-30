@@ -12,6 +12,7 @@ from reconciler import reconcile
 GROUP = "liveedgecast.io"
 VERSION = "v1alpha1"
 PLURAL = "livestreams"
+NAMESPACE = "media"
 RESYNC_SECONDS = 5
 LOGGER = logging.getLogger(__name__)
 
@@ -26,7 +27,9 @@ def _load_configuration() -> None:
 
 
 def _reconcile_all(custom_api, batch_api, core_api) -> str | None:
-    response = custom_api.list_cluster_custom_object(GROUP, VERSION, PLURAL)
+    response = custom_api.list_namespaced_custom_object(
+        GROUP, VERSION, NAMESPACE, PLURAL
+    )
     for resource in response.get("items", []):
         reconcile(resource, custom_api, batch_api, core_api)
     return response.get("metadata", {}).get("resourceVersion")
@@ -43,9 +46,10 @@ def run() -> None:
             resource_version = _reconcile_all(custom_api, batch_api, core_api)
             stream = watch.Watch()
             for event in stream.stream(
-                custom_api.list_cluster_custom_object,
+                custom_api.list_namespaced_custom_object,
                 GROUP,
                 VERSION,
+                NAMESPACE,
                 PLURAL,
                 resource_version=resource_version,
                 timeout_seconds=RESYNC_SECONDS,
