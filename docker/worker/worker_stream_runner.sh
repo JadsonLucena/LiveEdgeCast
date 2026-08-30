@@ -139,6 +139,11 @@ ffmpeg_pid=$!
 (
   while kill -0 "$ffmpeg_pid" 2>/dev/null; do
     sleep 1
+    # FFmpeg may have completed while the watchdog was sleeping. Recheck here
+    # so a normal exit at the health deadline is not misclassified as a stall.
+    if ! kill -0 "$ffmpeg_pid" 2>/dev/null; then
+      exit 0
+    fi
     now_ms="$(monotonic_milliseconds)"
     last_progress_ms="$(cat "$last_progress_file" 2>/dev/null || printf '%s' "$started_at_ms")"
     if (( now_ms - last_progress_ms >= health_interval_ms )); then
