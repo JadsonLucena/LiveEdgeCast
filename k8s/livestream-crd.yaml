@@ -163,6 +163,27 @@ spec:
                       type: string
                       format: date-time
                       description: Time at which recovery was last attempted.
+                cleanup:
+                  type: object
+                  description: Validated workload identities retained while deletion converges.
+                  additionalProperties: false
+                  properties:
+                    jobs:
+                      type: array
+                      description: Jobs validated as controlled by this LiveStream during finalization.
+                      items:
+                        type: object
+                        additionalProperties: false
+                        required:
+                          - name
+                          - uid
+                        properties:
+                          name:
+                            type: string
+                            description: Name of the validated Job.
+                          uid:
+                            type: string
+                            description: Kubernetes UID of the validated Job.
                 conditions:
                   type: array
                   description: Conditions representing the latest available observations of the live stream.

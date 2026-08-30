@@ -132,10 +132,15 @@ def _pod_phase(
     return pod.status.phase, ready
 
 
-def _list_processing_pods(core_api: Any, namespace: str, current: dict) -> list[Any]:
-    """List labelled processing Pods even after their owning Job disappears."""
+def _list_processing_pods(
+    core_api: Any,
+    namespace: str,
+    current: dict,
+    owned_job_ids: set[tuple[str, str]],
+) -> list[Any]:
+    """Return labelled Pods controlled by current or previously validated Jobs."""
     stream_name = current.get("metadata", {}).get("name")
-    if not stream_name:
+    if not stream_name or not owned_job_ids:
         return []
     try:
         candidates = core_api.list_namespaced_pod(
@@ -146,16 +151,16 @@ def _list_processing_pods(core_api: Any, namespace: str, current: dict) -> list[
         if _is_not_found(error):
             return []
         raise
-    pods = [
+    return [
         pod
         for pod in candidates
-        if (pod.metadata.labels or {}).get(jobs.LIVESTREAM_LABEL) == stream_name
-        and any(
-            owner.api_version == "batch/v1" and owner.kind == "Job"
+        if any(
+            owner.api_version == "batch/v1"
+            and owner.kind == "Job"
+            and (owner.name, owner.uid) in owned_job_ids
             for owner in (pod.metadata.owner_references or [])
         )
     ]
-    return pods
 
 
 def _observe(current: dict, batch_api: Any, core_api: Any) -> ReconcileObservations:
@@ -226,10 +231,35 @@ def _patch_finalizers(custom_api: Any, current: dict, finalizers: list[str]) -> 
     )
 
 
-def _stopping_status(current: dict) -> tuple[dict, bool]:
-    """Preserve observations while recording this deletion cycle's first pass."""
+def _validated_cleanup_job_ids(
+    current: dict, owned_jobs: list[Any]
+) -> set[tuple[str, str]]:
+    """Combine current Job identities with those persisted during cleanup."""
+    persisted = current.get("status", {}).get("cleanup", {}).get("jobs", [])
+    job_ids = {
+        (item.get("name"), item.get("uid"))
+        for item in persisted
+        if item.get("name") and item.get("uid")
+    }
+    job_ids.update(
+        (job.metadata.name, job.metadata.uid)
+        for job in owned_jobs
+        if job.metadata.name and job.metadata.uid
+    )
+    return job_ids
+
+
+def _stopping_status(
+    current: dict, owned_job_ids: set[tuple[str, str]]
+) -> tuple[dict, bool]:
+    """Preserve observations and validated Job identities during cleanup."""
     calculated = dict(current.get("status") or {})
     calculated["phase"] = "Stopping"
+    calculated["cleanup"] = {
+        "jobs": [
+            {"name": name, "uid": uid} for name, uid in sorted(owned_job_ids)
+        ]
+    }
     conditions = [dict(item) for item in calculated.get("conditions", [])]
     already_observed = any(
         item.get("type") == "CleanupPending"
@@ -267,17 +297,22 @@ def _finalize(current: dict, custom_api: Any, batch_api: Any, core_api: Any) -> 
         return
     namespace = metadata["namespace"]
     owned_jobs = _list_owned_jobs(batch_api, metadata["namespace"], current)
-    processing_pods = _list_processing_pods(core_api, namespace, current)
+    owned_job_ids = _validated_cleanup_job_ids(current, owned_jobs)
+    processing_pods = _list_processing_pods(
+        core_api, namespace, current, owned_job_ids
+    )
 
-    calculated, cleanup_was_previously_observed = _stopping_status(current)
+    calculated, cleanup_was_previously_observed = _stopping_status(
+        current, owned_job_ids
+    )
     status.patch_if_changed(
         custom_api, namespace, metadata["name"], current, calculated
     )
 
     for job in owned_jobs:
         jobs.delete_for_livestream(batch_api, namespace, current, job)
-    # Foreground deletion is asynchronous. Keep our finalizer until a later
-    # reconciliation verifies that every owned Job and its Pods have gone.
+    # Job deletion is asynchronous and Pods can outlive their Job observation.
+    # Keep our finalizer until both the validated Jobs and their Pods are gone.
     if owned_jobs or processing_pods or not cleanup_was_previously_observed:
         return
     try:
