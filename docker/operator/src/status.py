@@ -17,5 +17,6 @@ def patch_if_changed(
         plural="livestreams",
         name=name,
         body={"status": calculated},
+        _content_type="application/merge-patch+json",
     )
     return True

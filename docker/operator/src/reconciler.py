@@ -13,14 +13,19 @@ import status
 LOGGER = logging.getLogger(__name__)
 
 
-def _condition(current: dict, generation: int, available: bool) -> dict:
-    condition_status = "True" if available else "Unknown"
-    reason = "SourceObserved" if available else "AwaitingSourceObservation"
-    message = (
-        "The current source publication was observed as available."
-        if available
-        else "Waiting for the Proxy ingest integration to report source availability."
-    )
+def _condition(current: dict, generation: int, available: bool | None) -> dict:
+    if available is True:
+        condition_status = "True"
+        reason = "SourceObserved"
+        message = "The current source publication was observed as available."
+    elif available is False:
+        condition_status = "False"
+        reason = "SourceUnavailable"
+        message = "The Proxy reported that the current source is unavailable."
+    else:
+        condition_status = "Unknown"
+        reason = "AwaitingSourceObservation"
+        message = "Waiting for the Proxy to report source availability."
     previous = next(
         (
             item
@@ -58,7 +63,10 @@ def _pod_phase(
     job_names = {job.metadata.name for job in owned_jobs}
     if not job_names:
         return None, False
-    pods = core_api.list_namespaced_pod(namespace=namespace).items
+    pods = core_api.list_namespaced_pod(
+        namespace=namespace,
+        label_selector=f"job-name={next(iter(job_names))}",
+    ).items
     selected = [
         pod
         for pod in pods
@@ -95,12 +103,29 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
         raise
 
     owned_jobs = jobs.list_for_livestream(batch_api, namespace, current)
-    job_observation = jobs.observe(owned_jobs[0]) if owned_jobs else None
-    pod_phase, pod_ready = _pod_phase(core_api, namespace, owned_jobs[:1])
+    desired_session_id = current.get("spec", {}).get("source", {}).get("sessionId")
+    observed_jobs = [(job, jobs.observe(job)) for job in owned_jobs]
+    current_job = next(
+        (
+            (job, observation)
+            for job, observation in observed_jobs
+            if observation.bound_source_session_id == desired_session_id
+        ),
+        None,
+    )
+    job_observation = current_job[1] if current_job else None
+    pod_phase, pod_ready = _pod_phase(
+        core_api, namespace, [current_job[0]] if current_job else []
+    )
     source_observation = source.observe(current)
+    source_available = source_observation.get("available")
     generation = current.get("metadata", {}).get("generation", 0)
 
-    if not job_observation:
+    if source_available is False and (job_observation or owned_jobs):
+        phase = "Interrupted"
+    elif not job_observation and owned_jobs:
+        phase = "Handover"
+    elif not job_observation:
         phase = "Registered"
     elif job_observation.phase == "Failed":
         phase = "Recovering"
@@ -118,9 +143,7 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
         "phase": phase,
         "source": source_observation,
         "processing": {"healthy": pod_ready},
-        "conditions": [
-            _condition(current, generation, source_observation["available"])
-        ],
+        "conditions": [_condition(current, generation, source_available)],
     }
     if job_observation:
         calculated["job"] = {

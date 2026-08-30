@@ -12,6 +12,7 @@ from reconciler import reconcile
 GROUP = "liveedgecast.io"
 VERSION = "v1alpha1"
 PLURAL = "livestreams"
+RESYNC_SECONDS = 5
 LOGGER = logging.getLogger(__name__)
 
 
@@ -47,10 +48,18 @@ def run() -> None:
                 VERSION,
                 PLURAL,
                 resource_version=resource_version,
-                timeout_seconds=300,
+                timeout_seconds=RESYNC_SECONDS,
             ):
+                if event.get("type") == "ERROR":
+                    error = event.get("object", {})
+                    LOGGER.warning(
+                        "Kubernetes watch returned an error (code=%s, reason=%s); relisting",
+                        error.get("code"),
+                        error.get("reason"),
+                    )
+                    break
                 resource = event.get("object", {})
-                if event.get("type") != "DELETED":
+                if event.get("type") in {"ADDED", "MODIFIED"}:
                     reconcile(resource, custom_api, batch_api, core_api)
         except (ApiException, OSError) as error:
             LOGGER.warning(

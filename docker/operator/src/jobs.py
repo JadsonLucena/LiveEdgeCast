@@ -16,14 +16,19 @@ def list_for_livestream(batch_api: Any, namespace: str, livestream: dict) -> lis
     metadata = livestream.get("metadata", {})
     uid = metadata.get("uid")
     name = metadata.get("name")
-    jobs = batch_api.list_namespaced_job(namespace=namespace).items
+    jobs = batch_api.list_namespaced_job(
+        namespace=namespace,
+        label_selector=f"liveedgecast.io/livestream={name}",
+    ).items
 
     def belongs_to_stream(job: Any) -> bool:
-        owners = job.metadata.owner_references or []
-        if uid and any(
-            owner.uid == uid and owner.kind == "LiveStream" for owner in owners
-        ):
-            return True
+        stream_owners = [
+            owner
+            for owner in (job.metadata.owner_references or [])
+            if owner.kind == "LiveStream"
+        ]
+        if stream_owners:
+            return bool(uid) and any(owner.uid == uid for owner in stream_owners)
         labels = job.metadata.labels or {}
         return labels.get("liveedgecast.io/livestream") == name
 

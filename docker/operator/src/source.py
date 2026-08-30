@@ -14,12 +14,12 @@ def observe(livestream: dict[str, Any]) -> dict[str, Any]:
     observation: dict[str, Any] = {
         "proxyName": desired.get("proxyName", ""),
         "sessionId": desired.get("sessionId", ""),
-        "available": False,
     }
     if previous.get("proxyName") == desired.get("proxyName") and previous.get(
         "sessionId"
     ) == desired.get("sessionId"):
-        observation["available"] = bool(previous.get("available", False))
+        if "available" in previous:
+            observation["available"] = bool(previous["available"])
         if previous.get("lastSeenAt"):
             observation["lastSeenAt"] = previous["lastSeenAt"]
     return observation
