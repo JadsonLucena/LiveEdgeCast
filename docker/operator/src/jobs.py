@@ -14,6 +14,7 @@ SOURCE_SESSION_ANNOTATION = "liveedgecast.io/source-session-id"
 CONFIGURATION_ID_ANNOTATION = "liveedgecast.io/configuration-id"
 WORKER_IMAGE = "liveedgecast-worker:latest"
 JOB_BACKOFF_LIMIT = 2
+MEDIA_HEALTH_INTERVAL_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,10 @@ def create_for_livestream(batch_api: Any, namespace: str, livestream: dict) -> s
                                 {
                                     "name": "TARGET_RTMP_URL",
                                     "value": spec["target"]["url"],
+                                },
+                                {
+                                    "name": "MEDIA_HEALTH_INTERVAL_SECONDS",
+                                    "value": str(MEDIA_HEALTH_INTERVAL_SECONDS),
                                 },
                             ],
                             "resources": {
