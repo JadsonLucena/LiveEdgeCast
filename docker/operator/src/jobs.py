@@ -14,6 +14,8 @@ SOURCE_SESSION_ANNOTATION = "liveedgecast.io/source-session-id"
 CONFIGURATION_ID_ANNOTATION = "liveedgecast.io/configuration-id"
 WORKER_IMAGE = "liveedgecast-worker:latest"
 JOB_BACKOFF_LIMIT = 2
+# Operational constant shared by every Worker Job. It is deliberately part of
+# configuration_id() because changing a Pod template requires replacing its Job.
 MEDIA_HEALTH_INTERVAL_SECONDS = 10
 
 
