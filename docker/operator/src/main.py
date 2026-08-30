@@ -1,7 +1,8 @@
 """LiveEdgeCast Operator watch loop."""
 
 import logging
-import time
+import signal
+import threading
 
 from kubernetes import client, config, watch
 from kubernetes.client.exceptions import ApiException
@@ -15,6 +16,13 @@ PLURAL = "livestreams"
 NAMESPACE = "media"
 RESYNC_SECONDS = 5
 LOGGER = logging.getLogger(__name__)
+STOP_EVENT = threading.Event()
+
+
+def _request_shutdown(signum, _frame) -> None:
+    """Ask the active watch loop to finish after Kubernetes sends SIGTERM."""
+    LOGGER.info("received signal %s; stopping the Operator watch", signum)
+    STOP_EVENT.set()
 
 
 def _load_configuration() -> None:
@@ -41,7 +49,7 @@ def run() -> None:
     batch_api = client.BatchV1Api()
     core_api = client.CoreV1Api()
 
-    while True:
+    while not STOP_EVENT.is_set():
         try:
             resource_version = _reconcile_all(custom_api, batch_api, core_api)
             stream = watch.Watch()
@@ -54,6 +62,9 @@ def run() -> None:
                 resource_version=resource_version,
                 timeout_seconds=RESYNC_SECONDS,
             ):
+                if STOP_EVENT.is_set():
+                    stream.stop()
+                    break
                 if event.get("type") == "ERROR":
                     error = event.get("object", {})
                     LOGGER.warning(
@@ -69,7 +80,9 @@ def run() -> None:
             LOGGER.warning(
                 "Kubernetes watch interrupted; relisting before retry: %s", error
             )
-            time.sleep(2)
+            STOP_EVENT.wait(2)
+
+    LOGGER.info("Operator watch stopped")
 
 
 if __name__ == "__main__":
@@ -77,4 +90,6 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    signal.signal(signal.SIGTERM, _request_shutdown)
+    signal.signal(signal.SIGINT, _request_shutdown)
     run()
