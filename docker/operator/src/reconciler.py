@@ -132,15 +132,16 @@ def _pod_phase(
     return pod.status.phase, ready
 
 
-def _list_processing_pods(
-    core_api: Any, namespace: str, owned_jobs: list[Any]
-) -> list[Any]:
-    """List Pods whose Job owner is one of the freshly observed owned Jobs."""
-    owned_job_ids = {(job.metadata.name, job.metadata.uid) for job in owned_jobs}
-    if not owned_job_ids:
+def _list_processing_pods(core_api: Any, namespace: str, current: dict) -> list[Any]:
+    """List labelled processing Pods even after their owning Job disappears."""
+    stream_name = current.get("metadata", {}).get("name")
+    if not stream_name:
         return []
     try:
-        candidates = core_api.list_namespaced_pod(namespace=namespace).items
+        candidates = core_api.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=f"{jobs.LIVESTREAM_LABEL}={stream_name}",
+        ).items
     except ApiException as error:
         if _is_not_found(error):
             return []
@@ -148,10 +149,9 @@ def _list_processing_pods(
     pods = [
         pod
         for pod in candidates
-        if any(
-            owner.api_version == "batch/v1"
-            and owner.kind == "Job"
-            and (owner.name, owner.uid) in owned_job_ids
+        if (pod.metadata.labels or {}).get(jobs.LIVESTREAM_LABEL) == stream_name
+        and any(
+            owner.api_version == "batch/v1" and owner.kind == "Job"
             for owner in (pod.metadata.owner_references or [])
         )
     ]
@@ -267,7 +267,7 @@ def _finalize(current: dict, custom_api: Any, batch_api: Any, core_api: Any) -> 
         return
     namespace = metadata["namespace"]
     owned_jobs = _list_owned_jobs(batch_api, metadata["namespace"], current)
-    processing_pods = _list_processing_pods(core_api, namespace, owned_jobs)
+    processing_pods = _list_processing_pods(core_api, namespace, current)
 
     calculated, cleanup_was_previously_observed = _stopping_status(current)
     status.patch_if_changed(

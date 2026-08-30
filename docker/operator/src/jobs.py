@@ -7,6 +7,7 @@ from kubernetes.client.exceptions import ApiException
 
 LIVESTREAM_API_VERSION = "liveedgecast.io/v1alpha1"
 LIVESTREAM_KIND = "LiveStream"
+LIVESTREAM_LABEL = "liveedgecast.io/livestream"
 
 
 @dataclass(frozen=True)
@@ -33,7 +34,13 @@ def _is_owned_by_livestream(job: Any, livestream: dict) -> bool:
 
 def list_for_livestream(batch_api: Any, namespace: str, livestream: dict) -> list[Any]:
     """Return Jobs owned by this LiveStream, newest first."""
-    jobs = batch_api.list_namespaced_job(namespace=namespace).items
+    name = livestream.get("metadata", {}).get("name")
+    if not name:
+        return []
+    jobs = batch_api.list_namespaced_job(
+        namespace=namespace,
+        label_selector=f"{LIVESTREAM_LABEL}={name}",
+    ).items
 
     owned = [job for job in jobs if _is_owned_by_livestream(job, livestream)]
     return sorted(
