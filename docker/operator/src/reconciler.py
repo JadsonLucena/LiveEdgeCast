@@ -132,10 +132,17 @@ def _pod_phase(
     return pod.status.phase, ready
 
 
-def _list_processing_pods(core_api: Any, namespace: str, current: dict) -> list[Any]:
-    """List labelled processing Pods even after their owning Job disappears."""
+def _list_processing_pods(
+    core_api: Any, namespace: str, current: dict, owned_jobs: list[Any]
+) -> list[Any]:
+    """Return labelled Pods controlled by the already validated Jobs."""
     stream_name = current.get("metadata", {}).get("name")
-    if not stream_name:
+    owned_job_ids = {
+        (job.metadata.name, job.metadata.uid)
+        for job in owned_jobs
+        if job.metadata.name and job.metadata.uid
+    }
+    if not stream_name or not owned_job_ids:
         return []
     try:
         candidates = core_api.list_namespaced_pod(
@@ -146,16 +153,16 @@ def _list_processing_pods(core_api: Any, namespace: str, current: dict) -> list[
         if _is_not_found(error):
             return []
         raise
-    pods = [
+    return [
         pod
         for pod in candidates
-        if (pod.metadata.labels or {}).get(jobs.LIVESTREAM_LABEL) == stream_name
-        and any(
-            owner.api_version == "batch/v1" and owner.kind == "Job"
+        if any(
+            owner.api_version == "batch/v1"
+            and owner.kind == "Job"
+            and (owner.name, owner.uid) in owned_job_ids
             for owner in (pod.metadata.owner_references or [])
         )
     ]
-    return pods
 
 
 def _observe(current: dict, batch_api: Any, core_api: Any) -> ReconcileObservations:
@@ -267,7 +274,7 @@ def _finalize(current: dict, custom_api: Any, batch_api: Any, core_api: Any) -> 
         return
     namespace = metadata["namespace"]
     owned_jobs = _list_owned_jobs(batch_api, metadata["namespace"], current)
-    processing_pods = _list_processing_pods(core_api, namespace, current)
+    processing_pods = _list_processing_pods(core_api, namespace, current, owned_jobs)
 
     calculated, cleanup_was_previously_observed = _stopping_status(current)
     status.patch_if_changed(
