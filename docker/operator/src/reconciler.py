@@ -1,7 +1,9 @@
 """Stateless reconciliation of LiveStream observations."""
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 
 from kubernetes.client.exceptions import ApiException
@@ -11,6 +13,36 @@ import source
 import status
 
 LOGGER = logging.getLogger(__name__)
+FINALIZER = "liveedgecast.io/finalizer"
+
+
+class LifecycleAction(Enum):
+    """One operation selected from the current API observations."""
+
+    NONE = "none"
+
+
+@dataclass(frozen=True)
+class ReconcileObservations:
+    """All API facts used by the lifecycle decision."""
+
+    source: dict[str, Any]
+    owned_jobs: tuple[Any, ...]
+    selected_job: jobs.JobObservation | None
+    pod_phase: str | None
+    pod_ready: bool
+
+
+@dataclass(frozen=True)
+class LifecycleDecision:
+    """Domain result and, at most, its single required operation."""
+
+    phase: str
+    action: LifecycleAction = LifecycleAction.NONE
+
+
+def _is_not_found(error: ApiException) -> bool:
+    return error.status == 404
 
 
 def _condition(current: dict, generation: int, available: bool | None) -> dict:
@@ -57,15 +89,29 @@ def _condition(current: dict, generation: int, available: bool | None) -> dict:
     }
 
 
+def _list_owned_jobs(batch_api: Any, namespace: str, current: dict) -> list[Any]:
+    try:
+        return jobs.list_for_livestream(batch_api, namespace, current)
+    except ApiException as error:
+        if _is_not_found(error):
+            return []
+        raise
+
+
 def _pod_phase(
     core_api: Any, namespace: str, job: Any | None
 ) -> tuple[str | None, bool]:
     if job is None:
         return None, False
-    pods = core_api.list_namespaced_pod(
-        namespace=namespace,
-        label_selector=f"job-name={job.metadata.name}",
-    ).items
+    try:
+        pods = core_api.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=f"job-name={job.metadata.name}",
+        ).items
+    except ApiException as error:
+        if _is_not_found(error):
+            return None, False
+        raise
     selected = [
         pod
         for pod in pods
@@ -86,8 +132,101 @@ def _pod_phase(
     return pod.status.phase, ready
 
 
+def _observe(current: dict, batch_api: Any, core_api: Any) -> ReconcileObservations:
+    """Read a complete, immutable snapshot from the current LiveStream."""
+    namespace = current["metadata"]["namespace"]
+    source_observation = source.observe(current)
+    owned_jobs = _list_owned_jobs(batch_api, namespace, current)
+    desired_session_id = current.get("spec", {}).get("source", {}).get("sessionId")
+    observed_jobs = tuple((job, jobs.observe(job)) for job in owned_jobs)
+    selected = next(
+        (
+            (job, observation)
+            for job, observation in observed_jobs
+            if observation.bound_source_session_id == desired_session_id
+        ),
+        None,
+    )
+    pod_phase, pod_ready = _pod_phase(
+        core_api, namespace, selected[0] if selected else None
+    )
+    return ReconcileObservations(
+        source=source_observation,
+        owned_jobs=tuple(owned_jobs),
+        selected_job=selected[1] if selected else None,
+        pod_phase=pod_phase,
+        pod_ready=pod_ready,
+    )
+
+
+def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
+    """Derive lifecycle solely from the supplied current observations."""
+    source_available = observed.source.get("available")
+    if source_available is False and (observed.selected_job or observed.owned_jobs):
+        phase = "Interrupted"
+    elif not observed.selected_job and observed.owned_jobs:
+        phase = "Handover"
+    elif not observed.selected_job:
+        phase = "Registered"
+    elif observed.selected_job.phase == "Failed":
+        phase = "Recovering"
+    elif observed.selected_job.phase == "Succeeded":
+        phase = "Stopping"
+    elif observed.pod_ready:
+        phase = "Streaming"
+    elif observed.pod_phase == "Running":
+        phase = "Starting"
+    else:
+        phase = "Provisioning"
+    return LifecycleDecision(phase=phase)
+
+
+def _patch_finalizers(custom_api: Any, current: dict, finalizers: list[str]) -> None:
+    metadata = current["metadata"]
+    custom_api.patch_namespaced_custom_object(
+        group="liveedgecast.io",
+        version="v1alpha1",
+        namespace=metadata["namespace"],
+        plural="livestreams",
+        name=metadata["name"],
+        body={"metadata": {"finalizers": finalizers}},
+        _content_type="application/merge-patch+json",
+    )
+
+
+def _finalize(current: dict, custom_api: Any, batch_api: Any) -> None:
+    """Idempotently remove dependants before releasing the LiveStream."""
+    metadata = current["metadata"]
+    finalizers = metadata.get("finalizers") or []
+    if FINALIZER not in finalizers:
+        return
+    for job in _list_owned_jobs(batch_api, metadata["namespace"], current):
+        try:
+            batch_api.delete_namespaced_job(
+                name=job.metadata.name,
+                namespace=metadata["namespace"],
+                propagation_policy="Background",
+            )
+        except ApiException as error:
+            if not _is_not_found(error):
+                raise
+    try:
+        _patch_finalizers(
+            custom_api, current, [item for item in finalizers if item != FINALIZER]
+        )
+    except ApiException as error:
+        if not _is_not_found(error):
+            raise
+
+
+def _execute(decision: LifecycleDecision) -> None:
+    """Execute the one action selected by the pure lifecycle decision."""
+    if decision.action is not LifecycleAction.NONE:
+        raise ValueError(f"unsupported lifecycle action: {decision.action}")
+
+
 def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) -> None:
-    """Rebuild status from current API objects; no in-memory state is authoritative."""
+    """Rebuild lifecycle from current API state without cross-run memory."""
     metadata = resource.get("metadata", {})
     namespace, name = metadata["namespace"], metadata["name"]
     try:
@@ -99,64 +238,50 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
             name=name,
         )
     except ApiException as error:
-        if error.status == 404:
+        if _is_not_found(error):
             return
         raise
 
-    owned_jobs = jobs.list_for_livestream(batch_api, namespace, current)
-    desired_session_id = current.get("spec", {}).get("source", {}).get("sessionId")
-    observed_jobs = [(job, jobs.observe(job)) for job in owned_jobs]
-    current_job = next(
-        (
-            (job, observation)
-            for job, observation in observed_jobs
-            if observation.bound_source_session_id == desired_session_id
-        ),
-        None,
-    )
-    job_observation = current_job[1] if current_job else None
-    pod_phase, pod_ready = _pod_phase(
-        core_api, namespace, current_job[0] if current_job else None
-    )
-    source_observation = source.observe(current)
-    source_available = source_observation.get("available")
-    generation = current.get("metadata", {}).get("generation", 0)
+    current_metadata = current.get("metadata", {})
+    if current_metadata.get("deletionTimestamp"):
+        _finalize(current, custom_api, batch_api)
+        return
 
-    if source_available is False and (job_observation or owned_jobs):
-        phase = "Interrupted"
-    elif not job_observation and owned_jobs:
-        phase = "Handover"
-    elif not job_observation:
-        phase = "Registered"
-    elif job_observation.phase == "Failed":
-        phase = "Recovering"
-    elif job_observation.phase == "Succeeded":
-        phase = "Stopping"
-    elif pod_ready:
-        phase = "Streaming"
-    elif pod_phase == "Running":
-        phase = "Starting"
-    else:
-        phase = "Provisioning"
+    finalizers = current_metadata.get("finalizers") or []
+    if FINALIZER not in finalizers:
+        _patch_finalizers(custom_api, current, [*finalizers, FINALIZER])
+        return
 
+    observed = _observe(current, batch_api, core_api)
+    decision = decide_lifecycle(observed)
+    _execute(decision)
+
+    generation = current_metadata.get("generation", 0)
     calculated: dict[str, Any] = {
         "observedGeneration": generation,
-        "phase": phase,
-        "source": source_observation,
-        "processing": {"healthy": pod_ready},
-        "conditions": [_condition(current, generation, source_available)],
+        "phase": decision.phase,
+        "source": observed.source,
+        "processing": {"healthy": observed.pod_ready},
+        "conditions": [
+            _condition(current, generation, observed.source.get("available"))
+        ],
     }
-    if job_observation:
+    if observed.selected_job:
         calculated["job"] = {
-            "name": job_observation.name,
-            "phase": job_observation.phase,
+            "name": observed.selected_job.name,
+            "phase": observed.selected_job.phase,
         }
-        if job_observation.bound_source_session_id:
+        if observed.selected_job.bound_source_session_id:
             calculated["job"]["boundSourceSessionId"] = (
-                job_observation.bound_source_session_id
+                observed.selected_job.bound_source_session_id
             )
 
     changed = status.patch_if_changed(custom_api, namespace, name, current, calculated)
     LOGGER.info(
-        "reconciled LiveStream %s/%s (status_changed=%s)", namespace, name, changed
+        "reconciled LiveStream %s/%s (phase=%s, action=%s, status_changed=%s)",
+        namespace,
+        name,
+        decision.phase,
+        decision.action.value,
+        changed,
     )
