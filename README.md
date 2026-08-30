@@ -4,10 +4,13 @@ LiveEdgeCast contains the minimal foundation completed in **Phase 1**, the
 declarative `LiveStream` API established in **Phase 2**, and the namespaced
 Operator, watch, RBAC, Deployment, and stateless reconstruction delivered in
 **Phase 3**, lifecycle finalization from **Phase 4**, and per-stream processing
-Jobs from **Phase 5**. The repository includes an RTMP Proxy, an FFmpeg-based
-Worker container image, the `LiveStream` CRD, and the Operator. Ingest
-integration and the remaining recovery/handover lifecycle are not implemented
-yet.
+Jobs from **Phase 5**. **Phase 6** adds the Worker's media health watchdog and
+the Job-based failure flow: stalled FFmpeg processing fails its container and
+lets Kubernetes exhaust the Job's short retry budget before the Operator marks
+the stream as recovering. The repository includes an RTMP Proxy, an
+FFmpeg-based Worker container image, the `LiveStream` CRD, and the Operator.
+Ingest integration and the remaining recovery/handover lifecycle are not
+implemented yet.
 
 ## Current repository state
 
@@ -42,8 +45,9 @@ does not use a ConfigMap or in-memory state as a source of truth, so it can
 resume reconciliation after a restart.
 
 The manifests and scripts combine the completed foundation and API work from
-Phases 1–2 with the Operator, finalization, and Job reconciliation delivered in
-Phases 3–5. They are not yet a production implementation of the target design.
+Phases 1–2 with the Operator, finalization, Job reconciliation, and media health
+watchdog delivered in Phases 3–6. They are not yet a production implementation
+of the target design.
 
 ## Fixed target architecture
 
@@ -128,17 +132,20 @@ configuration identity, so after an Operator rollout it replaces Jobs created
 with the previous interval instead of retaining their immutable Pod templates.
 
 The Worker reads FFmpeg's dedicated `-progress` stream and refreshes its health
-state only when `out_time_us` or `out_time_ms` increases. If neither advances
-within the interval, the watchdog logs the stall, sends FFmpeg `SIGTERM`, waits
-briefly, and uses `SIGKILL` only if FFmpeg ignores the grace period. The Worker
-then waits for FFmpeg and exits non-zero. It does not restart FFmpeg or keep the
-container alive.
+state only when `out_time_us` or `out_time_ms` increases. These processed-media
+timestamps, rather than generic FFmpeg output or connection activity, are the
+indicators of significant progress. If neither advances within the interval,
+the watchdog logs the stall, sends FFmpeg `SIGTERM`, waits for a **5-second
+grace period**, and uses `SIGKILL` only if FFmpeg is still running. The Worker
+then waits for FFmpeg and exits non-zero, which makes the Pod `Failed`. It does
+not restart FFmpeg or keep the container alive.
 
 The recovery flow is therefore **FFmpeg without media progress → container
 exits non-zero → Pod becomes `Failed` → the Kubernetes Job Controller creates
-the next retry**. The Operator does not poll the Worker and does not replace the
-Job while that Job is still retrying; it reacts only after the Job reaches a
-terminal condition.
+the next retry**. The Job Controller, not the Operator, performs these short
+retries. The Operator does not poll the Worker and does not replace the Job
+while that Job is still retrying; only a terminally `Failed` Job starts recovery
+in the Operator.
 
 To validate a stalled source manually, publish a stream and then leave its
 connection open without producing more media. In another terminal, watch:
