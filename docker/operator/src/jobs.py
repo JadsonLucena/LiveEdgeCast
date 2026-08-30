@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from typing import Any
 
 
+LIVESTREAM_API_VERSION = "liveedgecast.io/v1alpha1"
+LIVESTREAM_KIND = "LiveStream"
+LIVESTREAM_LABEL = "liveedgecast.io/livestream"
+
+
 @dataclass(frozen=True)
 class JobObservation:
     name: str
@@ -12,24 +17,24 @@ class JobObservation:
 
 
 def list_for_livestream(batch_api: Any, namespace: str, livestream: dict) -> list[Any]:
-    """Return Jobs controlled by this LiveStream, newest first."""
+    """Return Jobs owned by this LiveStream, newest first."""
     metadata = livestream.get("metadata", {})
     uid = metadata.get("uid")
     name = metadata.get("name")
     jobs = batch_api.list_namespaced_job(
         namespace=namespace,
-        label_selector=f"liveedgecast.io/livestream={name}",
+        label_selector=f"{LIVESTREAM_LABEL}={name}",
     ).items
 
     def belongs_to_stream(job: Any) -> bool:
         owners = job.metadata.owner_references or []
-        stream_owners = [owner for owner in owners if owner.kind == "LiveStream"]
-        if stream_owners:
-            return bool(uid) and any(owner.uid == uid for owner in stream_owners)
-        if owners:
-            return False
-        labels = job.metadata.labels or {}
-        return labels.get("liveedgecast.io/livestream") == name
+        return bool(name and uid) and any(
+            owner.api_version == LIVESTREAM_API_VERSION
+            and owner.kind == LIVESTREAM_KIND
+            and owner.name == name
+            and owner.uid == uid
+            for owner in owners
+        )
 
     owned = [job for job in jobs if belongs_to_stream(job)]
     return sorted(
