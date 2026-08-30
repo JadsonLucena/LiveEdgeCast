@@ -23,7 +23,10 @@ The deployable Kubernetes resources are limited to:
 The proxy accepts and serves RTMP streams. For each `LiveStream` requiring
 processing, the Operator creates one owned Kubernetes Job that runs the Worker.
 The Job Controller retries failed Pods within its small retry budget; the
-Operator reacts only after the Job becomes terminally failed.
+Operator reacts only after the Job becomes terminally failed. Changes to the
+stream key or source/target URLs are detected as desired-configuration drift;
+the Operator then replaces the immutable Job rather than leaving it bound to
+stale Pod environment values.
 
 The following are deliberately absent:
 
