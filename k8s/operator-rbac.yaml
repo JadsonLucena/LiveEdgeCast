@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: liveedgecast-operator
+  namespace: media
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: liveedgecast-operator
+  namespace: media
+rules:
+  - apiGroups:
+      - liveedgecast.io
+    resources:
+      - livestreams
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+      - update
+  - apiGroups:
+      - liveedgecast.io
+    resources:
+      - livestreams/status
+      - livestreams/finalizers
+    verbs:
+      - get
+      - patch
+      - update
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: liveedgecast-operator
+  namespace: media
+subjects:
+  - kind: ServiceAccount
+    name: liveedgecast-operator
+    namespace: media
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: liveedgecast-operator
