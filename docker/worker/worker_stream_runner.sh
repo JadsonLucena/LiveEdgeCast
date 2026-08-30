@@ -6,6 +6,7 @@ SOURCE_RTMP_URL="${SOURCE_RTMP_URL:-}"
 TARGET_RTMP_URL="${TARGET_RTMP_URL:-}"
 MEDIA_HEALTH_INTERVAL_SECONDS="${MEDIA_HEALTH_INTERVAL_SECONDS:-10}"
 FFMPEG_TERMINATION_GRACE_SECONDS=5
+WATCHDOG_STALL_EXIT_CODE=75
 
 ffmpeg_pid=""
 reader_pid=""
@@ -103,7 +104,6 @@ MEDIA_HEALTH_INTERVAL_SECONDS=$((10#$MEDIA_HEALTH_INTERVAL_SECONDS))
 monitor_dir="$(mktemp -d)"
 progress_fifo="$monitor_dir/ffmpeg-progress"
 last_progress_file="$monitor_dir/last-progress"
-watchdog_fired_file="$monitor_dir/watchdog-fired"
 mkfifo "$progress_fifo"
 
 started_at_ms="$(monotonic_milliseconds)"
@@ -142,29 +142,33 @@ ffmpeg_pid=$!
     now_ms="$(monotonic_milliseconds)"
     last_progress_ms="$(cat "$last_progress_file" 2>/dev/null || printf '%s' "$started_at_ms")"
     if (( now_ms - last_progress_ms >= health_interval_ms )); then
-      printf '%s\n' "no increasing FFmpeg media timestamp for ${MEDIA_HEALTH_INTERVAL_SECONDS}s" >"$watchdog_fired_file"
-      log "Media watchdog fired: no increasing FFmpeg media timestamp for ${MEDIA_HEALTH_INTERVAL_SECONDS}s; sending SIGTERM"
-      kill -TERM "$ffmpeg_pid" 2>/dev/null || true
-      sleep "$FFMPEG_TERMINATION_GRACE_SECONDS"
-      if kill -0 "$ffmpeg_pid" 2>/dev/null; then
-        log "FFmpeg did not stop within ${FFMPEG_TERMINATION_GRACE_SECONDS}s; sending SIGKILL"
-        kill -KILL "$ffmpeg_pid" 2>/dev/null || true
-      fi
-      exit 0
+      exit "$WATCHDOG_STALL_EXIT_CODE"
     fi
   done
 ) &
 watchdog_pid=$!
 
-wait "$ffmpeg_pid"
-ffmpeg_exit_code=$?
-ffmpeg_pid=""
-stop_auxiliary_processes
+# Reap whichever process completes first. Only the parent decides to terminate
+# FFmpeg, so a normal FFmpeg exit and a watchdog timeout cannot both claim the
+# outcome through an independently written marker.
+completed_pid=""
+if wait -n -p completed_pid "$ffmpeg_pid" "$watchdog_pid"; then
+  completed_exit_code=0
+else
+  completed_exit_code=$?
+fi
 
-if [ -f "$watchdog_fired_file" ]; then
+if [ "$completed_pid" = "$watchdog_pid" ]; then
+  watchdog_pid=""
+  log "Media watchdog fired: no increasing FFmpeg media timestamp for ${MEDIA_HEALTH_INTERVAL_SECONDS}s; sending SIGTERM"
+  terminate_ffmpeg TERM
+  ffmpeg_pid=""
+  stop_auxiliary_processes
   log "FFmpeg was terminated by the media watchdog; exiting non-zero"
   exit 1
 fi
 
-log "FFmpeg exited with code $ffmpeg_exit_code"
-exit "$ffmpeg_exit_code"
+ffmpeg_pid=""
+stop_auxiliary_processes
+log "FFmpeg exited with code $completed_exit_code"
+exit "$completed_exit_code"
