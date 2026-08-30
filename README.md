@@ -1,10 +1,12 @@
 # LiveEdgeCast
 
-LiveEdgeCast contains the minimal foundation completed in **Phase 1** and the
-declarative `LiveStream` API established in **Phase 2**. The repository includes
-an RTMP Proxy, an FFmpeg-based Worker container image, the `LiveStream` CRD,
-and a namespaced Operator. Ingest integration and complete per-stream Job
-processing are not implemented yet.
+LiveEdgeCast contains the minimal foundation completed in **Phase 1**, the
+declarative `LiveStream` API established in **Phase 2**, and the namespaced
+Operator, watch, RBAC, Deployment, and stateless reconstruction delivered in
+**Phase 3**. The repository includes an RTMP Proxy, an FFmpeg-based Worker
+container image, the `LiveStream` CRD, and the Operator. Phase 3 provides the
+reconciliation foundation, but complete Job creation, finalization, ingest
+integration, and end-to-end processing are not implemented yet.
 
 ## Current repository state
 
@@ -35,9 +37,9 @@ observations by listing LiveStreams, Jobs, and Pods from the Kubernetes API. It
 does not use a ConfigMap or in-memory state as a source of truth, so it can
 resume reconciliation after a restart.
 
-The manifests and scripts combine the completed Phase 1 foundation with the
-Phase 2 API definition; they are not a production implementation of the target
-design.
+The manifests and scripts combine the completed Phase 1 foundation, the Phase 2
+API definition, and the Phase 3 namespaced Operator foundation; they are not a
+production implementation of the target design.
 
 ## Fixed target architecture
 
@@ -59,7 +61,7 @@ Worker Deployment in the design.
 implemented in this repository yet.** The current Operator observes API state
 and updates status, but does not yet provide the full processing lifecycle.
 
-## Current foundation and API deployment
+## Current foundation, API, and Operator deployment
 
 ### Requirements
 
