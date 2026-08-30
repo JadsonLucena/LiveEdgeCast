@@ -45,6 +45,7 @@ kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/media --timeout=3
 
 PROXY_IMAGE="liveedgecast-proxy:latest"
 OPERATOR_IMAGE="liveedgecast-operator:latest"
+WORKER_IMAGE="liveedgecast-worker:latest"
 
 print_step "Building the Proxy container image..."
 docker build -t "$PROXY_IMAGE" -f docker/proxy/Dockerfile docker/proxy
@@ -54,12 +55,18 @@ print_step "Building the Operator container image..."
 docker build -t "$OPERATOR_IMAGE" -f docker/operator/Dockerfile docker/operator
 print_success "Operator container image built"
 
+print_step "Building the Worker container image..."
+docker build -t "$WORKER_IMAGE" -f docker/worker/Dockerfile docker/worker
+print_success "Worker container image built"
+
 if [[ $CONTEXT == kind-* ]]; then
     check_command kind
     print_step "Loading the Proxy image into the kind cluster..."
     kind load docker-image "$PROXY_IMAGE"
     print_step "Loading the Operator image into the kind cluster..."
     kind load docker-image "$OPERATOR_IMAGE"
+    print_step "Loading the Worker image into the kind cluster..."
+    kind load docker-image "$WORKER_IMAGE"
 fi
 
 print_step "Applying Kubernetes resources..."

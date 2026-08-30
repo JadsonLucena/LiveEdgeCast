@@ -20,6 +20,7 @@ class LifecycleAction(Enum):
     """One operation selected from the current API observations."""
 
     NONE = "none"
+    CREATE_JOB = "create_job"
 
 
 @dataclass(frozen=True)
@@ -198,7 +199,14 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
     elif not observed.selected_job and observed.owned_jobs:
         phase = "Handover"
     elif not observed.selected_job:
-        phase = "Registered"
+        return LifecycleDecision(
+            phase="Registered",
+            action=(
+                LifecycleAction.CREATE_JOB
+                if source_available is not False
+                else LifecycleAction.NONE
+            ),
+        )
     elif observed.selected_job.phase == "Failed":
         phase = "Recovering"
     elif observed.selected_job.phase == "Succeeded":
@@ -324,9 +332,18 @@ def _finalize(current: dict, custom_api: Any, batch_api: Any, core_api: Any) -> 
             raise
 
 
-def _execute(decision: LifecycleDecision) -> None:
+def _execute(
+    decision: LifecycleDecision,
+    current: dict,
+    batch_api: Any,
+) -> None:
     """Execute the one action selected by the pure lifecycle decision."""
-    if decision.action is not LifecycleAction.NONE:
+    if decision.action is LifecycleAction.CREATE_JOB:
+        metadata = current["metadata"]
+        jobs.create_for_livestream(
+            batch_api, metadata["namespace"], current
+        )
+    elif decision.action is not LifecycleAction.NONE:
         raise ValueError(f"unsupported lifecycle action: {decision.action}")
 
 
@@ -359,7 +376,7 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
 
     observed = _observe(current, batch_api, core_api)
     decision = decide_lifecycle(observed)
-    _execute(decision)
+    _execute(decision, current, batch_api)
 
     generation = current_metadata.get("generation", 0)
     calculated: dict[str, Any] = {

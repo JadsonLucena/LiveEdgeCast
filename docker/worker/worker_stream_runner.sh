@@ -9,24 +9,21 @@ log() {
 
 log "Starting worker stream runner for stream key '$STREAM_KEY'"
 
-RTMP_PUSH_BASE_URL="${RTMP_PUSH_BASE_URL:-}"
-PROXY_ADDR="${PROXY_DNS:-}"
+SOURCE_RTMP_URL="${SOURCE_RTMP_URL:-}"
+TARGET_RTMP_URL="${TARGET_RTMP_URL:-}"
 
-if [ -z "$PROXY_ADDR" ] || [ -z "$STREAM_KEY" ] || [ -z "$RTMP_PUSH_BASE_URL" ]; then
-  log "Missing required startup args (PROXY_DNS/STREAM_KEY/RTMP_PUSH_BASE_URL). Crashing worker."
+if [ -z "$SOURCE_RTMP_URL" ] || [ -z "$STREAM_KEY" ] || [ -z "$TARGET_RTMP_URL" ]; then
+  log "Missing required startup args (SOURCE_RTMP_URL/STREAM_KEY/TARGET_RTMP_URL). Crashing worker."
   exit 1
 fi
 
-PROXY_RTMP="rtmp://${PROXY_ADDR}:1935/live/${STREAM_KEY}"
-TARGET_RTMP="${RTMP_PUSH_BASE_URL}/${STREAM_KEY}"
-
-log "Launching FFmpeg (pull=$PROXY_RTMP push=$TARGET_RTMP)"
+log "Launching FFmpeg for stream '$STREAM_KEY'"
 
 exec ffmpeg \
   -loglevel warning \
   -nostats \
   -rw_timeout 5000000 \
-  -i "$PROXY_RTMP" \
+  -i "$SOURCE_RTMP_URL" \
   -c:v copy \
   -c:a copy \
-  -f flv "$TARGET_RTMP"
+  -f flv "$TARGET_RTMP_URL"

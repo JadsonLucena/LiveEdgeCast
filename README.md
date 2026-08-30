@@ -3,10 +3,11 @@
 LiveEdgeCast contains the minimal foundation completed in **Phase 1**, the
 declarative `LiveStream` API established in **Phase 2**, and the namespaced
 Operator, watch, RBAC, Deployment, and stateless reconstruction delivered in
-**Phase 3**. The repository includes an RTMP Proxy, an FFmpeg-based Worker
-container image, the `LiveStream` CRD, and the Operator. Phase 3 provides the
-reconciliation foundation, but complete Job creation, finalization, ingest
-integration, and end-to-end processing are not implemented yet.
+**Phase 3**, lifecycle finalization from **Phase 4**, and per-stream processing
+Jobs from **Phase 5**. The repository includes an RTMP Proxy, an FFmpeg-based
+Worker container image, the `LiveStream` CRD, and the Operator. Ingest
+integration and the remaining recovery/handover lifecycle are not implemented
+yet.
 
 ## Current repository state
 
@@ -19,10 +20,10 @@ The deployable Kubernetes resources are limited to:
 - the Operator ServiceAccount, Role, and RoleBinding;
 - the single-replica `liveedgecast-operator` Deployment.
 
-The proxy accepts and serves RTMP streams. Nothing in the current application
-creates per-stream workloads, persists stream ownership, reacts to stream
-lifecycle callbacks, or performs autoscaling. The worker image is retained as a
-building block, but no Kubernetes resource launches it.
+The proxy accepts and serves RTMP streams. For each `LiveStream` requiring
+processing, the Operator creates one owned Kubernetes Job that runs the Worker.
+The Job Controller retries failed Pods within its small retry budget; the
+Operator reacts only after the Job becomes terminally failed.
 
 The following are deliberately absent:
 
@@ -30,16 +31,16 @@ The following are deliberately absent:
 - HAProxy-based routing;
 - KEDA scaling and Prometheus metrics;
 - a shared Worker Deployment or Service; and
-- RTMP ingest integration and complete processing through per-stream Jobs.
+- RTMP ingest integration and the remaining recovery/handover behavior.
 
 The Operator continuously watches `LiveStream` resources and reconstructs its
 observations by listing LiveStreams, Jobs, and Pods from the Kubernetes API. It
 does not use a ConfigMap or in-memory state as a source of truth, so it can
 resume reconciliation after a restart.
 
-The manifests and scripts combine the completed Phase 1 foundation, the Phase 2
-API definition, and the Phase 3 namespaced Operator foundation; they are not a
-production implementation of the target design.
+The manifests and scripts combine the completed foundation and API work from
+Phases 1–2 with the Operator, finalization, and Job reconciliation delivered in
+Phases 3–5. They are not yet a production implementation of the target design.
 
 ## Fixed target architecture
 
@@ -57,9 +58,8 @@ Kubernetes API state is the source of truth in this target. There is no separate
 imperative Controller, HAProxy tier, Prometheus/KEDA scaling loop, or shared
 Worker Deployment in the design.
 
-**Ingest integration and complete per-stream Job reconciliation are not
-implemented in this repository yet.** The current Operator observes API state
-and updates status, but does not yet provide the full processing lifecycle.
+**Ingest integration and the complete recovery/handover lifecycle are not
+implemented in this repository yet.**
 
 ## Current foundation, API, and Operator deployment
 
@@ -77,8 +77,8 @@ Deploy the resources that currently exist:
 ./tools/up.sh
 ```
 
-The script builds both the Proxy and Operator images, loads them into kind when
-needed, applies the manifests, and waits for both Deployments. For a kind
+The script builds the Proxy, Operator, and Worker images, loads them into kind
+when needed, applies the manifests, and waits for both Deployments. For a kind
 cluster, it also starts a local port forward. Publish to:
 
 ```text
@@ -94,7 +94,7 @@ kubectl get service proxy -n media
 Remote clusters are not supported by this local deployment script. The Proxy
 Deployment uses a locally built image name with `imagePullPolicy: Never`.
 Docker Desktop shares its local image store, while the script explicitly loads
-both images into kind.
+all three images into kind.
 
 Follow the Operator logs with:
 
@@ -109,7 +109,6 @@ Remove the current deployment:
 ```
 
 Applying `k8s/` installs the `LiveStream` CRD, Operator RBAC, and Operator
-Deployment, but does not create any `LiveStream` instances, provide ingest
-integration, or complete the creation and processing of per-stream Jobs.
-Consequently, it does not yet launch Worker containers as a full stream
-processing flow.
+Deployment, but does not create any `LiveStream` instances or provide ingest
+integration. A manually created `LiveStream` is reconciled into an owned
+per-stream Job.
