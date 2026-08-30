@@ -22,13 +22,12 @@ def list_for_livestream(batch_api: Any, namespace: str, livestream: dict) -> lis
     ).items
 
     def belongs_to_stream(job: Any) -> bool:
-        stream_owners = [
-            owner
-            for owner in (job.metadata.owner_references or [])
-            if owner.kind == "LiveStream"
-        ]
+        owners = job.metadata.owner_references or []
+        stream_owners = [owner for owner in owners if owner.kind == "LiveStream"]
         if stream_owners:
             return bool(uid) and any(owner.uid == uid for owner in stream_owners)
+        if owners:
+            return False
         labels = job.metadata.labels or {}
         return labels.get("liveedgecast.io/livestream") == name
 

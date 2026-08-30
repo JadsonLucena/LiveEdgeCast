@@ -58,20 +58,21 @@ def _condition(current: dict, generation: int, available: bool | None) -> dict:
 
 
 def _pod_phase(
-    core_api: Any, namespace: str, owned_jobs: list[Any]
+    core_api: Any, namespace: str, job: Any | None
 ) -> tuple[str | None, bool]:
-    job_names = {job.metadata.name for job in owned_jobs}
-    if not job_names:
+    if job is None:
         return None, False
     pods = core_api.list_namespaced_pod(
         namespace=namespace,
-        label_selector=f"job-name={next(iter(job_names))}",
+        label_selector=f"job-name={job.metadata.name}",
     ).items
     selected = [
         pod
         for pod in pods
         if any(
-            owner.kind == "Job" and owner.name in job_names
+            owner.kind == "Job"
+            and owner.name == job.metadata.name
+            and owner.uid == job.metadata.uid
             for owner in (pod.metadata.owner_references or [])
         )
     ]
@@ -115,7 +116,7 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
     )
     job_observation = current_job[1] if current_job else None
     pod_phase, pod_ready = _pod_phase(
-        core_api, namespace, [current_job[0]] if current_job else []
+        core_api, namespace, current_job[0] if current_job else None
     )
     source_observation = source.observe(current)
     source_available = source_observation.get("available")
