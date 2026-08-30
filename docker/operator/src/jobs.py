@@ -93,6 +93,7 @@ def configuration_id(livestream: dict) -> str:
         spec["source"]["sessionId"],
         spec["source"]["url"],
         spec["target"]["url"],
+        str(MEDIA_HEALTH_INTERVAL_SECONDS),
     )
     framed = b"".join(
         len(value.encode()).to_bytes(8, byteorder="big") + value.encode()

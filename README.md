@@ -123,7 +123,9 @@ value is a positive integer in seconds and controls how long FFmpeg may run
 without reporting an increasing processed-media timestamp. Ten seconds is a
 small default intended to detect a stalled source promptly; change the
 `MEDIA_HEALTH_INTERVAL_SECONDS` constant in `docker/operator/src/jobs.py` when
-a deployment needs a different tolerance.
+a deployment needs a different tolerance. The interval is part of the Job
+configuration identity, so after an Operator rollout it replaces Jobs created
+with the previous interval instead of retaining their immutable Pod templates.
 
 The Worker reads FFmpeg's dedicated `-progress` stream and refreshes its health
 state only when `out_time_us` or `out_time_ms` increases. If neither advances
