@@ -132,6 +132,32 @@ def _pod_phase(
     return pod.status.phase, ready
 
 
+def _list_processing_pods(core_api: Any, namespace: str, current: dict) -> list[Any]:
+    """List labelled processing Pods even after their owning Job disappears."""
+    stream_name = current.get("metadata", {}).get("name")
+    if not stream_name:
+        return []
+    try:
+        candidates = core_api.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=f"{jobs.LIVESTREAM_LABEL}={stream_name}",
+        ).items
+    except ApiException as error:
+        if _is_not_found(error):
+            return []
+        raise
+    pods = [
+        pod
+        for pod in candidates
+        if (pod.metadata.labels or {}).get(jobs.LIVESTREAM_LABEL) == stream_name
+        and any(
+            owner.api_version == "batch/v1" and owner.kind == "Job"
+            for owner in (pod.metadata.owner_references or [])
+        )
+    ]
+    return pods
+
+
 def _observe(current: dict, batch_api: Any, core_api: Any) -> ReconcileObservations:
     """Read a complete, immutable snapshot from the current LiveStream."""
     namespace = current["metadata"]["namespace"]
@@ -200,26 +226,59 @@ def _patch_finalizers(custom_api: Any, current: dict, finalizers: list[str]) -> 
     )
 
 
-def _finalize(current: dict, custom_api: Any, batch_api: Any) -> None:
+def _stopping_status(current: dict) -> tuple[dict, bool]:
+    """Preserve observations while recording this deletion cycle's first pass."""
+    calculated = dict(current.get("status") or {})
+    calculated["phase"] = "Stopping"
+    conditions = [dict(item) for item in calculated.get("conditions", [])]
+    already_observed = any(
+        item.get("type") == "CleanupPending"
+        and item.get("message") == current["metadata"].get("deletionTimestamp")
+        for item in conditions
+    )
+    if not already_observed:
+        generation = calculated.get(
+            "observedGeneration", current["metadata"].get("generation", 0)
+        )
+        conditions = [
+            item for item in conditions if item.get("type") != "CleanupPending"
+        ]
+        conditions.append(
+            {
+                "type": "CleanupPending",
+                "status": "True",
+                "reason": "ProcessingDeletionRequested",
+                "message": current["metadata"].get("deletionTimestamp"),
+                "lastTransitionTime": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "observedGeneration": generation,
+            }
+        )
+        calculated["conditions"] = conditions
+    return calculated, already_observed
+
+
+def _finalize(current: dict, custom_api: Any, batch_api: Any, core_api: Any) -> None:
     """Request dependant deletion and release only after it has converged."""
     metadata = current["metadata"]
     finalizers = metadata.get("finalizers") or []
     if FINALIZER not in finalizers:
         return
+    namespace = metadata["namespace"]
     owned_jobs = _list_owned_jobs(batch_api, metadata["namespace"], current)
+    processing_pods = _list_processing_pods(core_api, namespace, current)
+
+    calculated, cleanup_was_previously_observed = _stopping_status(current)
+    status.patch_if_changed(
+        custom_api, namespace, metadata["name"], current, calculated
+    )
+
     for job in owned_jobs:
-        try:
-            batch_api.delete_namespaced_job(
-                name=job.metadata.name,
-                namespace=metadata["namespace"],
-                propagation_policy="Foreground",
-            )
-        except ApiException as error:
-            if not _is_not_found(error):
-                raise
+        jobs.delete_for_livestream(batch_api, namespace, current, job)
     # Foreground deletion is asynchronous. Keep our finalizer until a later
     # reconciliation verifies that every owned Job and its Pods have gone.
-    if owned_jobs:
+    if owned_jobs or processing_pods or not cleanup_was_previously_observed:
         return
     try:
         _patch_finalizers(
@@ -255,7 +314,7 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
 
     current_metadata = current.get("metadata", {})
     if current_metadata.get("deletionTimestamp"):
-        _finalize(current, custom_api, batch_api)
+        _finalize(current, custom_api, batch_api, core_api)
         return
 
     finalizers = current_metadata.get("finalizers") or []
@@ -283,9 +342,9 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
             "phase": observed.selected_job.phase,
         }
         if observed.selected_job.bound_source_session_id:
-            calculated["job"]["boundSourceSessionId"] = (
-                observed.selected_job.bound_source_session_id
-            )
+            calculated["job"][
+                "boundSourceSessionId"
+            ] = observed.selected_job.bound_source_session_id
 
     changed = status.patch_if_changed(custom_api, namespace, name, current, calculated)
     LOGGER.info(
