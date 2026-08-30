@@ -182,6 +182,7 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
 
 
 def _patch_finalizers(custom_api: Any, current: dict, finalizers: list[str]) -> None:
+    """Replace finalizers only if the observed resource version is current."""
     metadata = current["metadata"]
     custom_api.patch_namespaced_custom_object(
         group="liveedgecast.io",
@@ -189,27 +190,37 @@ def _patch_finalizers(custom_api: Any, current: dict, finalizers: list[str]) -> 
         namespace=metadata["namespace"],
         plural="livestreams",
         name=metadata["name"],
-        body={"metadata": {"finalizers": finalizers}},
+        body={
+            "metadata": {
+                "resourceVersion": metadata["resourceVersion"],
+                "finalizers": finalizers,
+            }
+        },
         _content_type="application/merge-patch+json",
     )
 
 
 def _finalize(current: dict, custom_api: Any, batch_api: Any) -> None:
-    """Idempotently remove dependants before releasing the LiveStream."""
+    """Request dependant deletion and release only after it has converged."""
     metadata = current["metadata"]
     finalizers = metadata.get("finalizers") or []
     if FINALIZER not in finalizers:
         return
-    for job in _list_owned_jobs(batch_api, metadata["namespace"], current):
+    owned_jobs = _list_owned_jobs(batch_api, metadata["namespace"], current)
+    for job in owned_jobs:
         try:
             batch_api.delete_namespaced_job(
                 name=job.metadata.name,
                 namespace=metadata["namespace"],
-                propagation_policy="Background",
+                propagation_policy="Foreground",
             )
         except ApiException as error:
             if not _is_not_found(error):
                 raise
+    # Foreground deletion is asynchronous. Keep our finalizer until a later
+    # reconciliation verifies that every owned Job and its Pods have gone.
+    if owned_jobs:
+        return
     try:
         _patch_finalizers(
             custom_api, current, [item for item in finalizers if item != FINALIZER]
