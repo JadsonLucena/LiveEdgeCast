@@ -34,9 +34,31 @@ forward_signal() {
   fi
 }
 
+terminate_ffmpeg() {
+  local signal="${1:-TERM}"
+  local killer_pid
+
+  if [ -z "$ffmpeg_pid" ] || ! kill -0 "$ffmpeg_pid" 2>/dev/null; then
+    return
+  fi
+
+  forward_signal "$signal"
+  (
+    sleep "$FFMPEG_TERMINATION_GRACE_SECONDS"
+    if kill -0 "$ffmpeg_pid" 2>/dev/null; then
+      log "FFmpeg did not stop within ${FFMPEG_TERMINATION_GRACE_SECONDS}s after SIG${signal}; sending SIGKILL"
+      kill -KILL "$ffmpeg_pid" 2>/dev/null || true
+    fi
+  ) &
+  killer_pid=$!
+  wait "$ffmpeg_pid" 2>/dev/null || true
+  kill "$killer_pid" 2>/dev/null || true
+  wait "$killer_pid" 2>/dev/null || true
+}
+
 cleanup() {
   trap - EXIT TERM INT
-  forward_signal TERM
+  terminate_ffmpeg TERM
   stop_auxiliary_processes
   [ -z "$monitor_dir" ] || rm -rf "$monitor_dir"
 }
@@ -46,10 +68,7 @@ handle_signal() {
   local exit_code="$2"
   trap - TERM INT
   log "Received SIG${signal}; forwarding it to FFmpeg"
-  forward_signal "$signal"
-  if [ -n "$ffmpeg_pid" ]; then
-    wait "$ffmpeg_pid" 2>/dev/null || true
-  fi
+  terminate_ffmpeg "$signal"
   exit "$exit_code"
 }
 
@@ -68,6 +87,8 @@ if ! [[ "$MEDIA_HEALTH_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   log "MEDIA_HEALTH_INTERVAL_SECONDS must be a positive integer (received '$MEDIA_HEALTH_INTERVAL_SECONDS')."
   exit 1
 fi
+# Keep subsequent arithmetic explicitly decimal.
+MEDIA_HEALTH_INTERVAL_SECONDS=$((10#$MEDIA_HEALTH_INTERVAL_SECONDS))
 
 monitor_dir="$(mktemp -d)"
 progress_fifo="$monitor_dir/ffmpeg-progress"
@@ -75,22 +96,21 @@ last_progress_file="$monitor_dir/last-progress"
 watchdog_fired_file="$monitor_dir/watchdog-fired"
 mkfifo "$progress_fifo"
 
-started_at="$(date +%s)"
-printf '%s\n' "$started_at" >"$last_progress_file"
+started_at_ms="$(date +%s%3N)"
+health_interval_ms=$((MEDIA_HEALTH_INTERVAL_SECONDS * 1000))
+printf '%s\n' "$started_at_ms" >"$last_progress_file"
 
 # Only increasing media timestamps from FFmpeg's dedicated progress FIFO count
 # as health. A separate value is retained for each FFmpeg timestamp key.
 (
-  declare -A last_media_timestamp=()
+  declare -A last_media_timestamp=([out_time_us]=0 [out_time_ms]=0)
   while IFS='=' read -r key value; do
     case "$key" in
       out_time_us|out_time_ms)
         if [[ "$value" =~ ^[0-9]+$ ]]; then
-          if [ -z "${last_media_timestamp[$key]+set}" ]; then
-            last_media_timestamp[$key]="$value"
-          elif (( value > last_media_timestamp[$key] )); then
-            last_media_timestamp[$key]="$value"
-            printf '%s\n' "$(date +%s)" >"$last_progress_file.tmp"
+          if (( 10#$value > last_media_timestamp[$key] )); then
+            last_media_timestamp[$key]=$((10#$value))
+            printf '%s\n' "$(date +%s%3N)" >"$last_progress_file.tmp"
             mv "$last_progress_file.tmp" "$last_progress_file"
           fi
         fi
@@ -109,9 +129,9 @@ ffmpeg_pid=$!
 (
   while kill -0 "$ffmpeg_pid" 2>/dev/null; do
     sleep 1
-    now="$(date +%s)"
-    last_progress="$(cat "$last_progress_file" 2>/dev/null || printf '%s' "$started_at")"
-    if (( now - last_progress >= MEDIA_HEALTH_INTERVAL_SECONDS )); then
+    now_ms="$(date +%s%3N)"
+    last_progress_ms="$(cat "$last_progress_file" 2>/dev/null || printf '%s' "$started_at_ms")"
+    if (( now_ms - last_progress_ms >= health_interval_ms )); then
       printf '%s\n' "no increasing FFmpeg media timestamp for ${MEDIA_HEALTH_INTERVAL_SECONDS}s" >"$watchdog_fired_file"
       log "Media watchdog fired: no increasing FFmpeg media timestamp for ${MEDIA_HEALTH_INTERVAL_SECONDS}s; sending SIGTERM"
       kill -TERM "$ffmpeg_pid" 2>/dev/null || true
