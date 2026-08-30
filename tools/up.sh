@@ -44,15 +44,22 @@ kubectl apply -f k8s/namespaces.yaml
 kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/media --timeout=30s
 
 PROXY_IMAGE="liveedgecast-proxy:latest"
+OPERATOR_IMAGE="liveedgecast-operator:latest"
 
 print_step "Building the Proxy container image..."
 docker build -t "$PROXY_IMAGE" -f docker/proxy/Dockerfile docker/proxy
 print_success "Proxy container image built"
 
+print_step "Building the Operator container image..."
+docker build -t "$OPERATOR_IMAGE" -f docker/operator/Dockerfile docker/operator
+print_success "Operator container image built"
+
 if [[ $CONTEXT == kind-* ]]; then
     check_command kind
     print_step "Loading the Proxy image into the kind cluster..."
     kind load docker-image "$PROXY_IMAGE"
+    print_step "Loading the Operator image into the kind cluster..."
+    kind load docker-image "$OPERATOR_IMAGE"
 fi
 
 print_step "Applying Kubernetes resources..."
@@ -62,9 +69,13 @@ kubectl apply -f k8s/
 # Deployment alone would leave an existing Pod running the previous image.
 print_step "Restarting the Proxy deployment to use the newly built image..."
 kubectl rollout restart deployment/proxy -n media
+print_step "Restarting the Operator deployment to use the newly built image..."
+kubectl rollout restart deployment/liveedgecast-operator -n media
 
 print_step "Waiting for the Proxy deployment..."
 kubectl rollout status deployment/proxy -n media --timeout=120s
+print_step "Waiting for the Operator deployment..."
+kubectl rollout status deployment/liveedgecast-operator -n media --timeout=120s
 
 print_success "LiveEdgeCast is ready"
 echo ""
@@ -97,3 +108,4 @@ echo ""
 echo "Useful commands:"
 echo "  kubectl get pods -n media"
 echo "  kubectl logs -l app=proxy -n media -f"
+echo "  kubectl logs deployment/liveedgecast-operator -n media -f"

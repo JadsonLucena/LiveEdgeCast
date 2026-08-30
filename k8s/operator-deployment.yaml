@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: liveedgecast-operator
+  namespace: media
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: liveedgecast-operator
+  template:
+    metadata:
+      labels:
+        app: liveedgecast-operator
+    spec:
+      serviceAccountName: liveedgecast-operator
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: operator
+          image: liveedgecast-operator:latest
+          imagePullPolicy: Never
+          command:
+            - python
+            - src/main.py
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi

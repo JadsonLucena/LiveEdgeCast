@@ -2,9 +2,9 @@
 
 LiveEdgeCast contains the minimal foundation completed in **Phase 1** and the
 declarative `LiveStream` API established in **Phase 2**. The repository includes
-an RTMP Proxy, an FFmpeg-based Worker container image, and the `LiveStream` CRD.
-It does not yet include ingest integration, an Operator, or per-stream Jobs, so
-stream orchestration and serverless retransmission are not implemented.
+an RTMP Proxy, an FFmpeg-based Worker container image, the `LiveStream` CRD,
+and a namespaced Operator. Ingest integration and complete per-stream Job
+processing are not implemented yet.
 
 ## Current repository state
 
@@ -13,7 +13,9 @@ The deployable Kubernetes resources are limited to:
 - the `media` namespace;
 - an NGINX-RTMP Proxy Deployment;
 - the singular `proxy` Service, of type `LoadBalancer`, exposed on TCP port 1935;
-- the `LiveStream` CRD.
+- the `LiveStream` CRD;
+- the Operator ServiceAccount, Role, and RoleBinding;
+- the single-replica `liveedgecast-operator` Deployment.
 
 The proxy accepts and serves RTMP streams. Nothing in the current application
 creates per-stream workloads, persists stream ownership, reacts to stream
@@ -26,11 +28,12 @@ The following are deliberately absent:
 - HAProxy-based routing;
 - KEDA scaling and Prometheus metrics;
 - a shared Worker Deployment or Service; and
-- an Operator, RTMP ingest integration, and per-stream Jobs.
+- RTMP ingest integration and complete processing through per-stream Jobs.
 
-The repository does not retain a health-check application as a placeholder for
-the future Operator. The Operator will be introduced directly in its
-corresponding implementation phase.
+The Operator continuously watches `LiveStream` resources and reconstructs its
+observations by listing LiveStreams, Jobs, and Pods from the Kubernetes API. It
+does not use a ConfigMap or in-memory state as a source of truth, so it can
+resume reconciliation after a restart.
 
 The manifests and scripts combine the completed Phase 1 foundation with the
 Phase 2 API definition; they are not a production implementation of the target
@@ -52,9 +55,9 @@ Kubernetes API state is the source of truth in this target. There is no separate
 imperative Controller, HAProxy tier, Prometheus/KEDA scaling loop, or shared
 Worker Deployment in the design.
 
-**The Operator, ingest integration, and per-stream Job reconciliation are not
-implemented in this repository yet.** Their names above describe the fixed
-target architecture only.
+**Ingest integration and complete per-stream Job reconciliation are not
+implemented in this repository yet.** The current Operator observes API state
+and updates status, but does not yet provide the full processing lifecycle.
 
 ## Current foundation and API deployment
 
@@ -72,7 +75,9 @@ Deploy the resources that currently exist:
 ./tools/up.sh
 ```
 
-For a kind cluster, the script also starts a local port forward. Publish to:
+The script builds both the Proxy and Operator images, loads them into kind when
+needed, applies the manifests, and waits for both Deployments. For a kind
+cluster, it also starts a local port forward. Publish to:
 
 ```text
 rtmp://127.0.0.1:1935/live/{stream-key}
@@ -87,7 +92,13 @@ kubectl get service proxy -n media
 Remote clusters are not supported by this local deployment script. The Proxy
 Deployment uses a locally built image name with `imagePullPolicy: Never`.
 Docker Desktop shares its local image store, while the script explicitly loads
-the Proxy image into kind.
+both images into kind.
+
+Follow the Operator logs with:
+
+```sh
+kubectl logs deployment/liveedgecast-operator -n media -f
+```
 
 Remove the current deployment:
 
@@ -95,6 +106,8 @@ Remove the current deployment:
 ./tools/down.sh
 ```
 
-Applying `k8s/` installs the `LiveStream` CRD, but does not create any
-`LiveStream` instances, install an Operator, provide ingest integration, or
-create per-stream Jobs. Consequently, it does not launch Worker containers.
+Applying `k8s/` installs the `LiveStream` CRD, Operator RBAC, and Operator
+Deployment, but does not create any `LiveStream` instances, provide ingest
+integration, or complete the creation and processing of per-stream Jobs.
+Consequently, it does not yet launch Worker containers as a full stream
+processing flow.
