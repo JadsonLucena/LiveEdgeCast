@@ -208,21 +208,35 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
     elif not selected_job and observed.owned_jobs:
         return LifecycleDecision(phase="Handover", action=LifecycleAction.DELETE_JOBS)
     elif not selected_job:
+        # With no workload to disambiguate the context, the phase persisted in
+        # the status subresource is itself part of the Kubernetes observation.
+        # In particular, an Interrupted stream must not look like a new stream
+        # merely because its Job has already disappeared.
+        if observed.previous_phase == "Interrupted":
+            return LifecycleDecision(phase="Interrupted")
         if observed.previous_phase == "Recovering":
             if source_available is True:
                 return LifecycleDecision(
                     phase="Provisioning", action=LifecycleAction.CREATE_JOB
                 )
             return LifecycleDecision(
-                phase=("Interrupted" if source_available is False else "Registered")
+                phase=("Interrupted" if source_available is False else "Recovering")
             )
+        if observed.previous_phase in {"Registered", "Provisioning", "Handover"}:
+            if source_available is False:
+                return LifecycleDecision(phase="Interrupted")
+            return LifecycleDecision(
+                phase="Provisioning", action=LifecycleAction.CREATE_JOB
+            )
+        if observed.previous_phase in {"Starting", "Streaming"}:
+            return LifecycleDecision(
+                phase=("Interrupted" if source_available is False else "Recovering")
+            )
+        # Persist the initial Registered state before provisioning. This makes
+        # a subsequent reconcile reconstruct the CREATE_JOB decision without
+        # relying on process-local counters or sequencing.
         return LifecycleDecision(
             phase="Registered",
-            action=(
-                LifecycleAction.CREATE_JOB
-                if source_available is not False
-                else LifecycleAction.NONE
-            ),
         )
     elif selected_job.phase == "Failed":
         return LifecycleDecision(

@@ -37,3 +37,10 @@ does not implement the Operator, per-stream Jobs, or Proxy callbacks.
 - The end of the current publication follows `Registered` | `Provisioning` |
   `Starting` | `Streaming` | `Recovering` | `Handover` → `Stopping`.
 - Finalization removes the `LiveStream` resource.
+
+The Operator reconstructs these decisions from the persisted `status.phase`
+together with the current Source, Job, and Pod observations. In particular, a
+Job-less `Recovering` stream provisions a replacement only after its source is
+available, while a Job-less `Interrupted` stream remains interrupted until the
+reconnection policy moves it through `Handover`. No process-local lifecycle
+counter or sequence is used.
