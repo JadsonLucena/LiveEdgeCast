@@ -18,9 +18,7 @@ def observe(livestream: dict[str, Any]) -> dict[str, Any]:
     desired_proxy = desired.get("proxyName")
     desired_session = desired.get("sessionId")
     matches_desired_source = (
-        bool(desired_proxy)
-        and bool(desired_session)
-        and previous.get("proxyName") == desired_proxy
+        previous.get("proxyName") == desired_proxy
         and previous.get("sessionId") == desired_session
     )
     if matches_desired_source:

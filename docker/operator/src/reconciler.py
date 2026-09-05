@@ -220,18 +220,18 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
             phase="Registered",
             action=(
                 LifecycleAction.CREATE_JOB
-                if source_available is True
+                if source_available is not False
                 else LifecycleAction.NONE
             ),
         )
     elif selected_job.phase == "Failed":
-        if source_available is not True:
-            # An unknown observation must not claim that recovery is underway.
-            # The explicitly unavailable case was classified as Interrupted above.
-            return LifecycleDecision(phase="Registered")
         return LifecycleDecision(
             phase="Recovering",
-            action=LifecycleAction.DELETE_FAILED_JOB,
+            action=(
+                LifecycleAction.DELETE_FAILED_JOB
+                if source_available is True
+                else LifecycleAction.NONE
+            ),
         )
     elif selected_job.phase == "Succeeded":
         phase = "Stopping"
