@@ -206,32 +206,32 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
     if source_available is False and (selected_job or observed.owned_jobs):
         phase = "Interrupted"
     elif not selected_job and observed.owned_jobs:
-        return LifecycleDecision(
-            phase="Handover", action=LifecycleAction.DELETE_JOBS
-        )
+        return LifecycleDecision(phase="Handover", action=LifecycleAction.DELETE_JOBS)
     elif not selected_job:
         if observed.previous_phase == "Recovering":
-            if source_available is False:
-                return LifecycleDecision(phase="Interrupted")
+            if source_available is True:
+                return LifecycleDecision(
+                    phase="Provisioning", action=LifecycleAction.CREATE_JOB
+                )
             return LifecycleDecision(
-                phase="Provisioning", action=LifecycleAction.CREATE_JOB
+                phase=("Interrupted" if source_available is False else "Registered")
             )
         return LifecycleDecision(
             phase="Registered",
             action=(
                 LifecycleAction.CREATE_JOB
-                if source_available is not False
+                if source_available is True
                 else LifecycleAction.NONE
             ),
         )
     elif selected_job.phase == "Failed":
+        if source_available is not True:
+            # An unknown observation must not claim that recovery is underway.
+            # The explicitly unavailable case was classified as Interrupted above.
+            return LifecycleDecision(phase="Registered")
         return LifecycleDecision(
             phase="Recovering",
-            action=(
-                LifecycleAction.DELETE_FAILED_JOB
-                if source_available is True
-                else LifecycleAction.NONE
-            ),
+            action=LifecycleAction.DELETE_FAILED_JOB,
         )
     elif selected_job.phase == "Succeeded":
         phase = "Stopping"
@@ -288,9 +288,7 @@ def _stopping_status(
     calculated = dict(current.get("status") or {})
     calculated["phase"] = "Stopping"
     calculated["cleanup"] = {
-        "jobs": [
-            {"name": name, "uid": uid} for name, uid in sorted(owned_job_ids)
-        ]
+        "jobs": [{"name": name, "uid": uid} for name, uid in sorted(owned_job_ids)]
     }
     conditions = [dict(item) for item in calculated.get("conditions", [])]
     already_observed = any(
@@ -330,9 +328,7 @@ def _finalize(current: dict, custom_api: Any, batch_api: Any, core_api: Any) -> 
     namespace = metadata["namespace"]
     owned_jobs = _list_owned_jobs(batch_api, metadata["namespace"], current)
     owned_job_ids = _validated_cleanup_job_ids(current, owned_jobs)
-    processing_pods = _list_processing_pods(
-        core_api, namespace, current, owned_job_ids
-    )
+    processing_pods = _list_processing_pods(core_api, namespace, current, owned_job_ids)
 
     calculated, cleanup_was_previously_observed = _stopping_status(
         current, owned_job_ids
@@ -365,9 +361,7 @@ def _execute(
     """Execute the one action selected by the pure lifecycle decision."""
     if decision.action is LifecycleAction.CREATE_JOB:
         metadata = current["metadata"]
-        jobs.create_for_livestream(
-            batch_api, metadata["namespace"], current
-        )
+        jobs.create_for_livestream(batch_api, metadata["namespace"], current)
     elif decision.action is LifecycleAction.DELETE_FAILED_JOB:
         if observed is None or observed.selected_job is None:
             raise ValueError("failed Job deletion requires its observed resource")
@@ -377,12 +371,8 @@ def _execute(
         )
     elif decision.action is LifecycleAction.DELETE_JOBS:
         metadata = current["metadata"]
-        for job in jobs.list_for_livestream(
-            batch_api, metadata["namespace"], current
-        ):
-            jobs.delete_for_livestream(
-                batch_api, metadata["namespace"], current, job
-            )
+        for job in jobs.list_for_livestream(batch_api, metadata["namespace"], current):
+            jobs.delete_for_livestream(batch_api, metadata["namespace"], current, job)
     elif decision.action is not LifecycleAction.NONE:
         raise ValueError(f"unsupported lifecycle action: {decision.action}")
 
