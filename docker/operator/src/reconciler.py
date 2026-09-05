@@ -211,6 +211,8 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
         )
     elif not selected_job:
         if observed.previous_phase == "Recovering":
+            if source_available is False:
+                return LifecycleDecision(phase="Interrupted")
             return LifecycleDecision(
                 phase="Provisioning", action=LifecycleAction.CREATE_JOB
             )

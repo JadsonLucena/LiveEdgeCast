@@ -5,6 +5,7 @@ import hashlib
 import re
 from typing import Any
 
+from kubernetes.client import V1DeleteOptions, V1Preconditions
 from kubernetes.client.exceptions import ApiException
 
 LIVESTREAM_API_VERSION = "liveedgecast.io/v1alpha1"
@@ -73,16 +74,22 @@ def delete_for_livestream(
     was deliberately left untouched. A missing, previously owned Job counts as
     a successful deletion.
     """
-    if not _is_owned_by_livestream(job, livestream):
+    job_uid = getattr(job.metadata, "uid", None)
+    if not job_uid or not _is_owned_by_livestream(job, livestream):
         return False
     try:
         batch_api.delete_namespaced_job(
             name=job.metadata.name,
             namespace=namespace,
+            body=V1DeleteOptions(
+                preconditions=V1Preconditions(uid=job_uid),
+            ),
             propagation_policy="Foreground",
         )
     except ApiException as error:
-        if error.status != 404:
+        # A UID-precondition conflict means the observed Job has disappeared
+        # and a different same-named object must be left untouched.
+        if error.status not in (404, 409):
             raise
     return True
 

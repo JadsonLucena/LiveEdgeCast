@@ -10,6 +10,7 @@ sys.path.insert(0, str(SRC))
 
 import jobs  # noqa: E402
 import reconciler  # noqa: E402
+from kubernetes.client.exceptions import ApiException  # noqa: E402
 
 
 def job_observation(phase: str = "Failed") -> jobs.JobObservation:
@@ -67,6 +68,16 @@ class TerminalRecoveryDecisionTests(TestCase):
 
         self.assertEqual("Provisioning", decision.phase)
         self.assertIs(reconciler.LifecycleAction.CREATE_JOB, decision.action)
+
+    def test_recovery_does_not_recreate_job_when_source_became_unavailable(self):
+        observed = observations(
+            previous_phase="Recovering", source_available=False
+        )
+
+        decision = reconciler.decide_lifecycle(observed)
+
+        self.assertEqual("Interrupted", decision.phase)
+        self.assertIs(reconciler.LifecycleAction.NONE, decision.action)
 
     def test_failed_pod_does_not_trigger_terminal_job_recovery(self):
         selected = object()
@@ -153,3 +164,56 @@ class TerminalRecoveryExecutionTests(TestCase):
         reconciler._execute(decision, self.current, batch_api, observed)
 
         create_job.assert_called_once_with(batch_api, "media", self.current)
+
+
+class JobDeletionPreconditionTests(TestCase):
+    def setUp(self):
+        self.current = {
+            "metadata": {"name": "stream", "uid": "stream-uid"}
+        }
+        self.job = SimpleNamespace(
+            metadata=SimpleNamespace(
+                name="worker-job",
+                uid="observed-job-uid",
+                owner_references=[
+                    SimpleNamespace(
+                        api_version=jobs.LIVESTREAM_API_VERSION,
+                        kind=jobs.LIVESTREAM_KIND,
+                        name="stream",
+                        uid="stream-uid",
+                    )
+                ],
+            )
+        )
+
+    def test_delete_uses_observed_job_uid_as_precondition(self):
+        batch_api = mock.Mock()
+
+        deleted = jobs.delete_for_livestream(
+            batch_api, "media", self.current, self.job
+        )
+
+        self.assertTrue(deleted)
+        call = batch_api.delete_namespaced_job.call_args
+        self.assertEqual("worker-job", call.kwargs["name"])
+        self.assertEqual("media", call.kwargs["namespace"])
+        self.assertEqual("Foreground", call.kwargs["propagation_policy"])
+        self.assertEqual(
+            "observed-job-uid", call.kwargs["body"].preconditions.uid
+        )
+
+    def test_uid_conflict_leaves_same_named_replacement_untouched(self):
+        batch_api = mock.Mock()
+        batch_api.delete_namespaced_job.side_effect = ApiException(status=409)
+
+        deleted = jobs.delete_for_livestream(
+            batch_api, "media", self.current, self.job
+        )
+
+        self.assertTrue(deleted)
+        self.assertEqual(
+            "observed-job-uid",
+            batch_api.delete_namespaced_job.call_args.kwargs[
+                "body"
+            ].preconditions.uid,
+        )
