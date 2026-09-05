@@ -42,5 +42,6 @@ The Operator reconstructs these decisions from the persisted `status.phase`
 together with the current Source, Job, and Pod observations. In particular, a
 Job-less `Recovering` stream provisions a replacement only after its source is
 available, while a Job-less `Interrupted` stream remains interrupted until the
-reconnection policy moves it through `Handover`. No process-local lifecycle
-counter or sequence is used.
+reconnection policy moves it through `Handover`, and a Job-less stream in
+`Stopping` remains in that phase. No process-local lifecycle counter or sequence
+is used.

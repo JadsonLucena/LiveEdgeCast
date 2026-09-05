@@ -210,10 +210,10 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
     elif not selected_job:
         # With no workload to disambiguate the context, the phase persisted in
         # the status subresource is itself part of the Kubernetes observation.
-        # In particular, an Interrupted stream must not look like a new stream
-        # merely because its Job has already disappeared.
-        if observed.previous_phase == "Interrupted":
-            return LifecycleDecision(phase="Interrupted")
+        # In particular, Interrupted and Stopping streams must not look like
+        # new streams merely because their Jobs have already disappeared.
+        if observed.previous_phase in {"Interrupted", "Stopping"}:
+            return LifecycleDecision(phase=observed.previous_phase)
         if observed.previous_phase == "Recovering":
             if source_available is True:
                 return LifecycleDecision(
