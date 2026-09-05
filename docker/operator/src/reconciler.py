@@ -22,6 +22,7 @@ class LifecycleAction(Enum):
     NONE = "none"
     CREATE_JOB = "create_job"
     DELETE_JOBS = "delete_jobs"
+    DELETE_FAILED_JOB = "delete_failed_job"
 
 
 @dataclass(frozen=True)
@@ -30,9 +31,11 @@ class ReconcileObservations:
 
     source: dict[str, Any]
     owned_jobs: tuple[Any, ...]
-    selected_job: jobs.JobObservation | None
+    selected_job: Any | None
+    selected_job_observation: jobs.JobObservation | None
     pod_phase: str | None
     pod_ready: bool
+    previous_phase: str | None
 
 
 @dataclass(frozen=True)
@@ -188,22 +191,31 @@ def _observe(current: dict, batch_api: Any, core_api: Any) -> ReconcileObservati
     return ReconcileObservations(
         source=source_observation,
         owned_jobs=tuple(owned_jobs),
-        selected_job=selected[1] if selected else None,
+        selected_job=selected[0] if selected else None,
+        selected_job_observation=selected[1] if selected else None,
         pod_phase=pod_phase,
         pod_ready=pod_ready,
+        previous_phase=current.get("status", {}).get("phase"),
     )
 
 
 def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
     """Derive lifecycle solely from the supplied current observations."""
     source_available = observed.source.get("available")
-    if source_available is False and (observed.selected_job or observed.owned_jobs):
+    selected_job = observed.selected_job_observation
+    if source_available is False and (selected_job or observed.owned_jobs):
         phase = "Interrupted"
-    elif not observed.selected_job and observed.owned_jobs:
+    elif not selected_job and observed.owned_jobs:
         return LifecycleDecision(
             phase="Handover", action=LifecycleAction.DELETE_JOBS
         )
-    elif not observed.selected_job:
+    elif not selected_job:
+        if observed.previous_phase == "Recovering":
+            if source_available is False:
+                return LifecycleDecision(phase="Interrupted")
+            return LifecycleDecision(
+                phase="Provisioning", action=LifecycleAction.CREATE_JOB
+            )
         return LifecycleDecision(
             phase="Registered",
             action=(
@@ -212,9 +224,16 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
                 else LifecycleAction.NONE
             ),
         )
-    elif observed.selected_job.phase == "Failed":
-        phase = "Recovering"
-    elif observed.selected_job.phase == "Succeeded":
+    elif selected_job.phase == "Failed":
+        return LifecycleDecision(
+            phase="Recovering",
+            action=(
+                LifecycleAction.DELETE_FAILED_JOB
+                if source_available is True
+                else LifecycleAction.NONE
+            ),
+        )
+    elif selected_job.phase == "Succeeded":
         phase = "Stopping"
     elif observed.pod_ready:
         phase = "Streaming"
@@ -341,12 +360,20 @@ def _execute(
     decision: LifecycleDecision,
     current: dict,
     batch_api: Any,
+    observed: ReconcileObservations | None = None,
 ) -> None:
     """Execute the one action selected by the pure lifecycle decision."""
     if decision.action is LifecycleAction.CREATE_JOB:
         metadata = current["metadata"]
         jobs.create_for_livestream(
             batch_api, metadata["namespace"], current
+        )
+    elif decision.action is LifecycleAction.DELETE_FAILED_JOB:
+        if observed is None or observed.selected_job is None:
+            raise ValueError("failed Job deletion requires its observed resource")
+        metadata = current["metadata"]
+        jobs.delete_for_livestream(
+            batch_api, metadata["namespace"], current, observed.selected_job
         )
     elif decision.action is LifecycleAction.DELETE_JOBS:
         metadata = current["metadata"]
@@ -389,7 +416,7 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
 
     observed = _observe(current, batch_api, core_api)
     decision = decide_lifecycle(observed)
-    _execute(decision, current, batch_api)
+    _execute(decision, current, batch_api, observed)
 
     generation = current_metadata.get("generation", 0)
     calculated: dict[str, Any] = {
@@ -401,15 +428,16 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
             _condition(current, generation, observed.source.get("available"))
         ],
     }
-    if observed.selected_job:
+    if observed.selected_job_observation:
+        selected_job = observed.selected_job_observation
         calculated["job"] = {
-            "name": observed.selected_job.name,
-            "phase": observed.selected_job.phase,
+            "name": selected_job.name,
+            "phase": selected_job.phase,
         }
-        if observed.selected_job.bound_source_session_id:
+        if selected_job.bound_source_session_id:
             calculated["job"][
                 "boundSourceSessionId"
-            ] = observed.selected_job.bound_source_session_id
+            ] = selected_job.bound_source_session_id
 
     changed = status.patch_if_changed(custom_api, namespace, name, current, calculated)
     LOGGER.info(
