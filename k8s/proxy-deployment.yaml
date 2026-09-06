@@ -10,6 +10,8 @@ spec:
     metadata:
       labels: { app: proxy }
     spec:
+      serviceAccountName: liveedgecast-proxy
+      automountServiceAccountToken: true
       containers:
         - name: nginx
           image: liveedgecast-proxy:latest
