@@ -204,7 +204,7 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
     source_available = observed.source.get("available")
     selected_job = observed.selected_job_observation
     if source_available is False and (selected_job or observed.owned_jobs):
-        phase = "Interrupted"
+        return LifecycleDecision(phase="Interrupted")
     elif not selected_job and observed.owned_jobs:
         return LifecycleDecision(phase="Handover", action=LifecycleAction.DELETE_JOBS)
     elif not selected_job:
