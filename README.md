@@ -87,6 +87,20 @@ Deploy the resources that currently exist:
 ./tools/up.sh
 ```
 
+Before publishing for the first time, configure the destination used when the
+Proxy creates a `LiveStream`. The Proxy reads it from a Secret so the image and
+Deployment do not embed endpoint credentials:
+
+```sh
+kubectl create secret generic liveedgecast-target -n media \
+  --from-literal=rtmp-url='rtmps://destination.example/live/key'
+kubectl rollout restart deployment/proxy -n media
+```
+
+The Secret reference is optional at Pod startup to keep the Proxy available
+while configuration is being provisioned, but a publication is rejected until
+`TARGET_RTMP_URL` is populated.
+
 The script builds the Proxy, Operator, and Worker images, loads them into kind
 when needed, applies the manifests, and waits for both Deployments. For a kind
 cluster, it also starts a local port forward. Publish to:
