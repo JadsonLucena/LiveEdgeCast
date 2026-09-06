@@ -21,36 +21,60 @@ The CRD schema validates the possible `status.phase` values. The current
 Operator implements creation, processing, terminal-Job recovery, interruption
 when the source is unavailable, stopping, and finalization as described below.
 
-## Implemented processing sequence
+## Implemented finite-state machine
 
-- A new resource is first recorded as `Registered`; a subsequent reconciliation
-  creates its Job and records `Provisioning`.
-- A pending Job remains `Provisioning`. A running Pod moves the stream to
-  `Starting`, and a Ready Pod moves it to `Streaming`.
-- An FFmpeg failure exits the Worker container non-zero and fails the Pod. The
-  Job Controller, not the Operator, creates the short Pod attempts for the same
-  Job until its `backoffLimit` is reached. Individual Pod failures do not
-  replace the Job.
-- The Operator recognizes processing failure only from a Job condition with
-  `type: Failed` and `status: "True"`. It does not infer terminal failure from a
-  failed Pod.
-- When that terminal Job failure is observed and the current source is
-  available, the Operator records `Recovering` and deletes the failed Job. A
-  following reconciliation observes the Job-less `Recovering` state, creates a
-  replacement Job, and records `Provisioning`.
-- When the terminal Job failure is observed and the current source is
-  unavailable, the Operator records `Interrupted`, does not delete the failed
-  Job, and does not run processing recovery.
-- If source availability is absent or `null`, the Operator treats it as
-  unknown rather than available. It retains a failed Job, does not enter
-  destructive recovery, and publishes a `SourceAvailable` condition with
-  status `Unknown` and reason `AwaitingSourceObservation` until the Proxy
-  supplies an explicit observation.
-- A source reported unavailable while a processing Job exists also records
-  `Interrupted`; source availability therefore takes precedence over
-  terminal-Job replacement.
-- A completed Job records `Stopping`. Deletion finalization removes Jobs and
-  processing Pods owned by the `LiveStream` before removing its finalizer.
+The lifecycle decision applies the following transitions in order. The order is
+significant because source unavailability takes precedence over the state of an
+existing Job.
+
+| Current observation | Required source observation | Result | Operator action |
+| --- | --- | --- | --- |
+| Any selected or owned Job exists | `available: false` | `Interrupted` | None; retain the Job |
+| Owned Jobs exist, but none matches the desired session and configuration | Not `false` | `Handover` | Delete all owned Jobs |
+| No Job, persisted `Interrupted` or `Stopping` | Any | Preserve the persisted phase | None |
+| No Job, persisted `Recovering` | `available: true` | `Provisioning` | Create the replacement Job |
+| No Job, persisted `Recovering` | `available: false` | `Interrupted` | None |
+| No Job, persisted `Recovering` | Missing or `null` | `Recovering` | None |
+| No Job, persisted `Registered`, `Provisioning`, or `Handover` | Not `false` | `Provisioning` | Create the Job |
+| No Job, persisted `Registered`, `Provisioning`, or `Handover` | `available: false` | `Interrupted` | None |
+| No Job, persisted `Starting` or `Streaming` | `available: true` | `Recovering` | None |
+| No Job, persisted `Starting` or `Streaming` | `available: false` | `Interrupted` | None |
+| No Job, persisted `Starting` or `Streaming` | Missing or `null` | Preserve the persisted phase | None |
+| No Job and no recognized persisted phase | Any | `Registered` | None |
+| Selected Job has terminal condition `Failed=True` | `available: true` | `Recovering` | Delete that failed Job |
+| Selected Job has terminal condition `Failed=True` | `available: false` | `Interrupted` | None; retain the failed Job |
+| Selected Job has terminal condition `Failed=True` | Missing or `null` | Preserve the persisted phase, or use `Provisioning` if absent | None; retain the failed Job |
+| Selected Job has terminal condition `Complete=True` | Not `false` | `Stopping` | None |
+| Selected Job and newest owned Pod is Ready | Not `false` | `Streaming` | None |
+| Selected Job and newest owned Pod is Running but not Ready | Not `false` | `Starting` | None |
+| Selected Job is otherwise pending | Not `false` | `Provisioning` | None |
+
+An FFmpeg failure exits the Worker container non-zero and fails its Pod. Short
+retries belong exclusively to the Kubernetes Job Controller, which creates new
+Pod attempts for the **same Job** until `backoffLimit` is reached. An individual
+Pod failure never causes the Operator to replace the Job. The only processing
+failure signal that starts Operator recovery is a Job condition whose `type` is
+`Failed` and whose `status` is `"True"`.
+
+Recovery additionally requires an explicit observation of
+`source.available: true` for the desired proxy and session. In that case, the
+Operator records `Recovering` and requests deletion of the failed Job. Job
+deletion is foreground and asynchronous, so reconciliation continues to retain
+`Recovering` and request deletion while that Job remains observable. The
+Operator creates no replacement until a later observation contains no failed
+Job; it then creates the replacement as part of the transition to
+`Provisioning`.
+
+An explicit `source.available: false` leads to `Interrupted` and takes
+precedence whenever a selected or owned Job exists. If availability is absent
+or `null`, it is unknown rather than available: the failed Job is retained,
+destructive recovery is not started, and the Operator publishes a
+`SourceAvailable` condition with status `Unknown` and reason
+`AwaitingSourceObservation`.
+
+A completed Job records `Stopping`. Deletion finalization independently records
+`Stopping`, removes Jobs and processing Pods owned by the `LiveStream`, and
+only then removes its finalizer.
 
 The Operator reconstructs these decisions from the persisted `status.phase`
 together with current Source, Job, and Pod observations. In particular, a
