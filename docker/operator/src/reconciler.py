@@ -249,14 +249,12 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
         if source_available is False:
             return LifecycleDecision(phase="Interrupted")
         # A terminal Job is evidence of failed processing, but not evidence that
-        # its source can sustain a replacement. Keep both the Job and the last
-        # non-recovery lifecycle phase until the Proxy publishes availability.
+        # its source can sustain a replacement. Keep both the Job and the
+        # persisted phase until the Proxy publishes availability. In particular,
+        # retaining Recovering keeps the jobless replacement gated on True if a
+        # previously requested foreground deletion completes asynchronously.
         return LifecycleDecision(
-            phase=(
-                observed.persisted_phase
-                if observed.persisted_phase not in {None, "Recovering"}
-                else "Provisioning"
-            )
+            phase=observed.persisted_phase or "Provisioning"
         )
     elif selected_job.phase == "Succeeded":
         phase = "Stopping"
