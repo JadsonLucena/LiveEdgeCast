@@ -31,8 +31,8 @@ class ReconcileObservations:
 
     source: dict[str, Any]
     owned_jobs: tuple[Any, ...]
-    selected_job: Any | None
-    selected_job_observation: jobs.JobObservation | None
+    selected_job: jobs.JobObservation | None
+    selected_job_resource: Any | None
     pod_phase: str | None
     pod_ready: bool
     persisted_phase: str | None
@@ -191,8 +191,8 @@ def _observe(current: dict, batch_api: Any, core_api: Any) -> ReconcileObservati
     return ReconcileObservations(
         source=source_observation,
         owned_jobs=tuple(owned_jobs),
-        selected_job=selected[0] if selected else None,
-        selected_job_observation=selected[1] if selected else None,
+        selected_job=selected[1] if selected else None,
+        selected_job_resource=selected[0] if selected else None,
         pod_phase=pod_phase,
         pod_ready=pod_ready,
         persisted_phase=current.get("status", {}).get("phase"),
@@ -202,7 +202,7 @@ def _observe(current: dict, batch_api: Any, core_api: Any) -> ReconcileObservati
 def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
     """Derive lifecycle solely from the supplied current observations."""
     source_available = observed.source.get("available")
-    selected_job = observed.selected_job_observation
+    selected_job = observed.selected_job
     if source_available is False and (selected_job or observed.owned_jobs):
         return LifecycleDecision(phase="Interrupted")
     elif not selected_job and observed.owned_jobs:
@@ -248,11 +248,9 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
             )
         if source_available is False:
             return LifecycleDecision(phase="Interrupted")
-        # A terminal Job is evidence of failed processing, but not evidence that
-        # its source can sustain a replacement. Keep both the Job and the
-        # persisted phase until the Proxy publishes availability. In particular,
-        # retaining Recovering keeps the jobless replacement gated on True if a
-        # previously requested foreground deletion completes asynchronously.
+        # Foreground deletion is asynchronous. Preserve Recovering while the
+        # failed Job remains observed so its disappearance can enter the
+        # jobless recovery branch and provision once availability returns.
         return LifecycleDecision(
             phase=observed.persisted_phase or "Provisioning"
         )
@@ -386,11 +384,14 @@ def _execute(
         metadata = current["metadata"]
         jobs.create_for_livestream(batch_api, metadata["namespace"], current)
     elif decision.action is LifecycleAction.DELETE_FAILED_JOB:
-        if observed is None or observed.selected_job is None:
+        if observed is None or observed.selected_job_resource is None:
             raise ValueError("failed Job deletion requires its observed resource")
         metadata = current["metadata"]
         jobs.delete_for_livestream(
-            batch_api, metadata["namespace"], current, observed.selected_job
+            batch_api,
+            metadata["namespace"],
+            current,
+            observed.selected_job_resource,
         )
     elif decision.action is LifecycleAction.DELETE_JOBS:
         metadata = current["metadata"]
@@ -441,8 +442,8 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
             _condition(current, generation, observed.source.get("available"))
         ],
     }
-    if observed.selected_job_observation:
-        selected_job = observed.selected_job_observation
+    if observed.selected_job:
+        selected_job = observed.selected_job
         calculated["job"] = {
             "name": selected_job.name,
             "phase": selected_job.phase,
