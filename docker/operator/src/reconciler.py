@@ -239,13 +239,22 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
             phase="Registered",
         )
     elif selected_job.phase == "Failed":
+        if source_available is True:
+            return LifecycleDecision(
+                phase="Recovering",
+                action=LifecycleAction.DELETE_FAILED_JOB,
+            )
+        if source_available is False:
+            return LifecycleDecision(phase="Interrupted")
+        # A terminal Job is evidence of failed processing, but not evidence that
+        # its source can sustain a replacement. Keep both the Job and the last
+        # non-recovery lifecycle phase until the Proxy publishes availability.
         return LifecycleDecision(
-            phase="Recovering",
-            action=(
-                LifecycleAction.DELETE_FAILED_JOB
-                if source_available is True
-                else LifecycleAction.NONE
-            ),
+            phase=(
+                observed.persisted_phase
+                if observed.persisted_phase not in {None, "Recovering"}
+                else "Provisioning"
+            )
         )
     elif selected_job.phase == "Succeeded":
         phase = "Stopping"

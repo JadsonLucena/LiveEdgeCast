@@ -41,6 +41,11 @@ when the source is unavailable, stopping, and finalization as described below.
 - When the terminal Job failure is observed and the current source is
   unavailable, the Operator records `Interrupted`, does not delete the failed
   Job, and does not run processing recovery.
+- If source availability is absent or `null`, the Operator treats it as
+  unknown rather than available. It retains a failed Job, does not enter
+  destructive recovery, and publishes a `SourceAvailable` condition with
+  status `Unknown` and reason `AwaitingSourceObservation` until the Proxy
+  supplies an explicit observation.
 - A source reported unavailable while a processing Job exists also records
   `Interrupted`; source availability therefore takes precedence over
   terminal-Job replacement.
