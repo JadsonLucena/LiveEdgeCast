@@ -229,9 +229,11 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
                 phase="Provisioning", action=LifecycleAction.CREATE_JOB
             )
         if observed.persisted_phase in {"Starting", "Streaming"}:
-            return LifecycleDecision(
-                phase=("Interrupted" if source_available is False else "Recovering")
-            )
+            if source_available is True:
+                return LifecycleDecision(phase="Recovering")
+            if source_available is False:
+                return LifecycleDecision(phase="Interrupted")
+            return LifecycleDecision(phase=observed.persisted_phase)
         # Persist the initial Registered state before provisioning. This makes
         # a subsequent reconcile reconstruct the CREATE_JOB decision without
         # relying on process-local counters or sequencing.
