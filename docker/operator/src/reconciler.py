@@ -229,9 +229,11 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
                 phase="Provisioning", action=LifecycleAction.CREATE_JOB
             )
         if observed.persisted_phase in {"Starting", "Streaming"}:
-            return LifecycleDecision(
-                phase=("Interrupted" if source_available is False else "Recovering")
-            )
+            if source_available is True:
+                return LifecycleDecision(phase="Recovering")
+            if source_available is False:
+                return LifecycleDecision(phase="Interrupted")
+            return LifecycleDecision(phase=observed.persisted_phase)
         # Persist the initial Registered state before provisioning. This makes
         # a subsequent reconcile reconstruct the CREATE_JOB decision without
         # relying on process-local counters or sequencing.
@@ -239,13 +241,20 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
             phase="Registered",
         )
     elif selected_job.phase == "Failed":
+        if source_available is True:
+            return LifecycleDecision(
+                phase="Recovering",
+                action=LifecycleAction.DELETE_FAILED_JOB,
+            )
+        if source_available is False:
+            return LifecycleDecision(phase="Interrupted")
+        # A terminal Job is evidence of failed processing, but not evidence that
+        # its source can sustain a replacement. Keep both the Job and the
+        # persisted phase until the Proxy publishes availability. In particular,
+        # retaining Recovering keeps the jobless replacement gated on True if a
+        # previously requested foreground deletion completes asynchronously.
         return LifecycleDecision(
-            phase="Recovering",
-            action=(
-                LifecycleAction.DELETE_FAILED_JOB
-                if source_available is True
-                else LifecycleAction.NONE
-            ),
+            phase=observed.persisted_phase or "Provisioning"
         )
     elif selected_job.phase == "Succeeded":
         phase = "Stopping"
