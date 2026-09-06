@@ -246,7 +246,14 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
                 phase="Recovering",
                 action=LifecycleAction.DELETE_FAILED_JOB,
             )
-        return LifecycleDecision(phase="Interrupted")
+        if source_available is False:
+            return LifecycleDecision(phase="Interrupted")
+        # Foreground deletion is asynchronous. Preserve Recovering while the
+        # failed Job remains observed so its disappearance can enter the
+        # jobless recovery branch and provision once availability returns.
+        return LifecycleDecision(
+            phase=observed.persisted_phase or "Provisioning"
+        )
     elif selected_job.phase == "Succeeded":
         phase = "Stopping"
     elif observed.pod_ready:
