@@ -5,10 +5,10 @@ declarative `LiveStream` API established in **Phase 2**, the namespaced
 Operator, watch, RBAC, Deployment, and stateless reconstruction delivered in
 **Phase 3**, lifecycle finalization from **Phase 4**, per-stream processing Jobs
 from **Phase 5**, and the Worker's media health watchdog and Job-based failure
-flow from **Phase 6**. **Phase 7** completes processing recovery after a Job
-reaches terminal failure: according to the observed source availability, the
-Operator either replaces the failed Job or records that processing was
-interrupted.
+flow from **Phase 6**. **Phase 7** implements processing recovery after a Job
+reaches terminal failure: the Operator replaces the failed Job only when the
+source is confirmed as available; otherwise it records that processing was
+interrupted. Phase 7 remains subject to final validation.
 
 The repository includes an RTMP Proxy, an FFmpeg-based Worker container image,
 the `LiveStream` CRD, and the Operator. Ingest integration, handover, and
@@ -145,8 +145,9 @@ not restart FFmpeg or keep the container alive.
 
 ### Phase 7: terminal Job recovery
 
-Phase 7 is complete. Its recovery responsibilities are deliberately divided
-between the Worker, Kubernetes, and the Operator:
+The Phase 7 implementation remains subject to final validation. Its recovery
+responsibilities are deliberately divided between the Worker, Kubernetes, and
+the Operator:
 
 1. An FFmpeg failure makes the Worker container exit non-zero, causing its Pod
    to fail.
@@ -163,10 +164,9 @@ between the Worker, Kubernetes, and the Operator:
    reconciliation confirms that the failed Job has been deleted does the
    Operator create its replacement, during the transition from `Recovering`
    to `Provisioning`.
-6. An explicitly unavailable source (`source.available: false`) moves the
-   stream to `Interrupted`; the Operator retains the failed Job and performs no
-   processing recovery. Missing or `null` availability is unknown and also
-   cannot authorize recovery.
+6. An unavailable (`source.available: false`) or unconfirmed (missing or
+   `null`) source moves the stream to `Interrupted`; the Operator retains the
+   failed Job and creates no replacement.
 
 The complete implemented sequence is therefore **FFmpeg failure → failed Pod →
 Job Controller retries up to `backoffLimit` → terminal Job `Failed=True` →
