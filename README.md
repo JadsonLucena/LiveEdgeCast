@@ -1,16 +1,18 @@
 # LiveEdgeCast
 
 LiveEdgeCast contains the minimal foundation completed in **Phase 1**, the
-declarative `LiveStream` API established in **Phase 2**, and the namespaced
+declarative `LiveStream` API established in **Phase 2**, the namespaced
 Operator, watch, RBAC, Deployment, and stateless reconstruction delivered in
-**Phase 3**, lifecycle finalization from **Phase 4**, and per-stream processing
-Jobs from **Phase 5**. **Phase 6** adds the Worker's media health watchdog and
-the Job-based failure flow: stalled FFmpeg processing fails its container and
-lets Kubernetes exhaust the Job's short retry budget before the Operator marks
-the stream as recovering. The repository includes an RTMP Proxy, an
-FFmpeg-based Worker container image, the `LiveStream` CRD, and the Operator.
-Ingest integration and the remaining recovery/handover lifecycle are not
-implemented yet.
+**Phase 3**, lifecycle finalization from **Phase 4**, per-stream processing Jobs
+from **Phase 5**, and the Worker's media health watchdog and Job-based failure
+flow from **Phase 6**. **Phase 7** completes processing recovery after a Job
+reaches terminal failure: according to the observed source availability, the
+Operator either replaces the failed Job or records that processing was
+interrupted.
+
+The repository includes an RTMP Proxy, an FFmpeg-based Worker container image,
+the `LiveStream` CRD, and the Operator. Ingest integration, handover, and
+recovery from an interrupted source are not implemented yet.
 
 ## Current repository state
 
@@ -37,7 +39,8 @@ The following are deliberately absent:
 - HAProxy-based routing;
 - KEDA scaling and Prometheus metrics;
 - a shared Worker Deployment or Service; and
-- RTMP ingest integration and the remaining recovery/handover behavior.
+- RTMP ingest integration, handover, and recovery after an unavailable source
+  becomes available again.
 
 The Operator continuously watches `LiveStream` resources and reconstructs its
 observations by listing LiveStreams, Jobs, and Pods from the Kubernetes API. It
@@ -46,7 +49,7 @@ resume reconciliation after a restart.
 
 The manifests and scripts combine the completed foundation and API work from
 Phases 1–2 with the Operator, finalization, Job reconciliation, and media health
-watchdog delivered in Phases 3–6. They are not yet a production implementation
+watchdog delivered in Phases 3–7. They are not yet a production implementation
 of the target design.
 
 ## Fixed target architecture
@@ -65,8 +68,8 @@ Kubernetes API state is the source of truth in this target. There is no separate
 imperative Controller, HAProxy tier, Prometheus/KEDA scaling loop, or shared
 Worker Deployment in the design.
 
-**Ingest integration and the complete recovery/handover lifecycle are not
-implemented in this repository yet.**
+**Ingest integration, handover, and recovery from the `Interrupted` phase are
+not implemented in this repository yet.**
 
 ## Current foundation, API, and Operator deployment
 
@@ -140,12 +143,29 @@ grace period**, and uses `SIGKILL` only if FFmpeg is still running. The Worker
 then waits for FFmpeg and exits non-zero, which makes the Pod `Failed`. It does
 not restart FFmpeg or keep the container alive.
 
-The recovery flow is therefore **FFmpeg without media progress → container
-exits non-zero → Pod becomes `Failed` → the Kubernetes Job Controller creates
-the next retry**. The Job Controller, not the Operator, performs these short
-retries. The Operator does not poll the Worker and does not replace the Job
-while that Job is still retrying; only a terminally `Failed` Job starts recovery
-in the Operator.
+The recovery responsibilities are deliberately divided between the Worker,
+Kubernetes, and the Operator:
+
+1. An FFmpeg failure makes the Worker container exit non-zero, causing its Pod
+   to fail.
+2. The Kubernetes Job Controller performs the short attempts for that same Job,
+   up to its `backoffLimit`. An individual failed Pod therefore does **not**
+   cause the Operator to replace the Job.
+3. The Operator starts processing recovery only after observing the Job
+   condition `type: Failed` with `status: "True"`; Pod failure alone is not a
+   recovery signal.
+4. If the current source is available, the Operator sets the stream to
+   `Recovering` and deletes the terminally failed Job. On the following
+   reconciliation, it creates the replacement Job and sets the stream to
+   `Provisioning`.
+5. If the current source is unavailable, the Operator sets the stream to
+   `Interrupted`, retains the failed Job, and performs no processing recovery.
+
+The complete implemented sequence is therefore **FFmpeg failure → failed Pod →
+Job Controller retries up to `backoffLimit` → terminal Job `Failed=True` →
+Operator chooses recovery from the observed source availability**. The Operator
+does not poll the Worker and does not replace the Job while the Job Controller
+is still retrying.
 
 To validate a stalled source manually, publish a stream and then leave its
 connection open without producing more media. In another terminal, watch:
