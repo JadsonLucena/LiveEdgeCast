@@ -80,6 +80,28 @@ class FailedJobRecoveryTest(unittest.TestCase):
         self.assertEqual("Interrupted", decision.phase)
         self.assertIs(reconciler.LifecycleAction.NONE, decision.action)
 
+    def test_failed_job_deletion_rejects_a_different_resource(self) -> None:
+        observed = reconciler.ReconcileObservations(
+            **{
+                **self.observed.__dict__,
+                "selected_job": SimpleNamespace(
+                    metadata=SimpleNamespace(name="replacement", uid="other-uid")
+                ),
+            }
+        )
+        decision = reconciler.LifecycleDecision(
+            phase="Recovering",
+            action=reconciler.LifecycleAction.DELETE_FAILED_JOB,
+        )
+
+        with (
+            patch.object(jobs, "delete_for_livestream") as delete,
+            self.assertRaisesRegex(ValueError, "does not match"),
+        ):
+            reconciler._execute(decision, self.current, Mock(), observed)
+
+        delete.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
