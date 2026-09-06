@@ -204,7 +204,7 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
     source_available = observed.source.get("available")
     selected_job = observed.selected_job_observation
     if source_available is False and (selected_job or observed.owned_jobs):
-        phase = "Interrupted"
+        return LifecycleDecision(phase="Interrupted")
     elif not selected_job and observed.owned_jobs:
         return LifecycleDecision(phase="Handover", action=LifecycleAction.DELETE_JOBS)
     elif not selected_job:
@@ -377,21 +377,11 @@ def _execute(
         metadata = current["metadata"]
         jobs.create_for_livestream(batch_api, metadata["namespace"], current)
     elif decision.action is LifecycleAction.DELETE_FAILED_JOB:
-        if (
-            observed is None
-            or observed.selected_job is None
-            or observed.selected_job_observation is None
-        ):
-            raise ValueError("failed Job deletion requires its complete observation")
-        selected_job = observed.selected_job
-        selected_job_observation = observed.selected_job_observation
-        if selected_job_observation.phase != "Failed":
-            raise ValueError("DELETE_FAILED_JOB requires a terminally failed Job")
-        if selected_job.metadata.name != selected_job_observation.name:
-            raise ValueError("selected Job resource does not match its observation")
+        if observed is None or observed.selected_job is None:
+            raise ValueError("failed Job deletion requires its observed resource")
         metadata = current["metadata"]
         jobs.delete_for_livestream(
-            batch_api, metadata["namespace"], current, selected_job
+            batch_api, metadata["namespace"], current, observed.selected_job
         )
     elif decision.action is LifecycleAction.DELETE_JOBS:
         metadata = current["metadata"]
