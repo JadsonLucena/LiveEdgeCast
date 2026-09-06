@@ -164,9 +164,11 @@ the Operator:
    reconciliation confirms that the failed Job has been deleted does the
    Operator create its replacement, during the transition from `Recovering`
    to `Provisioning`.
-6. An unavailable (`source.available: false`) or unconfirmed (missing or
-   `null`) source moves the stream to `Interrupted`; the Operator retains the
-   failed Job and creates no replacement.
+6. An unavailable (`source.available: false`) source moves the stream to
+   `Interrupted`. An unconfirmed source (missing or `null`) does the same and
+   retains the failed Job when recovery has not started. If foreground deletion
+   was already requested, persisted `Recovering` is retained so a later
+   available observation can safely create the replacement.
 
 The complete implemented sequence is therefore **FFmpeg failure → failed Pod →
 Job Controller retries up to `backoffLimit` → terminal Job `Failed=True` →

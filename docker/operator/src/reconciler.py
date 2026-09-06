@@ -219,7 +219,12 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
                 return LifecycleDecision(
                     phase="Provisioning", action=LifecycleAction.CREATE_JOB
                 )
-            return LifecycleDecision(phase="Interrupted")
+            if source_available is False:
+                return LifecycleDecision(phase="Interrupted")
+            # Foreground deletion may finish while source observation is
+            # temporarily unknown. Keep the persisted recovery checkpoint so
+            # a later positive observation can provision the replacement.
+            return LifecycleDecision(phase="Recovering")
         if observed.current_phase in {"Registered", "Provisioning", "Handover"}:
             if source_available is False:
                 return LifecycleDecision(phase="Interrupted")
@@ -246,9 +251,13 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
             )
         if source_available is False:
             return LifecycleDecision(phase="Interrupted")
-        # Recovery is safe only with an explicit availability observation.
-        # Retain the failed Job when source availability is unknown so a
-        # replacement cannot be provisioned from incomplete information.
+        # Recovering is a persisted checkpoint that proves deletion was
+        # already requested by a reconcile with an explicitly available
+        # source. Preserve it while foreground deletion remains observable.
+        if observed.current_phase == "Recovering":
+            return LifecycleDecision(phase="Recovering")
+        # Without that checkpoint, retain the failed Job and do not begin
+        # destructive recovery from incomplete source information.
         return LifecycleDecision(phase="Interrupted")
     elif selected_job.phase == "Succeeded":
         phase = "Stopping"

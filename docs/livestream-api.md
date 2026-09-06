@@ -34,7 +34,7 @@ existing Job.
 | No Job, persisted `Interrupted` or `Stopping` | Any | Preserve the persisted phase | None |
 | No Job, persisted `Recovering` | `available: true` | `Provisioning` | Create the replacement Job |
 | No Job, persisted `Recovering` | `available: false` | `Interrupted` | None |
-| No Job, persisted `Recovering` | Missing or `null` | `Interrupted` | None |
+| No Job, persisted `Recovering` | Missing or `null` | Preserve `Recovering` | None; await a definitive source observation |
 | No Job, persisted `Registered`, `Provisioning`, or `Handover` | Not `false` | `Provisioning` | Create the Job |
 | No Job, persisted `Registered`, `Provisioning`, or `Handover` | `available: false` | `Interrupted` | None |
 | No Job, persisted `Starting` or `Streaming` | `available: true` | `Recovering` | None |
@@ -43,7 +43,8 @@ existing Job.
 | No Job and no recognized persisted phase | Any | `Registered` | None |
 | Selected Job has terminal condition `Failed=True` | `available: true` | `Recovering` | Delete that failed Job |
 | Selected Job has terminal condition `Failed=True` | `available: false` | `Interrupted` | None; retain the failed Job |
-| Selected Job has terminal condition `Failed=True` | Missing or `null` | `Interrupted` | None; retain the failed Job |
+| Selected Job has terminal condition `Failed=True`, not already `Recovering` | Missing or `null` | `Interrupted` | None; retain the failed Job |
+| Selected Job has terminal condition `Failed=True`, persisted `Recovering` | Missing or `null` | Preserve `Recovering` | None; foreground deletion was already requested |
 | Selected Job has terminal condition `Complete=True` | Not `false` | `Stopping` | None |
 | Selected Job and newest owned Pod is Ready | Not `false` | `Streaming` | None |
 | Selected Job and newest owned Pod is Running but not Ready | Not `false` | `Starting` | None |
@@ -65,12 +66,15 @@ Operator creates no replacement until a later observation contains no failed
 Job; it then creates the replacement as part of the transition to
 `Provisioning`.
 
-An explicit `source.available: false` or an unconfirmed availability (absent or
-`null`) leads a failed-Job recovery to `Interrupted`. In both cases, the failed
-Job is retained, destructive recovery is not started, and no replacement is
-created. For an unconfirmed source, the Operator also publishes a
-`SourceAvailable` condition with status `Unknown` and reason
-`AwaitingSourceObservation`.
+An explicit `source.available: false` leads a failed-Job recovery to
+`Interrupted`. An unconfirmed availability (absent or `null`) also leads to
+`Interrupted` when recovery has not started, retaining the failed Job and
+creating no replacement. If foreground deletion was already requested from an
+explicitly available observation, however, persisted `Recovering` is retained
+across a temporary unknown observation—even after the failed Job disappears—so
+a later `available: true` can safely provision the replacement. For an
+unconfirmed source, the Operator publishes a `SourceAvailable` condition with
+status `Unknown` and reason `AwaitingSourceObservation`.
 
 A completed Job records `Stopping`. Deletion finalization independently records
 `Stopping`, removes Jobs and processing Pods owned by the `LiveStream`, and
@@ -79,8 +83,10 @@ only then removes its finalizer.
 The Operator reconstructs these decisions from the persisted `status.phase`
 together with current Source, Job, and Pod observations. In particular, a
 Job-less `Recovering` stream provisions a replacement only when its source is
-explicitly available, while a Job-less stream in `Interrupted` or `Stopping`
-remains in that phase. No process-local lifecycle counter or sequence is used.
+explicitly available and otherwise retains that persisted checkpoint unless
+the source is explicitly unavailable. A Job-less stream in `Interrupted` or
+`Stopping` remains in that phase. No process-local lifecycle counter or
+sequence is used.
 
 ## Not implemented yet
 
