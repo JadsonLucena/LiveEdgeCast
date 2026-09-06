@@ -35,7 +35,7 @@ class ReconcileObservations:
     selected_job_resource: Any | None
     pod_phase: str | None
     pod_ready: bool
-    persisted_phase: str | None
+    current_phase: str | None
 
 
 @dataclass(frozen=True)
@@ -195,7 +195,7 @@ def _observe(current: dict, batch_api: Any, core_api: Any) -> ReconcileObservati
         selected_job_resource=selected[0] if selected else None,
         pod_phase=pod_phase,
         pod_ready=pod_ready,
-        persisted_phase=current.get("status", {}).get("phase"),
+        current_phase=current.get("status", {}).get("phase"),
     )
 
 
@@ -212,28 +212,26 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
         # the status subresource is itself part of the Kubernetes observation.
         # In particular, Interrupted and Stopping streams must not look like
         # new streams merely because their Jobs have already disappeared.
-        if observed.persisted_phase in {"Interrupted", "Stopping"}:
-            return LifecycleDecision(phase=observed.persisted_phase)
-        if observed.persisted_phase == "Recovering":
+        if observed.current_phase in {"Interrupted", "Stopping"}:
+            return LifecycleDecision(phase=observed.current_phase)
+        if observed.current_phase == "Recovering":
             if source_available is True:
                 return LifecycleDecision(
                     phase="Provisioning", action=LifecycleAction.CREATE_JOB
                 )
-            return LifecycleDecision(
-                phase=("Interrupted" if source_available is False else "Recovering")
-            )
-        if observed.persisted_phase in {"Registered", "Provisioning", "Handover"}:
+            return LifecycleDecision(phase="Interrupted")
+        if observed.current_phase in {"Registered", "Provisioning", "Handover"}:
             if source_available is False:
                 return LifecycleDecision(phase="Interrupted")
             return LifecycleDecision(
                 phase="Provisioning", action=LifecycleAction.CREATE_JOB
             )
-        if observed.persisted_phase in {"Starting", "Streaming"}:
+        if observed.current_phase in {"Starting", "Streaming"}:
             if source_available is True:
                 return LifecycleDecision(phase="Recovering")
             if source_available is False:
                 return LifecycleDecision(phase="Interrupted")
-            return LifecycleDecision(phase=observed.persisted_phase)
+            return LifecycleDecision(phase=observed.current_phase)
         # Persist the initial Registered state before provisioning. This makes
         # a subsequent reconcile reconstruct the CREATE_JOB decision without
         # relying on process-local counters or sequencing.
@@ -252,7 +250,7 @@ def decide_lifecycle(observed: ReconcileObservations) -> LifecycleDecision:
         # failed Job remains observed so its disappearance can enter the
         # jobless recovery branch and provision once availability returns.
         return LifecycleDecision(
-            phase=observed.persisted_phase or "Provisioning"
+            phase=observed.current_phase or "Provisioning"
         )
     elif selected_job.phase == "Succeeded":
         phase = "Stopping"
