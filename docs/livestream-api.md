@@ -34,7 +34,7 @@ existing Job.
 | No Job, persisted `Interrupted` or `Stopping` | Any | Preserve the persisted phase | None |
 | No Job, persisted `Recovering` | `available: true` | `Provisioning` | Create the replacement Job |
 | No Job, persisted `Recovering` | `available: false` | `Interrupted` | None |
-| No Job, persisted `Recovering` | Missing or `null` | `Recovering` | None |
+| No Job, persisted `Recovering` | Missing or `null` | `Interrupted` | None |
 | No Job, persisted `Registered`, `Provisioning`, or `Handover` | Not `false` | `Provisioning` | Create the Job |
 | No Job, persisted `Registered`, `Provisioning`, or `Handover` | `available: false` | `Interrupted` | None |
 | No Job, persisted `Starting` or `Streaming` | `available: true` | `Recovering` | None |
@@ -43,7 +43,7 @@ existing Job.
 | No Job and no recognized persisted phase | Any | `Registered` | None |
 | Selected Job has terminal condition `Failed=True` | `available: true` | `Recovering` | Delete that failed Job |
 | Selected Job has terminal condition `Failed=True` | `available: false` | `Interrupted` | None; retain the failed Job |
-| Selected Job has terminal condition `Failed=True` | Missing or `null` | Preserve the persisted phase, or use `Provisioning` if absent | None; retain the failed Job |
+| Selected Job has terminal condition `Failed=True` | Missing or `null` | `Interrupted` | None; retain the failed Job |
 | Selected Job has terminal condition `Complete=True` | Not `false` | `Stopping` | None |
 | Selected Job and newest owned Pod is Ready | Not `false` | `Streaming` | None |
 | Selected Job and newest owned Pod is Running but not Ready | Not `false` | `Starting` | None |
@@ -65,10 +65,10 @@ Operator creates no replacement until a later observation contains no failed
 Job; it then creates the replacement as part of the transition to
 `Provisioning`.
 
-An explicit `source.available: false` leads to `Interrupted` and takes
-precedence whenever a selected or owned Job exists. If availability is absent
-or `null`, it is unknown rather than available: the failed Job is retained,
-destructive recovery is not started, and the Operator publishes a
+An explicit `source.available: false` or an unconfirmed availability (absent or
+`null`) leads a failed-Job recovery to `Interrupted`. In both cases, the failed
+Job is retained, destructive recovery is not started, and no replacement is
+created. For an unconfirmed source, the Operator also publishes a
 `SourceAvailable` condition with status `Unknown` and reason
 `AwaitingSourceObservation`.
 
