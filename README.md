@@ -143,8 +143,10 @@ grace period**, and uses `SIGKILL` only if FFmpeg is still running. The Worker
 then waits for FFmpeg and exits non-zero, which makes the Pod `Failed`. It does
 not restart FFmpeg or keep the container alive.
 
-The recovery responsibilities are deliberately divided between the Worker,
-Kubernetes, and the Operator:
+### Phase 7: terminal Job recovery
+
+Phase 7 is complete. Its recovery responsibilities are deliberately divided
+between the Worker, Kubernetes, and the Operator:
 
 1. An FFmpeg failure makes the Worker container exit non-zero, causing its Pod
    to fail.
@@ -154,18 +156,24 @@ Kubernetes, and the Operator:
 3. The Operator starts processing recovery only after observing the Job
    condition `type: Failed` with `status: "True"`; Pod failure alone is not a
    recovery signal.
-4. If the current source is available, the Operator sets the stream to
-   `Recovering` and deletes the terminally failed Job. On the following
-   reconciliation, it creates the replacement Job and sets the stream to
-   `Provisioning`.
-5. If the current source is unavailable, the Operator sets the stream to
-   `Interrupted`, retains the failed Job, and performs no processing recovery.
+4. Recovery is allowed only when the observation for the current source is
+   explicitly `source.available: true`. The Operator then sets the stream to
+   `Recovering` and requests deletion of the terminally failed Job.
+5. The replacement is never created alongside the failed Job. Only after a
+   reconciliation confirms that the failed Job has been deleted does the
+   Operator create its replacement, during the transition from `Recovering`
+   to `Provisioning`.
+6. An explicitly unavailable source (`source.available: false`) moves the
+   stream to `Interrupted`; the Operator retains the failed Job and performs no
+   processing recovery. Missing or `null` availability is unknown and also
+   cannot authorize recovery.
 
 The complete implemented sequence is therefore **FFmpeg failure → failed Pod →
 Job Controller retries up to `backoffLimit` → terminal Job `Failed=True` →
 Operator chooses recovery from the observed source availability**. The Operator
-does not poll the Worker and does not replace the Job while the Job Controller
-is still retrying.
+does not poll the Worker, does not replace a Job because an individual Pod
+failed, and does not replace the Job while the Job Controller is still
+retrying.
 
 To validate a stalled source manually, publish a stream and then leave its
 connection open without producing more media. In another terminal, watch:
