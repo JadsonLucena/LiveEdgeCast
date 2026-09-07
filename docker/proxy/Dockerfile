@@ -40,16 +40,27 @@ ENV NGINX_VERSION=1.24.0
 
 RUN apk add --no-cache \
     ca-certificates \
-    openssl \
+    curl \
+    jq \
+    libssl3 \
     pcre2 \
+    socat \
     zlib
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
 RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
-    && mkdir -p /var/log/nginx
+    && mkdir -p /var/log/nginx /scripts /var/run/liveedgecast/publications \
+    && chmod 700 /var/run/liveedgecast/publications
 
+COPY kubernetes_api.sh \
+    publication_started.sh \
+    publication_ended.sh \
+    lifecycle_http.sh \
+    entrypoint.sh \
+    /scripts/
+RUN chmod 755 /scripts/*.sh
 COPY nginx.conf /etc/nginx/nginx.conf
 
 EXPOSE 1935
 STOPSIGNAL SIGQUIT
-CMD ["nginx", "-g", "daemon off;"]
+ENTRYPOINT ["/scripts/entrypoint.sh"]

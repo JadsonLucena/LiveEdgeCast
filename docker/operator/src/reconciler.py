@@ -36,6 +36,7 @@ class ReconcileObservations:
     pod_phase: str | None
     pod_ready: bool
     current_phase: str | None
+    configuration_id: str
 
 
 @dataclass(frozen=True)
@@ -174,7 +175,7 @@ def _observe(current: dict, batch_api: Any, core_api: Any) -> ReconcileObservati
     source_observation = source.observe(current)
     owned_jobs = _list_owned_jobs(batch_api, namespace, current)
     desired_session_id = current.get("spec", {}).get("source", {}).get("sessionId")
-    desired_configuration_id = jobs.configuration_id(current)
+    desired_configuration_id = jobs.configuration_id(current, core_api)
     observed_jobs = tuple((job, jobs.observe(job)) for job in owned_jobs)
     selected = next(
         (
@@ -196,6 +197,7 @@ def _observe(current: dict, batch_api: Any, core_api: Any) -> ReconcileObservati
         pod_phase=pod_phase,
         pod_ready=pod_ready,
         current_phase=current.get("status", {}).get("phase"),
+        configuration_id=desired_configuration_id,
     )
 
 
@@ -387,7 +389,14 @@ def _execute(
     """Execute the one action selected by the pure lifecycle decision."""
     if decision.action is LifecycleAction.CREATE_JOB:
         metadata = current["metadata"]
-        jobs.create_for_livestream(batch_api, metadata["namespace"], current)
+        if observed is None:
+            raise ValueError("Job creation requires observed configuration identity")
+        jobs.create_for_livestream(
+            batch_api,
+            metadata["namespace"],
+            current,
+            observed.configuration_id,
+        )
     elif decision.action is LifecycleAction.DELETE_FAILED_JOB:
         if observed is None or observed.selected_job_resource is None:
             raise ValueError("failed Job deletion requires its observed resource")

@@ -16,6 +16,19 @@ spec:
         - name: nginx
           image: liveedgecast-proxy:latest
           imagePullPolicy: Never
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: TARGET_RTMP_SECRET_NAME
+              value: liveedgecast-target
+            - name: TARGET_RTMP_SECRET_KEY
+              value: base-url
           ports:
             - containerPort: 1935
               name: rtmp
