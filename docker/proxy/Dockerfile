@@ -49,12 +49,13 @@ RUN apk add --no-cache \
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
 RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
-    && mkdir -p /var/log/nginx /scripts /var/run/liveedgecast/publications \
-    && chmod 700 /var/run/liveedgecast/publications
+    && mkdir -p /var/log/nginx /scripts /run/liveedgecast/sessions \
+    && chmod 700 /run/liveedgecast/sessions
 
 COPY kubernetes_api.sh \
     publication_started.sh \
     publication_ended.sh \
+    publication_state.sh \
     lifecycle_http.sh \
     entrypoint.sh \
     /scripts/
