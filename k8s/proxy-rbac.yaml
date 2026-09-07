@@ -16,7 +16,6 @@ rules:
       - secrets
     resourceNames:
       - liveedgecast-target
-      - liveedgecast-stream-keys
     verbs:
       - get
   - apiGroups:
