@@ -9,6 +9,12 @@ stream. There is deliberately no `Offline` phase.
 - `spec` is the desired configuration supplied by the ingest integration. It
   identifies the stream, its current source, its target, and its recovery
   policy.
+- `spec.source.available` is set by the Proxy for the registered publication;
+  the Operator reflects this desired-source fact into its own status without
+  requiring the Proxy to write the status subresource.
+- `spec.target.baseUrlSecretRef` identifies the Secret key containing the
+  credential-bearing destination base URL. The Worker reads that Secret
+  directly and appends `spec.streamKey` to select a distinct target stream.
 - `status` is the state observed while reconciling that desired configuration.
   It contains the lifecycle phase and observations about the source, Job,
   processing health, interruption, and conditions.
@@ -94,7 +100,6 @@ The phase enum also reserves states needed by the target lifecycle, but their
 presence in the API is not a claim that their workflows are complete. In
 particular, the current implementation does **not** yet provide:
 
-- ingest callbacks that create, update, or remove `LiveStream` resources;
 - handover for a changed source or session;
 - reconnection and recovery from `Interrupted` through `Handover`;
 - interruption TTL expiry; or

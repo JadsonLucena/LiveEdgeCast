@@ -22,9 +22,15 @@ kubernetes_api_init() {
         return 1
     }
 
-    KUBERNETES_NAMESPACE=$(cat "$KUBERNETES_NAMESPACE_FILE")
-    KUBERNETES_API_URL="https://${KUBERNETES_SERVICE_HOST:?KUBERNETES_SERVICE_HOST is required}:${KUBERNETES_SERVICE_PORT_HTTPS:-443}"
+    KUBERNETES_NAMESPACE=$(tr -d '\r\n' <"$KUBERNETES_NAMESPACE_FILE")
+    [ -n "$KUBERNETES_NAMESPACE" ] || return 1
+    kubernetes_host=${KUBERNETES_SERVICE_HOST:?KUBERNETES_SERVICE_HOST is required}
+    case "$kubernetes_host" in
+        *:*) kubernetes_host="[$kubernetes_host]" ;;
+    esac
+    KUBERNETES_API_URL="https://${kubernetes_host}:${KUBERNETES_SERVICE_PORT_HTTPS:-443}"
     LIVESTREAMS_API_PATH="/apis/liveedgecast.io/v1alpha1/namespaces/${KUBERNETES_NAMESPACE}/livestreams"
+    SECRETS_API_PATH="/api/v1/namespaces/${KUBERNETES_NAMESPACE}/secrets"
 }
 
 # Writes the response body to the supplied file and prints only the HTTP status.
@@ -39,7 +45,7 @@ kubernetes_api_request() {
         --silent --show-error \
         --request "$method" \
         --cacert "$KUBERNETES_CA_FILE" \
-        --header "Authorization: Bearer $(cat "$KUBERNETES_TOKEN_FILE")" \
+        --header "Authorization: Bearer $(tr -d '\r\n' <"$KUBERNETES_TOKEN_FILE")" \
         --header "Accept: application/json" \
         --output "$output_file" \
         --write-out '%{http_code}'

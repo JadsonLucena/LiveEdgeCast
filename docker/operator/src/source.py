@@ -15,6 +15,8 @@ def observe(livestream: dict[str, Any]) -> dict[str, Any]:
         "proxyName": desired.get("proxyName", ""),
         "sessionId": desired.get("sessionId", ""),
     }
+    if isinstance(desired.get("available"), bool):
+        observation["available"] = desired["available"]
     desired_proxy = desired.get("proxyName")
     desired_session = desired.get("sessionId")
     matches_desired_source = (
@@ -22,10 +24,6 @@ def observe(livestream: dict[str, Any]) -> dict[str, Any]:
         and previous.get("sessionId") == desired_session
     )
     if matches_desired_source:
-        if previous.get("available") is True:
-            observation["available"] = True
-        elif previous.get("available") is False:
-            observation["available"] = False
         if previous.get("lastSeenAt"):
             observation["lastSeenAt"] = previous["lastSeenAt"]
     return observation

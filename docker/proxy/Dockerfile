@@ -10,7 +10,6 @@ RUN apk add --no-cache \
     pcre2-dev \
     zlib-dev \
     linux-headers \
-    patch \
     wget \
     tar
 
@@ -21,9 +20,7 @@ RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
     && tar -xzf nginx-rtmp-module.tar.gz
 
 WORKDIR /tmp/build/nginx-${NGINX_VERSION}
-COPY nginx-rtmp-clientid.patch /tmp/build/nginx-rtmp-clientid.patch
-RUN patch -d ../nginx-rtmp-module-${NGINX_RTMP_MODULE_VERSION} -p1 <../nginx-rtmp-clientid.patch \
-    && ./configure \
+RUN ./configure \
     --prefix=/usr/local/nginx \
     --conf-path=/etc/nginx/nginx.conf \
     --error-log-path=/var/log/nginx/error.log \
@@ -47,6 +44,7 @@ RUN apk add --no-cache \
     jq \
     libssl3 \
     pcre2 \
+    socat \
     zlib
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
@@ -54,10 +52,15 @@ RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
     && mkdir -p /var/log/nginx /scripts /var/run/liveedgecast/publications \
     && chmod 700 /var/run/liveedgecast/publications
 
-COPY kubernetes_api.sh publication_started.sh publication_ended.sh /scripts/
+COPY kubernetes_api.sh \
+    publication_started.sh \
+    publication_ended.sh \
+    lifecycle_http.sh \
+    entrypoint.sh \
+    /scripts/
 RUN chmod 755 /scripts/*.sh
 COPY nginx.conf /etc/nginx/nginx.conf
 
 EXPOSE 1935
 STOPSIGNAL SIGQUIT
-CMD ["nginx", "-g", "daemon off;"]
+ENTRYPOINT ["/scripts/entrypoint.sh"]

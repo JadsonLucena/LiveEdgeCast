@@ -11,6 +11,14 @@ metadata:
   namespace: media
 rules:
   - apiGroups:
+      - ""
+    resources:
+      - secrets
+    resourceNames:
+      - liveedgecast-target
+    verbs:
+      - get
+  - apiGroups:
       - liveedgecast.io
     resources:
       - livestreams

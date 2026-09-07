@@ -40,6 +40,7 @@ spec:
                     - proxyName
                     - sessionId
                     - url
+                    - available
                   properties:
                     proxyName:
                       type: string
@@ -50,16 +51,28 @@ spec:
                     url:
                       type: string
                       description: URL from which the source publication is consumed.
+                    available:
+                      type: boolean
+                      description: Whether this desired source session is currently publishing.
                 target:
                   type: object
                   description: Destination to which the live stream is delivered.
                   additionalProperties: false
                   required:
-                    - url
+                    - baseUrlSecretRef
                   properties:
-                    url:
-                      type: string
-                      description: URL to which the live stream is delivered.
+                    baseUrlSecretRef:
+                      type: object
+                      description: Secret containing the credential-bearing RTMP base URL; the stream key is appended by the Worker.
+                      additionalProperties: false
+                      required:
+                        - name
+                        - key
+                      properties:
+                        name:
+                          type: string
+                        key:
+                          type: string
                 recoveryPolicy:
                   type: object
                   description: Retry and interruption handling policy for the live stream.

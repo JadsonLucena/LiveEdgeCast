@@ -10,9 +10,10 @@ reaches terminal failure: the Operator replaces the failed Job only when the
 source is confirmed as available; otherwise it records that processing was
 interrupted. Phase 7 remains subject to final validation.
 
-The repository includes an RTMP Proxy, an FFmpeg-based Worker container image,
-the `LiveStream` CRD, and the Operator. Ingest integration, handover, and
-recovery from an interrupted source are not implemented yet.
+The repository includes an RTMP Proxy with Kubernetes-backed publication
+admission, an FFmpeg-based Worker container image, the `LiveStream` CRD, and
+the Operator. Handover and recovery from an interrupted source are not
+implemented yet.
 
 ## Current repository state
 
@@ -39,8 +40,7 @@ The following are deliberately absent:
 - HAProxy-based routing;
 - KEDA scaling and Prometheus metrics;
 - a shared Worker Deployment or Service; and
-- RTMP ingest integration, handover, and recovery after an unavailable source
-  becomes available again.
+- handover and recovery after an unavailable source becomes available again.
 
 The Operator continuously watches `LiveStream` resources and reconstructs its
 observations by listing LiveStreams, Jobs, and Pods from the Kubernetes API. It
@@ -68,8 +68,8 @@ Kubernetes API state is the source of truth in this target. There is no separate
 imperative Controller, HAProxy tier, Prometheus/KEDA scaling loop, or shared
 Worker Deployment in the design.
 
-**Ingest integration, handover, and recovery from the `Interrupted` phase are
-not implemented in this repository yet.**
+**Handover and recovery from the `Interrupted` phase are not implemented in
+this repository yet.**
 
 ## Current foundation, API, and Operator deployment
 
@@ -93,13 +93,13 @@ Deployment do not embed endpoint credentials:
 
 ```sh
 kubectl create secret generic liveedgecast-target -n media \
-  --from-literal=rtmp-url='rtmps://destination.example/live/key'
-kubectl rollout restart deployment/proxy -n media
+  --from-literal=base-url='rtmps://destination.example/live/credential'
 ```
 
-The Secret reference is optional at Pod startup to keep the Proxy available
-while configuration is being provisioned, but a publication is rejected until
-`TARGET_RTMP_URL` is populated.
+The `LiveStream` stores only this Secret reference. Each Worker reads the base
+URL directly from the Secret and appends its input stream key, so concurrent
+streams receive distinct destinations without exposing credentials in the
+`LiveStream` or Job specification.
 
 The script builds the Proxy, Operator, and Worker images, loads them into kind
 when needed, applies the manifests, and waits for both Deployments. For a kind

@@ -20,6 +20,7 @@ publication_id=${4:-}
 state_dir=${PUBLICATION_STATE_DIR:-/var/run/liveedgecast/publications}
 state_key=$(printf '%s\n%s' "$stream_key" "$publication_id" | sha256sum | cut -d ' ' -f 1)
 state_file="${state_dir}/${state_key}.json"
+retry_file="${state_file}.terminate"
 [ -f "$state_file" ] || { log "no confirmed local session for '$stream_key'; ignoring"; exit 0; }
 
 session_id=$(jq -er --arg publicationId "$publication_id" \
@@ -28,6 +29,7 @@ session_id=$(jq -er --arg publicationId "$publication_id" \
     exit 0
 }
 resource_name=$(jq -er '.resourceName' "$state_file")
+touch "$retry_file"
 
 kubernetes_api_init
 work_dir=$(mktemp -d "${state_dir}/.ended.XXXXXX")
@@ -37,7 +39,7 @@ request_file="${work_dir}/request.json"
 
 status=$(kubernetes_api_request GET "${LIVESTREAMS_API_PATH}/${resource_name}" "$response_file")
 if [ "$status" = 404 ]; then
-    rm -f "$state_file"
+    rm -f "$state_file" "$retry_file"
     exit 0
 fi
 [ "$status" = 200 ] || { log "could not read LiveStream (HTTP $status)"; exit 1; }
@@ -48,18 +50,26 @@ remote_session=$(jq -er '.spec.source.sessionId' "$response_file") || {
 }
 if [ "$remote_session" != "$session_id" ]; then
     log "session '$session_id' is stale; leaving LiveStream untouched"
-    rm -f "$state_file"
+    rm -f "$state_file" "$retry_file"
     exit 0
 fi
 
 uid=$(jq -er '.metadata.uid' "$response_file")
-jq -n --arg uid "$uid" '{kind: "DeleteOptions", apiVersion: "v1", preconditions: {uid: $uid}}' >"$request_file"
+resource_version=$(jq -er '.metadata.resourceVersion' "$response_file")
+jq -n --arg uid "$uid" --arg resourceVersion "$resource_version" \
+    '{kind: "DeleteOptions", apiVersion: "v1",
+      preconditions: {uid: $uid, resourceVersion: $resourceVersion}}' >"$request_file"
 status=$(kubernetes_api_request DELETE "${LIVESTREAMS_API_PATH}/${resource_name}" \
     "$response_file" "$request_file")
+[ "$status" = 409 ] && {
+    log "resource changed after session check; treating termination as stale"
+    rm -f "$state_file" "$retry_file"
+    exit 0
+}
 [ "$status" = 200 ] || [ "$status" = 202 ] || [ "$status" = 404 ] || {
     log "Kubernetes rejected LiveStream deletion (HTTP $status)"
     exit 1
 }
 
-rm -f "$state_file"
+rm -f "$state_file" "$retry_file"
 log "removed stream '$stream_key' for session '$session_id'"

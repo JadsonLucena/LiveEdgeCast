@@ -101,7 +101,8 @@ def configuration_id(livestream: dict) -> str:
         spec["streamKey"],
         spec["source"]["sessionId"],
         spec["source"]["url"],
-        spec["target"]["url"],
+        spec["target"]["baseUrlSecretRef"]["name"],
+        spec["target"]["baseUrlSecretRef"]["key"],
         str(MEDIA_HEALTH_INTERVAL_SECONDS),
     )
     framed = b"".join(
@@ -174,8 +175,12 @@ def create_for_livestream(batch_api: Any, namespace: str, livestream: dict) -> s
                                     "value": spec["source"]["url"],
                                 },
                                 {
-                                    "name": "TARGET_RTMP_URL",
-                                    "value": spec["target"]["url"],
+                                    "name": "TARGET_RTMP_BASE_URL",
+                                    "valueFrom": {
+                                        "secretKeyRef": spec["target"][
+                                            "baseUrlSecretRef"
+                                        ]
+                                    },
                                 },
                                 {
                                     "name": "MEDIA_HEALTH_INTERVAL_SECONDS",
