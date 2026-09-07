@@ -94,15 +94,34 @@ def delete_for_livestream(
     return True
 
 
-def configuration_id(livestream: dict) -> str:
+def _target_identity(livestream: dict, core_api: Any) -> tuple[str, ...]:
+    """Resolve new Secret-backed targets while retaining v1alpha1 URL objects."""
+    target = livestream["spec"]["target"]
+    secret_ref = target.get("baseUrlSecretRef")
+    if secret_ref:
+        secret = core_api.read_namespaced_secret(
+            name=secret_ref["name"], namespace=livestream["metadata"]["namespace"]
+        )
+        return (
+            "secret",
+            secret_ref["name"],
+            secret_ref["key"],
+            secret.metadata.uid or "",
+            secret.metadata.resource_version or "",
+        )
+    # Objects persisted before baseUrlSecretRef was introduced remain valid and
+    # reconcilable during a rolling CRD/Operator migration.
+    return ("legacy-url", target["url"])
+
+
+def configuration_id(livestream: dict, core_api: Any) -> str:
     """Fingerprint every mutable desired field embedded in a Job Pod template."""
     spec = livestream["spec"]
     values = (
         spec["streamKey"],
         spec["source"]["sessionId"],
         spec["source"]["url"],
-        spec["target"]["baseUrlSecretRef"]["name"],
-        spec["target"]["baseUrlSecretRef"]["key"],
+        *_target_identity(livestream, core_api),
         str(MEDIA_HEALTH_INTERVAL_SECONDS),
     )
     framed = b"".join(
@@ -112,23 +131,36 @@ def configuration_id(livestream: dict) -> str:
     return hashlib.sha256(framed).hexdigest()
 
 
-def _job_name(livestream: dict) -> str:
+def _job_name(livestream: dict, desired_configuration_id: str) -> str:
     """Return a stable DNS name for the current desired processing configuration."""
     metadata = livestream["metadata"]
-    identity = f"{metadata['uid']}:{configuration_id(livestream)}".encode()
+    identity = f"{metadata['uid']}:{desired_configuration_id}".encode()
     suffix = hashlib.sha256(identity).hexdigest()[:10]
     stream_name = re.sub(r"[^a-z0-9-]", "-", metadata["name"].lower()).strip("-")
     return f"lec-{stream_name[:47].rstrip('-')}-{suffix}"
 
 
-def create_for_livestream(batch_api: Any, namespace: str, livestream: dict) -> str:
+def create_for_livestream(
+    batch_api: Any,
+    namespace: str,
+    livestream: dict,
+    desired_configuration_id: str,
+) -> str:
     """Create the deterministic processing Job, treating an existing Job as success."""
     metadata = livestream["metadata"]
     spec = livestream["spec"]
     session_id = spec["source"]["sessionId"]
-    desired_configuration_id = configuration_id(livestream)
-    name = _job_name(livestream)
+    name = _job_name(livestream, desired_configuration_id)
     labels = {LIVESTREAM_LABEL: metadata["name"]}
+    target = spec["target"]
+    if target.get("baseUrlSecretRef"):
+        target_env = {
+            "name": "TARGET_RTMP_BASE_URL",
+            "valueFrom": {"secretKeyRef": target["baseUrlSecretRef"]},
+        }
+    else:
+        target_env = {"name": "TARGET_RTMP_URL", "value": target["url"]}
+
     body = {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -174,14 +206,7 @@ def create_for_livestream(batch_api: Any, namespace: str, livestream: dict) -> s
                                     "name": "SOURCE_RTMP_URL",
                                     "value": spec["source"]["url"],
                                 },
-                                {
-                                    "name": "TARGET_RTMP_BASE_URL",
-                                    "valueFrom": {
-                                        "secretKeyRef": spec["target"][
-                                            "baseUrlSecretRef"
-                                        ]
-                                    },
-                                },
+                                target_env,
                                 {
                                     "name": "MEDIA_HEALTH_INTERVAL_SECONDS",
                                     "value": str(MEDIA_HEALTH_INTERVAL_SECONDS),

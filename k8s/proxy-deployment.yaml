@@ -29,6 +29,8 @@ spec:
               value: liveedgecast-target
             - name: TARGET_RTMP_SECRET_KEY
               value: base-url
+            - name: STREAM_KEYS_SECRET_NAME
+              value: liveedgecast-stream-keys
           ports:
             - containerPort: 1935
               name: rtmp

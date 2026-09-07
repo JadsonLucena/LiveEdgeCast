@@ -15,6 +15,10 @@ stream. There is deliberately no `Offline` phase.
 - `spec.target.baseUrlSecretRef` identifies the Secret key containing the
   credential-bearing destination base URL. The Worker reads that Secret
   directly and appends `spec.streamKey` to select a distinct target stream.
+  The Operator includes the Secret UID and `resourceVersion` in its Job
+  configuration identity, so rotation replaces the Job on the next relist.
+  The deprecated `spec.target.url` remains accepted for resources persisted
+  before this representation was introduced.
 - `status` is the state observed while reconciling that desired configuration.
   It contains the lifecycle phase and observations about the source, Job,
   processing health, interruption, and conditions.

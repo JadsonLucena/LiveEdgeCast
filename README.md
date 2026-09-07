@@ -94,12 +94,21 @@ Deployment do not embed endpoint credentials:
 ```sh
 kubectl create secret generic liveedgecast-target -n media \
   --from-literal=base-url='rtmps://destination.example/live/credential'
+kubectl create secret generic liveedgecast-stream-keys -n media \
+  --from-literal=my-stream-key=authorized
 ```
 
 The `LiveStream` stores only this Secret reference. Each Worker reads the base
 URL directly from the Secret and appends its input stream key, so concurrent
 streams receive distinct destinations without exposing credentials in the
 `LiveStream` or Job specification.
+
+Only keys present in `liveedgecast-stream-keys` are admitted. Secret-backed
+destination rotation is detected during the Operator's periodic relist through
+the Secret `resourceVersion`; the corresponding immutable Job is then replaced.
+Existing v1alpha1 resources that still contain `spec.target.url` remain
+reconcilable during migration, although new Proxy-created resources always use
+`baseUrlSecretRef`.
 
 The script builds the Proxy, Operator, and Worker images, loads them into kind
 when needed, applies the manifests, and waits for both Deployments. For a kind

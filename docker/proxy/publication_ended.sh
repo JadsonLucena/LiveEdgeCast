@@ -62,9 +62,8 @@ jq -n --arg uid "$uid" --arg resourceVersion "$resource_version" \
 status=$(kubernetes_api_request DELETE "${LIVESTREAMS_API_PATH}/${resource_name}" \
     "$response_file" "$request_file")
 [ "$status" = 409 ] && {
-    log "resource changed after session check; treating termination as stale"
-    rm -f "$state_file" "$retry_file"
-    exit 0
+    log "resource changed after session check; scheduling a fresh session check"
+    exit 1
 }
 [ "$status" = 200 ] || [ "$status" = 202 ] || [ "$status" = 404 ] || {
     log "Kubernetes rejected LiveStream deletion (HTTP $status)"

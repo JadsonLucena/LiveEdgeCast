@@ -4,6 +4,7 @@ set -uo pipefail
 STREAM_KEY="${STREAM_KEY:-}"
 SOURCE_RTMP_URL="${SOURCE_RTMP_URL:-}"
 TARGET_RTMP_BASE_URL="${TARGET_RTMP_BASE_URL:-}"
+TARGET_RTMP_URL="${TARGET_RTMP_URL:-}"
 MEDIA_HEALTH_INTERVAL_SECONDS="${MEDIA_HEALTH_INTERVAL_SECONDS:-10}"
 FFMPEG_TERMINATION_GRACE_SECONDS=5
 WATCHDOG_STALL_EXIT_CODE=75
@@ -89,12 +90,15 @@ trap 'handle_signal INT 130' INT
 
 log "Starting worker stream runner for stream key '$STREAM_KEY'"
 
-if [ -z "$SOURCE_RTMP_URL" ] || [ -z "$STREAM_KEY" ] || [ -z "$TARGET_RTMP_BASE_URL" ]; then
-  log "Missing required startup args (SOURCE_RTMP_URL/STREAM_KEY/TARGET_RTMP_BASE_URL). Crashing worker."
+if [ -z "$SOURCE_RTMP_URL" ] || [ -z "$STREAM_KEY" ] || \
+   { [ -z "$TARGET_RTMP_BASE_URL" ] && [ -z "$TARGET_RTMP_URL" ]; }; then
+  log "Missing required startup args (SOURCE_RTMP_URL/STREAM_KEY/target). Crashing worker."
   exit 1
 fi
 
-TARGET_RTMP_URL="${TARGET_RTMP_BASE_URL%/}/${STREAM_KEY}"
+if [ -n "$TARGET_RTMP_BASE_URL" ]; then
+  TARGET_RTMP_URL="${TARGET_RTMP_BASE_URL%/}/${STREAM_KEY}"
+fi
 
 if ! [[ "$MEDIA_HEALTH_INTERVAL_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
   log "MEDIA_HEALTH_INTERVAL_SECONDS must be a positive integer (received '$MEDIA_HEALTH_INTERVAL_SECONDS')."

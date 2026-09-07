@@ -40,6 +40,14 @@ trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 response_file="${work_dir}/response.json"
 request_file="${work_dir}/request.json"
 
+stream_keys_secret=${STREAM_KEYS_SECRET_NAME:-liveedgecast-stream-keys}
+status=$(kubernetes_api_request GET "${SECRETS_API_PATH}/${stream_keys_secret}" "$response_file")
+[ "$status" = 200 ] && jq -e --arg streamKey "$stream_key" \
+    '.data[$streamKey] | type == "string" and length > 0' "$response_file" >/dev/null || {
+    log "stream key is not authorized"
+    exit 1
+}
+
 source_json=$(jq -n \
     --arg proxyName "$proxy_name" \
     --arg sessionId "$session_id" \

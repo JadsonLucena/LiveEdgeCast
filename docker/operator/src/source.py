@@ -24,6 +24,10 @@ def observe(livestream: dict[str, Any]) -> dict[str, Any]:
         and previous.get("sessionId") == desired_session
     )
     if matches_desired_source:
+        if "available" not in observation and isinstance(
+            previous.get("available"), bool
+        ):
+            observation["available"] = previous["available"]
         if previous.get("lastSeenAt"):
             observation["lastSeenAt"] = previous["lastSeenAt"]
     return observation

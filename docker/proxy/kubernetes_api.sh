@@ -43,6 +43,8 @@ kubernetes_api_request() {
 
     set -- \
         --silent --show-error \
+        --connect-timeout "${KUBERNETES_API_CONNECT_TIMEOUT_SECONDS:-2}" \
+        --max-time "${KUBERNETES_API_REQUEST_TIMEOUT_SECONDS:-5}" \
         --request "$method" \
         --cacert "$KUBERNETES_CA_FILE" \
         --header "Authorization: Bearer $(tr -d '\r\n' <"$KUBERNETES_TOKEN_FILE")" \
