@@ -65,7 +65,7 @@ spec:
                   properties:
                     url:
                       type: string
-                      description: Deprecated inline destination retained for compatibility with existing v1alpha1 resources.
+                      description: Complete RTMP destination URL for this live stream.
                     baseUrlSecretRef:
                       type: object
                       description: Secret containing the credential-bearing RTMP base URL; the stream key is appended by the Worker.

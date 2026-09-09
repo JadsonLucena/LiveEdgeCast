@@ -29,10 +29,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: TARGET_RTMP_SECRET_NAME
-              value: liveedgecast-target
-            - name: TARGET_RTMP_SECRET_KEY
-              value: base-url
+            # Declarative base used by the ingest hook to build
+            # spec.target.url as ${RTMP_TARGET_BASE_URL}/${streamKey}.
+            - name: RTMP_TARGET_BASE_URL
+              value: rtmp://destination.example/live
           ports:
             - containerPort: 1935
               name: rtmp

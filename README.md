@@ -87,26 +87,27 @@ Deploy the resources that currently exist:
 ./tools/up.sh
 ```
 
-Before publishing for the first time, configure the destination used when the
-Proxy creates a `LiveStream`. The Proxy reads it from a Secret so the image and
-Deployment do not embed endpoint credentials:
+Before publishing for the first time, configure `RTMP_TARGET_BASE_URL` in
+`k8s/proxy-deployment.yaml`. This is the Proxy's single declarative source for
+the destination used when it creates a `LiveStream`:
 
-```sh
-kubectl create secret generic liveedgecast-target -n media \
-  --from-literal=base-url='rtmps://destination.example/live/credential'
+```yaml
+- name: RTMP_TARGET_BASE_URL
+  value: rtmps://destination.example/live/credential
 ```
 
-The `LiveStream` stores only this Secret reference. Each Worker reads the base
-URL directly from the Secret and appends its input stream key, so concurrent
-streams receive distinct destinations without exposing credentials in the
-`LiveStream` or Job specification.
+The Proxy removes a trailing slash, appends the URL-encoded stream key, and
+stores that complete `rtmp://` or `rtmps://` destination in `spec.target.url`.
+It validates the base and result before contacting Kubernetes. If the target is
+missing or invalid, the publication hook fails with a clear log and no
+`LiveStream` is created. The Proxy does not consult a legacy Controller or an
+external database.
 
 All syntactically valid stream keys are admitted; no allowlist Secret is
-required. Secret-backed destination rotation is detected during the Operator's
-periodic relist through the Secret `resourceVersion`; the corresponding
-immutable Job is then replaced. Existing v1alpha1 resources that still contain
-`spec.target.url` remain reconcilable during migration, although new
-Proxy-created resources always use `baseUrlSecretRef`.
+required. On a reconnection, the Proxy changes only `spec.source`, preserving
+the existing `spec.target` and `spec.recoveryPolicy`. Existing declarative
+resources that use `spec.target.baseUrlSecretRef` remain reconcilable by the
+Operator, although new Proxy-created resources use `spec.target.url`.
 
 The script builds the Proxy, Operator, and Worker images, loads them into kind
 when needed, applies the manifests, and waits for both Deployments. For a kind
