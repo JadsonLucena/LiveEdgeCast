@@ -25,11 +25,19 @@ esac
 
 kubernetes_api_init
 
-proxy_name=${POD_NAME:-$(hostname)}
-proxy_host=${POD_IP:-$proxy_name}
+proxy_name=${POD_NAME:?POD_NAME is required}
+proxy_host=${POD_IP:?POD_IP is required}
+# The Downward API supplies the address, but constrain it before interpolating it
+# so a misconfigured environment cannot alter the RTMP URL structure.
+case "$proxy_host" in
+    *[!0-9a-fA-F:.]*|''|.*|*.) log "invalid pod IP"; exit 1 ;;
+esac
 case "$proxy_host" in *:*) proxy_host="[$proxy_host]" ;; esac
 session_id=$(cat /proc/sys/kernel/random/uuid)
-source_url="rtmp://${proxy_host}:1935/${application}/${stream_key}"
+# Admitted keys are already RFC 3986 unreserved characters. Still encode at the
+# URL boundary so this remains safe if the resource-name policy evolves.
+encoded_stream_key=$(printf '%s' "$stream_key" | jq -sRr @uri)
+source_url="rtmp://${proxy_host}:1935/${application}/${encoded_stream_key}"
 state_dir=$(publication_state_dir)
 state_file=$(publication_state_file "$state_dir" "$stream_key" "$publication_id")
 
