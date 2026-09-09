@@ -2,6 +2,7 @@
 set -eu
 
 . /scripts/kubernetes_api.sh
+. /scripts/publication_state.sh
 
 log() {
     printf '%s publication_started: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2
@@ -29,9 +30,8 @@ proxy_host=${POD_IP:-$proxy_name}
 case "$proxy_host" in *:*) proxy_host="[$proxy_host]" ;; esac
 session_id=$(cat /proc/sys/kernel/random/uuid)
 source_url="rtmp://${proxy_host}:1935/${application}/${stream_key}"
-state_dir=${PUBLICATION_STATE_DIR:-/var/run/liveedgecast/publications}
-state_key=$(printf '%s\n%s' "$stream_key" "$publication_id" | sha256sum | cut -d ' ' -f 1)
-state_file="${state_dir}/${state_key}.json"
+state_dir=$(publication_state_dir)
+state_file=$(publication_state_file "$state_dir" "$stream_key" "$publication_id")
 
 umask 077
 mkdir -p "$state_dir"
@@ -104,9 +104,11 @@ esac
 # The session is durable locally only after Kubernetes accepted the desired source.
 state_tmp="${state_file}.tmp.$$"
 jq -n \
+    --arg streamKey "$stream_key" \
     --arg resourceName "$stream_key" \
-    --arg publicationId "$publication_id" \
+    --arg localConnectionId "$publication_id" \
     --arg sessionId "$session_id" \
-    '{resourceName: $resourceName, publicationId: $publicationId, sessionId: $sessionId}' >"$state_tmp"
-mv "$state_tmp" "$state_file"
+    '{streamKey: $streamKey, sessionId: $sessionId,
+      localConnectionId: $localConnectionId, resourceName: $resourceName}' >"$state_tmp"
+publication_state_commit "$state_tmp" "$state_file"
 log "registered stream '$stream_key' with session '$session_id'"

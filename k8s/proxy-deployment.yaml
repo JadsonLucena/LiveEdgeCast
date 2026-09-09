@@ -48,3 +48,9 @@ spec:
             tcpSocket: { port: 1935 }
             initialDelaySeconds: 5
             periodSeconds: 10
+          volumeMounts:
+            - name: publication-sessions
+              mountPath: /run/liveedgecast/sessions
+      volumes:
+        - name: publication-sessions
+          emptyDir: {}
