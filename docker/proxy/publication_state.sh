@@ -12,34 +12,23 @@ publication_state_file() {
     printf '%s/%s.json\n' "$state_dir" "$state_key"
 }
 
-publication_state_lock() {
-    lock_dir=$1
-    while ! mkdir "$lock_dir" 2>/dev/null; do
-        sleep 0.05
-    done
-}
-
-publication_state_commit() (
+publication_state_commit() {
     temporary_file=$1
     state_file=$2
-    lock_dir="${state_file}.lock"
 
-    publication_state_lock "$lock_dir"
-    trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT HUP INT TERM
-    mv "$temporary_file" "$state_file"
-)
+    flock --close "${state_file}.lock" mv "$temporary_file" "$state_file"
+}
 
-publication_state_remove_if_session() (
+publication_state_remove_if_session() {
     state_file=$1
     expected_session_id=$2
     retry_file=$3
-    lock_dir="${state_file}.lock"
 
-    publication_state_lock "$lock_dir"
-    trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT HUP INT TERM
-    current_session_id=$(jq -er '.sessionId' "$state_file" 2>/dev/null || true)
-    if [ "$current_session_id" = "$expected_session_id" ]; then
-        rm -f "$state_file"
-    fi
-    rm -f "$retry_file"
-)
+    flock --close "${state_file}.lock" sh -c '
+        current_session_id=$(jq -er ".sessionId" "$1" 2>/dev/null || true)
+        if [ "$current_session_id" = "$2" ]; then
+            rm -f "$1"
+        fi
+        rm -f "$3"
+    ' sh "$state_file" "$expected_session_id" "$retry_file"
+}

@@ -41,6 +41,7 @@ ENV NGINX_VERSION=1.24.0
 RUN apk add --no-cache \
     ca-certificates \
     curl \
+    flock \
     jq \
     libssl3 \
     pcre2 \
