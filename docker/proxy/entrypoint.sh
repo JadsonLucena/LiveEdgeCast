@@ -34,8 +34,14 @@ lifecycle_pid=$!
                 rm -f "$marker"
                 continue
             fi
-            stream_key=$(jq -er '.streamKey' "$state" 2>/dev/null) || continue
-            connection_id=$(jq -er '.localConnectionId' "$state" 2>/dev/null) || continue
+            stream_key=$(jq -er '.streamKey' "$state" 2>/dev/null) || {
+                rm -f "$marker"
+                continue
+            }
+            connection_id=$(jq -er '.localConnectionId' "$state" 2>/dev/null) || {
+                rm -f "$marker"
+                continue
+            }
             /scripts/publication_ended.sh "$stream_key" live retry "$connection_id" "$marker_session" || true
         done
         sleep "${TERMINATION_RETRY_SECONDS:-2}"
