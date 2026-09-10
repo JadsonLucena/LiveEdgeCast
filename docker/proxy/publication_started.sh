@@ -116,6 +116,11 @@ if [ "$status" = 200 ]; then
     jq -n --argjson source "$source_json" '{spec: {source: $source}}' >"$request_file"
     update_attempt=0
     while :; do
+        if ! jq -e --arg streamKey "$stream_key" \
+            '.spec.streamKey == $streamKey' "$response_file" >/dev/null; then
+            log "derived resource name collision for stream '$stream_key'; rejecting publication"
+            exit 1
+        fi
         status=$(kubernetes_api_request PATCH "${LIVESTREAMS_API_PATH}/${resource_name}" \
             "$response_file" "$request_file" 'application/merge-patch+json')
         [ "$status" = 409 ] || break

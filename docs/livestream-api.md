@@ -19,7 +19,10 @@ stream. There is deliberately no `Offline` phase.
   name, separator, and hash fit the Kubernetes 63-byte DNS-label limit. The
   hash is added whenever normalization or truncation is necessary, preventing
   differently spelled keys that normalize to the same prefix from sharing a
-  resource name.
+  resource name in normal operation. Because a valid literal key can still
+  equal another key's complete derived name, the Proxy also compares the
+  fetched `spec.streamKey` with the current original key before every source
+  patch and rejects the publication on a mismatch.
 - `spec.source.available` is set by the Proxy for the registered publication;
   the Operator reflects this desired-source fact into its own status without
   requiring the Proxy to write the status subresource.
@@ -58,6 +61,12 @@ conflicting source update is retried at most three times by default, with a
 fresh read before every retry. Consequently, the most recently accepted
 publication session remains in `spec.source.sessionId`, without the hook
 maintaining cluster-wide ownership state outside that `LiveStream`.
+
+The HTTP lifecycle endpoint decodes the nginx
+`application/x-www-form-urlencoded` notify fields exactly once before invoking
+either hook. Thus an escaped name such as `hello%20world` is stored as the
+original `hello world`, and only URL-encoded again when constructing its source
+and target URLs.
 
 The CRD schema validates the possible `status.phase` values. The current
 Operator implements creation, processing, terminal-Job recovery, interruption

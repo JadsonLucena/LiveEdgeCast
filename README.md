@@ -108,8 +108,12 @@ All non-empty stream keys are admitted; no allowlist Secret is required. The
 Proxy preserves the original key in `spec.streamKey` and derives a stable,
 DNS-safe `metadata.name`. Already valid lowercase DNS labels remain unchanged;
 other keys receive a normalized readable prefix plus a short SHA-256 suffix to
-avoid normalization collisions. On a reconnection, the Proxy changes only
-`spec.source`, preserving the existing `spec.target` and
+avoid normalization collisions. Notify form fields are decoded before the
+hooks run, preserving escaped characters in the original key. Every
+reconnection also verifies that the fetched resource contains that exact
+original key, rejecting even the unlikely case where a literal key equals a
+different key's complete derived name. On a reconnection, the Proxy changes
+only `spec.source`, preserving the existing `spec.target` and
 `spec.recoveryPolicy`; therefore, reconnecting an existing resource does not
 require a valid `RTMP_TARGET_BASE_URL`. Existing declarative resources that use
 `spec.target.baseUrlSecretRef` remain reconcilable by the Operator, although
