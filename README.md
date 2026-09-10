@@ -104,13 +104,16 @@ validates the base and result. If the target is missing or invalid, the
 publication hook fails with a clear log and no `LiveStream` is created. The
 Proxy does not consult a legacy Controller or an external database.
 
-All syntactically valid stream keys are admitted; no allowlist Secret is
-required. On a reconnection, the Proxy changes only `spec.source`, preserving
-the existing `spec.target` and `spec.recoveryPolicy`; therefore, reconnecting
-an existing resource does not require a valid `RTMP_TARGET_BASE_URL`. Existing
-declarative resources that use `spec.target.baseUrlSecretRef` remain
-reconcilable by the Operator, although new Proxy-created resources use
-`spec.target.url`.
+All non-empty stream keys are admitted; no allowlist Secret is required. The
+Proxy preserves the original key in `spec.streamKey` and derives a stable,
+DNS-safe `metadata.name`. Already valid lowercase DNS labels remain unchanged;
+other keys receive a normalized readable prefix plus a short SHA-256 suffix to
+avoid normalization collisions. On a reconnection, the Proxy changes only
+`spec.source`, preserving the existing `spec.target` and
+`spec.recoveryPolicy`; therefore, reconnecting an existing resource does not
+require a valid `RTMP_TARGET_BASE_URL`. Existing declarative resources that use
+`spec.target.baseUrlSecretRef` remain reconcilable by the Operator, although
+new Proxy-created resources use `spec.target.url`.
 
 The script builds the Proxy, Operator, and Worker images, loads them into kind
 when needed, applies the manifests, and waits for both Deployments. For a kind
