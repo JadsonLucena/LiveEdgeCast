@@ -23,6 +23,8 @@ esac
 [ -n "$publisher_address" ] || { log "publisher address is required"; exit 1; }
 [ -n "$publication_id" ] || { log "publication identifier is required"; exit 1; }
 
+encoded_stream_key=$(printf '%s' "$stream_key" | jq -sRr @uri)
+
 kubernetes_api_init
 
 proxy_name=${POD_NAME:?POD_NAME is required}
@@ -36,7 +38,6 @@ case "$proxy_host" in *:*) proxy_host="[$proxy_host]" ;; esac
 session_id=$(cat /proc/sys/kernel/random/uuid)
 # Admitted keys are already RFC 3986 unreserved characters. Still encode at the
 # URL boundary so this remains safe if the resource-name policy evolves.
-encoded_stream_key=$(printf '%s' "$stream_key" | jq -sRr @uri)
 source_url="rtmp://${proxy_host}:1935/${application}/${encoded_stream_key}"
 state_dir=$(publication_state_dir)
 state_file=$(publication_state_file "$state_dir" "$stream_key" "$publication_id")
@@ -75,24 +76,29 @@ case "$status" in
         [ "$status" = 200 ] || { log "Kubernetes rejected LiveStream source update (HTTP $status)"; exit 1; }
         ;;
     404)
-        target_secret_name=${TARGET_RTMP_SECRET_NAME:?TARGET_RTMP_SECRET_NAME is required to create a LiveStream}
-        target_secret_key=${TARGET_RTMP_SECRET_KEY:-base-url}
-        status=$(kubernetes_api_request GET "${SECRETS_API_PATH}/${target_secret_name}" "$response_file")
-        [ "$status" = 200 ] && jq -e --arg key "$target_secret_key" \
-            '.data[$key] | type == "string" and length > 0' "$response_file" >/dev/null || {
-            log "target Secret or key is unavailable; rejecting publication"
+        # This configuration is needed only to create a resource. Existing
+        # resources retain their own target when a publication reconnects.
+        target_base_url=${RTMP_TARGET_BASE_URL:-}
+        if ! jq -en --arg url "$target_base_url" \
+            '$url | test("^rtmps?://[^/[:space:]?#]+(/[^[:space:]?#]*)?$")' >/dev/null; then
+            log "RTMP_TARGET_BASE_URL must be a non-empty rtmp:// or rtmps:// URL without a query or fragment; rejecting publication"
             exit 1
-        }
+        fi
+        target_url="${target_base_url%/}/${encoded_stream_key}"
+        if ! jq -en --arg url "$target_url" \
+            '$url | test("^rtmps?://[^/[:space:]?#]+(/[^[:space:]?#]*)+$")' >/dev/null; then
+            log "could not construct a valid RTMP target URL; rejecting publication"
+            exit 1
+        fi
         jq -n \
             --arg name "$stream_key" \
             --arg streamKey "$stream_key" \
-            --arg targetSecretName "$target_secret_name" \
-            --arg targetSecretKey "$target_secret_key" \
+            --arg targetUrl "$target_url" \
             --argjson source "$source_json" \
             '{apiVersion: "liveedgecast.io/v1alpha1", kind: "LiveStream",
               metadata: {name: $name},
               spec: {streamKey: $streamKey, source: $source,
-                target: {baseUrlSecretRef: {name: $targetSecretName, key: $targetSecretKey}}}}' >"$request_file"
+                target: {url: $targetUrl}}}' >"$request_file"
         status=$(kubernetes_api_request POST "$LIVESTREAMS_API_PATH" \
             "$response_file" "$request_file")
         if [ "$status" = 409 ]; then

@@ -30,7 +30,6 @@ kubernetes_api_init() {
     esac
     KUBERNETES_API_URL="https://${kubernetes_host}:${KUBERNETES_SERVICE_PORT_HTTPS:-443}"
     LIVESTREAMS_API_PATH="/apis/liveedgecast.io/v1alpha1/namespaces/${KUBERNETES_NAMESPACE}/livestreams"
-    SECRETS_API_PATH="/api/v1/namespaces/${KUBERNETES_NAMESPACE}/secrets"
 }
 
 # Writes the response body to the supplied file and prints only the HTTP status.

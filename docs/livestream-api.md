@@ -12,13 +12,20 @@ stream. There is deliberately no `Offline` phase.
 - `spec.source.available` is set by the Proxy for the registered publication;
   the Operator reflects this desired-source fact into its own status without
   requiring the Proxy to write the status subresource.
-- `spec.target.baseUrlSecretRef` identifies the Secret key containing the
-  credential-bearing destination base URL. The Worker reads that Secret
-  directly and appends `spec.streamKey` to select a distinct target stream.
-  The Operator includes the Secret UID and `resourceVersion` in its Job
-  configuration identity, so rotation replaces the Job on the next relist.
-  The deprecated `spec.target.url` remains accepted for resources persisted
-  before this representation was introduced.
+- `spec.target.url` is the complete destination for this publication. For new
+  resources, the Proxy constructs it exclusively from its explicit
+  `RTMP_TARGET_BASE_URL` configuration and the URL-encoded stream key. The
+  base cannot contain a query or fragment because the key is appended to its
+  path. Before sending a create request, the Proxy validates the resulting
+  `rtmp://` or `rtmps://` URL and rejects the publication with a clear hook log
+  if no valid destination can be determined. It does not query a legacy
+  Controller or an external database. Target configuration is not required to
+  reconnect a resource that already has a target.
+- `spec.target.baseUrlSecretRef` remains accepted for existing declarative
+  resources and is resolved by the Worker, but it is not used by the Proxy
+  when creating a `LiveStream`.
+- On reconnection, the Proxy merge-patches only `spec.source`; the existing
+  `spec.target` and `spec.recoveryPolicy` remain untouched.
 - `status` is the state observed while reconciling that desired configuration.
   It contains the lifecycle phase and observations about the source, Job,
   processing health, interruption, and conditions.
