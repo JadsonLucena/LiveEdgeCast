@@ -129,6 +129,50 @@ begins. The Proxy RBAC intentionally grants no access to the
 `livestreams/status` subresource; lifecycle status is owned exclusively by the
 Operator.
 
+### Publication hooks and API ownership
+
+The nginx `on_publish` and `on_publish_done` notifications are handled inside
+the Proxy Pod by the publication hooks. This is not a separate Controller HTTP
+API: there is no Controller request in the publication path and no imperative
+lifecycle service between the Proxy and Kubernetes. The hooks authenticate and
+write directly to the Kubernetes API.
+
+Ownership is intentionally split at the API boundary:
+
+- the **Proxy is the exclusive writer for publication intent**: it creates the
+  `LiveStream`, updates only `spec.source` on a reconnection, and requests
+  deletion when that publication ends;
+- the **Operator is the exclusive writer for `status`** and never replaces the
+  Proxy's desired source; and
+- Proxy RBAC applies to the main `livestreams` resource only, while Operator
+  RBAC owns the `livestreams/status` subresource.
+
+Every accepted publish hook generates a fresh UUID `sessionId`, including a
+reconnection using the same stream key. The source records both that session
+and `proxyName`, the name of the Proxy Pod that accepted the connection; its
+RTMP URL uses that Pod's Downward-API IP. The origin is therefore bound to a
+specific Proxy replica rather than to the load-balanced `proxy` Service.
+
+After Kubernetes accepts the source, the Proxy stores a small session record
+under `/run/liveedgecast/sessions` (or `PUBLICATION_STATE_DIR`). This is local,
+ephemeral publication state—not a cluster source of truth—and maps nginx's
+connection identifier to the generated session and `LiveStream`. It exists
+only so the same Proxy replica can correlate `on_publish_done` with the publish
+it accepted; Pod replacement discards it.
+
+Creation is idempotent for the deterministic resource name. The hook reads
+first, creates only on `404`, and treats `409` as a concurrent creator winning:
+it reads the winning object and continues through the reconnection path after
+verifying the original stream key. The create body contains no `status`; the
+reconnection merge patch contains only `spec.source`.
+
+The implemented end hook reads the locally confirmed session, compares it with
+the current `spec.source.sessionId`, and submits a UID/resourceVersion-
+preconditioned deletion only when they still match. A stale end notification
+therefore leaves a newer publication untouched. This guarantee applies to the
+implemented `publication_ended` hook; it does not imply that the future
+handover or `Interrupted`-recovery workflows are complete.
+
 The script builds the Proxy, Operator, and Worker images, loads them into kind
 when needed, applies the manifests, and waits for both Deployments. For a kind
 cluster, it also starts a local port forward. Publish to:

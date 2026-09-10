@@ -4,6 +4,24 @@
 means that the publication is being managed; its absence represents an offline
 stream. There is deliberately no `Offline` phase.
 
+## Writers and publication path
+
+There are exactly two API writers, with separate ownership:
+
+- the **Proxy exclusively writes publication intent** on the main resource. It
+  creates a `LiveStream`, merge-patches only `spec.source` for a publication of
+  an existing stream, and requests deletion when the publication ends;
+- the **Operator exclusively writes `status`** through the status subresource.
+  It observes `spec`, reconciles Jobs, and must not rewrite the Proxy-owned
+  source.
+
+Proxy RBAC deliberately has no access to `livestreams/status`. Conversely, the
+publication path contains no Controller HTTP service: nginx invokes hooks in
+the Proxy Pod, and those hooks call the Kubernetes API directly. The small
+HTTP listener used as nginx's local notify target is only a hook adapter; it is
+not the removed imperative Controller and holds no authoritative lifecycle
+state.
+
 ## API fields
 
 - `spec` is the desired configuration supplied by the ingest integration. It
@@ -26,6 +44,11 @@ stream. There is deliberately no `Offline` phase.
 - `spec.source.available` is set by the Proxy for the registered publication;
   the Operator reflects this desired-source fact into its own status without
   requiring the Proxy to write the status subresource.
+- `spec.source.proxyName` is the name of the Proxy Pod that accepted the
+  publication, and `spec.source.url` uses that Pod's Downward-API IP. The
+  source is consequently bound to that Proxy replica, not to the load-balanced
+  Proxy Service. A different replica accepting a reconnection writes a new
+  source identity.
 - `spec.target.url` is the complete destination for this publication. For new
   resources, the Proxy constructs it exclusively from its explicit
   `RTMP_TARGET_BASE_URL` configuration and the URL-encoded stream key. The
@@ -51,6 +74,16 @@ stream. There is deliberately no `Offline` phase.
   to be recognized as stale. `spec.source.sessionId` is the desired source;
   session IDs under `status` record the source observed or bound to a Job.
 
+For every publish notification, `publication_started` generates a fresh UUID
+before creating or updating the resource. Once Kubernetes has accepted that
+source, the Proxy atomically stores a record mapping the nginx connection ID to
+the stream key, resource name, and generated session ID. These records live in
+`/run/liveedgecast/sessions` by default (configurable with
+`PUBLICATION_STATE_DIR`), local to the Proxy replica and only for the duration
+of the publication. They are ephemeral correlation data for the end hook, not
+a durable or cluster-wide source of truth; restarting or replacing the Pod
+discards them.
+
 The `publication_started` hook first reads the deterministic resource name. A
 missing resource is created with only `metadata` and the desired `spec` (plus
 the required Kubernetes type identifiers). That creation includes the original
@@ -63,8 +96,21 @@ Proxy has no RBAC permission for `livestreams/status`; that subresource is
 owned exclusively by the Operator. A conflicting source update is retried at
 most three times by default, with a fresh read before every retry.
 Consequently, the most recently accepted publication session remains in
-`spec.source.sessionId`, without the hook maintaining cluster-wide ownership
-state outside that `LiveStream`.
+`spec.source.sessionId`. This makes creation idempotent for the deterministic
+name: retrying observes the existing object instead of creating a duplicate,
+and a `409` creation race is resolved by reading and validating the winning
+object before applying the source-only reconnection update. The only state
+outside that `LiveStream` is the per-replica, ephemeral end-hook correlation
+record described above; there is no cluster-wide ownership database.
+
+The implemented `publication_ended` hook accepts a termination only when its
+local record belongs to the same nginx connection and its session ID still
+matches `spec.source.sessionId`. It then requests deletion with both UID and
+resource-version preconditions. A stale notification, or a conflict after the
+session check, cannot delete a newer accepted publication: a stale session is
+ignored, while a conflict is retried from a fresh read by the notify adapter.
+This completed behavior is limited to the implemented end hook and must not be
+read as completion of handover, recovery from `Interrupted`, or TTL expiry.
 
 The HTTP lifecycle endpoint decodes the nginx
 `application/x-www-form-urlencoded` notify fields exactly once before invoking
