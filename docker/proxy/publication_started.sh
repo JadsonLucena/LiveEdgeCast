@@ -23,22 +23,7 @@ esac
 [ -n "$publisher_address" ] || { log "publisher address is required"; exit 1; }
 [ -n "$publication_id" ] || { log "publication identifier is required"; exit 1; }
 
-# The Proxy owns the minimal ingest configuration used for new resources. Resolve
-# and validate it before making any Kubernetes API request so an invalid target
-# can never result in an incomplete LiveStream.
-target_base_url=${RTMP_TARGET_BASE_URL:-}
-if ! jq -en --arg url "$target_base_url" \
-    '$url | test("^rtmps?://[^/[:space:]]+(/[^[:space:]]*)?$")' >/dev/null; then
-    log "RTMP_TARGET_BASE_URL must be a non-empty rtmp:// or rtmps:// URL; rejecting publication"
-    exit 1
-fi
 encoded_stream_key=$(printf '%s' "$stream_key" | jq -sRr @uri)
-target_url="${target_base_url%/}/${encoded_stream_key}"
-if ! jq -en --arg url "$target_url" \
-    '$url | test("^rtmps?://[^/[:space:]]+(/[^[:space:]]*)+$")' >/dev/null; then
-    log "could not construct a valid RTMP target URL; rejecting publication"
-    exit 1
-fi
 
 kubernetes_api_init
 
@@ -91,6 +76,20 @@ case "$status" in
         [ "$status" = 200 ] || { log "Kubernetes rejected LiveStream source update (HTTP $status)"; exit 1; }
         ;;
     404)
+        # This configuration is needed only to create a resource. Existing
+        # resources retain their own target when a publication reconnects.
+        target_base_url=${RTMP_TARGET_BASE_URL:-}
+        if ! jq -en --arg url "$target_base_url" \
+            '$url | test("^rtmps?://[^/[:space:]?#]+(/[^[:space:]?#]*)?$")' >/dev/null; then
+            log "RTMP_TARGET_BASE_URL must be a non-empty rtmp:// or rtmps:// URL without a query or fragment; rejecting publication"
+            exit 1
+        fi
+        target_url="${target_base_url%/}/${encoded_stream_key}"
+        if ! jq -en --arg url "$target_url" \
+            '$url | test("^rtmps?://[^/[:space:]?#]+(/[^[:space:]?#]*)+$")' >/dev/null; then
+            log "could not construct a valid RTMP target URL; rejecting publication"
+            exit 1
+        fi
         jq -n \
             --arg name "$stream_key" \
             --arg streamKey "$stream_key" \

@@ -15,10 +15,12 @@ stream. There is deliberately no `Offline` phase.
 - `spec.target.url` is the complete destination for this publication. For new
   resources, the Proxy constructs it exclusively from its explicit
   `RTMP_TARGET_BASE_URL` configuration and the URL-encoded stream key. The
-  Proxy validates the resulting `rtmp://` or `rtmps://` URL before its first
-  Kubernetes API request and rejects the publication with a clear hook log if
-  no valid destination can be determined. It does not query a legacy
-  Controller or an external database.
+  base cannot contain a query or fragment because the key is appended to its
+  path. Before sending a create request, the Proxy validates the resulting
+  `rtmp://` or `rtmps://` URL and rejects the publication with a clear hook log
+  if no valid destination can be determined. It does not query a legacy
+  Controller or an external database. Target configuration is not required to
+  reconnect a resource that already has a target.
 - `spec.target.baseUrlSecretRef` remains accepted for existing declarative
   resources and is resolved by the Worker, but it is not used by the Proxy
   when creating a `LiveStream`.

@@ -98,16 +98,19 @@ the destination used when it creates a `LiveStream`:
 
 The Proxy removes a trailing slash, appends the URL-encoded stream key, and
 stores that complete `rtmp://` or `rtmps://` destination in `spec.target.url`.
-It validates the base and result before contacting Kubernetes. If the target is
-missing or invalid, the publication hook fails with a clear log and no
-`LiveStream` is created. The Proxy does not consult a legacy Controller or an
-external database.
+The base must not contain a query (`?`) or fragment (`#`), because the stream
+key is appended to its path. Before sending a create request, the Proxy
+validates the base and result. If the target is missing or invalid, the
+publication hook fails with a clear log and no `LiveStream` is created. The
+Proxy does not consult a legacy Controller or an external database.
 
 All syntactically valid stream keys are admitted; no allowlist Secret is
 required. On a reconnection, the Proxy changes only `spec.source`, preserving
-the existing `spec.target` and `spec.recoveryPolicy`. Existing declarative
-resources that use `spec.target.baseUrlSecretRef` remain reconcilable by the
-Operator, although new Proxy-created resources use `spec.target.url`.
+the existing `spec.target` and `spec.recoveryPolicy`; therefore, reconnecting
+an existing resource does not require a valid `RTMP_TARGET_BASE_URL`. Existing
+declarative resources that use `spec.target.baseUrlSecretRef` remain
+reconcilable by the Operator, although new Proxy-created resources use
+`spec.target.url`.
 
 The script builds the Proxy, Operator, and Worker images, loads them into kind
 when needed, applies the manifests, and waits for both Deployments. For a kind
