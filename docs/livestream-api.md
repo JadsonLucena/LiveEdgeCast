@@ -51,16 +51,20 @@ stream. There is deliberately no `Offline` phase.
   to be recognized as stale. `spec.source.sessionId` is the desired source;
   session IDs under `status` record the source observed or bound to a Job.
 
-The publication-start hook first reads the deterministic resource name. A
-missing resource is created with only its original stream key, current source,
-derived target, and default recovery policy. If another request creates it
-first, the hook reads the winner and proceeds as a reconnection. Updates send a
-merge patch containing only `spec.source`; they never copy `status`,
-`metadata.finalizers`, or any Operator-owned field from the read response. A
-conflicting source update is retried at most three times by default, with a
-fresh read before every retry. Consequently, the most recently accepted
-publication session remains in `spec.source.sessionId`, without the hook
-maintaining cluster-wide ownership state outside that `LiveStream`.
+The `publication_started` hook first reads the deterministic resource name. A
+missing resource is created with only `metadata` and the desired `spec` (plus
+the required Kubernetes type identifiers). That creation includes the original
+stream key, current source, derived target, and default recovery policy, and it
+never includes `status`. If another request creates the resource first, the
+hook reads the winner and proceeds as a reconnection. Updates send a merge
+patch containing only `spec.source`; they never copy `status`,
+`metadata.finalizers`, or any Operator-owned field from the read response. The
+Proxy has no RBAC permission for `livestreams/status`; that subresource is
+owned exclusively by the Operator. A conflicting source update is retried at
+most three times by default, with a fresh read before every retry.
+Consequently, the most recently accepted publication session remains in
+`spec.source.sessionId`, without the hook maintaining cluster-wide ownership
+state outside that `LiveStream`.
 
 The HTTP lifecycle endpoint decodes the nginx
 `application/x-www-form-urlencoded` notify fields exactly once before invoking
@@ -71,6 +75,10 @@ and target URLs.
 The CRD schema validates the possible `status.phase` values. The current
 Operator implements creation, processing, terminal-Job recovery, interruption
 when the source is unavailable, stopping, and finalization as described below.
+For a newly created resource with no Job, the first Operator reconciliation
+adds its finalizer and records `status.phase: Registered`; it performs no
+provisioning action. Only a subsequent reconciliation can use that persisted
+phase to move to `Provisioning` and create the processing Job.
 
 ## Implemented finite-state machine
 

@@ -119,6 +119,16 @@ require a valid `RTMP_TARGET_BASE_URL`. Existing declarative resources that use
 `spec.target.baseUrlSecretRef` remain reconcilable by the Operator, although
 new Proxy-created resources use `spec.target.url`.
 
+When nginx accepts a new publication, `publication_started` creates its
+`LiveStream` with only `metadata` and the desired `spec` (plus the Kubernetes
+type identifiers); the create request never supplies `status`. On the first
+Operator reconciliation, the resource is recorded as `Registered` without a
+processing Job. A later reconciliation advances it to `Provisioning` and
+creates the Job, so registration is always persisted before provisioning
+begins. The Proxy RBAC intentionally grants no access to the
+`livestreams/status` subresource; lifecycle status is owned exclusively by the
+Operator.
+
 The script builds the Proxy, Operator, and Worker images, loads them into kind
 when needed, applies the manifests, and waits for both Deployments. For a kind
 cluster, it also starts a local port forward. Publish to:

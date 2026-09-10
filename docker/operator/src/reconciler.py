@@ -439,8 +439,12 @@ def reconcile(resource: dict, custom_api: Any, batch_api: Any, core_api: Any) ->
 
     finalizers = current_metadata.get("finalizers") or []
     if FINALIZER not in finalizers:
+        # Install ownership protection before taking any lifecycle action, but
+        # keep reconciling this same observation. A newly created, Job-less
+        # stream must publish Registered on its first reconcile; its following
+        # reconcile can then advance from that persisted checkpoint and create
+        # the processing Job.
         _patch_finalizers(custom_api, current, [*finalizers, FINALIZER])
-        return
 
     observed = _observe(current, batch_api, core_api)
     decision = decide_lifecycle(observed)
