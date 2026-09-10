@@ -54,6 +54,7 @@ RUN ln -s /usr/local/nginx/sbin/nginx /usr/sbin/nginx \
     && chmod 700 /run/liveedgecast/sessions
 
 COPY kubernetes_api.sh \
+    livestream_name.sh \
     publication_started.sh \
     publication_ended.sh \
     publication_state.sh \

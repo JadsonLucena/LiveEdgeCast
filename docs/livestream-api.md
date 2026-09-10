@@ -9,6 +9,20 @@ stream. There is deliberately no `Offline` phase.
 - `spec` is the desired configuration supplied by the ingest integration. It
   identifies the stream, its current source, its target, and its recovery
   policy.
+- `metadata.name` is derived deterministically from `spec.streamKey`, while
+  `spec.streamKey` always retains the original key byte-for-byte. A key that is
+  already a lowercase DNS label of at most 63 bytes is used as-is. Otherwise,
+  the Proxy lowercases it, replaces each run outside `[a-z0-9-]` with `-`,
+  removes leading and trailing hyphens, and appends the first 12 hexadecimal
+  characters of the SHA-256 hash of the original key. An empty normalized
+  prefix becomes `stream`; the readable prefix is limited to 50 bytes so the
+  name, separator, and hash fit the Kubernetes 63-byte DNS-label limit. The
+  hash is added whenever normalization or truncation is necessary, preventing
+  differently spelled keys that normalize to the same prefix from sharing a
+  resource name in normal operation. Because a valid literal key can still
+  equal another key's complete derived name, the Proxy also compares the
+  fetched `spec.streamKey` with the current original key before every source
+  patch and rejects the publication on a mismatch.
 - `spec.source.available` is set by the Proxy for the registered publication;
   the Operator reflects this desired-source fact into its own status without
   requiring the Proxy to write the status subresource.
@@ -26,6 +40,9 @@ stream. There is deliberately no `Offline` phase.
   when creating a `LiveStream`.
 - On reconnection, the Proxy merge-patches only `spec.source`; the existing
   `spec.target` and `spec.recoveryPolicy` remain untouched.
+- New resources receive the default recovery policy explicitly:
+  `retryIntervalSeconds: 2`, `maxRetries: 5`, and
+  `interruptionTTLSeconds: 10`.
 - `status` is the state observed while reconciling that desired configuration.
   It contains the lifecycle phase and observations about the source, Job,
   processing health, interruption, and conditions.
@@ -33,6 +50,23 @@ stream. There is deliberately no `Offline` phase.
   reconnection has a new session ID, allowing events for an older publication
   to be recognized as stale. `spec.source.sessionId` is the desired source;
   session IDs under `status` record the source observed or bound to a Job.
+
+The publication-start hook first reads the deterministic resource name. A
+missing resource is created with only its original stream key, current source,
+derived target, and default recovery policy. If another request creates it
+first, the hook reads the winner and proceeds as a reconnection. Updates send a
+merge patch containing only `spec.source`; they never copy `status`,
+`metadata.finalizers`, or any Operator-owned field from the read response. A
+conflicting source update is retried at most three times by default, with a
+fresh read before every retry. Consequently, the most recently accepted
+publication session remains in `spec.source.sessionId`, without the hook
+maintaining cluster-wide ownership state outside that `LiveStream`.
+
+The HTTP lifecycle endpoint decodes the nginx
+`application/x-www-form-urlencoded` notify fields exactly once before invoking
+either hook. Thus an escaped name such as `hello%20world` is stored as the
+original `hello world`, and only URL-encoded again when constructing its source
+and target URLs.
 
 The CRD schema validates the possible `status.phase` values. The current
 Operator implements creation, processing, terminal-Job recovery, interruption
