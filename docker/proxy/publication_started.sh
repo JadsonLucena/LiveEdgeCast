@@ -83,6 +83,9 @@ case "$status" in
             log "could not construct a valid RTMP target URL; rejecting publication"
             exit 1
         fi
+        # Creation owns only metadata and the desired spec (in addition to the
+        # Kubernetes type identifiers). Lifecycle status belongs exclusively
+        # to the Operator and is deliberately absent from this request.
         jq -n \
             --arg name "$resource_name" \
             --arg streamKey "$stream_key" \
