@@ -53,7 +53,9 @@ EOF
     log "local publication identity does not match; ignoring"
     exit 0
 }
-resource_name=$(printf '%s\n' "$state_record" | jq -er '.resourceName')
+# Accept records left by an older container in the Pod's emptyDir while all new
+# records use the field that explicitly describes the persisted association.
+resource_name=$(printf '%s\n' "$state_record" | jq -er '.liveStreamName // .resourceName')
 if [ -n "$expected_session_id" ] && [ "$session_id" != "$expected_session_id" ]; then
     rm -f "${state_file}.${expected_session_id}.terminate"
     log "retry belongs to stale session '$expected_session_id'; ignoring"

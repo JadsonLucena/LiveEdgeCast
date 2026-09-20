@@ -159,13 +159,13 @@ fi
 state_tmp="${state_file}.tmp.$$"
 jq -n \
     --arg streamKey "$stream_key" \
-    --arg resourceName "$resource_name" \
+    --arg liveStreamName "$resource_name" \
     --arg connectionIdentity "$connection_identity" \
     --arg nginxLifetimeId "$nginx_lifetime_id" \
     --arg sessionId "$session_id" \
     '{streamKey: $streamKey, sessionId: $sessionId,
       connectionIdentity: $connectionIdentity, nginxLifetimeId: $nginxLifetimeId,
-      resourceName: $resourceName}' >"$state_tmp"
+      liveStreamName: $liveStreamName}' >"$state_tmp"
 publication_state_commit "$state_tmp" "$state_file"
 if [ -f "${state_file}.pending-terminate" ]; then
     touch "${state_file}.${session_id}.terminate"

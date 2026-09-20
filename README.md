@@ -156,7 +156,9 @@ specific Proxy replica rather than to the load-balanced `proxy` Service.
 After Kubernetes accepts the source, the Proxy stores a small session record
 under `/run/liveedgecast/sessions` (or `PUBLICATION_STATE_DIR`). This is local,
 ephemeral publication state—not a cluster source of truth—and maps nginx's
-connection identifier to the generated session and `LiveStream`. It exists
+connection identifier to the stream key, generated session, and `LiveStream`
+name. Each connection has its own atomically replaced record, so overlapping
+publications for the same stream key never overwrite one another. It exists
 only so the same Proxy replica can correlate `on_publish_done` with the publish
 it accepted; Pod replacement discards it.
 
