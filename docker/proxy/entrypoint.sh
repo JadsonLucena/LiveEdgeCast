@@ -8,6 +8,8 @@ umask 077
 mkdir -p "$state_dir"
 chmod 700 "$state_dir"
 
+socat TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork EXEC:/scripts/lifecycle_http.sh &
+
 # Resume termination requests retained after a transient API failure or
 # proxy restart.
 (

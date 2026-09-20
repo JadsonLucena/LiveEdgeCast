@@ -37,6 +37,22 @@ state_file=$(publication_state_file "$state_dir" "$stream_key" "$connection_iden
 
 umask 077
 mkdir -p "$state_dir"
+exec 9>"${state_file}.lifecycle.lock"
+flock 9
+
+# notify and exec deliberately invoke the same hook. Whichever arrives second
+# observes the transaction committed by the first instead of rotating source.
+if jq -e --arg streamKey "$stream_key" --arg connectionIdentity "$connection_identity" \
+    '.streamKey == $streamKey and .connectionIdentity == $connectionIdentity' \
+    "$state_file" >/dev/null 2>&1; then
+    log "publication '$stream_key' is already registered for this connection"
+    exit 0
+fi
+[ ! -f "${state_file}.ended" ] || {
+    log "connection already ended; skipping delayed start"
+    exit 0
+}
+
 work_dir=$(mktemp -d "${state_dir}/.started.XXXXXX")
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 response_file="${work_dir}/response.json"
@@ -146,4 +162,8 @@ jq -n \
     '{streamKey: $streamKey, sessionId: $sessionId,
       connectionIdentity: $connectionIdentity, resourceName: $resourceName}' >"$state_tmp"
 publication_state_commit "$state_tmp" "$state_file"
+if [ -f "${state_file}.pending-terminate" ]; then
+    touch "${state_file}.${session_id}.terminate"
+    rm -f "${state_file}.pending-terminate"
+fi
 log "registered stream '$stream_key' with session '$session_id'"

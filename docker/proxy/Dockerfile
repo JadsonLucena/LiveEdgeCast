@@ -10,14 +10,17 @@ RUN apk add --no-cache \
     pcre2-dev \
     zlib-dev \
     linux-headers \
+    patch \
     wget \
     tar
 
 WORKDIR /tmp/build
+COPY nginx-rtmp-clientid.patch /tmp/build/nginx-rtmp-clientid.patch
 RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
     && wget -q https://github.com/arut/nginx-rtmp-module/archive/v${NGINX_RTMP_MODULE_VERSION}.tar.gz -O nginx-rtmp-module.tar.gz \
     && tar -xzf nginx-${NGINX_VERSION}.tar.gz \
-    && tar -xzf nginx-rtmp-module.tar.gz
+    && tar -xzf nginx-rtmp-module.tar.gz \
+    && patch -d nginx-rtmp-module-${NGINX_RTMP_MODULE_VERSION} -p1 < nginx-rtmp-clientid.patch
 
 WORKDIR /tmp/build/nginx-${NGINX_VERSION}
 RUN ./configure \
@@ -45,6 +48,7 @@ RUN apk add --no-cache \
     jq \
     libssl3 \
     pcre2 \
+    socat \
     zlib
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
@@ -57,6 +61,7 @@ COPY kubernetes_api.sh \
     publication_started.sh \
     publication_ended.sh \
     publication_state.sh \
+    lifecycle_http.sh \
     entrypoint.sh \
     /scripts/
 RUN chmod 755 /scripts/*.sh
