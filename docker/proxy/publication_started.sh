@@ -17,6 +17,7 @@ nginx_lifetime_id=${NGINX_LIFETIME_ID:-}
 [ -n "$connection_identity" ] || { log "connection identity is required"; exit 1; }
 [ -n "$nginx_lifetime_id" ] || { log "nginx lifetime identity is required"; exit 1; }
 
+session_id=$(cat /proc/sys/kernel/random/uuid)
 encoded_stream_key=$(printf '%s' "$stream_key" | jq -sRr @uri)
 resource_name=$(livestream_resource_name "$stream_key")
 
@@ -30,7 +31,6 @@ case "$proxy_host" in
     *[!0-9a-fA-F:.]*|''|.*|*.) log "invalid pod IP"; exit 1 ;;
 esac
 case "$proxy_host" in *:*) proxy_host="[$proxy_host]" ;; esac
-session_id=$(cat /proc/sys/kernel/random/uuid)
 # The original key may contain any non-empty text, so encode it only at the URL
 # boundary while preserving its exact value in spec.streamKey.
 source_url="rtmp://${proxy_host}:1935/live/${encoded_stream_key}"

@@ -48,7 +48,9 @@ state.
   publication, and `spec.source.url` uses that Pod's Downward-API IP. The
   source is consequently bound to that Proxy replica, not to the load-balanced
   Proxy Service. A different replica accepting a reconnection writes a new
-  source identity.
+  source identity. The Proxy also uses the Downward-API namespace for the
+  namespaced `LiveStream` API path and verifies that it matches the namespace
+  projected with its ServiceAccount credentials.
 - `spec.target.url` is the complete destination for this publication. For new
   resources, the Proxy constructs it exclusively from its explicit
   `RTMP_TARGET_BASE_URL` configuration and the URL-encoded stream key. The
