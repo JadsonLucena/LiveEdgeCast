@@ -1,0 +1,12 @@
+--- a/ngx_rtmp_exec_module.c
++++ b/ngx_rtmp_exec_module.c
+@@ -133,0 +134 @@
++    u_char                              clientid[NGX_INT_T_LEN + 1];
+@@ -338,0 +340,4 @@
++    { ngx_string("clientid"),
++      ngx_rtmp_exec_eval_ctx_cstr,
++      offsetof(ngx_rtmp_exec_ctx_t, clientid) },
++
+@@ -958,0 +964,2 @@
++    ngx_sprintf(ctx->clientid, "%ui%Z",
++                (ngx_uint_t) s->connection->number);

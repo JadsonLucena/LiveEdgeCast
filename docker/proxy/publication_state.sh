@@ -8,7 +8,9 @@ publication_state_file() (
     state_dir=$1
     stream_key=$2
     connection_id=$3
-    state_key=$(printf '%s\n%s' "$stream_key" "$connection_id" | sha256sum | cut -d ' ' -f 1)
+    nginx_lifetime_id=$4
+    state_key=$(printf '%s\n%s\n%s' "$nginx_lifetime_id" "$stream_key" "$connection_id" |
+        sha256sum | cut -d ' ' -f 1)
     printf '%s/%s.json\n' "$state_dir" "$state_key"
 )
 

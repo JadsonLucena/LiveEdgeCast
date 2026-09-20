@@ -9,25 +9,43 @@ log() {
 }
 
 stream_key=${1:-}
-application=${2:-}
-publisher_address=${3:-}
-publication_id=${4:-}
-expected_session_id=${5:-}
-[ -n "$stream_key" ] && [ "$application" = live ] && \
-    [ -n "$publisher_address" ] && [ -n "$publication_id" ] || {
+connection_identity=${2:-}
+expected_session_id=${3:-}
+nginx_lifetime_id=${4:-${NGINX_LIFETIME_ID:-}}
+state_file_override=${5:-}
+[ -n "$stream_key" ] && [ -n "$connection_identity" ] || {
     log "incomplete publication identity"
     exit 1
 }
 
 state_dir=$(publication_state_dir)
-state_file=$(publication_state_file "$state_dir" "$stream_key" "$publication_id")
+if [ -n "$state_file_override" ]; then
+    state_file=$state_file_override
+else
+    [ -n "$nginx_lifetime_id" ] || { log "nginx lifetime identity is required"; exit 1; }
+    state_file=$(publication_state_file "$state_dir" "$stream_key" "$connection_identity" \
+        "$nginx_lifetime_id")
+fi
+umask 077
+mkdir -p "$state_dir"
+exec 9>"${state_file}.lifecycle.lock"
+flock 9
+
 state_record=$(cat "$state_file" 2>/dev/null) || {
-    log "no confirmed local session for '$stream_key'; ignoring"
+    if [ -f "${state_file}.ended" ]; then
+        log "publication '$stream_key' was already terminated"
+    else
+        # Preserve an early end event until a concurrent start transaction has
+        # committed its session. The entrypoint reaper consumes the marker that
+        # publication_started creates after committing that state.
+        touch "${state_file}.pending-terminate"
+        log "publication ended before registration completed; termination retained"
+    fi
     exit 0
 }
 
-session_id=$(jq -er --arg streamKey "$stream_key" --arg localConnectionId "$publication_id" \
-    'select(.streamKey == $streamKey and .localConnectionId == $localConnectionId) | .sessionId' \
+session_id=$(jq -er --arg streamKey "$stream_key" --arg connectionIdentity "$connection_identity" \
+    'select(.streamKey == $streamKey and .connectionIdentity == $connectionIdentity) | .sessionId' \
     <<EOF
 $state_record
 EOF
@@ -53,6 +71,8 @@ request_file="${work_dir}/request.json"
 status=$(kubernetes_api_request GET "${LIVESTREAMS_API_PATH}/${resource_name}" "$response_file")
 if [ "$status" = 404 ]; then
     publication_state_remove_if_session "$state_file" "$session_id" "$retry_file"
+    touch "${state_file}.ended"
+    rm -f "${state_file}.pending-terminate"
     exit 0
 fi
 [ "$status" = 200 ] || { log "could not read LiveStream (HTTP $status)"; exit 1; }
@@ -64,6 +84,8 @@ remote_session=$(jq -er '.spec.source.sessionId' "$response_file") || {
 if [ "$remote_session" != "$session_id" ]; then
     log "session '$session_id' is stale; leaving LiveStream untouched"
     publication_state_remove_if_session "$state_file" "$session_id" "$retry_file"
+    touch "${state_file}.ended"
+    rm -f "${state_file}.pending-terminate"
     exit 0
 fi
 
@@ -84,4 +106,6 @@ status=$(kubernetes_api_request DELETE "${LIVESTREAMS_API_PATH}/${resource_name}
 }
 
 publication_state_remove_if_session "$state_file" "$session_id" "$retry_file"
+touch "${state_file}.ended"
+rm -f "${state_file}.pending-terminate"
 log "removed stream '$stream_key' for session '$session_id'"

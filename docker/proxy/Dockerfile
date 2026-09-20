@@ -10,14 +10,17 @@ RUN apk add --no-cache \
     pcre2-dev \
     zlib-dev \
     linux-headers \
+    patch \
     wget \
     tar
 
 WORKDIR /tmp/build
+COPY nginx-rtmp-clientid.patch /tmp/build/nginx-rtmp-clientid.patch
 RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
     && wget -q https://github.com/arut/nginx-rtmp-module/archive/v${NGINX_RTMP_MODULE_VERSION}.tar.gz -O nginx-rtmp-module.tar.gz \
     && tar -xzf nginx-${NGINX_VERSION}.tar.gz \
-    && tar -xzf nginx-rtmp-module.tar.gz
+    && tar -xzf nginx-rtmp-module.tar.gz \
+    && patch -d nginx-rtmp-module-${NGINX_RTMP_MODULE_VERSION} -p1 < nginx-rtmp-clientid.patch
 
 WORKDIR /tmp/build/nginx-${NGINX_VERSION}
 RUN ./configure \
