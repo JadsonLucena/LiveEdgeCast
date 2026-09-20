@@ -45,7 +45,6 @@ RUN apk add --no-cache \
     jq \
     libssl3 \
     pcre2 \
-    socat \
     zlib
 
 COPY --from=builder /usr/local/nginx /usr/local/nginx
@@ -58,7 +57,6 @@ COPY kubernetes_api.sh \
     publication_started.sh \
     publication_ended.sh \
     publication_state.sh \
-    lifecycle_http.sh \
     entrypoint.sh \
     /scripts/
 RUN chmod 755 /scripts/*.sh

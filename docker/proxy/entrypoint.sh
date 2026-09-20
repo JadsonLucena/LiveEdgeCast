@@ -8,17 +8,8 @@ umask 077
 mkdir -p "$state_dir"
 chmod 700 "$state_dir"
 
-cleanup() {
-    kill "$lifecycle_pid" 2>/dev/null || true
-    kill "$reaper_pid" 2>/dev/null || true
-}
-trap cleanup EXIT HUP INT TERM
-
-socat TCP-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork EXEC:/scripts/lifecycle_http.sh &
-lifecycle_pid=$!
-
 # Resume termination requests retained after a transient API failure or
-# lifecycle-handler restart.
+# proxy restart.
 (
     while :; do
         for marker in "$state_dir"/*.json.*.terminate; do
@@ -38,15 +29,14 @@ lifecycle_pid=$!
                 rm -f "$marker"
                 continue
             }
-            connection_id=$(jq -er '.localConnectionId' "$state" 2>/dev/null) || {
+            connection_identity=$(jq -er '.connectionIdentity' "$state" 2>/dev/null) || {
                 rm -f "$marker"
                 continue
             }
-            /scripts/publication_ended.sh "$stream_key" live retry "$connection_id" "$marker_session" || true
+            /scripts/publication_ended.sh "$stream_key" "$connection_identity" "$marker_session" || true
         done
         sleep "${TERMINATION_RETRY_SECONDS:-2}"
     done
 ) &
-reaper_pid=$!
 
 exec nginx -g 'daemon off;'

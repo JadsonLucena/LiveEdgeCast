@@ -9,25 +9,22 @@ log() {
 }
 
 stream_key=${1:-}
-application=${2:-}
-publisher_address=${3:-}
-publication_id=${4:-}
-expected_session_id=${5:-}
-[ -n "$stream_key" ] && [ "$application" = live ] && \
-    [ -n "$publisher_address" ] && [ -n "$publication_id" ] || {
+connection_identity=${2:-}
+expected_session_id=${3:-}
+[ -n "$stream_key" ] && [ -n "$connection_identity" ] || {
     log "incomplete publication identity"
     exit 1
 }
 
 state_dir=$(publication_state_dir)
-state_file=$(publication_state_file "$state_dir" "$stream_key" "$publication_id")
+state_file=$(publication_state_file "$state_dir" "$stream_key" "$connection_identity")
 state_record=$(cat "$state_file" 2>/dev/null) || {
     log "no confirmed local session for '$stream_key'; ignoring"
     exit 0
 }
 
-session_id=$(jq -er --arg streamKey "$stream_key" --arg localConnectionId "$publication_id" \
-    'select(.streamKey == $streamKey and .localConnectionId == $localConnectionId) | .sessionId' \
+session_id=$(jq -er --arg streamKey "$stream_key" --arg connectionIdentity "$connection_identity" \
+    'select(.streamKey == $streamKey and .connectionIdentity == $connectionIdentity) | .sessionId' \
     <<EOF
 $state_record
 EOF
