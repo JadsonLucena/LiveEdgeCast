@@ -77,8 +77,10 @@ state.
 For every publish notification, `publication_started` generates a fresh UUID
 before creating or updating the resource. Once Kubernetes has accepted that
 source, the Proxy atomically stores a record mapping the nginx connection ID to
-the stream key, resource name, and generated session ID. These records live in
-`/run/liveedgecast/sessions` by default (configurable with
+the stream key, `LiveStream` name, and generated session ID. Records are keyed
+by the nginx-process lifetime and connection ID (as well as the stream key), so
+overlapping publications cannot replace each other's local state. These records
+live in `/run/liveedgecast/sessions` by default (configurable with
 `PUBLICATION_STATE_DIR`), local to the Proxy replica and only for the duration
 of the publication. They are ephemeral correlation data for the end hook, not
 a durable or cluster-wide source of truth; restarting or replacing the Pod
