@@ -22,8 +22,12 @@ kubernetes_api_init() {
         return 1
     }
 
-    KUBERNETES_NAMESPACE=$(tr -d '\r\n' <"$KUBERNETES_NAMESPACE_FILE")
-    [ -n "$KUBERNETES_NAMESPACE" ] || return 1
+    serviceaccount_namespace=$(tr -d '\r\n' <"$KUBERNETES_NAMESPACE_FILE")
+    KUBERNETES_NAMESPACE=${POD_NAMESPACE:?POD_NAMESPACE is required}
+    [ "$KUBERNETES_NAMESPACE" = "$serviceaccount_namespace" ] || {
+        echo "Pod namespace does not match ServiceAccount namespace" >&2
+        return 1
+    }
     kubernetes_host=${KUBERNETES_SERVICE_HOST:?KUBERNETES_SERVICE_HOST is required}
     case "$kubernetes_host" in
         *:*) kubernetes_host="[$kubernetes_host]" ;;
