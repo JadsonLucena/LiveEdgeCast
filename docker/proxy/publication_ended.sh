@@ -11,13 +11,21 @@ log() {
 stream_key=${1:-}
 connection_identity=${2:-}
 expected_session_id=${3:-}
+nginx_lifetime_id=${4:-${NGINX_LIFETIME_ID:-}}
+state_file_override=${5:-}
 [ -n "$stream_key" ] && [ -n "$connection_identity" ] || {
     log "incomplete publication identity"
     exit 1
 }
 
 state_dir=$(publication_state_dir)
-state_file=$(publication_state_file "$state_dir" "$stream_key" "$connection_identity")
+if [ -n "$state_file_override" ]; then
+    state_file=$state_file_override
+else
+    [ -n "$nginx_lifetime_id" ] || { log "nginx lifetime identity is required"; exit 1; }
+    state_file=$(publication_state_file "$state_dir" "$stream_key" "$connection_identity" \
+        "$nginx_lifetime_id")
+fi
 umask 077
 mkdir -p "$state_dir"
 exec 9>"${state_file}.lifecycle.lock"

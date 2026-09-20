@@ -11,9 +11,11 @@ log() {
 
 stream_key=${1:-}
 connection_identity=${2:-}
+nginx_lifetime_id=${NGINX_LIFETIME_ID:-}
 
 [ -n "$stream_key" ] || { log "stream key is required"; exit 1; }
 [ -n "$connection_identity" ] || { log "connection identity is required"; exit 1; }
+[ -n "$nginx_lifetime_id" ] || { log "nginx lifetime identity is required"; exit 1; }
 
 encoded_stream_key=$(printf '%s' "$stream_key" | jq -sRr @uri)
 resource_name=$(livestream_resource_name "$stream_key")
@@ -33,7 +35,8 @@ session_id=$(cat /proc/sys/kernel/random/uuid)
 # boundary while preserving its exact value in spec.streamKey.
 source_url="rtmp://${proxy_host}:1935/live/${encoded_stream_key}"
 state_dir=$(publication_state_dir)
-state_file=$(publication_state_file "$state_dir" "$stream_key" "$connection_identity")
+state_file=$(publication_state_file "$state_dir" "$stream_key" "$connection_identity" \
+    "$nginx_lifetime_id")
 
 umask 077
 mkdir -p "$state_dir"
@@ -158,9 +161,11 @@ jq -n \
     --arg streamKey "$stream_key" \
     --arg resourceName "$resource_name" \
     --arg connectionIdentity "$connection_identity" \
+    --arg nginxLifetimeId "$nginx_lifetime_id" \
     --arg sessionId "$session_id" \
     '{streamKey: $streamKey, sessionId: $sessionId,
-      connectionIdentity: $connectionIdentity, resourceName: $resourceName}' >"$state_tmp"
+      connectionIdentity: $connectionIdentity, nginxLifetimeId: $nginxLifetimeId,
+      resourceName: $resourceName}' >"$state_tmp"
 publication_state_commit "$state_tmp" "$state_file"
 if [ -f "${state_file}.pending-terminate" ]; then
     touch "${state_file}.${session_id}.terminate"
