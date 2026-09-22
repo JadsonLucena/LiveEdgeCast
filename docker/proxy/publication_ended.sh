@@ -33,7 +33,7 @@ flock 9
 
 state_record=$(cat "$state_file" 2>/dev/null) || {
     if [ -f "${state_file}.ended" ]; then
-        log "publication '$stream_key' was already terminated"
+        log "publication was already terminated"
     else
         # Preserve an early end event until a concurrent start transaction has
         # committed its session. The entrypoint reaper consumes the marker that
@@ -45,7 +45,9 @@ state_record=$(cat "$state_file" 2>/dev/null) || {
 }
 
 session_id=$(jq -er --arg streamKey "$stream_key" --arg connectionIdentity "$connection_identity" \
-    'select(.streamKey == $streamKey and .connectionIdentity == $connectionIdentity) | .sessionId' \
+    'select(.streamKey == $streamKey and .connectionIdentity == $connectionIdentity) |
+     .sessionId | select(type == "string" and
+       test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"))' \
     <<EOF
 $state_record
 EOF
@@ -56,9 +58,20 @@ EOF
 # Accept records left by an older container in the Pod's emptyDir while all new
 # records use the field that explicitly describes the persisted association.
 resource_name=$(printf '%s\n' "$state_record" | jq -er '.liveStreamName // .resourceName')
+if ! jq -en --arg name "$resource_name" \
+    '$name | test("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$") and (length <= 63)' >/dev/null; then
+    log "local publication record contains an invalid LiveStream name"
+    exit 1
+fi
+if [ -n "$expected_session_id" ] && ! jq -en --arg sessionId "$expected_session_id" \
+    '$sessionId | test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")' \
+    >/dev/null; then
+    log "termination retry contains an invalid session identifier"
+    exit 1
+fi
 if [ -n "$expected_session_id" ] && [ "$session_id" != "$expected_session_id" ]; then
     rm -f "${state_file}.${expected_session_id}.terminate"
-    log "retry belongs to stale session '$expected_session_id'; ignoring"
+    log "retry belongs to a stale session; ignoring"
     exit 0
 fi
 retry_file="${state_file}.${session_id}.terminate"
@@ -84,7 +97,7 @@ remote_session=$(jq -er '.spec.source.sessionId' "$response_file") || {
     exit 1
 }
 if [ "$remote_session" != "$session_id" ]; then
-    log "session '$session_id' is stale; leaving LiveStream untouched"
+    log "session is stale; leaving LiveStream untouched"
     publication_state_remove_if_session "$state_file" "$session_id" "$retry_file"
     touch "${state_file}.ended"
     rm -f "${state_file}.pending-terminate"
@@ -110,4 +123,4 @@ status=$(kubernetes_api_request DELETE "${LIVESTREAMS_API_PATH}/${resource_name}
 publication_state_remove_if_session "$state_file" "$session_id" "$retry_file"
 touch "${state_file}.ended"
 rm -f "${state_file}.pending-terminate"
-log "removed stream '$stream_key' for session '$session_id'"
+log "removed LiveStream for the completed publication"

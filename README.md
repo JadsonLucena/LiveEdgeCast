@@ -171,9 +171,17 @@ reconnection merge patch contains only `spec.source`.
 The implemented end hook reads the locally confirmed session, compares it with
 the current `spec.source.sessionId`, and submits a UID/resourceVersion-
 preconditioned deletion only when they still match. A stale end notification
-therefore leaves a newer publication untouched. This guarantee applies to the
-implemented `publication_ended` hook; it does not imply that the future
-handover or `Interrupted`-recovery workflows are complete.
+therefore leaves a newer publication untouched and removes only the stale
+connection's local record. The matching local record is removed only after
+Kubernetes accepts the lifecycle operation (or confirms that the resource no
+longer exists), so transient API failures remain retryable. This guarantee
+applies to the implemented `publication_ended` hook; it does not imply that the
+future handover or `Interrupted`-recovery workflows are complete.
+
+Values placed in JSON bodies and RTMP paths are encoded at their respective
+boundaries, and locally persisted Kubernetes resource names are validated
+before use in an API path. Hook logs deliberately omit stream keys, session
+identifiers, URLs, ServiceAccount tokens, and any URL credentials.
 
 The script builds the Proxy, Operator, and Worker images, loads them into kind
 when needed, applies the manifests, and waits for both Deployments. For a kind

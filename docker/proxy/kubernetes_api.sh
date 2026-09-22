@@ -28,11 +28,33 @@ kubernetes_api_init() {
         echo "Pod namespace does not match ServiceAccount namespace" >&2
         return 1
     }
+    case "$KUBERNETES_NAMESPACE" in
+        ''|*[!a-z0-9.-]*|.*|*.)
+            echo "Pod namespace is not a valid Kubernetes namespace" >&2
+            return 1
+            ;;
+    esac
     kubernetes_host=${KUBERNETES_SERVICE_HOST:?KUBERNETES_SERVICE_HOST is required}
+    # Keep environment-controlled values from changing the URL authority or
+    # injecting credentials. Kubernetes supplies either an IP literal or a DNS
+    # name here; brackets are added locally for an IPv6 literal.
+    case "$kubernetes_host" in
+        ''|*[!0-9A-Za-z:.-]*|.*|*.)
+            echo "Kubernetes service host is invalid" >&2
+            return 1
+            ;;
+    esac
     case "$kubernetes_host" in
         *:*) kubernetes_host="[$kubernetes_host]" ;;
     esac
-    KUBERNETES_API_URL="https://${kubernetes_host}:${KUBERNETES_SERVICE_PORT_HTTPS:-443}"
+    kubernetes_port=${KUBERNETES_SERVICE_PORT_HTTPS:-443}
+    case "$kubernetes_port" in
+        ''|*[!0-9]*)
+            echo "Kubernetes service port is invalid" >&2
+            return 1
+            ;;
+    esac
+    KUBERNETES_API_URL="https://${kubernetes_host}:${kubernetes_port}"
     LIVESTREAMS_API_PATH="/apis/liveedgecast.io/v1alpha1/namespaces/${KUBERNETES_NAMESPACE}/livestreams"
 }
 
