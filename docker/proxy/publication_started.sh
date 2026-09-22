@@ -48,7 +48,7 @@ flock 9
 if jq -e --arg streamKey "$stream_key" --arg connectionIdentity "$connection_identity" \
     '.streamKey == $streamKey and .connectionIdentity == $connectionIdentity' \
     "$state_file" >/dev/null 2>&1; then
-    log "publication '$stream_key' is already registered for this connection"
+    log "publication is already registered for this connection"
     exit 0
 fi
 [ ! -f "${state_file}.ended" ] || {
@@ -136,7 +136,7 @@ if [ "$status" = 200 ]; then
     while :; do
         if ! jq -e --arg streamKey "$stream_key" \
             '.spec.streamKey == $streamKey' "$response_file" >/dev/null; then
-            log "derived resource name collision for stream '$stream_key'; rejecting publication"
+            log "derived resource name collision; rejecting publication"
             exit 1
         fi
         status=$(kubernetes_api_request PATCH "${LIVESTREAMS_API_PATH}/${resource_name}" \
@@ -171,4 +171,4 @@ if [ -f "${state_file}.pending-terminate" ]; then
     touch "${state_file}.${session_id}.terminate"
     rm -f "${state_file}.pending-terminate"
 fi
-log "registered stream '$stream_key' with session '$session_id'"
+log "registered publication source"

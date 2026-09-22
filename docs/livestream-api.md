@@ -112,7 +112,9 @@ local record belongs to the same nginx connection and its session ID still
 matches `spec.source.sessionId`. It then requests deletion with both UID and
 resource-version preconditions. A stale notification, or a conflict after the
 session check, cannot delete a newer accepted publication: a stale session is
-ignored, while a conflict is retried from a fresh read by the notify adapter.
+removed only from local state, while a conflict is retried from a fresh read by
+the notify adapter. Matching state is removed only after an accepted API
+response, preserving the retry after a transient failure.
 This completed behavior is limited to the implemented end hook and must not be
 read as completion of handover, recovery from `Interrupted`, or TTL expiry.
 
@@ -120,7 +122,9 @@ The HTTP lifecycle endpoint decodes the nginx
 `application/x-www-form-urlencoded` notify fields exactly once before invoking
 either hook. Thus an escaped name such as `hello%20world` is stored as the
 original `hello world`, and only URL-encoded again when constructing its source
-and target URLs.
+and target URLs. JSON is produced with `jq`, API path names are validated, and
+logs omit stream names, session IDs, tokens, and URLs so embedded credentials
+cannot be disclosed.
 
 The CRD schema validates the possible `status.phase` values. The current
 Operator implements creation, processing, terminal-Job recovery, interruption
